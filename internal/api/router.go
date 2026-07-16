@@ -3,6 +3,7 @@ package api
 import (
 	"log"
 	"net/http"
+
 )
 
 // corsMiddleware CORS 中间件 (支持所有来源, 适用于 NAS 局域网)
@@ -11,7 +12,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 		// 处理 OPTIONS 预检请求
 		if r.Method == http.MethodOptions {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 			w.Header().Set("Access-Control-Max-Age", "86400")
 			w.WriteHeader(http.StatusNoContent)
@@ -25,6 +26,9 @@ func corsMiddleware(next http.Handler) http.Handler {
 func NewRouter(svc *Service) http.Handler {
 	mux := http.NewServeMux()
 
+	// 仪表盘首页
+	mux.HandleFunc("/", svc.HandleDashboard)
+
 	// 核心接口
 	mux.HandleFunc("/api/daily", svc.HandleDaily)       // GET 每日操盘报告(汇总)
 	mux.HandleFunc("/api/positions", svc.HandlePositions) // GET 持仓诊断
@@ -33,6 +37,10 @@ func NewRouter(svc *Service) http.Handler {
 	mux.HandleFunc("/api/news/llm", svc.HandleLLMNews)   // GET LLM深度新闻分析
 	mux.HandleFunc("/api/strategy", svc.HandleStrategy)  // GET 策略建议
 	mux.HandleFunc("/api/market", svc.HandleMarket)      // GET 市场概况
+
+	// 仪表盘专用接口
+	mux.HandleFunc("/api/kline", svc.HandleKline)         // GET K线数据
+	mux.HandleFunc("/api/snapshots", svc.HandleSnapshots)  // GET 账户快照历史
 
 	// 基础接口
 	mux.HandleFunc("/api/health", svc.HandleHealth) // GET 健康检查
@@ -57,6 +65,7 @@ func NewRouter(svc *Service) http.Handler {
 		method string
 		desc   string
 	}{
+		{"/", "GET", "仪表盘首页"},
 		{"/api/health", "GET", "健康检查"},
 		{"/api/daily", "GET", "每日操盘报告(汇总)"},
 		{"/api/positions", "GET", "持仓诊断"},
@@ -65,6 +74,8 @@ func NewRouter(svc *Service) http.Handler {
 		{"/api/news/llm", "GET", "LLM深度新闻分析"},
 		{"/api/strategy", "GET", "策略建议"},
 		{"/api/market", "GET", "市场概况"},
+		{"/api/kline", "GET", "K线数据"},
+		{"/api/snapshots", "GET", "账户快照历史"},
 		{"/api/portfolio", "GET", "获取持仓列表"},
 		{"/api/portfolio/sync", "POST", "同步持仓"},
 		{"/api/trade/confirm", "POST", "交易反馈确认"},

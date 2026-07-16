@@ -21,6 +21,8 @@ import (
 	"jingzhe-trader/internal/store"
 	"jingzhe-trader/internal/strategy"
 	"jingzhe-trader/pkg/logger"
+
+	"jingzhe-trader/web"
 )
 
 // ==================== JSON 响应结构 ====================
@@ -1211,4 +1213,63 @@ func parseFloatParam(r *http.Request, key string, defaultVal float64) float64 {
 		return defaultVal
 	}
 	return n
+}
+// ==================== 仪表盘专用接口 ====================
+
+// HandleKline 处理 GET /api/kline?code=510050.SH&start=20260101&end=20260716
+func (s *Service) HandleKline(w http.ResponseWriter, r *http.Request) {
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		writeError(w, http.StatusBadRequest, "code 参数不能为空")
+		return
+	}
+	start := r.URL.Query().Get("start")
+	end := r.URL.Query().Get("end")
+	if start == "" {
+		start = "20200101"
+	}
+	if end == "" {
+		end = time.Now().Format("20060102")
+	}
+
+	bars, err := s.barRepo.GetBars(code, start, end)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if bars == nil {
+		bars = []model.Bar{}
+	}
+	writeJSON(w, http.StatusOK, bars)
+}
+
+// HandleSnapshots 处理 GET /api/snapshots?limit=30
+func (s *Service) HandleSnapshots(w http.ResponseWriter, r *http.Request) {
+	limit := parseIntParam(r, "limit", 30)
+
+	var snaps []model.AccountSnapshot
+	query := `SELECT trade_date, total_asset, cash, market_value, pnl, pnl_pct, total_pnl, total_pnl_pct
+	          FROM account_snapshot ORDER BY trade_date DESC LIMIT ?`
+	if err := s.db.Select(&snaps, query, limit); err != nil {
+		writeJSON(w, http.StatusOK, []model.AccountSnapshot{})
+		return
+	}
+	if snaps == nil {
+		snaps = []model.AccountSnapshot{}
+	}
+	// 反转为升序
+	for i, j := 0, len(snaps)-1; i < j; i, j = i+1, j-1 {
+		snaps[i], snaps[j] = snaps[j], snaps[i]
+	}
+	writeJSON(w, http.StatusOK, snaps)
+}
+
+// HandleDashboard 处理 GET / → 返回嵌入的仪表盘 HTML
+func (s *Service) HandleDashboard(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(web.DashboardHTML)
 }
