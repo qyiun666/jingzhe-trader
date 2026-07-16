@@ -61,6 +61,7 @@ type PortfolioJSON struct {
 	TotalAsset    float64                      `json:"total_asset"`
 	Cash          float64                      `json:"cash"`
 	MarketValue   float64                      `json:"market_value"`
+	DailyPnLPct   float64                      `json:"daily_pnl_pct"`
 	HealthScore   float64                      `json:"health_score"`
 	Concentration map[string]float64           `json:"concentration"`
 	SectorDist    []map[string]interface{}     `json:"sector_distribution"`
@@ -613,6 +614,13 @@ func (s *Service) buildPortfolioJSON(
 		healthScore = 100
 	}
 	result.HealthScore = healthScore
+
+	// 计算日收益率（对比昨日快照）
+	var prevTotalAsset float64
+	err := s.db.Get(&prevTotalAsset, "SELECT total_asset FROM account_snapshot ORDER BY trade_date DESC LIMIT 1")
+	if err == nil && prevTotalAsset > 0 {
+		result.DailyPnLPct = (totalAsset - prevTotalAsset) / prevTotalAsset
+	}
 
 	return result
 }
@@ -1251,12 +1259,48 @@ func (s *Service) HandleSnapshots(w http.ResponseWriter, r *http.Request) {
 	query := `SELECT trade_date, total_asset, cash, market_value, pnl, pnl_pct, total_pnl, total_pnl_pct
 	          FROM account_snapshot ORDER BY trade_date DESC LIMIT ?`
 	if err := s.db.Select(&snaps, query, limit); err != nil {
-		writeJSON(w, http.StatusOK, []model.AccountSnapshot{})
-		return
+		snaps = []model.AccountSnapshot{}
 	}
 	if snaps == nil {
 		snaps = []model.AccountSnapshot{}
 	}
+
+	// 如果没有历史数据，用当前 portfolio 生成一个实时快照
+	if len(snaps) == 0 {
+		// 先刷新市值
+		date := time.Now().Format("20060102")
+		allBars, _ := s.barRepo.GetBarsByDate(date)
+		todayBars := make(map[string]*model.Bar)
+		for i := range allBars {
+			b := &allBars[i]
+			todayBars[b.TsCode] = b
+		}
+		s.brk.UpdateMarketValue(todayBars)
+
+		asset, _ := s.brk.QueryAsset()
+		if asset != nil && asset.TotalAsset > 0 {
+			var totalPnL, totalPnLPct float64
+			portfolioRepo := store.NewPortfolioRepo(s.db)
+			initialStr, _ := portfolioRepo.GetMeta("initial_capital")
+			if initialStr != "" {
+				var ic float64
+				fmt.Sscanf(initialStr, "%f", &ic)
+				if ic > 0 {
+					totalPnL = asset.TotalAsset - ic
+					totalPnLPct = totalPnL / ic
+				}
+			}
+			snaps = append(snaps, model.AccountSnapshot{
+				TradeDate:   date,
+				TotalAsset:  asset.TotalAsset,
+				Cash:        asset.Cash,
+				MarketValue: asset.MarketValue,
+				TotalPnL:    totalPnL,
+				TotalPnLPct: totalPnLPct,
+			})
+		}
+	}
+
 	// 反转为升序
 	for i, j := 0, len(snaps)-1; i < j; i, j = i+1, j-1 {
 		snaps[i], snaps[j] = snaps[j], snaps[i]

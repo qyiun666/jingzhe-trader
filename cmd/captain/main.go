@@ -32,6 +32,56 @@ var (
 	universeFlag = flag.String("universe", "", "股票池文件路径")
 )
 
+// saveSnapshot 保存账户快照到数据库
+func saveSnapshot(db *sqlx.DB, tradeDate string, asset *broker.AssetInfo, positions map[string]*model.Position) error {
+	if asset == nil {
+		return fmt.Errorf("asset is nil")
+	}
+
+	// 计算市值
+	marketValue := asset.TotalAsset - asset.Cash
+
+	// 计算累计盈亏（需要 initial_capital）
+	var totalPnL, totalPnLPct float64
+	portfolioRepo := store.NewPortfolioRepo(db)
+	initialCapitalStr, _ := portfolioRepo.GetMeta("initial_capital")
+	if initialCapitalStr != "" {
+		var initialCapital float64
+		fmt.Sscanf(initialCapitalStr, "%f", &initialCapital)
+		if initialCapital > 0 {
+			totalPnL = asset.TotalAsset - initialCapital
+			totalPnLPct = totalPnL / initialCapital
+		}
+	}
+
+	// 查询前一日快照计算当日盈亏
+	var pnl, pnlPct float64
+	var prevSnap model.AccountSnapshot
+	err := db.Get(&prevSnap, "SELECT * FROM account_snapshot ORDER BY trade_date DESC LIMIT 1")
+	if err == nil && prevSnap.TotalAsset > 0 {
+		pnl = asset.TotalAsset - prevSnap.TotalAsset
+		pnlPct = pnl / prevSnap.TotalAsset
+	}
+
+	_, err = db.Exec(`INSERT INTO account_snapshot
+		(trade_date, total_asset, cash, market_value, pnl, pnl_pct, total_pnl, total_pnl_pct)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(trade_date) DO UPDATE SET
+			total_asset = excluded.total_asset,
+			cash = excluded.cash,
+			market_value = excluded.market_value,
+			pnl = excluded.pnl,
+			pnl_pct = excluded.pnl_pct,
+			total_pnl = excluded.total_pnl,
+			total_pnl_pct = excluded.total_pnl_pct`,
+		tradeDate, asset.TotalAsset, asset.Cash, marketValue, pnl, pnlPct, totalPnL, totalPnLPct)
+	if err != nil {
+		return fmt.Errorf("插入快照失败: %w", err)
+	}
+	logger.L().Infof("账户快照已保存: %s 总资产=%.2f", tradeDate, asset.TotalAsset)
+	return nil
+}
+
 func main() {
 	flag.Parse()
 
@@ -220,6 +270,12 @@ func runDaily(ctx context.Context, cfg *config.Config, db *sqlx.DB, tradeDate st
 	}
 
 	logger.L().Infof("[Daily] 报告已生成: %s", outputPath)
+
+	// 17. 保存账户快照
+	if err := saveSnapshot(db, tradeDate, asset, positions); err != nil {
+		logger.L().Warnf("保存账户快照失败: %v", err)
+	}
+
 	return nil
 }
 
@@ -327,6 +383,11 @@ func runDiagnose(ctx context.Context, cfg *config.Config, db *sqlx.DB, tradeDate
 			p.TsCode, p.Name, p.TotalQty, p.CostPrice, p.MarketPrice, p.FloatingPnL, p.FloatingPnLPct*100, p.WeightPct*100, p.Advice)
 	}
 	fmt.Println("==============================")
+
+	// 保存账户快照
+	if err := saveSnapshot(db, tradeDate, asset, positions); err != nil {
+		logger.L().Warnf("保存账户快照失败: %v", err)
+	}
 	return nil
 }
 
@@ -374,6 +435,11 @@ func runRebalance(ctx context.Context, cfg *config.Config, db *sqlx.DB, tradeDat
 		}
 	}
 	fmt.Println("==============================")
+
+	// 保存账户快照
+	if err := saveSnapshot(db, tradeDate, asset, positions); err != nil {
+		logger.L().Warnf("保存账户快照失败: %v", err)
+	}
 	return nil
 }
 

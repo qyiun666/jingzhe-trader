@@ -3,9 +3,13 @@ package main
 import (
 	"flag"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/jmoiron/sqlx"
+
 	"jingzhe-trader/internal/config"
+	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/store"
 	"jingzhe-trader/internal/tushare"
 	"jingzhe-trader/pkg/logger"
@@ -22,6 +26,7 @@ func main() {
 	syncMoneyFlow := flag.Bool("moneyflow", false, "同步个股资金流向")
 	syncTopList := flag.Bool("toplist", false, "同步龙虎榜数据")
 	syncFina := flag.Bool("fina", false, "同步财务指标数据(按报告期获取, 每季度采集一次)")
+	cleanup := flag.Bool("cleanup", false, "清理不在股票池和持仓中的股票数据")
 	flag.Parse()
 
 	// 加载配置
@@ -56,6 +61,28 @@ func main() {
 	barRepo := store.NewBarRepo(db)
 	limitRepo := store.NewLimitRepo(db)
 	basicRepo := store.NewBasicRepo(db)
+	portfolioRepo := store.NewPortfolioRepo(db)
+
+	// 0. 清理模式: 直接清理数据后退出
+	if *cleanup {
+		logger.L().Info("=== 清理多余股票数据 ===")
+		watchCodes := buildWatchCodeSet(cfg, stockRepo, portfolioRepo)
+		logger.L().Infof("关注股票数: %d 只", len(watchCodes))
+		deletedBars, deletedLimits, deletedBasics, err := cleanupUnusedData(db, watchCodes)
+		if err != nil {
+			logger.L().Errorf("清理数据失败: %v", err)
+		} else {
+			logger.L().Infof("清理完成: 删除 %d 条日线, %d 条涨跌停, %d 条基本面",
+				deletedBars, deletedLimits, deletedBasics)
+		}
+		// 执行 VACUUM 回收空间
+		if _, err := db.Exec("VACUUM"); err != nil {
+			logger.L().Warnf("VACUUM 失败: %v", err)
+		} else {
+			logger.L().Info("VACUUM 完成, 空间已回收")
+		}
+		return
+	}
 
 	// 1. 同步交易日历
 	logger.L().Info("=== 同步交易日历 ===")
@@ -111,28 +138,65 @@ func main() {
 			logger.L().Errorf("获取 %s 日线失败: %v", cal.CalDate, err)
 			continue
 		}
+		// 筛选模式: 只保留关注的股票
+		if cfg.Dataloader.FilterMode {
+			watchCodes := getWatchCodeCache(cfg, stockRepo, portfolioRepo)
+			filtered := make([]model.Bar, 0, len(bars))
+			for _, bar := range bars {
+				if watchCodes[bar.TsCode] {
+					filtered = append(filtered, bar)
+				}
+			}
+			bars = filtered
+		}
 		if err := barRepo.BatchInsert(bars); err != nil {
 			logger.L().Errorf("存储 %s 日线失败: %v", cal.CalDate, err)
 			continue
 		}
 
 		// 涨跌停价
-		limits, err := tsClient.StkLimit(cal.CalDate)
-		if err == nil && len(limits) > 0 {
-			limitRepo.BatchInsert(limits)
+		if cfg.Dataloader.EnableLimit {
+			limits, err := tsClient.StkLimit(cal.CalDate)
+			if err == nil && len(limits) > 0 {
+				if cfg.Dataloader.FilterMode {
+					watchCodes := getWatchCodeCache(cfg, stockRepo, portfolioRepo)
+					filtered := make([]model.StkLimit, 0, len(limits))
+					for _, lim := range limits {
+						if watchCodes[lim.TsCode] {
+							filtered = append(filtered, lim)
+						}
+					}
+					limits = filtered
+				}
+				limitRepo.BatchInsert(limits)
+			}
 		}
 
 		// 每日基本面
-		basics, err := tsClient.DailyBasic(cal.CalDate)
-		if err == nil && len(basics) > 0 {
-			basicRepo.BatchInsert(basics)
+		if cfg.Dataloader.EnableBasic {
+			basics, err := tsClient.DailyBasic(cal.CalDate)
+			if err == nil && len(basics) > 0 {
+				if cfg.Dataloader.FilterMode {
+					watchCodes := getWatchCodeCache(cfg, stockRepo, portfolioRepo)
+					filtered := make([]model.DailyBasic, 0, len(basics))
+					for _, b := range basics {
+						if watchCodes[b.TsCode] {
+							filtered = append(filtered, b)
+						}
+					}
+					basics = filtered
+				}
+				basicRepo.BatchInsert(basics)
+			}
 		}
 
 		// ETF/基金日线(与股票日线共用 daily_bar 表, ts_code 可区分)
-		fundBars, err := tsClient.FundDaily(cal.CalDate)
-		if err == nil && len(fundBars) > 0 {
-			if err := barRepo.BatchInsert(fundBars); err != nil {
-				logger.L().Errorf("存储 %s ETF日线失败: %v", cal.CalDate, err)
+		if cfg.Dataloader.EnableFund {
+			fundBars, err := tsClient.FundDaily(cal.CalDate)
+			if err == nil && len(fundBars) > 0 {
+				if err := barRepo.BatchInsert(fundBars); err != nil {
+					logger.L().Errorf("存储 %s ETF日线失败: %v", cal.CalDate, err)
+				}
 			}
 		}
 
@@ -276,6 +340,108 @@ func main() {
 	}
 
 	logger.L().Info("数据同步全部完成!")
+}
+
+var watchCodeCache map[string]bool
+var watchCodeCacheDirty = true
+
+// getWatchCodeCache 获取关注股票代码集合(带缓存)
+func getWatchCodeCache(cfg *config.Config, stockRepo *store.StockRepo, portfolioRepo *store.PortfolioRepo) map[string]bool {
+	if !watchCodeCacheDirty {
+		return watchCodeCache
+	}
+	watchCodeCache = buildWatchCodeSet(cfg, stockRepo, portfolioRepo)
+	watchCodeCacheDirty = false
+	return watchCodeCache
+}
+
+// buildWatchCodeSet 构建关注的股票代码集合
+// 包含: 股票池(bluechip + tech) + 持仓 + watchlist 配置
+func buildWatchCodeSet(cfg *config.Config, stockRepo *store.StockRepo, portfolioRepo *store.PortfolioRepo) map[string]bool {
+	codeSet := make(map[string]bool)
+
+	// 1. 股票池
+	if cfg.Universe.Bluechip != "" {
+		for _, code := range strings.Split(cfg.Universe.Bluechip, ",") {
+			code = strings.TrimSpace(code)
+			if code != "" {
+				codeSet[code] = true
+			}
+		}
+	}
+	if cfg.Universe.Tech != "" {
+		for _, code := range strings.Split(cfg.Universe.Tech, ",") {
+			code = strings.TrimSpace(code)
+			if code != "" {
+				codeSet[code] = true
+			}
+		}
+	}
+
+	// 2. 配置中的 watchlist
+	for _, code := range cfg.Dataloader.Watchlist {
+		code = strings.TrimSpace(code)
+		if code != "" {
+			codeSet[code] = true
+		}
+	}
+
+	// 3. 当前持仓
+	if portfolioRepo != nil {
+		positions, err := portfolioRepo.GetAllPositions()
+		if err == nil {
+			for _, p := range positions {
+				codeSet[p.TsCode] = true
+			}
+		}
+	}
+
+	return codeSet
+}
+
+// cleanupUnusedData 清理不在关注列表中的股票数据
+// 返回删除的日线数、涨跌停数、基本面数
+func cleanupUnusedData(db *sqlx.DB, watchCodes map[string]bool) (int, int, int, error) {
+	// 构建 IN 查询的占位符
+	codes := make([]string, 0, len(watchCodes))
+	for code := range watchCodes {
+		codes = append(codes, code)
+	}
+	if len(codes) == 0 {
+		return 0, 0, 0, fmt.Errorf("关注列表为空, 拒绝清理全部数据")
+	}
+
+	// 构建 NOT IN 的参数
+	placeholders := make([]string, len(codes))
+	args := make([]interface{}, len(codes))
+	for i, code := range codes {
+		placeholders[i] = "?"
+		args[i] = code
+	}
+	notIn := strings.Join(placeholders, ",")
+
+	// 删除日线
+	result, err := db.Exec(fmt.Sprintf("DELETE FROM daily_bar WHERE ts_code NOT IN (%s)", notIn), args...)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("清理日线失败: %w", err)
+	}
+	deletedBars, _ := result.RowsAffected()
+
+	// 删除涨跌停
+	result, err = db.Exec(fmt.Sprintf("DELETE FROM stk_limit WHERE ts_code NOT IN (%s)", notIn), args...)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("清理涨跌停失败: %w", err)
+	}
+	deletedLimits, _ := result.RowsAffected()
+
+	// 删除每日基本面
+	result, err = db.Exec(fmt.Sprintf("DELETE FROM daily_basic WHERE ts_code NOT IN (%s)", notIn), args...)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("清理基本面失败: %w", err)
+	}
+	deletedBasics, _ := result.RowsAffected()
+
+	return int(deletedBars), int(deletedLimits), int(deletedBasics), nil
 }
 
 // genReportPeriods 生成 [startDate, endDate] 区间内的报告期列表(降序, 最近的在前)

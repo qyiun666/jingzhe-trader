@@ -20,8 +20,18 @@ type Config struct {
 	Strategy StrategyConfig `mapstructure:"strategy"`
 	Universe UniverseConfig `mapstructure:"universe"`
 	Server   ServerConfig   `mapstructure:"server"`
-	Feishu   FeishuConfig   `mapstructure:"feishu"`
-	LLM      LLMConfig      `mapstructure:"llm"`
+	Feishu     FeishuConfig     `mapstructure:"feishu"`
+	LLM        LLMConfig        `mapstructure:"llm"`
+	Dataloader DataloaderConfig `mapstructure:"dataloader"`
+}
+
+// DataloaderConfig 数据加载器配置
+type DataloaderConfig struct {
+	FilterMode  bool     `mapstructure:"filter_mode"`  // 筛选模式: 只拉取股票池+持仓+关注列表的股票
+	Watchlist   []string `mapstructure:"watchlist"`    // 额外关注的股票代码列表
+	EnableLimit bool     `mapstructure:"enable_limit"`   // 是否同步涨跌停价
+	EnableBasic bool     `mapstructure:"enable_basic"`   // 是否同步每日基本面
+	EnableFund  bool     `mapstructure:"enable_fund"`    // 是否同步ETF/基金日线
 }
 
 // LLMConfig LLM 配置
@@ -173,6 +183,10 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("llm.enabled", false)
 	v.SetDefault("llm.base_url", "https://api.deepseek.com/v1")
 	v.SetDefault("llm.model", "deepseek-chat")
+	v.SetDefault("dataloader.filter_mode", false)
+	v.SetDefault("dataloader.enable_limit", true)
+	v.SetDefault("dataloader.enable_basic", true)
+	v.SetDefault("dataloader.enable_fund", true)
 
 	if err := v.ReadInConfig(); err != nil {
 		return nil, fmt.Errorf("读取配置文件失败: %w", err)

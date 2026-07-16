@@ -550,6 +550,16 @@
     $('#statCash').textContent = fmt(data.cash);
     $('#statMarketValue').textContent = fmt(data.market_value);
 
+    // 日收益率
+    var dailyPnlEl = $('#statDailyPnl');
+    if (data.daily_pnl_pct != null) {
+      dailyPnlEl.textContent = pct(data.daily_pnl_pct);
+      dailyPnlEl.className = 'stat-value ' + (data.daily_pnl_pct >= 0 ? 'positive' : 'negative');
+    } else {
+      dailyPnlEl.textContent = '--';
+      dailyPnlEl.className = 'stat-value';
+    }
+
     var html = '';
     for (var i = 0; i < holdings.length; i++) {
       var h = holdings[i];
@@ -557,7 +567,7 @@
       var pctClass = h.pnl_pct >= 0 ? 'pnl-positive' : 'pnl-negative';
       var activeClass = (activeKlineCode && activeKlineCode === h.ts_code) ? ' active' : '';
       html += '<tr class="' + activeClass + '" data-code="' + h.ts_code + '" data-idx="' + i + '">'
-        + '<td><span class="stock-name">' + (h.name || '--') + '</span><span class="stock-code">' + h.ts_code + '</span></td>'
+        + '<td><span class="stock-name">' + ((h.name && h.name !== h.ts_code) ? h.name : '') + '</span><span class="stock-code">' + h.ts_code + '</span></td>'
         + '<td>' + (h.total_qty || 0) + '</td>'
         + '<td>' + fmt(h.cost_price) + '</td>'
         + '<td>' + fmt(h.market_price) + '</td>'
@@ -574,7 +584,9 @@
     rows.forEach(function(tr) {
       tr.addEventListener('click', function() {
         var code = tr.dataset.code;
-        if (code) loadKline(code, tr.querySelector('.stock-name').textContent);
+        var nameEl = tr.querySelector('.stock-name');
+        var nameText = nameEl && nameEl.textContent ? nameEl.textContent : tr.querySelector('.stock-code').textContent;
+        if (code) loadKline(code, nameText);
         rows.forEach(function(r) { r.classList.remove('active'); });
         tr.classList.add('active');
       });
@@ -705,7 +717,8 @@
         window.addEventListener('resize', function() { klineChartInstance.resize(); });
       }
 
-      if (!data || !data.bars || data.bars.length === 0) {
+      var bars = Array.isArray(data) ? data : (data && data.bars ? data.bars : []);
+      if (!bars || bars.length === 0) {
         klineChartInstance.setOption({
           title: { text: (name || code) + ' - 暂无K线数据', left: 'center', top: 'center', textStyle: { color: '#64748b', fontSize: 14 } },
           xAxis: { show: false }, yAxis: { show: false }, series: []
@@ -713,7 +726,7 @@
         return;
       }
 
-      var bars = data.bars;
+      // bars already assigned above
       var dates = [];
       var ohlc = [];
       var vols = [];
@@ -953,18 +966,15 @@
       $('#statStrategy').textContent = '--';
       return;
     }
-    $('#statStrategy').textContent = data.recommended || '--';
+    var rec = data.recommended || '--';
+    if (rec === '空仓') rec = '观望';
+    $('#statStrategy').textContent = rec;
   }
 
   // ============ Daily PnL ============
   function calcDailyPnl(snapshots) {
     if (!snapshots || snapshots.length < 2) {
-      if (snapshots && snapshots.length === 1 && snapshots[0].total_pnl_pct != null) {
-        var s = snapshots[0];
-        var el = $('#statDailyPnl');
-        el.textContent = pct(s.total_pnl_pct);
-        el.className = 'stat-value ' + (s.total_pnl_pct >= 0 ? 'positive' : 'negative');
-      }
+      // 只有一天数据，无法计算日收益率，保持 renderPositions 已设置的值
       return;
     }
     var last = snapshots[snapshots.length - 1];
@@ -1014,16 +1024,14 @@
         // Asset curve from snapshots
         renderAssetCurve(snapshots);
 
-        // Fallback daily PnL
-        if (!daily || !daily.portfolio) {
-          if (snapshots && snapshots.length > 0) {
-            var lastSnap = snapshots[snapshots.length - 1];
-            if (lastSnap.total_pnl_pct != null) {
-              var el = $('#statDailyPnl');
-              el.textContent = pct(lastSnap.total_pnl_pct);
-              el.className = 'stat-value ' + (lastSnap.total_pnl_pct >= 0 ? 'positive' : 'negative');
-            }
-          }
+        // Fallback daily PnL: 只有 portfolio 没提供 daily_pnl_pct 时才用 snapshots 计算
+        if ((!daily || !daily.portfolio || daily.portfolio.daily_pnl_pct == null) && snapshots && snapshots.length >= 2) {
+          var lastSnap = snapshots[snapshots.length - 1];
+          var prevSnap = snapshots[snapshots.length - 2];
+          var dailyPnlPct = prevSnap.total_asset > 0 ? (lastSnap.total_asset - prevSnap.total_asset) / prevSnap.total_asset : 0;
+          var el = $('#statDailyPnl');
+          el.textContent = pct(dailyPnlPct);
+          el.className = 'stat-value ' + (dailyPnlPct >= 0 ? 'positive' : 'negative');
         }
       });
     }).then(function() {
@@ -1045,6 +1053,10 @@
         return;
       }
       return loadAll();
+    }).then(function() {
+      hideLoading(); // 确保 init 的 showLoading 被平衡
+    }).catch(function() {
+      hideLoading(); // 确保 init 的 showLoading 被平衡
     });
   }
 
