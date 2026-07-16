@@ -290,9 +290,22 @@ func runMonitor(ctx context.Context, cfg *config.Config, db *sqlx.DB, tradeDate 
 func runDiagnose(ctx context.Context, cfg *config.Config, db *sqlx.DB, tradeDate string) error {
 	logger.L().Infof("[Diagnose] 持仓诊断 %s", tradeDate)
 	stockRepo := store.NewStockRepo(db)
+	barRepo := store.NewBarRepo(db)
 	stockMap := buildStockMap(stockRepo)
 
 	brk := buildBroker(cfg, db)
+
+	// 用当日行情更新持仓市值(含 ETF)
+	allBars, err := barRepo.GetBarsByDate(tradeDate)
+	if err == nil && len(allBars) > 0 {
+		todayBars := make(map[string]*model.Bar, len(allBars))
+		for i := range allBars {
+			b := &allBars[i]
+			todayBars[b.TsCode] = b
+		}
+		brk.UpdateMarketValue(todayBars)
+	}
+
 	positions, err := brk.QueryPositions()
 	if err != nil {
 		return fmt.Errorf("查询持仓失败: %w", err)
@@ -332,6 +345,10 @@ func runRebalance(ctx context.Context, cfg *config.Config, db *sqlx.DB, tradeDat
 	}
 
 	brk := buildBroker(cfg, db)
+
+	// 用当日行情更新持仓市值(含 ETF)
+	brk.UpdateMarketValue(todayBars)
+
 	positions, _ := brk.QueryPositions()
 	asset, _ := brk.QueryAsset()
 

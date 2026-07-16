@@ -128,6 +128,22 @@ func (c *Client) TradeCal(exchange, startDate, endDate string) ([]model.TradeCal
 	return result, nil
 }
 
+// FundDaily 按交易日获取全市场基金(含ETF)日线(未复权)
+// 返回数据结构与 Daily 相同, 可直接写入 daily_bar 表
+func (c *Client) FundDaily(tradeDate string) ([]model.Bar, error) {
+	params := map[string]interface{}{"trade_date": tradeDate}
+	rows, err := c.callAPI("fund_daily", params, dailyFields)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]model.Bar, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, parseBar(row))
+	}
+	return result, nil
+}
+
 // Daily 按交易日获取全市场日线(未复权)
 func (c *Client) Daily(tradeDate string) ([]model.Bar, error) {
 	params := map[string]interface{}{"trade_date": tradeDate}

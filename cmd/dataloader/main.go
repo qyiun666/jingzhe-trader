@@ -128,6 +128,14 @@ func main() {
 			basicRepo.BatchInsert(basics)
 		}
 
+		// ETF/基金日线(与股票日线共用 daily_bar 表, ts_code 可区分)
+		fundBars, err := tsClient.FundDaily(cal.CalDate)
+		if err == nil && len(fundBars) > 0 {
+			if err := barRepo.BatchInsert(fundBars); err != nil {
+				logger.L().Errorf("存储 %s ETF日线失败: %v", cal.CalDate, err)
+			}
+		}
+
 		syncedCount++
 		if syncedCount%10 == 0 {
 			logger.L().Infof("已同步 %d 个交易日", syncedCount)
