@@ -114,6 +114,105 @@ jingzhe-trader/
 └── Makefile              # 快捷命令
 ```
 
+## AI Agent 使用指南
+
+> 如果你是 AI Agent（如 HermesAgent / Cursor Agent 等），下载本仓库后按以下步骤操作即可。
+
+### 1. 启动服务
+
+```bash
+# 克隆仓库
+git clone https://github.com/qyiun666/jingzhe-trader.git
+cd jingzhe-trader
+
+# 安装依赖
+go mod tidy
+
+# 复制配置模板并填入密钥
+cp config/config.example.yaml config/config.yaml
+# 编辑 config.yaml，填入 Tushare Token 和 LLM API Key
+
+# 启动服务
+make server-small
+```
+
+服务启动后监听 `http://localhost:11270`。
+
+### 2. 每日调度计划
+
+| 时间 | 操作 | API | 说明 |
+|---|---|---|---|
+| **08:50** | 晨报 | `GET /api/daily?date=YYYYMMDD` | 获取今日操盘建议 |
+| **08:55** | 飞书推送 | 调用飞书 Webhook | 将报告内容推送 |
+| **11:35** | 午盘 | `GET /api/market?date=YYYYMMDD` | 市场概况 + 持仓诊断 |
+| **15:30** | 收盘报告 | `GET /api/daily?date=YYYYMMDD` | 收盘后最终建议 |
+| **15:35** | 飞书推送 | 调用飞书 Webhook | 推送收盘报告 |
+| **按需** | 交易反馈 | `POST /api/trade/confirm` | 用户操作后反馈 |
+
+### 3. API 调用示例
+
+**获取每日操盘报告：**
+```bash
+curl -s "http://localhost:11270/api/daily?date=20260716"
+```
+
+**同步用户持仓：**
+```bash
+curl -s -X POST "http://localhost:11270/api/portfolio/sync" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "positions": [
+      {"ts_code": "600519.SH", "total_qty": 100, "available_qty": 100, "cost_price": 1800},
+      {"ts_code": "000858.SZ", "total_qty": 300, "available_qty": 300, "cost_price": 150.5}
+    ],
+    "cash": 500000
+  }'
+```
+
+**交易反馈（买入）：**
+```bash
+curl -s -X POST "http://localhost:11270/api/trade/confirm" \
+  -H "Content-Type: application/json" \
+  -d '{"ts_code": "002049.SZ", "side": "buy", "qty": 200, "price": 68.50}'
+```
+
+**LLM 深度新闻分析：**
+```bash
+curl -s "http://localhost:11270/api/news/llm?limit=5"
+```
+
+### 4. 飞书推送配置
+
+在 `config/config.yaml` 中填入你的飞书 Webhook URL：
+
+```yaml
+feishu:
+  webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxx"
+  push_daily: true
+  push_time: "15:30"
+```
+
+获取方式：飞书群设置 → 添加机器人 → 自定义机器人 → 复制 Webhook 地址。
+
+### 5. 完整工作流
+
+```
+1. 每天早上 08:50，Agent 调用 /api/daily 获取晨报
+2. 解析报告中的 action_items（买入/卖出建议）
+3. 通过飞书 Webhook 推送 formatted 报告给用户
+4. 用户看到报告后决定是否操作
+5. 用户操作后，Agent 调用 /api/trade/confirm 反馈成交信息
+6. 系统更新持仓，下次报告基于真实持仓
+7. 收盘后 15:30 再次推送收盘报告
+```
+
+### 6. 回测验证（部署前建议跑一遍）
+
+```bash
+make backtest-small    # 跑回测验证策略有效性
+make optimize          # 参数网格搜索，找最优参数
+```
+
 ## 策略说明
 
 ### 均线交叉 (ma_cross) — 推荐策略
