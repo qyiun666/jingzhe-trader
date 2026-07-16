@@ -425,15 +425,20 @@ func seedPaperBrokerFromDB(pb *broker.PaperBroker, cfg *config.Config, db *sqlx.
 		}
 	}
 
-	capital := cfg.Backtest.InitialCapital
-	if capitalStr, err := portRepo.GetMeta("initial_capital"); err == nil && capitalStr != "" {
+	// 优先读取实际 cash，其次 initial_capital，最后 fallback 到 config
+	cash := cfg.Backtest.InitialCapital
+	if cashStr, err := portRepo.GetMeta("cash"); err == nil && cashStr != "" {
+		if v, err := strconv.ParseFloat(cashStr, 64); err == nil && v > 0 {
+			cash = v
+		}
+	} else if capitalStr, err := portRepo.GetMeta("initial_capital"); err == nil && capitalStr != "" {
 		if v, err := strconv.ParseFloat(capitalStr, 64); err == nil && v > 0 {
-			capital = v
+			cash = v
 		}
 	}
 
-	pb.ImportPositions(positionMap, capital)
-	logger.L().Infof("[Seed] 从 portfolio 表恢复 %d 只持仓, 资金 %.2f", len(positionMap), capital)
+	pb.ImportPositions(positionMap, cash)
+	logger.L().Infof("[Seed] 从 portfolio 表恢复 %d 只持仓, 资金 %.2f", len(positionMap), cash)
 }
 
 // buildStockMap 构建股票代码->名称映射

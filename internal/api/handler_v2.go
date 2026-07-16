@@ -109,7 +109,8 @@ func (s *Service) HandleSyncPortfolio(w http.ResponseWriter, r *http.Request) {
 		pb.ImportPositions(positionMap, cash)
 	}
 
-	// 4. 记录初始资金到元数据
+	// 4. 记录现金和初始资金到元数据
+	portRepo.SetMeta("cash", fmt.Sprintf("%.2f", cash))
 	portRepo.SetMeta("initial_capital", fmt.Sprintf("%.2f", cash))
 
 	writeJSON(w, http.StatusOK, SyncPortfolioResponse{
@@ -285,8 +286,9 @@ func (s *Service) HandleTradeConfirm(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 3. 查询更新后的资产
+	// 3. 查询更新后的资产并持久化 cash
 	asset, _ := s.brk.QueryAsset()
+	portRepo.SetMeta("cash", fmt.Sprintf("%.2f", asset.Cash))
 
 	resp := TradeConfirmResponse{
 		TsCode:     req.TsCode,
@@ -503,17 +505,20 @@ func (s *Service) restorePortfolioFromDB() {
 		}
 	}
 
-	// 获取初始资金
-	capitalStr, _ := portRepo.GetMeta("initial_capital")
-	capital := s.cfg.Backtest.InitialCapital
-	if capitalStr != "" {
+	// 优先读取实际 cash，其次 initial_capital，最后 fallback 到 config
+	cash := s.cfg.Backtest.InitialCapital
+	if cashStr, _ := portRepo.GetMeta("cash"); cashStr != "" {
+		if v, err := strconv.ParseFloat(cashStr, 64); err == nil && v > 0 {
+			cash = v
+		}
+	} else if capitalStr, _ := portRepo.GetMeta("initial_capital"); capitalStr != "" {
 		if v, err := strconv.ParseFloat(capitalStr, 64); err == nil && v > 0 {
-			capital = v
+			cash = v
 		}
 	}
 
 	// 导入到 PaperBroker
 	if pb, ok := s.brk.(*broker.PaperBroker); ok {
-		pb.ImportPositions(positionMap, capital)
+		pb.ImportPositions(positionMap, cash)
 	}
 }
