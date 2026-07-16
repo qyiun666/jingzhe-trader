@@ -18,6 +18,8 @@ import (
 	"jingzhe-trader/internal/store"
 	"jingzhe-trader/internal/strategy"
 	"jingzhe-trader/pkg/logger"
+
+	"strconv"
 )
 
 var (
@@ -142,7 +144,7 @@ func runDaily(ctx context.Context, cfg *config.Config, db *sqlx.DB, tradeDate st
 	}
 
 	// 6. 初始化券商并获取持仓
-	brk := buildBroker(cfg)
+	brk := buildBroker(cfg, db)
 	positions, err := brk.QueryPositions()
 	if err != nil {
 		logger.L().Warnf("查询持仓失败: %v", err)
@@ -245,7 +247,7 @@ func runMonitor(ctx context.Context, cfg *config.Config, db *sqlx.DB, tradeDate 
 		}
 	}
 
-	brk := buildBroker(cfg)
+	brk := buildBroker(cfg, db)
 	positions, _ := brk.QueryPositions()
 
 	// 模拟盘中每 30 秒刷新一次 (实际生产环境对接实时行情源)
@@ -290,7 +292,7 @@ func runDiagnose(ctx context.Context, cfg *config.Config, db *sqlx.DB, tradeDate
 	stockRepo := store.NewStockRepo(db)
 	stockMap := buildStockMap(stockRepo)
 
-	brk := buildBroker(cfg)
+	brk := buildBroker(cfg, db)
 	positions, err := brk.QueryPositions()
 	if err != nil {
 		return fmt.Errorf("查询持仓失败: %w", err)
@@ -329,7 +331,7 @@ func runRebalance(ctx context.Context, cfg *config.Config, db *sqlx.DB, tradeDat
 		todayBars[b.TsCode] = b
 	}
 
-	brk := buildBroker(cfg)
+	brk := buildBroker(cfg, db)
 	positions, _ := brk.QueryPositions()
 	asset, _ := brk.QueryAsset()
 
@@ -358,24 +360,63 @@ func runRebalance(ctx context.Context, cfg *config.Config, db *sqlx.DB, tradeDat
 	return nil
 }
 
-// buildBroker 根据配置创建券商实例
-func buildBroker(cfg *config.Config) broker.Broker {
+// buildBroker 根据配置创建券商实例，并从数据库 seed 持仓
+func buildBroker(cfg *config.Config, db *sqlx.DB) broker.Broker {
 	switch *brokerFlag {
 	case "qmt":
 		qmt := broker.NewQMTBridge(cfg.Broker.QMT.URL)
 		if err := qmt.Connect(cfg.Broker.QMT.Path, cfg.Broker.QMT.SessionID, cfg.Broker.QMT.AccountID); err != nil {
 			logger.L().Warnf("连接 QMT 失败: %v, 回退到 PaperBroker", err)
-			return fallbackPaperBroker(cfg)
+			return fallbackPaperBroker(cfg, db)
 		}
 		return qmt
 	default:
-		return fallbackPaperBroker(cfg)
+		return fallbackPaperBroker(cfg, db)
 	}
 }
 
-func fallbackPaperBroker(cfg *config.Config) broker.Broker {
+func fallbackPaperBroker(cfg *config.Config, db *sqlx.DB) broker.Broker {
 	costModel := market.NewCostModel(cfg.Cost)
-	return broker.NewPaperBroker("paper", cfg.Backtest.InitialCapital, costModel)
+	pb := broker.NewPaperBroker("paper", cfg.Backtest.InitialCapital, costModel)
+
+	// 从 portfolio 表 seed 持仓到 PaperBroker
+	if db != nil {
+		seedPaperBrokerFromDB(pb, cfg, db)
+	}
+
+	return pb
+}
+
+// seedPaperBrokerFromDB 从 portfolio 表读取持仓，注入到 PaperBroker
+func seedPaperBrokerFromDB(pb *broker.PaperBroker, cfg *config.Config, db *sqlx.DB) {
+	portRepo := store.NewPortfolioRepo(db)
+	positions, err := portRepo.GetAllPositions()
+	if err != nil || len(positions) == 0 {
+		return
+	}
+
+	positionMap := make(map[string]*model.Position)
+	for _, p := range positions {
+		if p.TotalQty <= 0 {
+			continue
+		}
+		positionMap[p.TsCode] = &model.Position{
+			TsCode:       p.TsCode,
+			TotalQty:     p.TotalQty,
+			AvailableQty: p.AvailableQty,
+			CostPrice:    p.CostPrice,
+		}
+	}
+
+	capital := cfg.Backtest.InitialCapital
+	if capitalStr, err := portRepo.GetMeta("initial_capital"); err == nil && capitalStr != "" {
+		if v, err := strconv.ParseFloat(capitalStr, 64); err == nil && v > 0 {
+			capital = v
+		}
+	}
+
+	pb.ImportPositions(positionMap, capital)
+	logger.L().Infof("[Seed] 从 portfolio 表恢复 %d 只持仓, 资金 %.2f", len(positionMap), capital)
 }
 
 // buildStockMap 构建股票代码->名称映射

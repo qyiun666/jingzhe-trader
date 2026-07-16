@@ -1,4 +1,4 @@
-.PHONY: build test vet clean dataloader backtest signal trader trader-qmt run backtest-small trader-small datasync datasync-full server-small build-small optimize
+.PHONY: build test vet clean dataloader backtest signal trader trader-qmt run backtest-small trader-small datasync datasync-full server-small build-small optimize captain email-report
 
 # 编译所有二进制
 build:
@@ -31,6 +31,22 @@ backtest-multi:
 # 参数优化 (均线交叉策略网格搜索, 找最优参数组合)
 optimize:
 	go run ./cmd/optimizer -config config/config.yaml -strategy ma_cross -start 20240101 -end 20260715 -capital 10000
+
+# Captain: 生成每日操盘报告 (HTML)
+# 用法: make captain date=20260716
+captain:
+	go run ./cmd/captain -mode daily -config config/config.yaml -date $(or $(date),$(shell date +%Y%m%d)) -report reports/daily_report_$(or $(date),$(shell date +%Y%m%d)).html
+
+# 发送每日报告邮件 (Hermes 18:00 cron 调用)
+# 用法: make email-report SMTP_SERVER=smtp.qq.com SMTP_USER=xxx@qq.com SMTP_PASS=xxx TO=you@qq.com REPORT=reports/daily_report_20260716.html
+email-report:
+	python3 scripts/send_daily_report.py \
+		--smtp-server $(SMTP_SERVER) \
+		--smtp-port $(or $(SMTP_PORT),465) \
+		--username $(SMTP_USER) \
+		--password $(SMTP_PASS) \
+		--to $(TO) \
+		--report $(REPORT)
 
 # 信号生成 (每日模式)
 signal-daily:
