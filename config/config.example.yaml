@@ -1,0 +1,114 @@
+# ============================================
+# 默认配置: 小资金模式 (1万本金)
+# 复制此文件为 config.yaml 并填入你的真实密钥
+# ============================================
+
+tushare:
+  token: "YOUR_TUSHARE_TOKEN_HERE"  # 从 https://tushare.pro/register.html 获取
+  base_url: "http://api.tushare.pro"
+  rate_limit: 450
+  max_retries: 3
+  retry_interval: 2
+
+database:
+  path: "data/jingzhe.db"
+
+# A股交易费用模型
+cost:
+  commission_rate: 0.000085   # 佣金万0.85
+  min_commission: 5.0         # 单笔最低佣金 5元
+  stamp_tax_rate: 0.0005      # 印花税万5 (仅卖出)
+  transfer_fee_rate: 0.00001  # 过户费万0.1
+
+# 回测默认参数
+backtest:
+  start_date: "20240101"
+  end_date: "20261231"
+  initial_capital: 10000      # 初始资金
+  benchmark: "000300.SH"
+  slippage: 0.0002
+  fill_price: "next_open"
+
+# 风控参数
+risk:
+  max_position_pct: 0.40       # 单票最大仓位 40%
+  max_total_position_pct: 0.90 # 总仓位上限 90%
+  max_sector_pct: 0.60         # 单板块最大仓位 60%
+  stop_loss_pct: 0.08          # 止损 8%
+  take_profit_pct: 0.15        # 基础止盈 15%
+  exclude_st: true
+  min_list_days: 60
+
+# 日志
+log:
+  level: "info"
+  format: "console"
+  output: "file"
+  file_path: "logs/jingzhe.log"
+
+# 券商配置
+broker:
+  type: "paper"
+  qmt:
+    url: "http://127.0.0.1:16888"
+    path: ""
+    account_id: ""
+    session_id: 123456
+
+# ============================================
+# 策略配置 (小资金专用)
+# ============================================
+strategy:
+  # 均线交叉策略
+  ma_cross:
+    short_period: 3
+    long_period: 25
+    position_pct: 0.40
+    enable_adaptive: true
+
+  # MACD策略
+  macd:
+    fast: 12
+    slow: 26
+    signal: 9
+    position_pct: 0.30
+    enable_adaptive: true
+
+  # 多因子策略
+  multi_factor:
+    top_n: 3
+    rebalance_freq: "weekly"
+    position_pct: 0.30
+    stop_loss_pct: 0.08
+    take_profit_pct: 0.15
+    enable_adaptive: true
+
+  # 日内做T策略
+  intraday_t:
+    t_amount_pct: 0.40
+    profit_target: 0.012
+    stop_loss_pct: -0.005
+    lookback_days: 20
+
+# 股票池
+universe:
+  bluechip: "000725.SZ,002230.SZ,002415.SZ,002475.SZ,000001.SZ,600030.SH,002594.SZ,000625.SZ,601012.SZ,601899.SH,601318.SH,000333.SZ,600036.SH,600276.SH"
+  tech: "000725.SZ,002230.SZ,002415.SZ,002475.SZ"
+
+# HTTP 服务
+server:
+  port: 11270
+  host: "0.0.0.0"
+
+# 飞书通知
+feishu:
+  webhook_url: ""
+  push_daily: true
+  push_time: "15:30"
+
+# LLM 配置 (可选)
+llm:
+  enabled: false
+  api_key: "YOUR_LLM_API_KEY_HERE"  # DeepSeek / 通义千问等 OpenAI 兼容接口
+  base_url: "https://api.deepseek.com/v1"
+  model: "deepseek-chat"
