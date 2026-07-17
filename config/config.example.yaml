@@ -91,6 +91,14 @@ strategy:
     lookback_days: 20
 
 # 股票池
+# 数据加载器配置
+dataloader:
+  filter_mode: true        # true=只拉股票池+持仓+关注列表, false=全市场
+  watchlist: []             # 额外关注代码, 如: ["600519.SH"]
+  enable_limit: true        # 涨跌停价（风控需要）
+  enable_basic: true        # 每日基本面（多因子策略需要）
+  enable_fund: true         # ETF/基金日线
+
 universe:
   bluechip: "000725.SZ,002230.SZ,002415.SZ,002475.SZ,000001.SZ,600030.SH,002594.SZ,000625.SZ,601012.SZ,601899.SH,601318.SH,000333.SZ,600036.SH,600276.SH"
   tech: "000725.SZ,002230.SZ,002415.SZ,002475.SZ"
