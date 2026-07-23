@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"strings"
 	"os"
 	"time"
 
@@ -63,17 +64,9 @@ func saveSnapshot(db *sqlx.DB, tradeDate string, asset *broker.AssetInfo, positi
 		pnlPct = pnl / prevSnap.TotalAsset
 	}
 
-	_, err = db.Exec(`INSERT INTO account_snapshot
+	_, err = db.Exec(`INSERT OR REPLACE INTO account_snapshot
 		(trade_date, total_asset, cash, market_value, pnl, pnl_pct, total_pnl, total_pnl_pct)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(trade_date) DO UPDATE SET
-			total_asset = excluded.total_asset,
-			cash = excluded.cash,
-			market_value = excluded.market_value,
-			pnl = excluded.pnl,
-			pnl_pct = excluded.pnl_pct,
-			total_pnl = excluded.total_pnl,
-			total_pnl_pct = excluded.total_pnl_pct`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		tradeDate, asset.TotalAsset, asset.Cash, marketValue, pnl, pnlPct, totalPnL, totalPnLPct)
 	if err != nil {
 		return fmt.Errorf("插入快照失败: %w", err)
@@ -219,7 +212,7 @@ func runDaily(ctx context.Context, cfg *config.Config, db *sqlx.DB, tradeDate st
 	stockMap := buildStockMap(stockRepo)
 
 	// 8. 运行策略产生信号
-	signals := runStrategy(ctx, cfg, *strategyFlag, todayBars, positions, asset)
+	signals := runStrategy(ctx, cfg, *strategyFlag, todayBars, positions, asset, db)
 
 	// 9. 构建持仓分析 (report 包需要的展示结构)
 	portfolioSummary := buildPortfolioSummary(positions, asset, stockMap)
@@ -413,7 +406,7 @@ func runRebalance(ctx context.Context, cfg *config.Config, db *sqlx.DB, tradeDat
 	positions, _ := brk.QueryPositions()
 	asset, _ := brk.QueryAsset()
 
-	signals := runStrategy(ctx, cfg, *strategyFlag, todayBars, positions, asset)
+	signals := runStrategy(ctx, cfg, *strategyFlag, todayBars, positions, asset, db)
 	plan := buildRebalanceSummary(signals, positions, asset)
 
 	fmt.Println("========== 调仓建议 ==========")
@@ -521,7 +514,7 @@ func buildStockMap(stockRepo *store.StockRepo) map[string]string {
 }
 
 // runStrategy 运行策略产生信号
-func runStrategy(ctx context.Context, cfg *config.Config, strategyName string, bars map[string]*model.Bar, positions map[string]*model.Position, asset *broker.AssetInfo) []model.Signal {
+func runStrategy(ctx context.Context, cfg *config.Config, strategyName string, bars map[string]*model.Bar, positions map[string]*model.Position, asset *broker.AssetInfo, db *sqlx.DB) []model.Signal {
 	reg := strategy.DefaultRegistry()
 	s, ok := reg.Get(strategyName)
 	if !ok {
@@ -529,9 +522,26 @@ func runStrategy(ctx context.Context, cfg *config.Config, strategyName string, b
 		return nil
 	}
 
-	// 构建股票池
-	universe := make([]string, 0, len(bars))
-	for code := range bars {
+	// 构建股票池: 配置的 universe(bluechip+tech) + 持仓中的股票
+	universeSet := make(map[string]bool)
+	for _, code := range strings.Split(cfg.Universe.Bluechip, ",") {
+		code = strings.TrimSpace(code)
+		if code != "" {
+			universeSet[code] = true
+		}
+	}
+	for _, code := range strings.Split(cfg.Universe.Tech, ",") {
+		code = strings.TrimSpace(code)
+		if code != "" {
+			universeSet[code] = true
+		}
+	}
+	// 添加持仓中的股票(可能不在股票池, 如ETF)
+	for code := range positions {
+		universeSet[code] = true
+	}
+	universe := make([]string, 0, len(universeSet))
+	for code := range universeSet {
 		universe = append(universe, code)
 	}
 
@@ -542,7 +552,7 @@ func runStrategy(ctx context.Context, cfg *config.Config, strategyName string, b
 		Positions:  positions,
 		Cash:       asset.Cash,
 		TotalAsset: asset.TotalAsset,
-		History:    &historyAdapter{}, // 简化历史数据适配器
+		History:    &dbHistoryAdapter{db: db},
 	}
 
 	if err := s.Init(ctx, nil); err != nil {
@@ -558,15 +568,35 @@ func runStrategy(ctx context.Context, cfg *config.Config, strategyName string, b
 	return signals
 }
 
-// historyAdapter 简化历史数据适配器 (占位)
-type historyAdapter struct{}
-
-func (h *historyAdapter) GetBars(tsCode, endDate string, n int) ([]model.Bar, error) {
-	return nil, nil
+// dbHistoryAdapter 从数据库读取历史K线的适配器
+type dbHistoryAdapter struct {
+	db *sqlx.DB
 }
 
-func (h *historyAdapter) GetCloses(tsCode, endDate string, n int) ([]float64, error) {
-	return nil, nil
+func (h *dbHistoryAdapter) GetBars(tsCode, endDate string, n int) ([]model.Bar, error) {
+	query := `SELECT ts_code, trade_date, open, high, low, close, pre_close, change, pct_chg, vol, amount, adj_factor
+	          FROM daily_bar WHERE ts_code = ? AND trade_date <= ? ORDER BY trade_date DESC LIMIT ?`
+	var bars []model.Bar
+	if err := h.db.Select(&bars, query, tsCode, endDate, n); err != nil {
+		return nil, err
+	}
+	// 反转为升序 (从旧到新)
+	for i, j := 0, len(bars)-1; i < j; i, j = i+1, j-1 {
+		bars[i], bars[j] = bars[j], bars[i]
+	}
+	return bars, nil
+}
+
+func (h *dbHistoryAdapter) GetCloses(tsCode, endDate string, n int) ([]float64, error) {
+	bars, err := h.GetBars(tsCode, endDate, n)
+	if err != nil || len(bars) == 0 {
+		return nil, err
+	}
+	closes := make([]float64, len(bars))
+	for i, b := range bars {
+		closes[i] = b.AdjClose()
+	}
+	return closes, nil
 }
 
 // buildPortfolioSummary 构建持仓分析展示数据
