@@ -180,9 +180,14 @@ func (o *OMS) RegisterCallback(callback func(model.Trade)) {
 	o.callbacks = append(o.callbacks, callback)
 }
 
+// emitTrade 触发成交回调
+// 调用方必须持有 o.mu 写锁 (与 RegisterCallback 互斥, 遍历安全);
+// 回调异步执行避免在锁内阻塞, 每个 goroutine 执行完回调后自然退出
 func (o *OMS) emitTrade(trade model.Trade) {
-	for _, cb := range o.callbacks {
-		go cb(trade) // 异步回调避免阻塞
+	callbacks := make([]func(model.Trade), len(o.callbacks))
+	copy(callbacks, o.callbacks)
+	for _, cb := range callbacks {
+		go cb(trade)
 	}
 }
 

@@ -103,15 +103,17 @@ func CalculateMetrics(snapshots []model.AccountSnapshot, trades []model.Trade, b
 			pairs[t.TsCode] = pair
 		}
 		if t.Side == model.SideBuy {
-			pair.buyAmount += t.Price * float64(t.Qty)
+			// 买入手续费摊入成本基数, 保证交易级盈亏为净值
+			pair.buyAmount += t.Price*float64(t.Qty) + t.TotalCost
 			pair.buyQty += t.Qty
 		} else {
 			pair.sellAmount += t.Price * float64(t.Qty)
 			pair.sellQty += t.Qty
-			// 卖出时计算这笔的盈亏
+			// 卖出时计算这笔的盈亏 (含买入摊费成本, 再扣除本笔卖出交易费用)
 			if pair.buyQty > 0 {
 				avgBuyPrice := pair.buyAmount / float64(pair.buyQty)
-				profit := (t.Price - avgBuyPrice) * float64(t.Qty)
+				gross := (t.Price - avgBuyPrice) * float64(t.Qty)
+				profit := gross - t.TotalCost
 				profits = append(profits, profit)
 				// 更新买入成本 (扣除已卖出的部分)
 				pair.buyAmount -= avgBuyPrice * float64(t.Qty)
@@ -142,14 +144,15 @@ func CalculateMetrics(snapshots []model.AccountSnapshot, trades []model.Trade, b
 			}
 		}
 		m.WinRate = float64(m.WinTrades) / float64(m.TotalTrades)
+		if m.WinTrades > 0 {
+			m.AvgWin = totalWin / float64(m.WinTrades)
+		}
 		if m.LossTrades > 0 {
 			avgLoss := totalLoss / float64(m.LossTrades)
 			m.AvgLoss = avgLoss
-			if avgLoss != 0 {
-				if m.WinTrades > 0 {
-					m.AvgWin = totalWin / float64(m.WinTrades)
-				}
-				m.ProfitLossRatio = (totalWin / float64(m.WinTrades)) / (-avgLoss)
+			// 仅在同时存在盈利与亏损交易时计算盈亏比, 避免 0/0 产生 NaN
+			if avgLoss != 0 && m.WinTrades > 0 {
+				m.ProfitLossRatio = m.AvgWin / (-avgLoss)
 			}
 		}
 	}

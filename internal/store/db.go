@@ -23,10 +23,11 @@ func NewDB(path string) (*sqlx.DB, error) {
 
 	// SQLite 性能与并发优化
 	pragmas := []string{
-		"PRAGMA journal_mode=WAL;",   // 写前日志, 提升并发读写
-		"PRAGMA synchronous=NORMAL;", // WAL 模式下安全且更快
-		"PRAGMA busy_timeout=5000;",  // 锁等待 5 秒
-		"PRAGMA foreign_keys=ON;",    // 开启外键约束
+		"PRAGMA journal_mode=WAL;",          // 写前日志, 提升并发读写
+		"PRAGMA synchronous=NORMAL;",        // WAL 模式下安全且更快
+		"PRAGMA busy_timeout=5000;",         // 锁等待 5 秒
+		"PRAGMA foreign_keys=ON;",           // 开启外键约束
+		"PRAGMA auto_vacuum=INCREMENTAL;",   // 支持增量回收空间 (配合定期清理)
 	}
 	for _, p := range pragmas {
 		if _, err := db.Exec(p); err != nil {
@@ -34,6 +35,9 @@ func NewDB(path string) (*sqlx.DB, error) {
 			return nil, fmt.Errorf("执行 %s 失败: %w", p, err)
 		}
 	}
+
+	// modernc/sqlite 单写者模型: 限制单连接, 避免长期运行后偶发 SQLITE_BUSY
+	db.SetMaxOpenConns(1)
 
 	if err := migrate(db); err != nil {
 		db.Close()
@@ -265,12 +269,62 @@ func migrate(db *sqlx.DB) error {
 			key   TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		);`,
+
+		// 交易计划 (EOD信号/盘中止损产出, Agent读取确认后执行)
+		`CREATE TABLE IF NOT EXISTS trade_plan (
+			id         INTEGER PRIMARY KEY AUTOINCREMENT,
+			trade_date TEXT NOT NULL,
+			ts_code    TEXT NOT NULL,
+			name       TEXT,
+			direction  TEXT NOT NULL,
+			qty        INTEGER NOT NULL,
+			ref_price  REAL,
+			reason     TEXT,
+			strategy   TEXT,
+			urgency    TEXT NOT NULL DEFAULT 'normal',
+			status     TEXT NOT NULL DEFAULT 'pending',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_trade_plan_date ON trade_plan(trade_date);
+		CREATE INDEX IF NOT EXISTS idx_trade_plan_status ON trade_plan(status);`,
+
+		// 调度任务执行记录 (防重复执行/启动补跑/健康度展示)
+		`CREATE TABLE IF NOT EXISTS job_run (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			job_name    TEXT NOT NULL,
+			trade_date  TEXT NOT NULL,
+			status      TEXT NOT NULL,
+			error       TEXT,
+			started_at  TEXT NOT NULL,
+			finished_at TEXT
+		);
+		CREATE INDEX IF NOT EXISTS idx_job_run_name_date ON job_run(job_name, trade_date);`,
 	}
 
 	for _, s := range stmts {
 		if _, err := db.Exec(s); err != nil {
 			return fmt.Errorf("建表失败: %w, sql=%s", err, s)
 		}
+	}
+	return migrateLegacy(db)
+}
+
+// migrateLegacy 历史库兼容迁移
+// 旧版曾在 account_snapshot(trade_date) 上建全局唯一索引, 多 run 共库时写入冲突;
+// 改为 (run_id, trade_date) 唯一
+func migrateLegacy(db *sqlx.DB) error {
+	var legacy int
+	if err := db.Get(&legacy, `SELECT COUNT(1) FROM sqlite_master
+		WHERE type='index' AND name='idx_account_snapshot_date'
+		AND sql LIKE '%UNIQUE%' AND sql NOT LIKE '%run_id%'`); err == nil && legacy > 0 {
+		if _, err := db.Exec(`DROP INDEX idx_account_snapshot_date`); err != nil {
+			return fmt.Errorf("删除旧快照唯一索引失败: %w", err)
+		}
+	}
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_account_snapshot_run_date
+		ON account_snapshot(run_id, trade_date)`); err != nil {
+		return fmt.Errorf("创建快照唯一索引失败: %w", err)
 	}
 	return nil
 }

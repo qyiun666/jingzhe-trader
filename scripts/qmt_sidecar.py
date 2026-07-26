@@ -11,6 +11,7 @@ import os
 import sys
 import logging
 from datetime import datetime
+from functools import wraps
 from typing import Any, Dict, List, Optional
 
 from flask import Flask, jsonify, request
@@ -30,6 +31,14 @@ except ImportError:
     XtQuantTraderCallback = object
     StockAccount = Any
     xtconstant = Any
+
+# xtdata 行情模块 (可选, /quote 接口使用)
+try:
+    from xtquant import xtdata
+    XTDATA_AVAILABLE = True
+except ImportError:
+    XTDATA_AVAILABLE = False
+    xtdata = None
 
 # ---------------------------------------------------------------------
 # 常量
@@ -78,6 +87,21 @@ logger = logging.getLogger("qmt_sidecar")
 # Flask 应用
 # ---------------------------------------------------------------------
 app = Flask(__name__)
+
+# 鉴权 token: 配置 QMT_SIDECAR_TOKEN 后, 敏感接口需携带 X-QMT-Token 头
+SIDECAR_TOKEN = os.environ.get("QMT_SIDECAR_TOKEN", "").strip()
+
+
+def require_token(f):
+    """敏感接口鉴权装饰器: 未配置 token 时不启用(兼容仅本机场景)"""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if SIDECAR_TOKEN:
+            token = request.headers.get("X-QMT-Token", "")
+            if token != SIDECAR_TOKEN:
+                return jsonify(_make_error("unauthorized")), 401
+        return f(*args, **kwargs)
+    return wrapper
 
 # ---------------------------------------------------------------------
 # 全局状态
@@ -270,7 +294,32 @@ def connect():
     return jsonify(result), status_code
 
 
+@app.route("/quote", methods=["POST"])
+def quote():
+    """批量查询最新价: 请求 {"codes": ["600519.SH", ...]}, 返回 {"prices": {code: price}}"""
+    if not XTDATA_AVAILABLE:
+        return jsonify(_make_error("xtdata 行情模块不可用")), 503
+
+    data = request.get_json(force=True, silent=True) or {}
+    codes = data.get("codes") or []
+    if not codes:
+        return jsonify({"success": True, "prices": {}})
+
+    try:
+        ticks = xtdata.get_full_tick(codes)
+        prices = {}
+        for code, tick in (ticks or {}).items():
+            last_price = tick.get("lastPrice") if isinstance(tick, dict) else getattr(tick, "lastPrice", 0)
+            if last_price and last_price > 0:
+                prices[code] = float(last_price)
+        return jsonify({"success": True, "prices": prices})
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("查询行情失败")
+        return jsonify(_make_error(f"查询行情失败: {exc}")), 500
+
+
 @app.route("/order", methods=["POST"])
+@require_token
 def order():
     if not _g_connected or _g_xt_trader is None:
         return jsonify(_make_error("未连接 miniQMT，请先调用 /connect")), 503
@@ -333,6 +382,7 @@ def order():
 
 
 @app.route("/cancel", methods=["POST"])
+@require_token
 def cancel():
     if not _g_connected or _g_xt_trader is None:
         return jsonify(_make_error("未连接 miniQMT，请先调用 /connect")), 503
@@ -457,6 +507,13 @@ if __name__ == "__main__":
     logger.info("miniQMT Sidecar 启动")
     logger.info("监听地址: %s:%s", host, port)
     logger.info("xtquant 可用: %s", XTQUANT_AVAILABLE)
+    if host != "127.0.0.1":
+        logger.warning("!" * 60)
+        logger.warning("警告: sidecar 监听在非本机地址 %s, 任何可访问该端口的客户端都能操作真实账户!", host)
+        logger.warning("请务必配置 QMT_SIDECAR_TOKEN 并用防火墙限制访问来源", )
+        logger.warning("!" * 60)
+    if not SIDECAR_TOKEN:
+        logger.warning("未配置 QMT_SIDECAR_TOKEN, 下单/撤单接口无鉴权 (仅建议本机场景)")
     logger.info("=" * 60)
 
     # Flask 生产环境警告可忽略，本机 IPC 场景使用单线程足够

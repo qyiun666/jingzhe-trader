@@ -1,10 +1,12 @@
 # ============================================
 # 默认配置: 小资金模式 (1万本金)
-# 复制此文件为 config.yaml 并填入你的真实密钥
+# 复制此文件为 config.yaml
+# 密钥类配置建议通过环境变量注入, 不要写入配置文件:
+#   TUSHARE_TOKEN / LLM_API_KEY / JZ_API_TOKEN / FEISHU_WEBHOOK / QMT_SIDECAR_TOKEN
 # ============================================
 
 tushare:
-  token: "YOUR_TUSHARE_TOKEN_HERE"  # 从 https://tushare.pro/register.html 获取
+  token: ""  # 留空, 用环境变量 TUSHARE_TOKEN 注入 (https://tushare.pro/register.html)
   base_url: "http://api.tushare.pro"
   rate_limit: 450
   max_retries: 3
@@ -30,12 +32,14 @@ backtest:
   fill_price: "next_open"
 
 # 风控参数
+# 1万资金默认档: 单票上限60%, 总仓位100%, 止损-5%, 止盈+10%
+# (小资金需集中持仓摊薄5元最低佣金, 单笔金额建议>=5000元)
 risk:
-  max_position_pct: 0.40       # 单票最大仓位 40%
-  max_total_position_pct: 0.90 # 总仓位上限 90%
+  max_position_pct: 0.60       # 单票最大仓位 60%
+  max_total_position_pct: 1.00 # 总仓位上限 100%
   max_sector_pct: 0.60         # 单板块最大仓位 60%
-  stop_loss_pct: 0.08          # 止损 8%
-  take_profit_pct: 0.15        # 基础止盈 15%
+  stop_loss_pct: 0.05          # 止损 5%
+  take_profit_pct: 0.10        # 基础止盈 10%
   exclude_st: true
   min_list_days: 60
 
@@ -63,8 +67,11 @@ strategy:
   ma_cross:
     short_period: 3
     long_period: 25
-    position_pct: 0.40
-    enable_adaptive: true
+    # 1万资金档: 仓位必须满足 资金×position_pct ≥ 最小交易额(默认5000元),
+    # 否则买入信号会被风控 min_trade_amount 规则全部拦截
+    position_pct: 0.55
+    # 自适应会动态降低仓位, 小资金易跌破最小交易额门槛, 资金 ≥ 5万再开启
+    enable_adaptive: false
 
   # MACD策略
   macd:
@@ -98,25 +105,58 @@ dataloader:
   enable_limit: true        # 涨跌停价（风控需要）
   enable_basic: true        # 每日基本面（多因子策略需要）
   enable_fund: true         # ETF/基金日线
+  enable_cleanup: false     # 危险: 清理非关注股票历史数据, 需同时加 --confirm-cleanup
 
 universe:
-  bluechip: "000725.SZ,002230.SZ,002415.SZ,002475.SZ,000001.SZ,600030.SH,002594.SZ,000625.SZ,601012.SZ,601899.SH,601318.SH,000333.SZ,600036.SH,600276.SH"
+  bluechip: "000725.SZ,002230.SZ,002415.SZ,002475.SZ,000001.SZ,600030.SH,002594.SZ,000625.SZ,601012.SH,601899.SH,601318.SH,000333.SZ,600036.SH,600276.SH"
   tech: "000725.SZ,002230.SZ,002415.SZ,002475.SZ"
 
 # HTTP 服务
 server:
   port: 11270
-  host: "0.0.0.0"
+  host: "127.0.0.1"          # 默认仅本机; 局域网访问改内网IP并务必配置 api_token
+  api_token: ""              # 非空时启用鉴权, 建议用环境变量 JZ_API_TOKEN 注入
+  allowed_origins:           # CORS 白名单
+    - "http://localhost"
+    - "http://127.0.0.1"
+
+# 内置调度器 (server 常驻进程自动执行, Agent 只需读 API)
+scheduler:
+  enabled: true
+  data_update_time: "15:10"  # 收盘后更新行情数据
+  signal_time: "15:30"       # 生成次日交易计划
+  report_time: "15:45"       # 日报生成+飞书推送
+  intraday:
+    enabled: true            # 盘中止损监控
+    interval_min: 5
+    start: "09:30"
+    end: "15:00"
+
+# 交易执行
+trading:
+  auto_execute: false        # false=只生成计划等确认, true=确认后自动下单(QMT)
+  min_trade_amount: 0        # 最小单笔金额, 0=自适应(最低佣金/0.1%=5000元)
+  max_positions: 0           # 最大持仓数, 0=按资金自适应(<5万→2只, <20万→4只, 否则6只)
+
+# 数据保留/自动清理 (防数据库无限膨胀)
+retention:
+  bar_years: 3               # 行情数据保留3年
+  news_days: 30              # 新闻保留30天
+  plan_days: 90              # 交易计划保留90天
+  backtest_runs: 20          # 保留最近20个回测run(实盘记录永久保留)
+  log_days: 30               # 日志文件保留30天
+  report_files: 30           # 保留最近30个报告HTML
+  cleanup_time: "16:30"      # 每日清理时间
 
 # 飞书通知
 feishu:
-  webhook_url: ""
+  webhook_url: ""            # 建议用环境变量 FEISHU_WEBHOOK 注入
   push_daily: true
   push_time: "15:30"
 
 # LLM 配置 (可选)
 llm:
   enabled: false
-  api_key: "YOUR_LLM_API_KEY_HERE"  # DeepSeek / 通义千问等 OpenAI 兼容接口
+  api_key: ""                # 留空, 用环境变量 LLM_API_KEY 注入
   base_url: "https://api.deepseek.com/v1"
   model: "deepseek-chat"

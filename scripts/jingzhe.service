@@ -1,0 +1,23 @@
+[Unit]
+Description=Jingzhe Trader Server (惊蛰交易系统常驻进程)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 按实际部署路径修改
+WorkingDirectory=/opt/jingzhe-trader
+ExecStart=/opt/jingzhe-trader/bin/server -config /opt/jingzhe-trader/config/config.yaml
+Restart=always
+RestartSec=5
+# 优雅关机: SIGTERM 后等待 15s (server 内部 5s HTTP Shutdown + 调度任务收尾 + WAL checkpoint)
+TimeoutStopSec=15
+KillSignal=SIGTERM
+# 敏感配置走环境变量 (勿写入 config.yaml)
+# Environment=TUSHARE_TOKEN=xxx
+# Environment=JZ_API_TOKEN=xxx
+# Environment=FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/xxx
+EnvironmentFile=-/opt/jingzhe-trader/.env
+
+[Install]
+WantedBy=multi-user.target

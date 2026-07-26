@@ -90,7 +90,8 @@ func (r *TradeRepo) GetTradesByRunID(runID string) ([]model.Trade, error) {
 	return trades, nil
 }
 
-const accountSnapshotInsertSQL = `INSERT INTO account_snapshot
+// 同一 run 重跑当日幂等覆盖 (配合 (run_id, trade_date) 唯一索引)
+const accountSnapshotInsertSQL = `INSERT OR REPLACE INTO account_snapshot
 	(run_id, trade_date, total_asset, cash, market_value, pnl, pnl_pct, total_pnl, total_pnl_pct)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
 

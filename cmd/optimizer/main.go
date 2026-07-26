@@ -23,8 +23,8 @@ import (
 	"strings"
 	"time"
 
-	"jingzhe-trader/internal/backtest"
 	"jingzhe-trader/internal/config"
+	"jingzhe-trader/internal/engine"
 	"jingzhe-trader/pkg/logger"
 )
 
@@ -48,7 +48,7 @@ func main() {
 	startDate := flag.String("start", "20240101", "回测起始日期 YYYYMMDD")
 	endDate := flag.String("end", "20260715", "回测结束日期 YYYYMMDD")
 	capital := flag.Float64("capital", 10000, "初始资金")
-	universeStr := flag.String("universe", "000725.SZ,002230.SZ,002415.SZ,002475.SZ,000001.SZ,600030.SH,000625.SZ,601012.SZ,601899.SH,601318.SH,000333.SZ,600036.SH,600276.SH", "股票池(逗号分隔)")
+	universeStr := flag.String("universe", "", "股票池(逗号分隔, 缺省用配置 universe)")
 	topN := flag.Int("top", 10, "输出前N个最优结果")
 	flag.Parse()
 
@@ -62,10 +62,15 @@ func main() {
 	// 2. 初始化日志: 批量回测时抑制 info 级别日志, 仅保留 warn/error, 避免刷屏
 	_ = logger.Init("warn", cfg.Log.Format, "stdout", "")
 
-	// 3. 解析股票池
-	universe := strings.Split(*universeStr, ",")
-	for i := range universe {
-		universe[i] = strings.TrimSpace(universe[i])
+	// 3. 解析股票池 (缺省用配置 universe)
+	var universe []string
+	if *universeStr != "" {
+		universe = strings.Split(*universeStr, ",")
+		for i := range universe {
+			universe[i] = strings.TrimSpace(universe[i])
+		}
+	} else {
+		universe = cfg.UniverseCodes()
 	}
 
 	// 4. 定义参数搜索网格
@@ -110,7 +115,7 @@ func main() {
 
 				// 构建回测配置
 				// 注意: ma_cross 策略 Init 用 v.(float64) 解析参数, 必须传 float64 类型
-				btCfg := backtest.EngineConfig{
+				btCfg := engine.RunConfig{
 					StartDate:      *startDate,
 					EndDate:        *endDate,
 					InitialCapital: *capital,
@@ -127,7 +132,7 @@ func main() {
 					Silent: true, // 静默模式: 不打印单次回测摘要
 				}
 
-				engine, err := backtest.NewEngine(btCfg, cfg)
+				runner, err := engine.NewBacktestRunner(btCfg, cfg)
 				if err != nil {
 					results = append(results, OptResult{
 						ShortPeriod: sp, LongPeriod: lp, PositionPct: pp, Err: err,
@@ -135,8 +140,8 @@ func main() {
 					continue
 				}
 
-				result, err := engine.Run()
-				_ = engine.Close() // 释放数据库连接, 避免批量回测时连接泄漏
+				result, err := runner.Run()
+				_ = runner.Close() // 释放数据库连接, 避免批量回测时连接泄漏
 				if err != nil {
 					results = append(results, OptResult{
 						ShortPeriod: sp, LongPeriod: lp, PositionPct: pp, Err: err,

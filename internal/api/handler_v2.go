@@ -10,8 +10,8 @@ import (
 
 	"jingzhe-trader/internal/analysis"
 	"jingzhe-trader/internal/broker"
+	"jingzhe-trader/internal/dataloader"
 	"jingzhe-trader/internal/llm"
-	"jingzhe-trader/internal/maintenance"
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/strategy"
 	"jingzhe-trader/internal/store"
@@ -23,7 +23,7 @@ import (
 type SyncPortfolioRequest struct {
 	Positions []SyncPositionItem `json:"positions"` // 持仓列表
 	Cash      float64            `json:"cash"`      // 可用现金（可选，默认从现有值推算）
-	Overwrite bool               `json:"overwrite"` // true=全量覆盖, false=增量更新（默认true）
+	Overwrite *bool              `json:"overwrite"` // true=全量覆盖, false=逐条增量更新（缺省true）
 }
 
 // SyncPositionItem 单只持仓同步条目
@@ -91,11 +91,21 @@ func (s *Service) HandleSyncPortfolio(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. 持久化到数据库
+	// 2. 持久化到数据库: Overwrite=true 全量覆盖, false 逐条 Upsert
+	overwrite := req.Overwrite == nil || *req.Overwrite
 	portRepo := store.NewPortfolioRepo(s.db)
-	if err := portRepo.SyncPortfolio(storeItems); err != nil {
-		writeError(w, http.StatusInternalServerError, "持仓持久化失败: "+err.Error())
-		return
+	if overwrite {
+		if err := portRepo.SyncPortfolio(storeItems); err != nil {
+			writeError(w, http.StatusInternalServerError, "持仓持久化失败: "+err.Error())
+			return
+		}
+	} else {
+		for _, item := range storeItems {
+			if err := portRepo.UpsertPosition(item); err != nil {
+				writeError(w, http.StatusInternalServerError, "持仓增量更新失败: "+err.Error())
+				return
+			}
+		}
 	}
 
 	// 3. 更新内存中的 PaperBroker 持仓
@@ -104,6 +114,20 @@ func (s *Service) HandleSyncPortfolio(w http.ResponseWriter, r *http.Request) {
 		// 从现有资产推算现金
 		asset, _ := s.brk.QueryAsset()
 		cash = asset.Cash
+	}
+	if !overwrite {
+		// 增量模式: 内存重建为数据库全量持仓 (含本次未触及的旧持仓)
+		positionMap = make(map[string]*model.Position)
+		if all, err := portRepo.GetAllPositions(); err == nil {
+			for _, p := range all {
+				positionMap[p.TsCode] = &model.Position{
+					TsCode:       p.TsCode,
+					TotalQty:     p.TotalQty,
+					AvailableQty: p.AvailableQty,
+					CostPrice:    p.CostPrice,
+				}
+			}
+		}
 	}
 	if pb, ok := s.brk.(*broker.PaperBroker); ok {
 		pb.ImportPositions(positionMap, cash)
@@ -239,56 +263,7 @@ func (s *Service) HandleTradeConfirm(w http.ResponseWriter, r *http.Request) {
 		side = model.SideSell
 	}
 
-	// 1. 更新 PaperBroker 内存持仓
-	if pb, ok := s.brk.(*broker.PaperBroker); ok {
-		pb.RecordTrade(req.TsCode, side, req.Qty, req.Price)
-	}
-
-	// 2. 更新数据库持仓
-	portRepo := store.NewPortfolioRepo(s.db)
-	pos, _ := portRepo.GetPosition(req.TsCode)
-	if pos == nil {
-		pos = &store.PortfolioSyncItem{} // 买入新股票时 pos 为 nil
-	}
-
-	if side == model.SideBuy {
-		// 买入: 更新或新增持仓
-		newQty := pos.TotalQty + req.Qty
-		newCost := pos.CostPrice // 保留原成本
-		if newQty > 0 && pos.TotalQty > 0 {
-			// 加权平均成本
-			oldTotal := pos.CostPrice * float64(pos.TotalQty)
-			newTotal := req.Price * float64(req.Qty)
-			newCost = (oldTotal + newTotal) / float64(newQty)
-		} else if pos.TotalQty == 0 {
-			newCost = req.Price
-		}
-		portRepo.UpsertPosition(store.PortfolioSyncItem{
-			TsCode:       req.TsCode,
-			TotalQty:     newQty,
-			AvailableQty: pos.AvailableQty, // T+1: 今日买入明日可卖
-			CostPrice:    newCost,
-			AvgPrice:     newCost,
-		})
-	} else {
-		// 卖出: 减少持仓
-		newQty := pos.TotalQty - req.Qty
-		if newQty <= 0 {
-			portRepo.RemovePosition(req.TsCode)
-		} else {
-			portRepo.UpsertPosition(store.PortfolioSyncItem{
-				TsCode:       req.TsCode,
-				TotalQty:     newQty,
-				AvailableQty: pos.AvailableQty,
-				CostPrice:    pos.CostPrice,
-				AvgPrice:     pos.AvgPrice,
-			})
-		}
-	}
-
-	// 3. 查询更新后的资产并持久化 cash
-	asset, _ := s.brk.QueryAsset()
-	portRepo.SetMeta("cash", fmt.Sprintf("%.2f", asset.Cash))
+	asset := s.applyTradeToPortfolio(req.TsCode, side, req.Qty, req.Price)
 
 	resp := TradeConfirmResponse{
 		TsCode:     req.TsCode,
@@ -301,6 +276,63 @@ func (s *Service) HandleTradeConfirm(w http.ResponseWriter, r *http.Request) {
 		TotalAsset: asset.TotalAsset,
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// applyTradeToPortfolio 将成交同步到内存持仓与数据库 (trade/confirm 与 plan/confirm 共用)
+func (s *Service) applyTradeToPortfolio(tsCode string, side model.Side, qty int, price float64) *broker.AssetInfo {
+	// 1. 更新 PaperBroker 内存持仓
+	if pb, ok := s.brk.(*broker.PaperBroker); ok {
+		pb.RecordTrade(tsCode, side, qty, price)
+	}
+
+	// 2. 更新数据库持仓
+	portRepo := store.NewPortfolioRepo(s.db)
+	pos, _ := portRepo.GetPosition(tsCode)
+	if pos == nil {
+		pos = &store.PortfolioSyncItem{} // 买入新股票时 pos 为 nil
+	}
+
+	if side == model.SideBuy {
+		// 买入: 更新或新增持仓, 加权平均成本
+		newQty := pos.TotalQty + qty
+		newCost := pos.CostPrice
+		if newQty > 0 && pos.TotalQty > 0 {
+			oldTotal := pos.CostPrice * float64(pos.TotalQty)
+			newCost = (oldTotal + price*float64(qty)) / float64(newQty)
+		} else if pos.TotalQty == 0 {
+			newCost = price
+		}
+		portRepo.UpsertPosition(store.PortfolioSyncItem{
+			TsCode:       tsCode,
+			TotalQty:     newQty,
+			AvailableQty: pos.AvailableQty, // T+1: 今日买入明日可卖
+			CostPrice:    newCost,
+			AvgPrice:     newCost,
+		})
+	} else {
+		// 卖出: 减少持仓, 清仓则删除记录
+		newQty := pos.TotalQty - qty
+		if newQty <= 0 {
+			portRepo.RemovePosition(tsCode)
+		} else {
+			portRepo.UpsertPosition(store.PortfolioSyncItem{
+				TsCode:       tsCode,
+				TotalQty:     newQty,
+				AvailableQty: pos.AvailableQty,
+				CostPrice:    pos.CostPrice,
+				AvgPrice:     pos.AvgPrice,
+			})
+		}
+	}
+
+	// 3. 查询更新后的资产并持久化 cash
+	asset, _ := s.brk.QueryAsset()
+	if asset != nil {
+		portRepo.SetMeta("cash", fmt.Sprintf("%.2f", asset.Cash))
+	} else {
+		asset = &broker.AssetInfo{}
+	}
+	return asset
 }
 
 // ==================== 动态策略 ====================
@@ -362,33 +394,73 @@ func (s *Service) HandleStrategySwitch(w http.ResponseWriter, r *http.Request) {
 
 // ==================== 系统维护 ====================
 
+// SystemStatus 系统状态
+type SystemStatus struct {
+	Healthy        bool   `json:"healthy"`
+	LastDataDate   string `json:"last_data_date"`  // 数据库中最新的行情日期
+	Today          string `json:"today"`
+	DataFresh      bool   `json:"data_fresh"`      // 数据是否是最新的
+	Uptime         string `json:"uptime"`
+	PortfolioCount int    `json:"portfolio_count"` // 持仓数量
+	NextMarketOpen string `json:"next_market_open"`// 下一个交易日
+}
+
 // HandleSystemStatus 处理 GET /api/system/status
 // 获取系统全面状态（数据新鲜度、持仓数量、运行时间等）
 func (s *Service) HandleSystemStatus(w http.ResponseWriter, r *http.Request) {
-	if s.updater == nil {
-		writeError(w, http.StatusServiceUnavailable, "自动维护器未启用")
+	status := SystemStatus{
+		Healthy: true,
+		Today:   time.Now().Format("20060102"),
+		Uptime:  time.Since(s.startTime).Truncate(time.Second).String(),
+	}
+	if err := s.db.Ping(); err != nil {
+		status.Healthy = false
+		writeJSON(w, http.StatusOK, status)
 		return
 	}
-	status := s.updater.RunHealthCheck()
+	if maxDate, err := s.barRepo.GetMaxTradeDate(); err == nil {
+		status.LastDataDate = maxDate
+		if preDate, perr := s.calRepo.GetPreTradeDate(status.Today); perr == nil && preDate != "" {
+			status.DataFresh = maxDate >= preDate
+		}
+	}
+	if positions, err := store.NewPortfolioRepo(s.db).GetAllPositions(); err == nil {
+		status.PortfolioCount = len(positions)
+	}
+	if nextDate, err := s.calRepo.GetNextTradeDate(status.Today); err == nil {
+		status.NextMarketOpen = nextDate
+	}
 	writeJSON(w, http.StatusOK, status)
 }
 
 // HandleUpdateData 处理 POST /api/system/update-data
-// 手动触发数据更新
+// 手动触发数据更新 (进程内调用 dataloader, 不再 exec 二进制)
 func (s *Service) HandleUpdateData(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "仅支持 POST")
 		return
 	}
-	if s.updater == nil {
-		writeError(w, http.StatusServiceUnavailable, "自动维护器未启用")
-		return
-	}
-	if err := s.updater.UpdateData(); err != nil {
+	if err := s.UpdateData(); err != nil {
 		writeError(w, http.StatusInternalServerError, "数据更新失败: "+err.Error())
 		return
 	}
+	// 数据更新后刷新股票名称缓存
+	s.loadStockMap()
 	writeJSON(w, http.StatusOK, map[string]string{"message": "数据更新成功"})
+}
+
+// UpdateData 进程内执行增量数据更新 (从库内最新日期补到今天); 同一时刻只允许一个更新任务
+func (s *Service) UpdateData() error {
+	if !s.updateMu.TryLock() {
+		return fmt.Errorf("数据更新任务正在执行中, 请稍后重试")
+	}
+	defer s.updateMu.Unlock()
+
+	opts := dataloader.Options{}
+	if maxDate, err := s.barRepo.GetMaxTradeDate(); err == nil && maxDate != "" {
+		opts.StartDate = maxDate // 增量: 从库内最新日期补起 (含当日, 幂等覆盖)
+	}
+	return dataloader.New(s.cfg, s.db).Run(opts)
 }
 
 // ==================== LLM 深度新闻分析 ====================
@@ -479,9 +551,6 @@ func (s *Service) initExtensions() {
 	// 初始化动态策略选择器
 	reg := strategy.DefaultRegistry()
 	s.dynamicSelector = strategy.NewDynamicSelector(reg, &advisorAdapter{})
-
-	// 初始化自动维护器
-	s.updater = maintenance.NewAutoUpdater(s.cfg, s.db)
 
 	// 尝试从数据库恢复持仓到内存
 	s.restorePortfolioFromDB()

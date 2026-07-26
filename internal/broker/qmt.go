@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -62,6 +63,7 @@ type qmtConnectReq struct {
 // QMTBridge 通过 HTTP 调用 Python sidecar 连接 miniQMT 的桥接器
 type QMTBridge struct {
 	baseURL   string       // sidecar 地址，如 "http://127.0.0.1:16888"
+	token     string       // sidecar 鉴权 token (环境变量 QMT_SIDECAR_TOKEN)
 	client    *http.Client // HTTP 客户端
 	mu        sync.RWMutex // 保护 callbacks
 	callbacks []func(model.Trade)
@@ -71,6 +73,7 @@ type QMTBridge struct {
 func NewQMTBridge(baseURL string) *QMTBridge {
 	return &QMTBridge{
 		baseURL: baseURL,
+		token:   os.Getenv("QMT_SIDECAR_TOKEN"),
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -295,25 +298,29 @@ func (q *QMTBridge) Connect(path string, sessionID int, accountID string) error 
 
 // get 发送 GET 请求
 func (q *QMTBridge) get(path string) ([]byte, error) {
-	url := q.baseURL + path
-	resp, err := q.client.Get(url)
+	req, err := http.NewRequest(http.MethodGet, q.baseURL+path, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("构建请求失败: %w", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
-	}
-
-	return io.ReadAll(resp.Body)
+	return q.do(req)
 }
 
 // post 发送 POST 请求
 func (q *QMTBridge) post(path string, body []byte) ([]byte, error) {
-	url := q.baseURL + path
-	resp, err := q.client.Post(url, "application/json", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, q.baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("构建请求失败: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return q.do(req)
+}
+
+// do 执行请求, 统一携带鉴权头并读取响应
+func (q *QMTBridge) do(req *http.Request) ([]byte, error) {
+	if q.token != "" {
+		req.Header.Set("X-QMT-Token", q.token)
+	}
+	resp, err := q.client.Do(req)
 	if err != nil {
 		return nil, err
 	}

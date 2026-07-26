@@ -55,6 +55,12 @@ func NewDataProvider(barRepo *store.BarRepo, universe []string, startDate, endDa
 	return dp, nil
 }
 
+// HasData 判断指定股票是否有已加载的行情数据
+func (dp *DataProvider) HasData(tsCode string) bool {
+	bars, ok := dp.barsByCode[tsCode]
+	return ok && len(bars) > 0
+}
+
 // GetBars 获取指定股票截至 endDate 的 N 根日线 (含 endDate)
 func (dp *DataProvider) GetBars(tsCode, endDate string, n int) ([]model.Bar, error) {
 	bars, ok := dp.barsByCode[tsCode]

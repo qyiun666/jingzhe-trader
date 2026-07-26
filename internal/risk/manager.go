@@ -25,6 +25,7 @@ type RiskManager struct {
 	stopLossManager *StopLossManager
 	exposureManager *ExposureManager
 	blacklist       *Blacklist
+	sizeLimits      SizeLimits // 小资金资金管理 (最小单笔金额/最大持仓数)
 }
 
 // NewRiskManager 创建风控管理器
@@ -58,6 +59,63 @@ func (rm *RiskManager) Blacklist() *Blacklist {
 	return rm.blacklist
 }
 
+// SetSizeLimits 配置小资金资金管理限制
+func (rm *RiskManager) SetSizeLimits(limits SizeLimits) {
+	rm.sizeLimits = limits
+}
+
+// checkSizeLimits 小资金资金管理检查 (仅针对买入信号)
+// 1. 单笔金额低于最小交易额时, 先尝试逐手上调数量达标 (整手取整误差补偿),
+//    上调后仍超单票仓位上限则拒绝 (避免最低佣金侵蚀)
+// 2. 新开仓超过最大持仓数时拒绝
+func (rm *RiskManager) checkSizeLimits(sig model.Signal, currentPrice, totalAsset float64,
+	positions map[string]*model.Position, newCodes map[string]bool) (model.Signal, *RejectReason) {
+
+	if minAmount := rm.sizeLimits.ResolveMinAmount(); minAmount > 0 && currentPrice > 0 {
+		amount := currentPrice * float64(sig.TargetQty)
+		if amount < minAmount {
+			// 整手取整导致的小额缺口: 逐手上调, 不突破单票仓位上限
+			maxAmount := totalAsset * rm.cfg.MaxPositionPct
+			qty := sig.TargetQty
+			for currentPrice*float64(qty) < minAmount &&
+				currentPrice*float64(qty+100) <= maxAmount {
+				qty += 100
+			}
+			if currentPrice*float64(qty) < minAmount {
+				return sig, &RejectReason{
+					TsCode: sig.TsCode,
+					Signal: sig,
+					Reason: fmt.Sprintf("单笔金额 %.0f 低于最小交易额 %.0f (最低佣金侵蚀)", amount, minAmount),
+					Rule:   "min_trade_amount",
+				}
+			}
+			sig.TargetQty = qty
+		}
+	}
+
+	if maxPos := rm.sizeLimits.ResolveMaxPositions(totalAsset); maxPos > 0 {
+		pos := positions[sig.TsCode]
+		isNew := (pos == nil || pos.TotalQty <= 0) && !newCodes[sig.TsCode]
+		if isNew {
+			held := len(newCodes)
+			for _, p := range positions {
+				if p != nil && p.TotalQty > 0 {
+					held++
+				}
+			}
+			if held >= maxPos {
+				return sig, &RejectReason{
+					TsCode: sig.TsCode,
+					Signal: sig,
+					Reason: fmt.Sprintf("持仓数已达上限 %d (小资金集中持仓)", maxPos),
+					Rule:   "max_positions",
+				}
+			}
+		}
+	}
+	return sig, nil
+}
+
 // Check 检查信号，返回通过的信号和被拒绝的原因
 // 检查顺序: 黑名单 -> 仓位限制 -> 止损止盈 -> 敞口控制 -> T+1 -> 涨跌停
 //
@@ -78,6 +136,8 @@ func (rm *RiskManager) Check(signals []model.Signal, positions map[string]*model
 
 	var passed []model.Signal
 	var rejected []RejectReason
+	// 本批次已通过的新开仓代码 (用于最大持仓数检查)
+	newCodes := make(map[string]bool)
 
 	// 第一步：黑名单过滤
 	survived, blRejected := rm.blacklist.FilterSignals(signals, stocks, tradeDate)
@@ -151,7 +211,15 @@ func (rm *RiskManager) Check(signals []model.Signal, positions map[string]*model
 				sig = adjusted
 			}
 
-			// 3. 敞口控制检查（板块限制）
+			// 3. 小资金资金管理检查 (最小单笔金额/最大持仓数); 可能上调数量补偿取整误差
+			sized, rej := rm.checkSizeLimits(sig, currentPrice, totalAsset, positions, newCodes)
+			if rej != nil {
+				rejected = append(rejected, *rej)
+				continue
+			}
+			sig = sized
+
+			// 4. 敞口控制检查（板块限制）
 			if err := rm.exposureManager.CheckSectorLimit(sig, positions, stocks, totalAsset, currentPrice, sig.TargetQty); err != nil {
 				rejected = append(rejected, RejectReason{
 					TsCode: sig.TsCode,
@@ -162,6 +230,9 @@ func (rm *RiskManager) Check(signals []model.Signal, positions map[string]*model
 				continue
 			}
 
+			if pos := positions[sig.TsCode]; pos == nil || pos.TotalQty <= 0 {
+				newCodes[sig.TsCode] = true
+			}
 			passed = append(passed, sig)
 
 		} else if sig.Direction == model.DirSell {

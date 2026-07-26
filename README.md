@@ -11,424 +11,279 @@
 
 专为**小资金**（1 万本金起）优化，强调**低频、集中、精准**的交易风格，用冷酷的规则代替冲动的人性。
 
+## 架构
+
+`cmd/server` 是唯一常驻进程，内置调度器在交易日自动完成全链路，结果全部落 SQLite。
+AI Agent（如 Hermes）只需定时 GET 只读 API 拿现成结果，POST 确认执行。
+
+```
+                      ┌──────────────────────────────────────────────┐
+                      │              cmd/server (常驻)                │
+                      │                                              │
+  Tushare ──────────▶ │  调度器 (交易日自动执行)                       │
+  腾讯免费行情 ──────▶ │   15:10 数据更新 (进程内 dataloader)          │
+  QMT sidecar ◀─────▶ │   15:30 EOD信号 → trade_plan 表              │
+                      │   15:35 对账 (QMT模式)                        │
+                      │   15:45 日报生成 + 飞书推送                    │
+                      │   盘中每5分钟 实时价止损监控 → 紧急计划+告警     │
+                      │   16:30 数据保留清理 + WAL checkpoint          │
+                      │                                              │
+                      │  统一执行管道 engine.Pipeline                  │
+                      │   信号 → 风控 → Broker下单 → 落库              │
+                      │   (回测/模拟/实盘共用, 只换 Broker 实现)        │
+                      └───────────────┬──────────────────────────────┘
+                                      │ SQLite (WAL)
+                      ┌───────────────┴──────────────────────────────┐
+                      │              HTTP API (Bearer 鉴权)           │
+                      └───────────────┬──────────────────────────────┘
+                                      │
+                 Agent/人: GET /api/agent/brief → POST /api/plan/confirm
+```
+
+### Agent 对接流程
+
+1. `GET /api/agent/brief` — 一次拿到全量上下文：待处理交易计划、持仓诊断、账户、市场概况、数据新鲜度、任务健康度
+2. Agent/人审阅计划后 `POST /api/plan/confirm {"id": 123}` 确认
+3. `trading.auto_execute=true` 且 `broker.type=qmt` 时确认即真实下单，否则仅标记 confirmed 由人工执行后 `POST /api/trade/confirm` 反馈成交
+
+详细用法见下方 [Agent 接入指南](#agent-接入指南hermes--任意-ai-agent)。
+
 ## 核心特点
 
-- **小资金友好** — 1 万本金即可运行，手续费优化，集中持仓
-- **多策略支持** — 均线交叉 / MACD / 布林带突破 / 多因子选股 / 日内做T
-- **动态策略选择** — 根据市场环境自动切换最优策略
-- **自适应参数** — 根据 ATR 波动率自动调整均线周期、止损止盈、仓位
-- **LLM 辅助** — 集成 DeepSeek 等大模型，深度分析新闻舆情
-- **完整链路** — 数据采集 → 回测验证 → 模拟盘 → 实盘(QMT)
-- **飞书推送** — 每日操盘报告自动推送到飞书
-
-## 回测表现
-
-| 策略 | 区间 | 总收益 | 年化 | 夏普 | 最大回撤 |
-|---|---|---|---|---|---|
-| **均线交叉 (3/25)** | 2024.01 ~ 2026.07 | **+67.25%** | **23.59%** | **1.11** | 12.72% |
-| 多因子 | 2024.01 ~ 2026.07 | +25.66% | 9.86% | 0.50 | 17.51% |
-| 均线交叉 | 2026.04 ~ 2026.07 | +17.37% | 76.56% | 1.74 | 15.65% |
-
-> 数据基于 13 只低价活跃股回测，手续费按真实万 0.85 佣金 + 万 5 印花税计算。
+- **小资金友好** — 1 万本金即可运行；按资金量级自适应持仓数与最小交易额（5 元最低佣金下默认单笔 ≥5000 元保证费率 ≤0.1%）
+- **回测即实盘** — 回测/模拟/实盘共用同一条 `信号 → 风控 → 下单 → 落库` 管道，回测结果不虚高
+- **风控内建** — 止损/止盈信号优先执行、单票/总仓位/板块敞口限制、含手续费的买入资金检查
+- **全自动闭环** — 内置调度器：数据更新 → EOD 信号 → 对账 → 日报飞书推送 → 盘中止损监控 → 数据自动清理
+- **常驻稳定** — 任务 panic 隔离、job_run 防重复/启动补跑、优雅关机、WAL checkpoint、goroutine 纪律
+- **多策略支持** — 均线交叉 / MACD / 布林带突破 / 多因子选股，动态策略选择器按市况切换
+- **LLM 辅助** — 集成 DeepSeek 等大模型深度分析新闻舆情（可选）
 
 ## 快速开始
 
-### 1. 克隆仓库
+### 1. 编译
 
 ```bash
 git clone https://github.com/qyiun666/jingzhe-trader.git
 cd jingzhe-trader
+go build -o bin/server ./cmd/server
+go build -o bin/backtest ./cmd/backtest
+go build -o bin/dataloader ./cmd/dataloader
+go build -o bin/optimizer ./cmd/optimizer
 ```
 
-### 2. 安装依赖
-
-```bash
-go mod tidy
-```
-
-### 3. 配置
+### 2. 配置
 
 ```bash
 cp config/config.example.yaml config/config.yaml
-# 编辑 config.yaml，填入你的 Tushare Token 和 LLM API Key
 ```
 
-- **Tushare Token**: 从 [tushare.pro](https://tushare.pro/register.html) 注册获取（500 元/年档）
-- **LLM API Key** (可选): 支持 DeepSeek / 通义千问 / 智谱等 OpenAI 兼容接口
-
-### 4. 采集数据
+**密钥一律走环境变量，不要写进配置文件**（配置文件中的同名项会被环境变量覆盖）：
 
 ```bash
-# 下载行情数据 (首次运行需要较长时间)
-make datasync
-
-# 下载财务指标数据
-make datasync-full
+export TUSHARE_TOKEN=你的tushare token       # 必需, 行情数据源
+export JZ_API_TOKEN=随机长字符串              # 推荐, API写接口鉴权
+export FEISHU_WEBHOOK=飞书机器人webhook       # 可选, 日报/告警推送
+export LLM_API_KEY=deepseek密钥              # 可选, 新闻分析
+export QMT_SIDECAR_TOKEN=随机长字符串         # QMT实盘时, sidecar鉴权
 ```
 
-### 5. 回测验证
+> ⚠️ 如果你的 token 曾经写在配置文件里提交过 git，请立即到对应平台**轮换**。
+
+### 3. 拉取数据 & 回测
 
 ```bash
-make backtest-small
+bin/dataloader -config config/config.yaml          # 首次约拉3年数据
+bin/backtest -config config/config.yaml            # 回测并生成HTML报告
 ```
 
-### 6. 启动服务
+### 4. 启动常驻服务
 
 ```bash
-make server-small
+bin/server -config config/config.yaml
+# 默认监听 127.0.0.1:8080, 调度器自动运行
+curl http://127.0.0.1:8080/api/health              # 健康检查
+curl http://127.0.0.1:8080/api/agent/brief         # Agent 全量上下文
 ```
 
-服务启动后访问 `http://localhost:11270`。
+## 小资金配置指南（1 万元档）
 
-## 项目架构
+`config.example.yaml` 默认即为 1 万资金调好的参数：
 
-```
-jingzhe-trader/
-├── cmd/                  # 命令行入口
-│   ├── server/           # HTTP API 服务
-│   ├── dataloader/       # 数据采集
-│   ├── backtest/         # 回测引擎
-│   ├── trader/           # 模拟/实盘交易
-│   ├── signal/           # 信号计算
-│   └── optimizer/        # 参数优化
-├── internal/
-│   ├── api/              # HTTP API 路由和处理器
-│   ├── backtest/         # 回测引擎核心
-│   ├── broker/           # 券商接口 (Paper / QMT)
-│   ├── config/           # 配置管理
-│   ├── factor/           # 选股因子 (价值/质量/成长/动量/情绪)
-│   ├── indicator/        # 技术指标 (MA/MACD/ATR/RSI/BOLL)
-│   ├── llm/              # LLM 客户端 (新闻分析/选股建议)
-│   ├── market/           # 市场数据和交易成本
-│   ├── model/            # 数据模型
-│   ├── risk/             # 风控引擎
-│   ├── signal/           # 信号系统
-│   ├── store/            # 数据持久化 (SQLite)
-│   ├── strategy/         # 策略引擎
-│   ├── tushare/          # Tushare 数据接口
-│   └── analysis/         # 策略分析和建议
-├── config/               # 配置文件
-├── data/                 # SQLite 数据库 (gitignored)
-├── logs/                 # 日志文件 (gitignored)
-├── reports/              # 回测报告 (gitignored)
-└── Makefile              # 快捷命令
-```
-
-## AI Agent 使用指南
-
-> 如果你是 AI Agent（如 TRAE / HermesAgent / Cursor Agent 等），下载本仓库后按以下步骤操作即可。
->
-> **核心定位**：Agent 是指挥官，负责分析数据、生成交易指令、推送给用户。用户是执行者，按指令操作后反馈结果，Agent 调接口更新持仓。
-
-### 1. 部署启动
-
-```bash
-# 克隆仓库
-git clone https://github.com/qyiun666/jingzhe-trader.git
-cd jingzhe-trader
-
-# 安装依赖
-go mod tidy
-
-# 复制配置模板并填入密钥
-cp config/config.example.yaml config/config.yaml
-# 编辑 config.yaml，填入 Tushare Token 和 LLM API Key
-
-# 编译
-make build-small
-
-# 启动 API 服务（后台常驻）
-./bin/jingzhe-server -config config/config.yaml &
-```
-
-服务启动后监听 `http://localhost:11270`，Agent 所有操作通过 HTTP API 完成。
-
-### 2. 数据管理
-
-#### 2.1 每日数据采集
-
-```bash
-# 增量同步（每个交易日收盘后执行）
-./bin/dataloader -config config/config.yaml
-
-# 含新闻+资金流向+龙虎榜
-./bin/dataloader -config config/config.yaml -news -moneyflow -toplist
-
-# 同步财务指标（每季度一次）
-./bin/dataloader -config config/config.yaml -fina
-```
-
-#### 2.2 筛选模式（节省空间）
-
-在 `config.yaml` 中开启筛选模式，只拉取股票池+持仓的行情数据，数据量减少 99%：
-
-```yaml
-dataloader:
-  filter_mode: false        # true=只拉关注股票, false=全量
-  watchlist: []             # 额外关注代码，如: ["600519.SH"]
-  enable_limit: true        # 涨跌停价（风控需要，建议开）
-  enable_basic: true        # 每日基本面（多因子策略需要，建议开）
-  enable_fund: true         # ETF/基金日线
-```
-
-#### 2.3 清理多余数据
-
-切换到筛选模式后，清理已积累的无用数据（删除不在股票池和持仓中的股票）：
-
-```bash
-./bin/dataloader -config config/config.yaml -cleanup
-```
-
-执行后自动 VACUUM 回收磁盘空间。**注意**：cleanup 会直接删除数据，确认股票池配置正确后再执行。
-
-### 3. 每日调度计划
-
-| 时间 | 操作 | 命令/API | 说明 |
-|---|---|---|---|
-| **15:30** | 数据采集 | `./bin/dataloader -config config/config.yaml` | 收盘后同步当日行情 |
-| **15:35** | 生成操盘报告 | `make captain date=YYYYMMDD` | 生成每日操盘报告 |
-| **15:40** | 获取交易指令 | `GET /api/rebalance?date=YYYYMMDD` | 获取买卖建议 |
-| **15:45** | 推送指令 | 飞书 Webhook | 把买卖指令推送给用户 |
-| **按需** | 交易反馈 | `POST /api/trade/confirm` | 用户操作完成后更新持仓 |
-| **16:00** | 持仓诊断 | `make captain-diagnose` | 检查持仓风控状态 |
-
-### 4. 交易指令闭环（核心流程）
-
-**角色分工**：
-- **Agent** = 指挥官：分析数据，生成具体交易指令（买/卖/设条件单/撤条件单）
-- **用户** = 执行者：按指令在交易软件操作，完成后反馈结果
-- **系统** = 账本：通过 API 记录交易，更新持仓和现金
-
-**流程**：
-
-```
-1. Agent 跑 captain daily → 生成买卖建议
-2. Agent 从 /api/rebalance 获取结构化指令
-3. Agent 推送指令给用户（飞书/通知），格式：
-   "买入 510050.SH 500股 限价3.05"
-   "卖出 510300.SH 200股 市价"
-   "510050.SH 设条件单：跌到2.90自动买入500股"
-   "撤掉 510050.SH 的条件单"
-4. 用户操作完成后反馈："510050买完了，500股，3.048成交"
-5. Agent 调 POST /api/trade/confirm 更新持仓
-6. 下次报告基于最新持仓
-```
-
-**条件单说明**：条件单在用户的交易软件上设置和管理，系统不跟踪条件单状态。条件单触发成交后，用户反馈成交结果，Agent 调 `/api/trade/confirm` 更新即可。
-
-### 5. API 接口
-
-#### 5.1 接口总览
-
-| 接口 | 方法 | 说明 |
+| 参数 | 默认值 | 说明 |
 |---|---|---|
-| `/api/health` | GET | 健康检查 |
-| `/api/daily` | GET | 每日操盘报告（汇总：持仓+调仓+市场+策略） |
-| `/api/positions` | GET | 持仓列表+诊断（盈亏、风控、集中度） |
-| `/api/rebalance` | GET | 调仓建议（买入/卖出/持有列表） |
-| `/api/strategy` | GET | 策略建议（推荐操作方向） |
-| `/api/strategy/status` | GET | 动态策略状态（当前策略+参数） |
-| `/api/market` | GET | 市场概况（指数+涨跌+板块） |
-| `/api/kline` | GET | K线数据（`?code=510050.SH&start=20260101&end=20260716`） |
-| `/api/snapshots` | GET | 账户快照历史（`?limit=30`） |
-| `/api/news` | GET | 新闻列表 |
-| `/api/news/llm` | GET | LLM 深度新闻分析（`?limit=5`） |
-| `/api/portfolio` | GET | 获取持仓列表（原始格式） |
-| `/api/portfolio/sync` | POST | 批量同步持仓（覆盖式） |
-| `/api/trade/confirm` | POST | 交易反馈（单笔成交确认） |
-| `/api/system/status` | GET | 系统状态（数据新鲜度+健康度） |
-| `/api/system/update-data` | POST | 手动触发数据更新 |
+| `risk.max_position_pct` | 0.6 | 单票上限 60%（小资金必须集中） |
+| `risk.max_total_position_pct` | 1.0 | 总仓位可满仓 |
+| `risk.stop_loss_pct` | 0.05 | 止损 -5% |
+| `risk.take_profit_pct` | 0.10 | 止盈 +10% |
+| `trading.min_trade_amount` | 0 | 0=自适应：最低佣金/0.1%（5元→5000元），低于该额的买入直接拒绝 |
+| `trading.max_positions` | 0 | 0=自适应：<5万→2只，<20万→4只，否则6只 |
+| `trading.auto_execute` | false | 默认只生成计划，人/Agent 确认后执行 |
+| `cost.min_commission` | 5.0 | 按你的券商实际佣金档修改 |
 
-#### 5.2 交易反馈接口
+资金量变大后无需改代码：把 `backtest.initial_capital` 改成实际资金，自适应参数自动放宽；也可以手动指定 `trading.*` 覆盖自适应。
 
-用户操作完成后，Agent 调用此接口更新持仓：
+## API 一览
+
+只读接口（GET，无需 token）：
+
+| 端点 | 说明 |
+|---|---|
+| `/api/agent/brief` | **Agent 首选**：计划+持仓+市场+健康度一次拿全 |
+| `/api/plan?date=` | 交易计划列表（不传 date 返回全部待处理） |
+| `/api/daily?date=` | 每日操盘报告（汇总） |
+| `/api/positions` | 持仓诊断 |
+| `/api/market` / `/api/news` / `/api/strategy` | 市场概况 / 新闻舆情 / 策略建议 |
+| `/api/reconcile?date=` | 本地 vs 券商对账 |
+| `/api/health` | uptime / goroutine数 / db大小 / 各任务最近成功时间 |
+| `/api/system/status` | 数据新鲜度 / 持仓数 / 下一交易日 |
+
+写接口（POST，配置 `server.api_token` 后需 `Authorization: Bearer <token>`）：
+
+| 端点 | 说明 |
+|---|---|
+| `/api/plan/confirm` | 确认交易计划 `{"id": 123}` |
+| `/api/trade/confirm` | 人工成交后反馈 `{"ts_code","side","qty","price"}` |
+| `/api/portfolio/sync` | 同步真实持仓（`overwrite: false` 为增量 Upsert） |
+| `/api/system/update-data` | 手动触发数据更新 |
+
+## Agent 接入指南（Hermes / 任意 AI Agent）
+
+本系统是 Agent 的“数据 + 执行后端”：调度器每个交易日自动完成数据更新→信号生成→盘中监控，结果全部落库；Agent 只需定时读取现成结果、审批计划、反馈成交，不需要自己算任何指标。
+
+### 鉴权
 
 ```bash
-# 买入反馈
-curl -s -X POST "http://localhost:11270/api/trade/confirm" \
-  -H "Content-Type: application/json" \
-  -d '{"ts_code": "510050.SH", "side": "buy", "qty": 500, "price": 3.048}'
+export JZ_API_TOKEN="your-random-token"    # 服务端: config 留空则从环境变量 JZ_API_TOKEN 读取
+# Agent 侧所有 POST 请求带头: Authorization: Bearer $JZ_API_TOKEN  (GET 无需 token)
 ```
+
+### 推荐轮询节奏（交易日）
+
+| 时间 | Agent 动作 | 说明 |
+|---|---|---|
+| 15:35 后 | `GET /api/agent/brief` | 调度器 15:10 更新数据、15:30 生成计划，此时计划已就绪 |
+| 审阅后 | `POST /api/plan/confirm` | 逐条确认要执行的计划 |
+| 成交后 | `POST /api/trade/confirm` | 人工/券商成交后反馈，保持持仓同步 |
+| 盘中（可选） | `GET /api/plan` | 盘中止损监控产生的 urgent 计划会实时出现在这里（同时飞书告警） |
+| 任意 | `GET /api/health` | 存活与任务健康度巡检 |
+
+### 1. 读取全量上下文
 
 ```bash
-# 卖出反馈
-curl -s -X POST "http://localhost:11270/api/trade/confirm" \
-  -H "Content-Type: application/json" \
-  -d '{"ts_code": "510300.SH", "side": "sell", "qty": 200, "price": 4.75}'
+curl http://NAS_IP:8080/api/agent/brief
 ```
 
-**参数说明**：
-- `ts_code`：股票代码（如 `510050.SH`）
-- `side`：`buy` 或 `sell`
-- `qty`：成交数量（必须 100 的整数倍）
-- `price`：实际成交价格
+响应字段（`data`）：
 
-**响应**：
-```json
+```jsonc
 {
-  "code": 0,
-  "msg": "ok",
-  "data": {
-    "ts_code": "510050.SH",
-    "side": "buy",
-    "qty": 500,
-    "price": 3.048,
-    "amount": 1524.0,
-    "cash": 8476.0,
-    "total_asset": 10000.0
-  }
+  "date": "20260726",           // 数据基准日
+  "data_last_date": "20260724", // 库内最新行情日
+  "data_fresh": true,            // false 时应提醒用户数据滞后, 不宜盲信计划
+  "open_plans": [{               // 待处理交易计划 (pending/confirmed)
+    "id": 12, "trade_date": "20260726",
+    "ts_code": "000001.SZ", "name": "平安银行",
+    "direction": "buy", "qty": 500, "ref_price": 11.13,
+    "reason": "均线金叉: MA3=11.05上穿MA25=10.98",
+    "strategy": "ma_cross", "urgency": "normal",  // urgent=止损类, 优先处理
+    "status": "pending"
+  }],
+  "portfolio": { /* 持仓明细+健康分+集中度+盈亏/风险指标 */ },
+  "market":    { /* 指数涨跌/市场情绪概况 */ },
+  "jobs":      { "signal": "2026-07-26 15:30:02", "data_update": "..." },
+  "warnings":  ["..."]           // 数据滞后/任务失败等异常, 非空时优先告知用户
 }
 ```
 
-系统自动处理：加权平均成本、现金增减、持仓数量更新。
-
-#### 5.3 批量同步持仓
-
-当需要从外部系统一次性导入完整持仓时使用（覆盖式，会清空旧持仓）：
+### 2. 确认执行计划
 
 ```bash
-curl -s -X POST "http://localhost:11270/api/portfolio/sync" \
+curl -X POST http://NAS_IP:8080/api/plan/confirm \
+  -H "Authorization: Bearer $JZ_API_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{
-    "positions": [
-      {"ts_code": "510050.SH", "total_qty": 500, "available_qty": 500, "cost_price": 3.059},
-      {"ts_code": "510300.SH", "total_qty": 200, "available_qty": 200, "cost_price": 4.936}
-    ],
-    "cash": 5000.0
-  }'
+  -d '{"id": 12}'
 ```
 
-#### 5.4 获取调仓建议
+- `broker.type=paper`（默认）：模拟盘立即成交并更新持仓，飞书推送成交回执
+- `broker.type=qmt` + `trading.auto_execute=true`：直接真实下单
+- 否则仅标记 `confirmed`，等人工在券商 App 成交后走第 3 步反馈
+
+不想执行的计划无需操作，次日自动过期（`expired`）。
+
+### 3. 人工成交后反馈（保持账本一致）
 
 ```bash
-curl -s "http://localhost:11270/api/rebalance?date=20260716"
+curl -X POST http://NAS_IP:8080/api/trade/confirm \
+  -H "Authorization: Bearer $JZ_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"ts_code":"000001.SZ","side":"buy","qty":500,"price":11.15}'
 ```
 
-**响应结构**：
-```json
-{
-  "code": 0,
-  "data": {
-    "sell_list": [
-      {"ts_code": "510300.SH", "qty": 200, "price": 4.75, "reason": "死叉卖出"}
-    ],
-    "buy_list": [
-      {"ts_code": "510050.SH", "qty": 500, "price": 3.05, "reason": "金叉买入"}
-    ],
-    "hold_list": [
-      {"ts_code": "510050.SH", "qty": 500, "suggestion": "继续持有"}
-    ],
-    "cash_pct": 0.15,
-    "reason": "调仓2只"
-  }
-}
-```
-
-### 6. 飞书推送配置
-
-在 `config/config.yaml` 中填入飞书 Webhook URL：
-
-```yaml
-feishu:
-  webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxx"
-  push_daily: true
-  push_time: "15:30"
-```
-
-获取方式：飞书群设置 → 添加机器人 → 自定义机器人 → 复制 Webhook 地址。
-
-**推送格式建议**（Agent 组装后发送）：
-
-```
-【交易指令 2026-07-16】
-
-卖出：
-  510300.SH  200股  市价  （死叉卖出）
-
-买入：
-  510050.SH  500股  限价3.05  （金叉买入）
-
-持有：
-  510050.SH  500股  继续持有
-
-现金占比：15%
-操作完成后请回复成交结果。
-```
-
-### 7. Captain 命令
-
-Captain 是操盘手工具，提供三种模式：
+### 4. 首次接入：同步真实持仓
 
 ```bash
-# 每日操盘报告（生成 HTML 报告 + 保存账户快照）
-make captain date=20260716
-
-# 持仓诊断（检查止损/止盈/集中度）
-make captain-diagnose
-
-# 调仓建议（生成买卖列表）
-make captain-rebalance
+curl -X POST http://NAS_IP:8080/api/portfolio/sync \
+  -H "Authorization: Bearer $JZ_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"cash": 10392.74, "overwrite": true, "positions": [
+        {"ts_code":"510050.SH","total_qty":500,"available_qty":500,"cost_price":3.059}
+      ]}'
 ```
 
-每个模式执行后会自动保存 `account_snapshot`（账户快照），用于绘制资产曲线。
+### Agent 提示词建议（可直接复制进 Agent 的定时任务）
 
-### 8. 回测验证（部署前建议跑一遍）
-
-```bash
-make backtest-small    # 跑回测验证策略有效性
-make optimize          # 参数网格搜索，找最优参数
+```text
+每个交易日 15:35 调用 GET /api/agent/brief：
+1. 若 warnings 非空或 data_fresh=false，先向我报告异常，不要确认任何计划；
+2. 逐条分析 open_plans：结合 reason、portfolio 风险指标、market 情绪，
+   给出 执行/跳过 建议及理由，urgent（止损）计划优先；
+3. 经我同意后用 POST /api/plan/confirm 确认；未同意的不操作；
+4. 汇报今日持仓盈亏与健康分变化。
 ```
 
-## 策略说明
+## 数据自动清理
 
-### 均线交叉 (ma_cross) — 推荐策略
+调度器每日 16:30 自动执行（`retention` 配置段），防止数据库无限膨胀：
 
-- **短均线**: 3 日，**长均线**: 25 日（经网格搜索优化）
-- 金叉买入，死叉卖出
-- 含 4 重信号过滤：成交量确认、趋势强度、大盘环境、冷却期
-- 自适应参数：根据波动率动态调整均线周期和仓位
+- 行情保留 3 年、新闻 30 天、交易计划/任务记录 90 天
+- 回测记录只保留最近 20 个 run，**实盘记录（`live_*`）永久保留**
+- 日志保留 30 天，HTML 报告保留最近 30 个
+- 每日 `wal_checkpoint(TRUNCATE)`，每周日增量 vacuum 回收空间
 
-### 多因子选股 (multi_factor)
+## 部署（开机自启 + 崩溃自动拉起）
 
-- 5 大类因子：价值(PE/PB) + 质量(ROE/毛利率) + 成长(净利润同比) + 动量(60日涨幅) + 情绪(换手率/量比/涨跌停)
-- 周度调仓，每次只选 top 3
-- 适合震荡市和弱趋势市场
+- **Linux (systemd)**：`scripts/jingzhe.service`，`systemctl enable --now jingzhe`
+- **macOS (launchd)**：`scripts/com.jingzhe.trader.plist`，`launchctl load`
 
-### 日内做T (intraday_t)
+进程意外退出由系统自动拉起，重启后调度器依据 `job_run` 表自动补跑当天漏掉的任务。
 
-- 利用底仓做日内高抛低吸
-- 自动评估：波动率够不够、做T划不划算
-- 震荡市自动推荐
+## QMT 实盘（可选，Windows）
 
-## API 接口
+1. Windows 机器上运行 miniQMT + `scripts/qmt_sidecar.py`（设置 `QMT_SIDECAR_TOKEN`，仅监听 127.0.0.1）
+2. 配置 `broker.type: qmt`、`broker.qmt.url`
+3. `trading.auto_execute: true` 后，确认计划即真实下单；每日 15:35 自动对账
 
-| 接口 | 方法 | 说明 |
-|---|---|---|
-| `/api/health` | GET | 健康检查 |
-| `/api/daily` | GET | 每日操盘报告 |
-| `/api/portfolio` | GET | 获取持仓列表 |
-| `/api/portfolio/sync` | POST | 同步真实持仓 |
-| `/api/trade/confirm` | POST | 交易反馈确认 |
-| `/api/strategy/status` | GET | 动态策略状态 |
-| `/api/news/llm` | GET | LLM 深度新闻分析 |
-| `/api/system/status` | GET | 系统全面状态 |
+## 项目结构
 
-## Makefile 快捷命令
-
-```bash
-make build-small        # 编译所有二进制
-make server-small       # 启动服务
-make backtest-small     # 小资金回测
-make trader-small       # 小资金模拟盘
-make datasync           # 数据采集
-make datasync-full      # 全量数据采集(含新闻/财务)
-make optimize           # 策略参数网格搜索
+```
+cmd/            server(常驻) / backtest / optimizer / dataloader
+internal/
+  engine/       统一执行管道 Pipeline (回测=实盘)
+  broker/       Broker接口: PaperBroker(模拟撮合) / QMTBridge
+  risk/         风控: 止损止盈 / 仓位限制 / 小资金自适应 sizing
+  scheduler/    内置调度器 (job_run 防重/补跑/panic隔离)
+  strategy/     策略与动态选择器
+  store/        SQLite 仓储 + retention 数据清理
+  quote/        盘中实时行情 (腾讯免费源 / QMT)
+  notify/       飞书通知
+  api/          HTTP API (鉴权/CORS/recover 中间件)
+  dataloader/   Tushare 数据同步 (库化, CLI与调度器共用)
 ```
 
 ## 免责声明
 
-本项目仅供学习和研究使用，不构成任何投资建议。股市有风险，投资需谨慎。使用本系统进行实盘交易产生的任何盈亏由使用者自行承担。
+本项目仅供学习研究，不构成投资建议。股市有风险，实盘需谨慎。
 
 ## License
 
-[MIT](LICENSE)
+MIT

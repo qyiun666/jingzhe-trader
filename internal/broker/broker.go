@@ -12,6 +12,12 @@ type OrderRequest struct {
 	Price     float64 // 限价单价格, 0表示市价单
 	Reason    string  // 下单原因
 	Strategy  string  // 来源策略名
+	FillDate  string  // 成交日 (Paper撮合用于涨跌停检查, 空时用当前交易日)
+}
+
+// LimitProvider 涨跌停价提供者接口 (由 store.LimitRepo 实现)
+type LimitProvider interface {
+	GetByCodeAndDate(tsCode, tradeDate string) (*model.StkLimit, error)
 }
 
 // Broker 统一券商接口

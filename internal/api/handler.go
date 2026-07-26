@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -15,7 +16,6 @@ import (
 	"jingzhe-trader/internal/broker"
 	"jingzhe-trader/internal/config"
 	"jingzhe-trader/internal/llm"
-	"jingzhe-trader/internal/maintenance"
 	"jingzhe-trader/internal/market"
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/store"
@@ -138,9 +138,10 @@ type Service struct {
 	stockMap        map[string]string // ts_code -> name
 	brk             broker.Broker
 	dynamicSelector *strategy.DynamicSelector // 动态策略选择器
-	updater         *maintenance.AutoUpdater  // 自动维护器
 	llmClient       *llm.Client                // LLM 客户端
 	llmNews         *llm.NewsAnalyzer          // LLM 新闻分析器
+	startTime       time.Time                  // 服务启动时间 (uptime用)
+	updateMu        sync.Mutex                 // 数据更新互斥 (防并发重入)
 }
 
 // NewService 创建 API 服务
@@ -151,10 +152,11 @@ func NewService(cfg *config.Config) (*Service, error) {
 	}
 
 	svc := &Service{
-		cfg:     cfg,
-		db:      db,
-		barRepo: store.NewBarRepo(db),
-		calRepo: store.NewCalendarRepo(db),
+		cfg:       cfg,
+		db:        db,
+		barRepo:   store.NewBarRepo(db),
+		calRepo:   store.NewCalendarRepo(db),
+		startTime: time.Now(),
 	}
 
 	// 加载股票名称映射
@@ -200,6 +202,11 @@ func (s *Service) stockName(tsCode string) string {
 		return name
 	}
 	return tsCode
+}
+
+// DB 返回底层数据库连接 (供调度器等外部组件复用同一连接)
+func (s *Service) DB() *sqlx.DB {
+	return s.db
 }
 
 // Close 释放资源
@@ -292,7 +299,52 @@ func (s *Service) RunPositions(date string) (*PortfolioJSON, error) {
 	positions, _ = s.brk.QueryPositions()
 	asset, _ = s.brk.QueryAsset()
 
-	return s.buildPortfolioJSON(positions, asset, todayBars), nil
+	result := s.buildPortfolioJSON(positions, asset, todayBars)
+	s.enrichPortfolioAnalysis(result, positions, todayBars)
+	return result, nil
+}
+
+// enrichPortfolioAnalysis 用 analysis.AnalyzePortfolio 的完整分析覆盖简化指标
+// (集中度/盈亏归因/风险指标/健康度评分)
+func (s *Service) enrichPortfolioAnalysis(result *PortfolioJSON,
+	positions map[string]*model.Position, todayBars map[string]*model.Bar) {
+
+	totalAsset := result.TotalAsset
+	if totalAsset <= 0 || len(positions) == 0 {
+		return
+	}
+
+	stockRepo := store.NewStockRepo(s.db)
+	stocks := make(map[string]*model.Stock, len(positions))
+	for tsCode := range positions {
+		if st, err := stockRepo.GetByCode(tsCode); err == nil && st != nil {
+			stocks[tsCode] = st
+		}
+	}
+
+	pa := analysis.AnalyzePortfolio(positions, todayBars, stocks, totalAsset, &dbHistoryAdapter{barRepo: s.barRepo})
+	result.HealthScore = pa.HealthScore
+	result.Concentration = map[string]float64{
+		"top1_pct":   pa.Concentration.Top1Pct,
+		"top3_pct":   pa.Concentration.Top3Pct,
+		"top5_pct":   pa.Concentration.Top5Pct,
+		"herfindahl": pa.Concentration.Herfindahl,
+	}
+	result.PnLSummary = map[string]interface{}{
+		"total_pnl":   pa.PnLAttribution.TotalFloatingPnL,
+		"win_count":   pa.PnLAttribution.WinCount,
+		"loss_count":  pa.PnLAttribution.LossCount,
+		"win_pct":     pa.PnLAttribution.WinPct,
+		"best_stock":  pa.PnLAttribution.BestStock,
+		"worst_stock": pa.PnLAttribution.WorstStock,
+		"summary":     pa.Summary,
+	}
+	result.RiskMetrics = map[string]interface{}{
+		"max_loss_pct":    pa.RiskMetrics.MaxSingleLossPct,
+		"var95":           pa.RiskMetrics.VaR95,
+		"beta":            pa.RiskMetrics.BetaToMarket,
+		"suspended_count": pa.RiskMetrics.SuspendedCount,
+	}
 }
 
 // RunRebalance 调仓建议
@@ -963,6 +1015,7 @@ func (s *Service) buildActionItems(
 }
 
 // runStrategy 运行策略产生信号
+// universe 限定为配置股票池 + 当前持仓 (与回测一致, 避免全市场扫描)
 func (s *Service) runStrategy(
 	date string,
 	strategyName string,
@@ -976,9 +1029,24 @@ func (s *Service) runStrategy(
 		return nil
 	}
 
-	universe := make([]string, 0, len(bars))
-	for code := range bars {
-		universe = append(universe, code)
+	// 股票池: 配置 universe + 持仓, 且当日有行情
+	seen := make(map[string]bool)
+	var universe []string
+	for _, code := range s.cfg.UniverseCodes() {
+		if !seen[code] && bars[code] != nil {
+			seen[code] = true
+			universe = append(universe, code)
+		}
+	}
+	for code := range positions {
+		if !seen[code] && bars[code] != nil {
+			seen[code] = true
+			universe = append(universe, code)
+		}
+	}
+	if len(universe) == 0 {
+		logger.L().Warnf("[%s] 股票池为空(配置 universe 无当日行情), 策略跳过", date)
+		return nil
 	}
 
 	barCtx := &strategy.BarContext{
@@ -988,29 +1056,54 @@ func (s *Service) runStrategy(
 		Positions:  positions,
 		Cash:       asset.Cash,
 		TotalAsset: asset.TotalAsset,
-		History:    &historyAdapter{},
+		History:    &dbHistoryAdapter{barRepo: s.barRepo}, // 真实历史K线, 均线类策略依赖
 	}
 
-	if err := strat.Init(context.Background(), nil); err != nil {
+	// 传入配置参数 (与回测同一入口, 保证线上与回测行为一致)
+	if err := strat.Init(context.Background(), s.cfg.StrategyParams(strategyName)); err != nil {
+		logger.L().Errorf("[%s] 策略 %s 初始化失败: %v", date, strategyName, err)
 		return nil
 	}
 
 	signals, err := strat.OnBar(context.Background(), barCtx)
 	if err != nil {
+		logger.L().Errorf("[%s] 策略 %s 执行失败: %v", date, strategyName, err)
 		return nil
 	}
 	return signals
 }
 
-// historyAdapter 简化历史数据适配器
-type historyAdapter struct{}
-
-func (h *historyAdapter) GetBars(tsCode, endDate string, n int) ([]model.Bar, error) {
-	return nil, nil
+// dbHistoryAdapter 基于数据库的历史数据适配器 (策略均线计算/持仓分析 Beta/VaR 用)
+type dbHistoryAdapter struct {
+	barRepo *store.BarRepo
 }
 
-func (h *historyAdapter) GetCloses(tsCode, endDate string, n int) ([]float64, error) {
-	return nil, nil
+func (h *dbHistoryAdapter) GetBars(tsCode, endDate string, n int) ([]model.Bar, error) {
+	// 自然日回退 n*2+10 天覆盖 n 个交易日
+	start := endDate
+	if t, err := time.Parse("20060102", endDate); err == nil {
+		start = t.AddDate(0, 0, -(n*2 + 10)).Format("20060102")
+	}
+	bars, err := h.barRepo.GetBars(tsCode, start, endDate)
+	if err != nil {
+		return nil, err
+	}
+	if len(bars) > n {
+		bars = bars[len(bars)-n:]
+	}
+	return bars, nil
+}
+
+func (h *dbHistoryAdapter) GetCloses(tsCode, endDate string, n int) ([]float64, error) {
+	bars, err := h.GetBars(tsCode, endDate, n)
+	if err != nil {
+		return nil, err
+	}
+	closes := make([]float64, len(bars))
+	for i, b := range bars {
+		closes[i] = b.Close
+	}
+	return closes, nil
 }
 
 // scoreToLabel 将情感分数转换为中文标签
@@ -1025,9 +1118,9 @@ func scoreToLabel(score float64) string {
 
 // ==================== HTTP Handler ====================
 
-// HandleHealth 健康检查
+// HandleHealth 健康检查 (含uptime/goroutine数/数据新鲜度/任务健康度)
 func (s *Service) HandleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	writeJSON(w, http.StatusOK, s.BuildHealthStatus())
 }
 
 // HandleDaily 每日操盘报告
@@ -1039,23 +1132,9 @@ func (s *Service) HandleDaily(w http.ResponseWriter, r *http.Request) {
 	}
 	strategyName := r.URL.Query().Get("strategy")
 
-	// 动态策略选择: 未指定策略时, 使用 dynamicSelector
-	if strategyName == "" && s.dynamicSelector != nil {
-		allBars, err := s.barRepo.GetBarsByDate(date)
-		if err == nil && len(allBars) > 0 {
-			barMap := make(map[string]*model.Bar, len(allBars))
-			for i := range allBars {
-				barMap[allBars[i].TsCode] = &allBars[i]
-			}
-			selectedName, switched := s.dynamicSelector.Select(date, barMap)
-			strategyName = selectedName
-			if switched {
-				logger.L().Infof("[动态策略] %s 策略切换为 %s", date, strategyName)
-			}
-		}
-	}
+	// 未指定策略时, 使用动态策略选择器 (兜底 ma_cross)
 	if strategyName == "" {
-		strategyName = "ma_cross"
+		strategyName = s.SelectStrategy(date)
 	}
 
 	report, err := s.RunDaily(date, strategyName)
@@ -1154,9 +1233,6 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 		Data: data,
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	w.WriteHeader(status)
 
 	body, _ := json.MarshalIndent(resp, "", "  ")
@@ -1172,9 +1248,6 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 		Data: nil,
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	w.WriteHeader(status)
 
 	body, _ := json.MarshalIndent(resp, "", "  ")

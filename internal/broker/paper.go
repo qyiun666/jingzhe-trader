@@ -81,6 +81,9 @@ func (pa *paperAccount) buy(tsCode string, qty int, price float64, cost model.Co
 	amount := price * float64(qty)
 	pa.cash -= amount + cost.Total()
 	market.OnBuy(pos, qty, price, cost)
+	// 成交价即时更新市值, 避免新仓当日快照市值为0造成假回撤
+	pos.MarketPrice = price
+	pos.MarketValue = price * float64(pos.TotalQty)
 }
 
 func (pa *paperAccount) sell(tsCode string, qty int, price float64, cost model.Cost) {
@@ -90,7 +93,11 @@ func (pa *paperAccount) sell(tsCode string, qty int, price float64, cost model.C
 	market.OnSell(pos, qty, price, cost)
 	if pos.TotalQty <= 0 {
 		delete(pa.positions, tsCode)
+		return
 	}
+	// 部分卖出: 按成交价刷新剩余持仓市值
+	pos.MarketPrice = price
+	pos.MarketValue = price * float64(pos.TotalQty)
 }
 
 func (pa *paperAccount) cleanEmpty() {
@@ -102,17 +109,20 @@ func (pa *paperAccount) cleanEmpty() {
 }
 
 // PaperBroker 纸面交易券商 (模拟券商)
-// 回测/纸面交易共用, 通过 Broker 接口统一执行路径
+// 回测/纸面交易共用唯一模拟账户, 通过 Broker 接口统一执行路径
+// 撮合规则: 滑点 -> 价格取整 -> 涨跌停检查 -> 含费资金检查/T+1 -> 成交
 type PaperBroker struct {
 	name           string
 	account        *paperAccount
 	oms            *OMS
 	mu             sync.RWMutex
 	tradeCallbacks []func(model.Trade)
-	// 撮合相关 (回测模式使用)
-	costModel      *market.CostModel
-	currentDate    string
-	nextDate       string
+	// 撮合相关
+	costModel   *market.CostModel
+	slippage    float64       // 滑点比例 (买入上浮/卖出下浮)
+	limitRepo   LimitProvider // 涨跌停价查询, 可为nil
+	currentDate string
+	nextDate    string
 }
 
 // NewPaperBroker 创建纸面交易券商
@@ -125,6 +135,14 @@ func NewPaperBroker(name string, initialCapital float64, costModel *market.CostM
 	}
 }
 
+// SetMatchRules 配置撮合规则 (滑点 + 涨跌停检查)
+func (pb *PaperBroker) SetMatchRules(slippage float64, limitRepo LimitProvider) {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+	pb.slippage = slippage
+	pb.limitRepo = limitRepo
+}
+
 func (pb *PaperBroker) Name() string { return pb.name }
 
 // SetTradeDate 设置当前交易日和下一交易日 (回测引擎调用)
@@ -135,104 +153,156 @@ func (pb *PaperBroker) SetTradeDate(current, next string) {
 	pb.nextDate = next
 }
 
-// PlaceOrder 下单
-// 在纸面交易模式中, 订单直接成交 (基于简单价格模型)
-// 在回测模式中, 由回测引擎传入成交结果
+// PlaceOrder 下单, 按撮合规则立即成交或拒绝
 func (pb *PaperBroker) PlaceOrder(req OrderRequest) (string, error) {
+	orderID, trade, err := pb.matchOrder(req)
+	if err != nil {
+		return orderID, err
+	}
+	// 锁外通知, 避免回调内再访问 broker 导致死锁
+	pb.notifyTrade(trade)
+	return orderID, nil
+}
+
+// matchOrder 锁内完成撮合全流程
+func (pb *PaperBroker) matchOrder(req OrderRequest) (string, model.Trade, error) {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
 	orderID := pb.oms.CreateOrder(req)
 	pb.oms.SubmitOrder(orderID)
 
-	// 检查方向
 	if req.Side != model.SideBuy && req.Side != model.SideSell {
 		pb.oms.RejectOrder(orderID, "未知方向")
-		return orderID, fmt.Errorf("未知方向")
+		return orderID, model.Trade{}, fmt.Errorf("未知方向")
+	}
+	if req.Price <= 0 {
+		pb.oms.RejectOrder(orderID, "委托价无效")
+		return orderID, model.Trade{}, fmt.Errorf("委托价无效")
 	}
 
+	// 应用滑点并取整价格
+	price := req.Price
 	if req.Side == model.SideBuy {
-		// 买入: 检查资金
-		if req.Price <= 0 {
-			pb.oms.RejectOrder(orderID, "买入价无效")
-			return orderID, fmt.Errorf("买入价无效")
-		}
-		qty := market.RoundLot(req.Qty)
-		if qty <= 0 {
-			pb.oms.RejectOrder(orderID, "买入数量不足100股")
-			return orderID, fmt.Errorf("买入数量不足100股")
-		}
-		buyCost := pb.costModel.BuyCost(req.Price, qty)
-		if buyCost > pb.account.cash {
-			// 资金不足, 减少数量
-			maxQty := int(pb.account.cash/req.Price/100) * 100
-			if maxQty <= 0 {
-				pb.oms.RejectOrder(orderID, "资金不足")
-				return orderID, fmt.Errorf("资金不足")
-			}
-			qty = maxQty
-		}
-		cost := pb.costModel.Calculate(model.SideBuy, req.Price, qty)
-		pb.account.buy(req.TsCode, qty, req.Price, cost)
-		trade := model.Trade{
-			TsCode:      req.TsCode,
-			Side:        model.SideBuy,
-			Price:       req.Price,
-			Qty:         qty,
-			Amount:      req.Price * float64(qty),
-			Commission:  cost.Commission,
-			StampTax:    cost.StampTax,
-			TransferFee: cost.TransferFee,
-			TotalCost:   cost.Total(),
-			TradeDate:   pb.currentDate,
-			TradeTime:   pb.currentDate + " 093000",
-		}
-		pb.oms.FillOrder(orderID, trade)
-		pb.notifyTrade(trade)
-		logger.L().Infof("[PaperBroker] 买入 %s %d股 @%.2f 费用:%.2f",
-			req.TsCode, qty, req.Price, cost.Total())
+		price *= (1 + pb.slippage)
 	} else {
-		// 卖出
-		pos, ok := pb.account.positions[req.TsCode]
-		if !ok || pos.TotalQty <= 0 {
-			pb.oms.RejectOrder(orderID, "无持仓")
-			return orderID, fmt.Errorf("无持仓")
-		}
-		qty := req.Qty
-		if pos.TotalQty < qty {
-			qty = pos.TotalQty
-		}
-		if !market.CanSell(pos, qty) {
-			if pos.AvailableQty > 0 {
-				qty = pos.AvailableQty
-			} else {
-				pb.oms.RejectOrder(orderID, "T+1限制: 当日买入不可卖")
-				return orderID, fmt.Errorf("T+1限制")
-			}
-		}
-		cost := pb.costModel.Calculate(model.SideSell, req.Price, qty)
-		pb.account.sell(req.TsCode, qty, req.Price, cost)
-		trade := model.Trade{
-			TsCode:      req.TsCode,
-			Side:        model.SideSell,
-			Price:       req.Price,
-			Qty:         qty,
-			Amount:      req.Price * float64(qty),
-			Commission:  cost.Commission,
-			StampTax:    cost.StampTax,
-			TransferFee: cost.TransferFee,
-			TotalCost:   cost.Total(),
-			TradeDate:   pb.currentDate,
-			TradeTime:   pb.currentDate + " 093000",
-		}
-		pb.oms.FillOrder(orderID, trade)
-		pb.notifyTrade(trade)
-		logger.L().Infof("[PaperBroker] 卖出 %s %d股 @%.2f 费用:%.2f",
-			req.TsCode, qty, req.Price, cost.Total())
+		price *= (1 - pb.slippage)
+	}
+	price = market.RoundPrice(price)
+
+	// 涨跌停检查: 涨停不买, 跌停不卖
+	if err := pb.checkPriceLimit(req, price); err != nil {
+		pb.oms.RejectOrder(orderID, err.Error())
+		return orderID, model.Trade{}, err
 	}
 
+	var trade model.Trade
+	var err error
+	if req.Side == model.SideBuy {
+		trade, err = pb.executeBuy(req, price)
+	} else {
+		trade, err = pb.executeSell(req, price)
+	}
+	if err != nil {
+		pb.oms.RejectOrder(orderID, err.Error())
+		return orderID, model.Trade{}, err
+	}
+
+	pb.oms.FillOrder(orderID, trade)
 	pb.account.cleanEmpty()
-	return orderID, nil
+	return orderID, trade, nil
+}
+
+// checkPriceLimit 涨跌停检查
+func (pb *PaperBroker) checkPriceLimit(req OrderRequest, price float64) error {
+	if pb.limitRepo == nil {
+		return nil
+	}
+	fillDate := req.FillDate
+	if fillDate == "" {
+		fillDate = pb.currentDate
+	}
+	limit, err := pb.limitRepo.GetByCodeAndDate(req.TsCode, fillDate)
+	if err != nil || limit == nil {
+		return nil // 无涨跌停数据时不拦截
+	}
+	if err := market.CheckLimit(req.Side, price, limit.UpLimit, limit.DownLimit); err != nil {
+		return fmt.Errorf("涨跌停限制: %w", err)
+	}
+	return nil
+}
+
+// executeBuy 执行买入: 含费资金检查, 资金不足时按含费总成本反推最大可买数量
+func (pb *PaperBroker) executeBuy(req OrderRequest, price float64) (model.Trade, error) {
+	qty := market.RoundLot(req.Qty)
+	if qty <= 0 {
+		return model.Trade{}, fmt.Errorf("买入数量不足100股")
+	}
+
+	cash := pb.account.cash
+	if pb.costModel.BuyCost(price, qty) > cash {
+		// 含手续费反推: 先预留安全边际估算, 再逐手递减直到总成本不超现金
+		maxQty := market.RoundLot(int(cash * 0.998 / price))
+		for maxQty > 0 && pb.costModel.BuyCost(price, maxQty) > cash {
+			maxQty -= 100
+		}
+		if maxQty <= 0 {
+			return model.Trade{}, fmt.Errorf("资金不足")
+		}
+		qty = maxQty
+	}
+
+	cost := pb.costModel.Calculate(model.SideBuy, price, qty)
+	pb.account.buy(req.TsCode, qty, price, cost)
+	trade := pb.buildTrade(req, model.SideBuy, price, qty, cost)
+	logger.L().Infof("[PaperBroker] 买入 %s %d股 @%.2f 费用:%.2f", req.TsCode, qty, price, cost.Total())
+	return trade, nil
+}
+
+// executeSell 执行卖出: 持仓与T+1检查
+func (pb *PaperBroker) executeSell(req OrderRequest, price float64) (model.Trade, error) {
+	pos, ok := pb.account.positions[req.TsCode]
+	if !ok || pos.TotalQty <= 0 {
+		return model.Trade{}, fmt.Errorf("无持仓")
+	}
+	qty := req.Qty
+	if pos.TotalQty < qty {
+		qty = pos.TotalQty
+	}
+	if !market.CanSell(pos, qty) {
+		if pos.AvailableQty > 0 {
+			qty = pos.AvailableQty
+		} else {
+			return model.Trade{}, fmt.Errorf("T+1限制: 当日买入不可卖")
+		}
+	}
+
+	cost := pb.costModel.Calculate(model.SideSell, price, qty)
+	pb.account.sell(req.TsCode, qty, price, cost)
+	trade := pb.buildTrade(req, model.SideSell, price, qty, cost)
+	logger.L().Infof("[PaperBroker] 卖出 %s %d股 @%.2f 费用:%.2f", req.TsCode, qty, price, cost.Total())
+	return trade, nil
+}
+
+// buildTrade 构建成交记录
+func (pb *PaperBroker) buildTrade(req OrderRequest, side model.Side, price float64, qty int, cost model.Cost) model.Trade {
+	tradeDate := pb.currentDate
+	if req.FillDate != "" {
+		tradeDate = req.FillDate
+	}
+	return model.Trade{
+		TsCode:      req.TsCode,
+		Side:        side,
+		Price:       price,
+		Qty:         qty,
+		Amount:      price * float64(qty),
+		Commission:  cost.Commission,
+		StampTax:    cost.StampTax,
+		TransferFee: cost.TransferFee,
+		TotalCost:   cost.Total(),
+		TradeDate:   tradeDate,
+		TradeTime:   tradeDate + " 093000",
+	}
 }
 
 func (pb *PaperBroker) CancelOrder(orderID string) error {
@@ -254,11 +324,17 @@ func (pb *PaperBroker) QueryPositions() (map[string]*model.Position, error) {
 func (pb *PaperBroker) QueryAsset() (*AssetInfo, error) {
 	pb.mu.RLock()
 	defer pb.mu.RUnlock()
+	// 深拷贝持仓, 避免外部持有内部map引用导致并发问题
+	positionsCopy := make(map[string]*model.Position, len(pb.account.positions))
+	for k, v := range pb.account.positions {
+		pos := *v
+		positionsCopy[k] = &pos
+	}
 	return &AssetInfo{
 		Cash:        pb.account.cash,
 		TotalAsset:  pb.account.totalAsset(),
 		MarketValue: pb.account.marketValue(),
-		Positions:   pb.account.positions,
+		Positions:   positionsCopy,
 	}, nil
 }
 
@@ -273,7 +349,13 @@ func (pb *PaperBroker) SettleT1() {
 }
 
 func (pb *PaperBroker) notifyTrade(trade model.Trade) {
-	for _, cb := range pb.tradeCallbacks {
+	// 锁内拷贝快照后锁外遍历, 避免与 OnTrade 注册并发产生 data race
+	pb.mu.RLock()
+	callbacks := make([]func(model.Trade), len(pb.tradeCallbacks))
+	copy(callbacks, pb.tradeCallbacks)
+	pb.mu.RUnlock()
+
+	for _, cb := range callbacks {
 		cb(trade)
 	}
 }

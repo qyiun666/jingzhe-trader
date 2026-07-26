@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/viper"
 )
@@ -23,6 +24,44 @@ type Config struct {
 	Feishu     FeishuConfig     `mapstructure:"feishu"`
 	LLM        LLMConfig        `mapstructure:"llm"`
 	Dataloader DataloaderConfig `mapstructure:"dataloader"`
+	Scheduler  SchedulerConfig  `mapstructure:"scheduler"`
+	Trading    TradingConfig    `mapstructure:"trading"`
+	Retention  RetentionConfig  `mapstructure:"retention"`
+}
+
+// SchedulerConfig 内置调度器配置
+type SchedulerConfig struct {
+	Enabled        bool           `mapstructure:"enabled"`          // 是否启用调度器
+	DataUpdateTime string         `mapstructure:"data_update_time"` // 数据更新时间 HH:MM
+	SignalTime     string         `mapstructure:"signal_time"`      // EOD信号生成时间 HH:MM
+	ReportTime     string         `mapstructure:"report_time"`      // 日报生成时间 HH:MM
+	Intraday       IntradayConfig `mapstructure:"intraday"`         // 盘中监控
+}
+
+// IntradayConfig 盘中止损监控配置
+type IntradayConfig struct {
+	Enabled     bool   `mapstructure:"enabled"`      // 是否启用盘中监控
+	IntervalMin int    `mapstructure:"interval_min"` // 监控间隔(分钟)
+	Start       string `mapstructure:"start"`        // 监控开始时间 HH:MM
+	End         string `mapstructure:"end"`          // 监控结束时间 HH:MM
+}
+
+// TradingConfig 交易执行配置
+type TradingConfig struct {
+	AutoExecute    bool    `mapstructure:"auto_execute"`     // true=确认后自动下单, false=仅生成计划
+	MinTradeAmount float64 `mapstructure:"min_trade_amount"` // 最小单笔交易金额, 0=按佣金自适应
+	MaxPositions   int     `mapstructure:"max_positions"`    // 最大持仓数, 0=按资金自适应
+}
+
+// RetentionConfig 数据保留/自动清理配置
+type RetentionConfig struct {
+	BarYears     int    `mapstructure:"bar_years"`     // 行情数据保留年数
+	NewsDays     int    `mapstructure:"news_days"`     // 新闻保留天数
+	PlanDays     int    `mapstructure:"plan_days"`     // 交易计划保留天数
+	BacktestRuns int    `mapstructure:"backtest_runs"` // 保留最近N个回测run
+	LogDays      int    `mapstructure:"log_days"`      // 日志文件保留天数
+	ReportFiles  int    `mapstructure:"report_files"`  // 保留最近N个报告文件
+	CleanupTime  string `mapstructure:"cleanup_time"`  // 每日清理时间 HH:MM
 }
 
 // DataloaderConfig 数据加载器配置
@@ -32,6 +71,7 @@ type DataloaderConfig struct {
 	EnableLimit bool     `mapstructure:"enable_limit"`   // 是否同步涨跌停价
 	EnableBasic bool     `mapstructure:"enable_basic"`   // 是否同步每日基本面
 	EnableFund  bool     `mapstructure:"enable_fund"`    // 是否同步ETF/基金日线
+	EnableCleanup bool   `mapstructure:"enable_cleanup"` // 是否允许清理非关注股票数据(危险操作, 默认关闭)
 }
 
 // LLMConfig LLM 配置
@@ -46,8 +86,10 @@ type LLMConfig struct {
 
 // ServerConfig HTTP 服务配置
 type ServerConfig struct {
-	Host string `mapstructure:"host"` // 监听地址
-	Port int    `mapstructure:"port"` // 监听端口
+	Host           string   `mapstructure:"host"`            // 监听地址
+	Port           int      `mapstructure:"port"`            // 监听端口
+	APIToken       string   `mapstructure:"api_token"`       // API鉴权token, 非空时启用Bearer校验
+	AllowedOrigins []string `mapstructure:"allowed_origins"` // CORS允许的来源列表
 }
 
 // FeishuConfig 飞书通知配置
@@ -125,17 +167,19 @@ type StrategyConfig struct {
 
 // MACrossConfig 均线交叉策略配置
 type MACrossConfig struct {
-	ShortPeriod int     `mapstructure:"short_period"`
-	LongPeriod  int     `mapstructure:"long_period"`
-	PositionPct float64 `mapstructure:"position_pct"`
+	ShortPeriod    int     `mapstructure:"short_period"`
+	LongPeriod     int     `mapstructure:"long_period"`
+	PositionPct    float64 `mapstructure:"position_pct"`
+	EnableAdaptive bool    `mapstructure:"enable_adaptive"`
 }
 
 // MACDConfig MACD策略配置
 type MACDConfig struct {
-	Fast        int     `mapstructure:"fast"`
-	Slow        int     `mapstructure:"slow"`
-	Signal      int     `mapstructure:"signal"`
-	PositionPct float64 `mapstructure:"position_pct"`
+	Fast           int     `mapstructure:"fast"`
+	Slow           int     `mapstructure:"slow"`
+	Signal         int     `mapstructure:"signal"`
+	PositionPct    float64 `mapstructure:"position_pct"`
+	EnableAdaptive bool    `mapstructure:"enable_adaptive"`
 }
 
 // MultiFactorConfig 多因子策略配置
@@ -151,6 +195,46 @@ type MultiFactorConfig struct {
 type UniverseConfig struct {
 	Bluechip string `mapstructure:"bluechip"`
 	Tech     string `mapstructure:"tech"`
+}
+
+// UniverseCodes 返回配置股票池代码列表 (bluechip + tech 去重, 保持顺序)
+func (c *Config) UniverseCodes() []string {
+	seen := make(map[string]bool)
+	var codes []string
+	for _, group := range []string{c.Universe.Bluechip, c.Universe.Tech} {
+		for _, code := range strings.Split(group, ",") {
+			code = strings.TrimSpace(code)
+			if code == "" || seen[code] {
+				continue
+			}
+			seen[code] = true
+			codes = append(codes, code)
+		}
+	}
+	return codes
+}
+
+// StrategyParams 返回策略初始化参数 (供 Strategy.Init, 回测/服务/调度器共用同一入口)
+func (c *Config) StrategyParams(name string) map[string]interface{} {
+	params := make(map[string]interface{})
+	switch name {
+	case "ma_cross":
+		params["short_period"] = float64(c.Strategy.MACross.ShortPeriod)
+		params["long_period"] = float64(c.Strategy.MACross.LongPeriod)
+		params["position_pct"] = c.Strategy.MACross.PositionPct
+		params["enable_adaptive"] = c.Strategy.MACross.EnableAdaptive
+	case "macd":
+		params["fast"] = float64(c.Strategy.MACD.Fast)
+		params["slow"] = float64(c.Strategy.MACD.Slow)
+		params["signal"] = float64(c.Strategy.MACD.Signal)
+		params["position_pct"] = c.Strategy.MACD.PositionPct
+		params["enable_adaptive"] = c.Strategy.MACD.EnableAdaptive
+	case "multi_factor":
+		params["position_pct"] = c.Strategy.MultiFactor.PositionPct
+	default:
+		params["position_pct"] = 0.15
+	}
+	return params
 }
 
 // Load 加载配置文件
@@ -177,7 +261,8 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("log.format", "console")
 	v.SetDefault("log.output", "stdout")
 	v.SetDefault("server.port", 8080)
-	v.SetDefault("server.host", "0.0.0.0")
+	v.SetDefault("server.host", "127.0.0.1")
+	v.SetDefault("server.allowed_origins", []string{"http://localhost", "http://127.0.0.1"})
 	v.SetDefault("feishu.push_daily", false)
 	v.SetDefault("feishu.push_time", "15:30")
 	v.SetDefault("llm.enabled", false)
@@ -187,6 +272,25 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("dataloader.enable_limit", true)
 	v.SetDefault("dataloader.enable_basic", true)
 	v.SetDefault("dataloader.enable_fund", true)
+	v.SetDefault("dataloader.enable_cleanup", false)
+	v.SetDefault("scheduler.enabled", true)
+	v.SetDefault("scheduler.data_update_time", "15:10")
+	v.SetDefault("scheduler.signal_time", "15:30")
+	v.SetDefault("scheduler.report_time", "15:45")
+	v.SetDefault("scheduler.intraday.enabled", true)
+	v.SetDefault("scheduler.intraday.interval_min", 5)
+	v.SetDefault("scheduler.intraday.start", "09:30")
+	v.SetDefault("scheduler.intraday.end", "15:00")
+	v.SetDefault("trading.auto_execute", false)
+	v.SetDefault("trading.min_trade_amount", 0)
+	v.SetDefault("trading.max_positions", 0)
+	v.SetDefault("retention.bar_years", 3)
+	v.SetDefault("retention.news_days", 30)
+	v.SetDefault("retention.plan_days", 90)
+	v.SetDefault("retention.backtest_runs", 20)
+	v.SetDefault("retention.log_days", 30)
+	v.SetDefault("retention.report_files", 30)
+	v.SetDefault("retention.cleanup_time", "16:30")
 
 	if err := v.ReadInConfig(); err != nil {
 		return nil, fmt.Errorf("读取配置文件失败: %w", err)
@@ -197,13 +301,34 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("解析配置失败: %w", err)
 	}
 
+	// 敏感项环境变量优先, 避免密钥写入配置文件
+	applyEnvOverrides(&cfg)
+
 	// 确保数据目录存在
 	dbDir := filepath.Dir(cfg.Database.Path)
 	if dbDir != "" && dbDir != "." {
-		os.MkdirAll(dbDir, 0755)
+		if err := os.MkdirAll(dbDir, 0755); err != nil {
+			return nil, fmt.Errorf("创建数据目录失败: %w", err)
+		}
 	}
 
 	return &cfg, nil
+}
+
+// applyEnvOverrides 用环境变量覆盖敏感配置项
+func applyEnvOverrides(cfg *Config) {
+	if t := os.Getenv("TUSHARE_TOKEN"); t != "" {
+		cfg.Tushare.Token = t
+	}
+	if k := os.Getenv("LLM_API_KEY"); k != "" {
+		cfg.LLM.APIKey = k
+	}
+	if t := os.Getenv("JZ_API_TOKEN"); t != "" {
+		cfg.Server.APIToken = t
+	}
+	if w := os.Getenv("FEISHU_WEBHOOK"); w != "" {
+		cfg.Feishu.WebhookURL = w
+	}
 }
 
 // DefaultConfigPath 返回默认配置文件路径

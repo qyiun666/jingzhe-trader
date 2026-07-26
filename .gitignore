@@ -18,8 +18,13 @@ vendor/
 go.work
 
 # ==================== Sensitive Data ====================
-# Configuration with real credentials (use config.example.yaml instead)
-config/config.yaml
+# 配置白名单: config/ 下除 example 外的所有 yaml 一律不提交 (防密钥泄露)
+config/*.yaml
+config/*.yml
+config/.tmp*
+!config/config.example.yaml
+.env
+.env.*
 
 # SQLite database (contains market data, not redistributable)
 data/*.db
@@ -54,6 +59,7 @@ temp/
 
 # Trae editor
 .trae-html-share-packages/
+.qoder/
 
 # Hermes guide (outdated)
 hermes-agent-guide/
@@ -64,9 +70,6 @@ __pycache__/
 
 # Signal dump
 signals.json
-
-# Old config
-config/config_small.yaml
 /dataloader
 /server
 /captain

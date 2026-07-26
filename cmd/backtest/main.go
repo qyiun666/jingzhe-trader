@@ -7,6 +7,7 @@ import (
 
 	"jingzhe-trader/internal/backtest"
 	"jingzhe-trader/internal/config"
+	"jingzhe-trader/internal/engine"
 	"jingzhe-trader/pkg/logger"
 )
 
@@ -15,7 +16,7 @@ func main() {
 	strategyName := flag.String("strategy", "ma_cross", "策略名称: ma_cross / macd / boll_breakout")
 	startDate := flag.String("start", "", "回测起始日期 YYYYMMDD")
 	endDate := flag.String("end", "", "回测结束日期 YYYYMMDD")
-	universeStr := flag.String("universe", "000001.SZ,600519.SH,000858.SZ,002415.SZ,600036.SH", "股票池(逗号分隔)")
+	universeStr := flag.String("universe", "", "股票池(逗号分隔, 缺省用配置 universe)")
 	capital := flag.Float64("capital", 1000000, "初始资金")
 	reportPath := flag.String("report", "reports/backtest_report.html", "报告输出路径")
 	flag.Parse()
@@ -42,14 +43,19 @@ func main() {
 		*capital = cfg.Backtest.InitialCapital
 	}
 
-	// 解析股票池
-	universe := strings.Split(*universeStr, ",")
-	for i := range universe {
-		universe[i] = strings.TrimSpace(universe[i])
+	// 解析股票池 (缺省用配置 universe)
+	var universe []string
+	if *universeStr != "" {
+		universe = strings.Split(*universeStr, ",")
+		for i := range universe {
+			universe[i] = strings.TrimSpace(universe[i])
+		}
+	} else {
+		universe = cfg.UniverseCodes()
 	}
 
 	// 构建回测配置
-	btCfg := backtest.EngineConfig{
+	btCfg := engine.RunConfig{
 		StartDate:      *startDate,
 		EndDate:        *endDate,
 		InitialCapital: *capital,
@@ -58,7 +64,7 @@ func main() {
 		Slippage:       cfg.Backtest.Slippage,
 		FillPrice:      cfg.Backtest.FillPrice,
 		StrategyName:   *strategyName,
-		StrategyParams: loadStrategyParams(cfg, *strategyName),
+		StrategyParams: cfg.StrategyParams(*strategyName),
 	}
 
 	fmt.Printf("=== 回测配置 ===\n")
@@ -68,13 +74,14 @@ func main() {
 	fmt.Printf("股票池: %v\n", universe)
 	fmt.Printf("================\n\n")
 
-	// 创建并运行回测引擎
-	engine, err := backtest.NewEngine(btCfg, cfg)
+	// 创建并运行回测 (统一执行管道, 含风控)
+	runner, err := engine.NewBacktestRunner(btCfg, cfg)
 	if err != nil {
-		logger.L().Fatalf("创建回测引擎失败: %v", err)
+		logger.L().Fatalf("创建回测运行器失败: %v", err)
 	}
+	defer runner.Close()
 
-	result, err := engine.Run()
+	result, err := runner.Run()
 	if err != nil {
 		logger.L().Fatalf("回测执行失败: %v", err)
 	}
@@ -85,25 +92,4 @@ func main() {
 	} else {
 		fmt.Printf("\n报告已生成: %s\n", *reportPath)
 	}
-}
-
-// loadStrategyParams 从配置文件读取策略参数
-func loadStrategyParams(cfg *config.Config, name string) map[string]interface{} {
-	params := make(map[string]interface{})
-	switch name {
-	case "ma_cross":
-		params["short_period"] = float64(cfg.Strategy.MACross.ShortPeriod)
-		params["long_period"] = float64(cfg.Strategy.MACross.LongPeriod)
-		params["position_pct"] = cfg.Strategy.MACross.PositionPct
-	case "macd":
-		params["fast"] = float64(cfg.Strategy.MACD.Fast)
-		params["slow"] = float64(cfg.Strategy.MACD.Slow)
-		params["signal"] = float64(cfg.Strategy.MACD.Signal)
-		params["position_pct"] = cfg.Strategy.MACD.PositionPct
-	case "multi_factor":
-		params["position_pct"] = cfg.Strategy.MultiFactor.PositionPct
-	default:
-		params["position_pct"] = 0.15
-	}
-	return params
 }
