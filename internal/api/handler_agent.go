@@ -110,13 +110,12 @@ func sellFirstSort(signals []model.Signal) {
 
 // loadRiskStocks 加载信号涉及股票的基本信息 (风控黑名单/ST过滤用)
 func (s *Service) loadRiskStocks(signals []model.Signal) map[string]*model.Stock {
-	stockRepo := store.NewStockRepo(s.db)
 	stocks := make(map[string]*model.Stock, len(signals))
 	for _, sig := range signals {
 		if _, ok := stocks[sig.TsCode]; ok {
 			continue
 		}
-		if st, err := stockRepo.GetByCode(sig.TsCode); err == nil && st != nil {
+		if st, err := s.stockRepo.GetByCode(sig.TsCode); err == nil && st != nil {
 			stocks[sig.TsCode] = st
 		} else {
 			stocks[sig.TsCode] = &model.Stock{TsCode: sig.TsCode, ListStatus: "L"}
@@ -209,16 +208,14 @@ func (s *Service) HandleAgentBrief(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 待处理计划
-	planRepo := store.NewPlanRepo(s.db)
-	if plans, perr := planRepo.GetOpenPlans(); perr == nil {
+	if plans, perr := s.planRepo.GetOpenPlans(); perr == nil {
 		brief.OpenPlans = plans
 	} else {
 		brief.Warnings = append(brief.Warnings, "查询交易计划失败: "+perr.Error())
 	}
 
 	// 辩论结果
-	debateRepo := store.NewDebateRepo(s.db)
-	if debates, derr := debateRepo.GetByDate(lastDate); derr == nil {
+	if debates, derr := s.debateRepo.GetByDate(lastDate); derr == nil {
 		brief.Debates = debates
 	}
 
@@ -231,9 +228,8 @@ func (s *Service) HandleAgentBrief(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 任务健康度
-	jobRepo := store.NewJobRepo(s.db)
 	for _, name := range []string{"data_update", "signal", "report", "intraday_monitor", "retention"} {
-		if run, jerr := jobRepo.LastSuccess(name); jerr == nil && run != nil {
+		if run, jerr := s.jobRepo.LastSuccess(name); jerr == nil && run != nil {
 			brief.Jobs[name] = run.FinishedAt
 		}
 	}
@@ -276,9 +272,8 @@ func (s *Service) buildPlanStatusSummary(plans []store.TradePlan) PlanStatusSumm
 // buildTaskCompletedStatus 构建当日任务完成状态
 func (s *Service) buildTaskCompletedStatus(today string) map[string]bool {
 	status := map[string]bool{}
-	jobRepo := store.NewJobRepo(s.db)
 	for _, name := range []string{"data_update", "signal", "report", "intraday_monitor", "retention"} {
-		done, err := jobRepo.HasSucceeded(name, today)
+		done, err := s.jobRepo.HasSucceeded(name, today)
 		if err == nil {
 			status[name] = done
 		} else {
@@ -319,15 +314,14 @@ func (s *Service) buildActionNeededEnhanced(plans []store.TradePlan, changes []a
 // HandlePlanList GET /api/plan?date=YYYYMMDD
 // 查询交易计划列表, 不传 date 时返回全部待处理计划
 func (s *Service) HandlePlanList(w http.ResponseWriter, r *http.Request) {
-	planRepo := store.NewPlanRepo(s.db)
 	date := r.URL.Query().Get("date")
 
 	var plans []store.TradePlan
 	var err error
 	if date != "" {
-		plans, err = planRepo.GetPlansByDate(parseDateParam(date))
+		plans, err = s.planRepo.GetPlansByDate(parseDateParam(date))
 	} else {
-		plans, err = planRepo.GetOpenPlans()
+		plans, err = s.planRepo.GetOpenPlans()
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -354,8 +348,7 @@ func (s *Service) HandlePlanConfirm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	planRepo := store.NewPlanRepo(s.db)
-	plan, err := planRepo.GetPlanByID(req.ID)
+	plan, err := s.planRepo.GetPlanByID(req.ID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
@@ -384,7 +377,7 @@ func (s *Service) HandlePlanConfirm(w http.ResponseWriter, r *http.Request) {
 		status = store.PlanStatusExecuted
 	}
 
-	if err := planRepo.UpdatePlanStatus(plan.ID, status); err != nil {
+	if err := s.planRepo.UpdatePlanStatus(plan.ID, status); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

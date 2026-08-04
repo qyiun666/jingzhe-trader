@@ -136,15 +136,25 @@ type Service struct {
 	db                 *sqlx.DB
 	barRepo            *store.BarRepo
 	calRepo            *store.CalendarRepo
-	stockMap           map[string]string // ts_code -> name
-	stockMapMu         sync.RWMutex         // 保护 stockMap 并发读写
+	basicRepo          *store.BasicRepo
+	finaRepo           *store.FinaRepo
+	newsRepo           *store.NewsRepo
+	debateRepo         *store.DebateRepo
+	alertRepo          *store.AlertRepo
+	planRepo           *store.PlanRepo
+	jobRepo            *store.JobRepo
+	stockRepo          *store.StockRepo
+	stockMap           map[string]string           // ts_code -> name
+	stockMapMu         sync.RWMutex                // 保护 stockMap 并发读写
 	brk                broker.Broker
-	dynamicSelector    *strategy.DynamicSelector // 动态策略选择器
-	llmClient          *llm.Client               // LLM 客户端
-	llmNews            *llm.NewsAnalyzer         // LLM 新闻分析器
-	debateOrchestrator *agent.DebateOrchestrator // 智能体辩论编排器
-	startTime          time.Time                 // 服务启动时间 (uptime用)
-	updateMu           sync.Mutex                // 数据更新互斥 (防并发重入)
+	dynamicSelector    *strategy.DynamicSelector      // 动态策略选择器
+	strategyCache      map[string]strategy.Strategy    // 策略实例缓存 (避免每次重建丢失状态)
+	strategyCacheMu    sync.RWMutex                    // 保护策略缓存并发读写
+	llmClient          *llm.Client                      // LLM 客户端
+	llmNews            *llm.NewsAnalyzer                // LLM 新闻分析器
+	debateOrchestrator *agent.DebateOrchestrator        // 智能体辩论编排器
+	startTime          time.Time                        // 服务启动时间 (uptime用)
+	updateMu           sync.Mutex                       // 数据更新互斥 (防并发重入)
 }
 
 // NewService 创建 API 服务
@@ -155,11 +165,20 @@ func NewService(cfg *config.Config) (*Service, error) {
 	}
 
 	svc := &Service{
-		cfg:       cfg,
-		db:        db,
-		barRepo:   store.NewBarRepo(db),
-		calRepo:   store.NewCalendarRepo(db),
-		startTime: time.Now(),
+		cfg:            cfg,
+		db:             db,
+		barRepo:        store.NewBarRepo(db),
+		calRepo:        store.NewCalendarRepo(db),
+		basicRepo:      store.NewBasicRepo(db),
+		finaRepo:       store.NewFinaRepo(db),
+		newsRepo:       store.NewNewsRepo(db),
+		debateRepo:     store.NewDebateRepo(db),
+		alertRepo:      store.NewAlertRepo(db),
+		planRepo:       store.NewPlanRepo(db),
+		jobRepo:        store.NewJobRepo(db),
+		stockRepo:      store.NewStockRepo(db),
+		strategyCache:  make(map[string]strategy.Strategy),
+		startTime:      time.Now(),
 	}
 
 	// 加载股票名称映射
@@ -169,7 +188,7 @@ func NewService(cfg *config.Config) (*Service, error) {
 	costModel := market.NewCostModel(cfg.Cost)
 	svc.brk = broker.NewPaperBroker("api", cfg.Backtest.InitialCapital, costModel)
 
-	// 初始化扩展功能（动态策略选择器、自动维护器、持仓恢复）
+	// 初始化扩展功能（动态策略选择器、策略缓存、持仓恢复）
 	svc.initExtensions()
 
 	// 初始化 LLM 客户端和新闻分析器
@@ -182,14 +201,14 @@ func NewService(cfg *config.Config) (*Service, error) {
 	svc.llmClient = llm.NewClient(llmCfg)
 	svc.llmNews = llm.NewNewsAnalyzer(svc.llmClient)
 
-	// 初始化智能体辩论编排器
+	// 初始化智能体辩论编排器 (复用 Service 的共享 Repo, 避免重复实例化)
 	svc.debateOrchestrator = agent.NewDebateOrchestrator(
 		svc.llmClient,
-		store.NewBarRepo(db),
-		store.NewBasicRepo(db),
-		store.NewFinaRepo(db),
-		store.NewNewsRepo(db),
-		store.NewDebateRepo(db),
+		svc.barRepo,
+		svc.basicRepo,
+		svc.finaRepo,
+		svc.newsRepo,
+		svc.debateRepo,
 	)
 
 	return svc, nil
@@ -335,10 +354,9 @@ func (s *Service) enrichPortfolioAnalysis(result *PortfolioJSON,
 		return
 	}
 
-	stockRepo := store.NewStockRepo(s.db)
 	stocks := make(map[string]*model.Stock, len(positions))
 	for tsCode := range positions {
-		if st, err := stockRepo.GetByCode(tsCode); err == nil && st != nil {
+		if st, err := s.stockRepo.GetByCode(tsCode); err == nil && st != nil {
 			stocks[tsCode] = st
 		}
 	}
@@ -915,9 +933,9 @@ func (s *Service) buildStrategyJSON(
 }
 
 // buildNewsJSON 构建新闻摘要 JSON
+// 优先展示与配置股票池相关的新闻, 不足时补充近期热点新闻
 func (s *Service) buildNewsJSON() *NewsJSON {
-	newsRepo := store.NewNewsRepo(s.db)
-	recentNews, err := newsRepo.GetRecent(20)
+	recentNews, err := s.newsRepo.GetRecent(50)
 	if err != nil || len(recentNews) == 0 {
 		return &NewsJSON{
 			Sentiment:   "中性",
@@ -925,13 +943,66 @@ func (s *Service) buildNewsJSON() *NewsJSON {
 		}
 	}
 
+	// 按股票池过滤: 优先展示与持仓/配置universe相关的新闻
+	universeCodes := s.cfg.UniverseCodes()
+	positions := s.getPositions()
+	relatedKeywords := make(map[string]bool)
+	for _, code := range universeCodes {
+		relatedKeywords[code] = true
+		// 提取6位代码 (如 600519 from 600519.SH)
+		if len(code) >= 9 {
+			relatedKeywords[code[:6]] = true
+		}
+	}
+	for code := range positions {
+		relatedKeywords[code] = true
+		if len(code) >= 9 {
+			relatedKeywords[code[:6]] = true
+		}
+		// 也加入股票名称
+		if name := s.stockName(code); name != code {
+			relatedKeywords[name] = true
+		}
+	}
+
+	var filtered []model.News
+	var others []model.News
+	for _, n := range recentNews {
+		text := n.Title + " " + n.Content
+		matched := false
+		for kw := range relatedKeywords {
+			if strings.Contains(text, kw) {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			filtered = append(filtered, n)
+		} else {
+			others = append(others, n)
+		}
+	}
+
+	// 相关新闻不足20条时, 用近期热点补充
+	if len(filtered) < 20 {
+		need := 20 - len(filtered)
+		if need > len(others) {
+			need = len(others)
+		}
+		filtered = append(filtered, others[:need]...)
+	}
+	// 最多展示20条
+	if len(filtered) > 20 {
+		filtered = filtered[:20]
+	}
+
 	// 使用 analysis.NewsAnalyzer 分析情感
 	na := analysis.NewNewsAnalyzer()
-	relatedNews := make([]map[string]string, 0, len(recentNews))
+	relatedNews := make([]map[string]string, 0, len(filtered))
 	var totalScore float64
 	count := 0
 
-	for _, n := range recentNews {
+	for _, n := range filtered {
 		score := na.SentimentScore(n.Title + " " + n.Content)
 		totalScore += score
 		count++
@@ -1038,6 +1109,35 @@ func (s *Service) buildActionItems(
 	return items
 }
 
+// getStrategy 获取缓存的策略实例 (首次调用时创建并初始化, 后续复用以保留内部状态)
+func (s *Service) getStrategy(name string) (strategy.Strategy, bool) {
+	// 先读缓存 (快速路径)
+	s.strategyCacheMu.RLock()
+	if strat, ok := s.strategyCache[name]; ok {
+		s.strategyCacheMu.RUnlock()
+		return strat, true
+	}
+	s.strategyCacheMu.RUnlock()
+
+	// 缓存未命中: 从注册表创建
+	reg := strategy.DefaultRegistry()
+	strat, ok := reg.Get(name)
+	if !ok {
+		return nil, false
+	}
+	// 初始化策略参数 (仅首次)
+	if err := strat.Init(context.Background(), s.cfg.StrategyParams(name)); err != nil {
+		logger.L().Errorf("策略 %s 初始化失败: %v", name, err)
+		return nil, false
+	}
+
+	// 写入缓存
+	s.strategyCacheMu.Lock()
+	s.strategyCache[name] = strat
+	s.strategyCacheMu.Unlock()
+	return strat, true
+}
+
 // runStrategy 运行策略产生信号
 // universe 限定为配置股票池 + 当前持仓 (与回测一致, 避免全市场扫描)
 func (s *Service) runStrategy(
@@ -1047,8 +1147,7 @@ func (s *Service) runStrategy(
 	positions map[string]*model.Position,
 	asset *broker.AssetInfo,
 ) []model.Signal {
-	reg := strategy.DefaultRegistry()
-	strat, ok := reg.Get(strategyName)
+	strat, ok := s.getStrategy(strategyName)
 	if !ok {
 		return nil
 	}
@@ -1083,12 +1182,7 @@ func (s *Service) runStrategy(
 		History:    &dbHistoryAdapter{barRepo: s.barRepo}, // 真实历史K线, 均线类策略依赖
 	}
 
-	// 传入配置参数 (与回测同一入口, 保证线上与回测行为一致)
-	if err := strat.Init(context.Background(), s.cfg.StrategyParams(strategyName)); err != nil {
-		logger.L().Errorf("[%s] 策略 %s 初始化失败: %v", date, strategyName, err)
-		return nil
-	}
-
+	// 直接调用 OnBar (策略已在 getStrategy 中初始化, 不再每次重置状态)
 	signals, err := strat.OnBar(context.Background(), barCtx)
 	if err != nil {
 		logger.L().Errorf("[%s] 策略 %s 执行失败: %v", date, strategyName, err)

@@ -13,10 +13,8 @@ import (
 // POST /api/agent/alerts  - 标记已读 {"id": N} 或 {"all": true}
 // Agent 获取飞书通知的持久化副本, 用于离线读取和状态追踪
 func (s *Service) HandleAgentAlerts(w http.ResponseWriter, r *http.Request) {
-	alertRepo := store.NewAlertRepo(s.db)
-
 	if r.Method == http.MethodPost {
-		s.handleAlertsMarkRead(w, r, alertRepo)
+		s.handleAlertsMarkRead(w, r)
 		return
 	}
 
@@ -28,11 +26,11 @@ func (s *Service) HandleAgentAlerts(w http.ResponseWriter, r *http.Request) {
 	var err error
 
 	if unreadOnly {
-		alerts, err = alertRepo.GetUnread()
+		alerts, err = s.alertRepo.GetUnread()
 	} else if date != "" {
-		alerts, err = alertRepo.GetByDate(parseDateParam(date))
+		alerts, err = s.alertRepo.GetByDate(parseDateParam(date))
 	} else {
-		alerts, err = alertRepo.GetRecent(50)
+		alerts, err = s.alertRepo.GetRecent(50)
 	}
 
 	if err != nil {
@@ -56,7 +54,7 @@ func (s *Service) HandleAgentAlerts(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAlertsMarkRead 标记通知为已读
-func (s *Service) handleAlertsMarkRead(w http.ResponseWriter, r *http.Request, alertRepo *store.AlertRepo) {
+func (s *Service) handleAlertsMarkRead(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID     int64 `json:"id"`      // 指定ID标记已读, 0=全部标记已读
 		All    bool  `json:"all"`     // true=全部标记已读
@@ -67,7 +65,7 @@ func (s *Service) handleAlertsMarkRead(w http.ResponseWriter, r *http.Request, a
 	}
 
 	if req.All || req.ID == 0 {
-		n, err := alertRepo.MarkAllRead()
+		n, err := s.alertRepo.MarkAllRead()
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -80,7 +78,7 @@ func (s *Service) handleAlertsMarkRead(w http.ResponseWriter, r *http.Request, a
 	}
 
 	if req.ID > 0 {
-		if err := alertRepo.MarkAsRead(req.ID); err != nil {
+		if err := s.alertRepo.MarkAsRead(req.ID); err != nil {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
@@ -97,24 +95,21 @@ func (s *Service) handleAlertsMarkRead(w http.ResponseWriter, r *http.Request, a
 // HandleAgentDashboard GET /api/agent/dashboard
 // Agent 专用仪表盘: 一次返回 alerts + brief + changes 的汇总视图
 func (s *Service) HandleAgentDashboard(w http.ResponseWriter, r *http.Request) {
-	alertRepo := store.NewAlertRepo(s.db)
 	today := time.Now().Format("20060102")
 
 	// 未读通知
-	unreadAlerts, _ := alertRepo.GetUnread()
+	unreadAlerts, _ := s.alertRepo.GetUnread()
 
 	// 今日通知
-	todayAlerts, _ := alertRepo.GetByDate(today)
+	todayAlerts, _ := s.alertRepo.GetByDate(today)
 
 	// 待处理计划
-	planRepo := store.NewPlanRepo(s.db)
-	openPlans, _ := planRepo.GetOpenPlans()
+	openPlans, _ := s.planRepo.GetOpenPlans()
 
 	// 任务完成状态
-	jobRepo := store.NewJobRepo(s.db)
 	taskStatus := map[string]bool{}
 	for _, name := range []string{"data_update", "signal", "report", "intraday_monitor", "retention"} {
-		done, _ := jobRepo.HasSucceeded(name, today)
+		done, _ := s.jobRepo.HasSucceeded(name, today)
 		taskStatus[name] = done
 	}
 
@@ -122,8 +117,7 @@ func (s *Service) HandleAgentDashboard(w http.ResponseWriter, r *http.Request) {
 	lastDate, _ := s.barRepo.GetMaxTradeDate()
 
 	// 辩论结果
-	debateRepo := store.NewDebateRepo(s.db)
-	todayDebates, _ := debateRepo.GetByDate(lastDate)
+	todayDebates, _ := s.debateRepo.GetByDate(lastDate)
 
 	// 决策变更
 	var decisionChanges interface{}

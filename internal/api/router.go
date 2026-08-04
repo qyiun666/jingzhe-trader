@@ -51,10 +51,22 @@ func originAllowed(origin string, allowed []string) bool {
 }
 
 // authMiddleware API 鉴权中间件
-// api_token 配置非空时, 所有写请求(非GET/OPTIONS)必须携带 Authorization: Bearer <token>
+// api_token 配置非空时, 所有 /api/* 请求 (含 GET) 必须携带 Authorization: Bearer <token>
+// 例外: /api/health (健康检查) 和 / (仪表盘首页) 不需要鉴权
 func authMiddleware(token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if token != "" && r.Method != http.MethodGet && r.Method != http.MethodOptions {
+		if token == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// 健康检查和仪表盘首页不需要鉴权
+		path := r.URL.Path
+		if path == "/api/health" || path == "/" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// 所有 /api/* 路径都需要鉴权
+		if strings.HasPrefix(path, "/api/") {
 			auth := r.Header.Get("Authorization")
 			if auth != "Bearer "+token {
 				writeError(w, http.StatusUnauthorized, "unauthorized")
@@ -106,6 +118,7 @@ func NewRouter(svc *Service) http.Handler {
 
 	// 动态策略
 	mux.HandleFunc("/api/strategy/status", svc.HandleStrategyStatus) // GET 策略状态
+	mux.HandleFunc("/api/strategy/switch", svc.HandleStrategySwitch) // POST 手动切换策略
 
 	// 系统维护
 	mux.HandleFunc("/api/system/status", svc.HandleSystemStatus)    // GET 系统状态

@@ -72,8 +72,7 @@ func (s *Service) HandleAgentChanges(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1. 决策变更检测
-	debateRepo := store.NewDebateRepo(s.db)
-	todayDebates, err := debateRepo.GetByDate(date)
+	todayDebates, err := s.debateRepo.GetByDate(date)
 	if err != nil {
 		logger.L().Warnw("查询当日辩论结果失败", "err", err)
 	}
@@ -93,8 +92,7 @@ func (s *Service) HandleAgentChanges(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 2. 计划状态变更 (获取当日所有计划，对比初始状态和当前状态)
-	planRepo := store.NewPlanRepo(s.db)
-	plans, err := planRepo.GetPlansByDate(date)
+	plans, err := s.planRepo.GetPlansByDate(date)
 	if err != nil {
 		logger.L().Warnw("查询当日交易计划失败", "err", err)
 	}
@@ -116,13 +114,12 @@ func (s *Service) HandleAgentChanges(w http.ResponseWriter, r *http.Request) {
 
 	// 3. 任务完成状态
 	today := time.Now().Format("20060102")
-	jobRepo := store.NewJobRepo(s.db)
 	for _, name := range []string{"data_update", "signal", "report", "intraday_monitor", "retention"} {
 		ts := TaskStatusJSON{Completed: false}
-		if done, err := jobRepo.HasSucceeded(name, today); err == nil {
+		if done, err := s.jobRepo.HasSucceeded(name, today); err == nil {
 			ts.Completed = done
 		}
-		if run, err := jobRepo.LastSuccess(name); err == nil && run != nil {
+		if run, err := s.jobRepo.LastSuccess(name); err == nil && run != nil {
 			ts.LastRun = run.FinishedAt
 			ts.LastStatus = run.Status
 		}

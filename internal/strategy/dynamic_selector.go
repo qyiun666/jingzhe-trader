@@ -90,6 +90,15 @@ func (ds *DynamicSelector) Select(date string, marketBars map[string]*model.Bar)
 	return ds.currentName, false // 没有切换
 }
 
+// SwitchTo 手动切换到指定策略 (供 API /api/strategy/switch 调用)
+// strat: 已初始化的策略实例 (由 Service.getStrategy 提供, 保证缓存一致)
+func (ds *DynamicSelector) SwitchTo(name string, strat Strategy) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	ds.current = strat
+	ds.currentName = name
+}
+
 // Current 获取当前策略
 func (ds *DynamicSelector) Current() Strategy {
 	ds.mu.RLock()

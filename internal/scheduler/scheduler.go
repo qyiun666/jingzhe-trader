@@ -52,6 +52,7 @@ type Scheduler struct {
 
 	running      sync.Map  // job_name -> bool, 防止同名任务重叠执行
 	lastIntraday time.Time // 上一轮盘中监控时间
+	jobWg        sync.WaitGroup // 等待所有 job goroutine 完成 (优雅关闭用)
 }
 
 // New 创建调度器
@@ -88,6 +89,8 @@ func (s *Scheduler) Start(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			logger.L().Info("调度器等待运行中任务完成后退出...")
+			s.jobWg.Wait() // 等待所有 job goroutine 完成, 防止关库时写入半截数据
 			logger.L().Info("调度器退出")
 			return
 		case <-ticker.C:
@@ -193,7 +196,9 @@ func (s *Scheduler) runJob(name, date string, fn func(date string) error) {
 		return
 	}
 
+	s.jobWg.Add(1)
 	go func() {
+		defer s.jobWg.Done()
 		defer s.running.Delete(name)
 
 		jobID, err := s.jobRepo.StartJob(name, date)
@@ -236,7 +241,7 @@ func (s *Scheduler) finishJob(jobID int64, status, errMsg string) {
 // 降级: 飞书发送失败只打日志, 不影响落库
 func (s *Scheduler) alert(title, text string) {
 	// 1. 落库 (无论飞书是否配置, 都存一份供 Agent 读取)
-	alertRepo := store.NewAlertRepo(s.db)
+	alertRepo := store.NewAlertRepo(s.db) // Scheduler 独立实例 (与 Service.alertRepo 不同生命周期)
 	level := store.AlertLevelInfo
 	jobName := ""
 	today := time.Now().Format("20060102")
@@ -370,8 +375,7 @@ func (s *Scheduler) notifySignalResult(date string, plans []*store.TradePlan) {
 	}
 
 	// 决策变更检测
-	debateRepo := store.NewDebateRepo(s.db)
-	if todayDebates, err := debateRepo.GetByDate(date); err == nil && len(todayDebates) > 0 {
+	if todayDebates, err := store.NewDebateRepo(s.db).GetByDate(date); err == nil && len(todayDebates) > 0 {
 		if s.svc.DebateOrchestrator() != nil && s.svc.DebateOrchestrator().IsEnabled() {
 			changes := s.svc.DebateOrchestrator().DetectDecisionChanges(todayDebates)
 			if len(changes) > 0 {

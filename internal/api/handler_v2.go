@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -150,7 +151,7 @@ func (s *Service) HandleSyncPortfolio(w http.ResponseWriter, r *http.Request) {
 // HandleGetPortfolio 处理 GET /api/portfolio
 // 获取当前持仓列表（从数据库读取）
 func (s *Service) HandleGetPortfolio(w http.ResponseWriter, r *http.Request) {
-	portRepo := store.NewPortfolioRepo(s.db)
+	portRepo := store.NewPortfolioRepo(s.db) // PortfolioRepo 含元数据操作, 暂不提升为共享字段
 	positions, err := portRepo.GetAllPositions()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -362,7 +363,7 @@ func (s *Service) HandleStrategyStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleStrategySwitch 处理 POST /api/strategy/switch
-// 手动切换策略
+// 手动切换策略: 更新动态选择器的当前策略 + 刷新策略缓存
 func (s *Service) HandleStrategySwitch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "仅支持 POST")
@@ -382,10 +383,16 @@ func (s *Service) HandleStrategySwitch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reg := strategy.DefaultRegistry()
-	if _, ok := reg.Get(name); !ok {
+	// 验证策略存在并确保缓存中有实例
+	strat, ok := s.getStrategy(name)
+	if !ok {
 		writeError(w, http.StatusBadRequest, "未知策略: "+name)
 		return
+	}
+
+	// 通过动态选择器执行切换
+	if s.dynamicSelector != nil {
+		s.dynamicSelector.SwitchTo(name, strat)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{
@@ -426,7 +433,7 @@ func (s *Service) HandleSystemStatus(w http.ResponseWriter, r *http.Request) {
 			status.DataFresh = maxDate >= preDate
 		}
 	}
-	if positions, err := store.NewPortfolioRepo(s.db).GetAllPositions(); err == nil {
+	if positions, err := store.NewPortfolioRepo(s.db).GetAllPositions(); err == nil { // 同上
 		status.PortfolioCount = len(positions)
 	}
 	if nextDate, err := s.calRepo.GetNextTradeDate(status.Today); err == nil {
@@ -561,6 +568,18 @@ func (s *Service) initExtensions() {
 	// 初始化动态策略选择器
 	reg := strategy.DefaultRegistry()
 	s.dynamicSelector = strategy.NewDynamicSelector(reg, &advisorAdapter{})
+
+	// 预热策略缓存: 为每个已注册策略创建并初始化实例, 避免运行时重建丢失内部状态
+	for _, name := range reg.Names() {
+		strat, ok := reg.Get(name)
+		if !ok {
+			continue
+		}
+		if err := strat.Init(context.Background(), s.cfg.StrategyParams(name)); err != nil {
+			continue
+		}
+		s.strategyCache[name] = strat
+	}
 
 	// 尝试从数据库恢复持仓到内存
 	s.restorePortfolioFromDB()
