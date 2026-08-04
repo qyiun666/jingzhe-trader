@@ -10,7 +10,7 @@ import (
 )
 
 // HandleAgentAlerts GET /api/agent/alerts?date=&unread_only=true
-// POST /api/agent/alerts/read  - 标记已读
+// POST /api/agent/alerts  - 标记已读 {"id": N} 或 {"all": true}
 // Agent 获取飞书通知的持久化副本, 用于离线读取和状态追踪
 func (s *Service) HandleAgentAlerts(w http.ResponseWriter, r *http.Request) {
 	alertRepo := store.NewAlertRepo(s.db)
@@ -66,7 +66,7 @@ func (s *Service) handleAlertsMarkRead(w http.ResponseWriter, r *http.Request, a
 		return
 	}
 
-	if req.All || (req.ID == 0 && req.All) {
+	if req.All || req.ID == 0 {
 		n, err := alertRepo.MarkAllRead()
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())

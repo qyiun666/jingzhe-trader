@@ -133,9 +133,11 @@ func (s *Service) HandleSyncPortfolio(w http.ResponseWriter, r *http.Request) {
 		pb.ImportPositions(positionMap, cash)
 	}
 
-	// 4. 记录现金和初始资金到元数据
+	// 4. 记录现金到元数据; initial_capital 仅首次设置 (避免覆盖已有值导致总盈亏计算错误)
 	portRepo.SetMeta("cash", fmt.Sprintf("%.2f", cash))
-	portRepo.SetMeta("initial_capital", fmt.Sprintf("%.2f", cash))
+	if existing, err := portRepo.GetMeta("initial_capital"); err != nil || existing == "" {
+		portRepo.SetMeta("initial_capital", fmt.Sprintf("%.2f", cash))
+	}
 
 	writeJSON(w, http.StatusOK, SyncPortfolioResponse{
 		SyncedCount: len(storeItems),

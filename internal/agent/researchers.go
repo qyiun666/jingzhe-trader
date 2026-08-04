@@ -62,6 +62,7 @@ func callResearcherLLM(client *llm.Client, tsCode, side, sysPrompt, userPrompt s
 		logger.L().Warnw("研究员响应解析失败", "side", side, "ts_code", tsCode, "raw", resp[:min(200, len(resp))])
 		return &ResearchArgument{Side: side, Sentiment: 0, Arguments: []string{"响应解析失败"}, Confidence: 0.2}, nil
 	}
+	arg.Side = side // 强制覆盖, 防止 LLM 幻觉翻转多空立场
 	return &arg, nil
 }
 

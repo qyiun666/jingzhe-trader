@@ -123,6 +123,11 @@ func (c *Client) Chat(systemPrompt, userPrompt string) (string, error) {
 		return "", fmt.Errorf("读取响应失败: %w", err)
 	}
 
+	// 非 2xx 响应直接报错 (避免将 HTML 错误页误报为"解析失败")
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("LLM HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+
 	var result ChatCompletionResponse
 	if err := json.Unmarshal(respBody, &result); err != nil {
 		return "", fmt.Errorf("解析响应失败: %w, 原始内容: %s", err, string(respBody))

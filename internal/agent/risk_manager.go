@@ -106,23 +106,64 @@ func (rm *RiskManagerAgent) fallbackJudge(ctx *DebateContext, reports []*Analysi
 	if len(reports) > 0 {
 		avgSentiment /= float64(len(reports))
 	}
+
+	// 结合多空研究员情绪
+	bullSentiment := 0.0
+	if bull != nil {
+		bullSentiment = bull.Sentiment
+	}
+	bearSentiment := 0.0
+	if bear != nil {
+		bearSentiment = bear.Sentiment
+	}
+	blended := (avgSentiment + bullSentiment + bearSentiment) / 3.0
+
 	decision := "hold"
 	positionPct := 0.0
-	if avgSentiment > 0.3 {
+	if blended > 0.1 {
 		decision = "buy"
 		positionPct = 0.3
-	} else if avgSentiment < -0.3 {
+	} else if blended < -0.1 {
 		decision = "reject"
 	}
+
+	// 已持仓且情绪极差时建议卖出
+	if ctx.Position != nil && blended < -0.3 {
+		decision = "sell"
+	}
+
+	// 多空分歧越小, 降级置信度越高
+	confidence := 0.4
+	if bull != nil && bear != nil {
+		spread := bullSentiment - bearSentiment
+		if spread < 0 {
+			spread = -spread
+		}
+		if spread < 0.5 {
+			confidence = 0.45
+		}
+	}
+
+	var bullArgs, bearArgs []string
+	if bull != nil {
+		bullArgs = bull.Arguments
+	}
+	if bear != nil {
+		bearArgs = bear.Arguments
+	}
+
 	return &DebateResult{
 		TradeDate:   ctx.TradeDate,
 		TsCode:      ctx.TsCode,
 		Name:        ctx.Name,
 		Decision:    decision,
-		Confidence:  0.4,
+		Confidence:  confidence,
 		PositionPct: positionPct,
 		RiskLevel:   "medium",
-		Summary:     fmt.Sprintf("规则降级: %s (情绪%.2f)", decision, avgSentiment),
+		BullArgs:    marshalStrList(bullArgs),
+		BearArgs:    marshalStrList(bearArgs),
+		RiskNote:    "LLM裁决失败, 使用规则降级(含多空情绪)",
+		Summary:     fmt.Sprintf("规则降级: %s (综合情绪%.2f)", decision, blended),
 	}
 }
 
@@ -147,3 +188,15 @@ const riskMgrSysPrompt = `你是专业的风险管理经理。你需要权衡看
 
 仓位建议(position_pct)不超过0.6(60%)。
 必须输出合法JSON。`
+
+// marshalStrList 将字符串列表序列化为 JSON 字符串
+func marshalStrList(list []string) string {
+	if len(list) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(list)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}

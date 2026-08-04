@@ -137,6 +137,7 @@ type Service struct {
 	barRepo            *store.BarRepo
 	calRepo            *store.CalendarRepo
 	stockMap           map[string]string // ts_code -> name
+	stockMapMu         sync.RWMutex         // 保护 stockMap 并发读写
 	brk                broker.Broker
 	dynamicSelector    *strategy.DynamicSelector // 动态策略选择器
 	llmClient          *llm.Client               // LLM 客户端
@@ -194,22 +195,25 @@ func NewService(cfg *config.Config) (*Service, error) {
 	return svc, nil
 }
 
-// loadStockMap 加载股票名称映射
+// loadStockMap 加载股票名称映射 (线程安全)
 func (s *Service) loadStockMap() {
 	stockRepo := store.NewStockRepo(s.db)
 	stocks, err := stockRepo.GetAll()
-	if err != nil {
-		s.stockMap = make(map[string]string)
-		return
+	m := make(map[string]string)
+	if err == nil {
+		for _, st := range stocks {
+			m[st.TsCode] = st.Name
+		}
 	}
-	s.stockMap = make(map[string]string, len(stocks))
-	for _, st := range stocks {
-		s.stockMap[st.TsCode] = st.Name
-	}
+	s.stockMapMu.Lock()
+	s.stockMap = m
+	s.stockMapMu.Unlock()
 }
 
-// stockName 获取股票名称
+// stockName 获取股票名称 (线程安全读)
 func (s *Service) stockName(tsCode string) string {
+	s.stockMapMu.RLock()
+	defer s.stockMapMu.RUnlock()
 	if name, ok := s.stockMap[tsCode]; ok {
 		return name
 	}
@@ -407,6 +411,9 @@ func (s *Service) RunStrategy(date string, strategyName string) (*StrategyJSON, 
 
 	positions := s.getPositions()
 	asset := s.getAsset()
+	s.brk.UpdateMarketValue(todayBars)
+	positions, _ = s.brk.QueryPositions()
+	asset, _ = s.brk.QueryAsset()
 
 	signals := s.runStrategy(date, strategyName, todayBars, positions, asset)
 	return s.buildStrategyJSON(date, signals, todayBars, nil), nil

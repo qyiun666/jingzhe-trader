@@ -58,11 +58,14 @@ func (o *DebateOrchestrator) Debate(ctx *DebateContext) (*DebateResult, error) {
 		bearArg = &ResearchArgument{Side: "bear", Sentiment: 0, Confidence: 0.2}
 	}
 	result, err := o.riskMgr.Judge(ctx, reports, bullArg, bearArg)
-	if err != nil {
-		logger.L().Warnw("风险管理员裁决失败", "ts_code", ctx.TsCode, "err", err)
+	if err != nil || result == nil {
+		logger.L().Warnw("风险管理员裁决失败, 使用降级逻辑", "ts_code", ctx.TsCode, "err", err)
 		result = o.riskMgr.fallbackJudge(ctx, reports, bullArg, bearArg)
 	}
-	if o.debateRepo != nil && result != nil {
+	if result == nil {
+		return nil, fmt.Errorf("辩论无结果: %s", ctx.TsCode)
+	}
+	if o.debateRepo != nil {
 		if _, err := o.debateRepo.Insert(result); err != nil {
 			logger.L().Warnw("辩论结果落库失败", "ts_code", ctx.TsCode, "err", err)
 		}
@@ -118,21 +121,21 @@ func (o *DebateOrchestrator) EnhanceSignals(date string, signals []model.Signal,
 			continue
 		}
 		switch result.Decision {
-		case "reject":
-			logger.L().Infof("[智能体辩论] 否决买入 %s: %s", sig.TsCode, result.Summary)
+		case "reject", "hold", "sell":
+			// reject=否决买入, hold=建议观望, sell=建议卖出(对买入信号而言都意味着不买入)
+			logger.L().Infof("[智能体辩论] %s 信号被过滤 %s: decision=%s summary=%s",
+				result.Decision, sig.TsCode, result.Decision, result.Summary)
 			continue
 		case "buy":
+			// 按辩论建议的仓位比例调整数量 (PositionPct 0~0.6, 不超过原始目标)
 			if result.PositionPct > 0 && result.PositionPct < 1 {
-				adjustedQty := int(float64(sig.TargetQty) * result.PositionPct / 0.5)
-				if adjustedQty > 0 {
+				adjustedQty := int(float64(sig.TargetQty) * result.PositionPct)
+				if adjustedQty > 0 && adjustedQty <= sig.TargetQty {
 					sig.TargetQty = adjustedQty
 				}
 			}
 			sig.Reason = fmt.Sprintf("%s | LLM辩论: %s", sig.Reason, result.Summary)
 			sig.Strength = result.Confidence
-		case "hold":
-			logger.L().Infof("[智能体辩论] 建议持有 %s: %s", sig.TsCode, result.Summary)
-			continue
 		}
 		enhanced = append(enhanced, sig)
 	}

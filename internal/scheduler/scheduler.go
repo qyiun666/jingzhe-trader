@@ -342,11 +342,12 @@ func (s *Scheduler) notifySignalResult(date string, plans []*store.TradePlan) {
 		lines = append(lines, fmt.Sprintf("📅 %s 信号生成完成: 今日无交易计划", date))
 		lines = append(lines, "策略未触发买卖信号, 继续持有当前仓位")
 	} else {
-		lines = append(lines, fmt.Sprintf("📋 %s 信号生成完成: 共%d条计划 (买入%d/卖出%d", date, len(plans), buyCount, sellCount))
+		summary := fmt.Sprintf("📋 %s 信号生成完成: 共%d条计划 (买入%d/卖出%d", date, len(plans), buyCount, sellCount)
 		if urgentCount > 0 {
-			lines = append(lines, fmt.Sprintf("⚠️ 含%d条紧急止损计划", urgentCount))
+			summary += fmt.Sprintf(", 紧急%d", urgentCount)
 		}
-		lines = append(lines, ")")
+		summary += ")"
+		lines = append(lines, summary)
 		// 列出前5条计划
 		showCount := len(plans)
 		if showCount > 5 {

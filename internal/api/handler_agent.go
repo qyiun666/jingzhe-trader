@@ -91,7 +91,21 @@ func (s *Service) GenerateTradePlans(date string) ([]*store.TradePlan, error) {
 		logger.L().Infof("[计划生成] 风控拦截 %s: %s (%s)", rej.TsCode, rej.Reason, rej.Rule)
 	}
 
+	// 卖出优先排序 (先卖释放资金再买), 与 engine.Pipeline 保持一致
+	sellFirstSort(passed)
+
 	return s.signalsToPlans(date, strategyName, passed, todayBars, stopCodes), nil
+}
+
+// sellFirstSort 卖出信号排前, 买入排后 (原地排序)
+func sellFirstSort(signals []model.Signal) {
+	for i := 0; i < len(signals); i++ {
+		for j := i + 1; j < len(signals); j++ {
+			if signals[i].Direction == model.DirBuy && signals[j].Direction == model.DirSell {
+				signals[i], signals[j] = signals[j], signals[i]
+			}
+		}
+	}
 }
 
 // loadRiskStocks 加载信号涉及股票的基本信息 (风控黑名单/ST过滤用)
@@ -239,28 +253,6 @@ func (s *Service) HandleAgentBrief(w http.ResponseWriter, r *http.Request) {
 	brief.ActionNeeded = s.buildActionNeededEnhanced(brief.OpenPlans, brief.DecisionChanges, brief.PlanStatusSummary)
 
 	writeJSON(w, http.StatusOK, brief)
-}
-
-// buildActionNeeded 构建需要用户操作的提示
-func (s *Service) buildActionNeeded(plans []store.TradePlan) []string {
-	var actions []string
-	pendingCount := 0
-	confirmedCount := 0
-	for _, p := range plans {
-		if p.Status == store.PlanStatusPending {
-			pendingCount++
-		}
-		if p.Status == store.PlanStatusConfirmed {
-			confirmedCount++
-		}
-	}
-	if pendingCount > 0 {
-		actions = append(actions, fmt.Sprintf("有%d条待确认的交易计划，请审阅后确认或忽略", pendingCount))
-	}
-	if confirmedCount > 0 {
-		actions = append(actions, fmt.Sprintf("有%d条已确认计划等待执行反馈，请在券商成交后反馈", confirmedCount))
-	}
-	return actions
 }
 
 // buildPlanStatusSummary 构建交易计划状态汇总

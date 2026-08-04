@@ -23,7 +23,8 @@ func (a *TechnicalAnalyst) Name() string { return "technical" }
 
 func (a *TechnicalAnalyst) Analyze(ctx *DebateContext) (*AnalysisReport, error) {
 	bars := ctx.Bars
-	if len(bars) < 10 {
+	if len(bars) < 20 {
+		// 需至少 20 根 K 线才能计算 MA20, 否则 ma20=0 会导致误导性的"金叉"信号
 		return &AnalysisReport{Agent: a.Name(), TsCode: ctx.TsCode, Confidence: 0.1}, nil
 	}
 	last := bars[len(bars)-1]
