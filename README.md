@@ -17,27 +17,33 @@
 AI Agent（如 Hermes）只需定时 GET 只读 API 拿现成结果，POST 确认执行。
 
 ```
-                      ┌──────────────────────────────────────────────┐
-                      │              cmd/server (常驻)                │
-                      │                                              │
-  Tushare ──────────▶ │  调度器 (交易日自动执行)                       │
-  腾讯免费行情 ──────▶ │   15:10 数据更新 (进程内 dataloader)          │
-  QMT sidecar ◀─────▶ │   15:30 EOD信号 → trade_plan 表              │
-                      │   15:35 对账 (QMT模式)                        │
-                      │   15:45 日报生成 + 飞书推送                    │
-                      │   盘中每5分钟 实时价止损监控 → 紧急计划+告警     │
-                      │   16:30 数据保留清理 + WAL checkpoint          │
-                      │                                              │
-                      │  统一执行管道 engine.Pipeline                  │
-                      │   信号 → 风控 → Broker下单 → 落库              │
-                      │   (回测/模拟/实盘共用, 只换 Broker 实现)        │
-                      └───────────────┬──────────────────────────────┘
-                                      │ SQLite (WAL)
-                      ┌───────────────┴──────────────────────────────┐
-                      │              HTTP API (Bearer 鉴权)           │
-                      └───────────────┬──────────────────────────────┘
-                                      │
-                 Agent/人: GET /api/agent/brief → POST /api/plan/confirm
+                      ┌──────────────────────────────────────────────────┐
+                      │                cmd/server (24h常驻)               │
+                      │                                                  │
+  Tushare ──────────▶ │  调度器 (交易日自动执行, 每次任务后飞书通知)         │
+  腾讯免费行情 ──────▶ │   15:10 数据更新 (进程内 dataloader)              │
+  QMT sidecar ◀─────▶ │   15:30 EOD信号 → 多智能体辩论 → trade_plan 表    │
+                      │   15:35 对账 (QMT模式)                            │
+                      │   15:45 日报生成 + 飞书推送 + 操作提醒              │
+                      │   盘中每5分钟 实时价止损监控 → 紧急计划+告警         │
+                      │   16:30 数据保留清理 + WAL checkpoint              │
+                      │                                                  │
+                      │  多智能体辩论 (LLM可用时增强买入信号)               │
+                      │   4分析师并行(技术/基本面/新闻/市场)               │
+                      │   → 多空研究员辩论 → 风险管理经理裁决              │
+                      │   → 决策变更检测(对比历史) → 通知用户              │
+                      │                                                  │
+                      │  统一执行管道 engine.Pipeline                      │
+                      │   信号 → 智能体辩论 → 风控 → Broker下单 → 落库     │
+                      │   (回测/模拟/实盘共用, 只换 Broker 实现)            │
+                      └───────────────────┬──────────────────────────────┘
+                                          │ SQLite (WAL)
+                      ┌───────────────────┴──────────────────────────────┐
+                      │              HTTP API (Bearer 鉴权)               │
+                      └───────────────────┬──────────────────────────────┘
+                                          │
+     Agent/人: GET /api/agent/brief → POST /api/plan/confirm
+               GET /api/agent/changes (决策变更检测)
 ```
 
 ### Agent 对接流程
@@ -57,6 +63,8 @@ AI Agent（如 Hermes）只需定时 GET 只读 API 拿现成结果，POST 确�
 - **常驻稳定** — 任务 panic 隔离、job_run 防重复/启动补跑、优雅关机、WAL checkpoint、goroutine 纪律
 - **多策略支持** — 均线交叉 / MACD / 布林带突破 / 多因子选股，动态策略选择器按市况切换
 - **LLM 辅助** — 集成 DeepSeek 等大模型深度分析新闻舆情（可选）
+- **多智能体辩论** — 4位分析师(技术/基本面/新闻/市场)并行分析 → 多空研究员辩论 → 风险管理经理裁决，对买入信号做二次验证（LLM 可用时自动启用）
+- **决策变更追踪** — 每次辩论结果与历史对比，自动检测决策方向、置信度、风险等级变化并通知
 
 ## 快速开始
 
@@ -128,7 +136,8 @@ curl http://127.0.0.1:8080/api/agent/brief         # Agent 全量上下文
 
 | 端点 | 说明 |
 |---|---|
-| `/api/agent/brief` | **Agent 首选**：计划+持仓+市场+健康度一次拿全 |
+| `/api/agent/brief` | **Agent 首选**：计划+持仓+市场+健康度+辩论结果+决策变更+任务状态 一次拿全 |
+| `/api/agent/changes` | 决策变更检测：辩论结果对比 + 计划状态变更 + 任务完成状态 |
 | `/api/plan?date=` | 交易计划列表（不传 date 返回全部待处理） |
 | `/api/daily?date=` | 每日操盘报告（汇总） |
 | `/api/positions` | 持仓诊断 |
@@ -161,11 +170,14 @@ export JZ_API_TOKEN="your-random-token"    # 服务端: config 留空则从环�
 
 | 时间 | Agent 动作 | 说明 |
 |---|---|---|
-| 15:35 后 | `GET /api/agent/brief` | 调度器 15:10 更新数据、15:30 生成计划，此时计划已就绪 |
+| 15:35 后 | `GET /api/agent/brief` | 调度器 15:10 更新数据、15:30 生成计划+辩论，此时结果已就绪 |
+| 15:35 后 | `GET /api/agent/changes` | 检查决策变更、计划状态变更、任务完成状态 |
 | 审阅后 | `POST /api/plan/confirm` | 逐条确认要执行的计划 |
 | 成交后 | `POST /api/trade/confirm` | 人工/券商成交后反馈，保持持仓同步 |
 | 盘中（可选） | `GET /api/plan` | 盘中止损监控产生的 urgent 计划会实时出现在这里（同时飞书告警） |
 | 任意 | `GET /api/health` | 存活与任务健康度巡检 |
+
+> **通知机制**: 调度器每次执行任务后自动通过飞书推送结果通知（无论有无交易计划），包含计划汇总、决策变更检测、待处理计划提醒。用户收到通知后审阅并操作，Agent 下次执行时自动检查状态是否更新。
 
 ### 1. 读取全量上下文
 
@@ -177,21 +189,46 @@ curl http://NAS_IP:8080/api/agent/brief
 
 ```jsonc
 {
-  "date": "20260726",           // 数据基准日
-  "data_last_date": "20260724", // 库内最新行情日
-  "data_fresh": true,            // false 时应提醒用户数据滞后, 不宜盲信计划
-  "open_plans": [{               // 待处理交易计划 (pending/confirmed)
+  "date": "20260726",             // 数据基准日
+  "data_last_date": "20260724",   // 库内最新行情日
+  "data_fresh": true,              // false 时应提醒用户数据滞后, 不宜盲信计划
+  "open_plans": [{                 // 待处理交易计划 (pending/confirmed)
     "id": 12, "trade_date": "20260726",
     "ts_code": "000001.SZ", "name": "平安银行",
     "direction": "buy", "qty": 500, "ref_price": 11.13,
-    "reason": "均线金叉: MA3=11.05上穿MA25=10.98",
-    "strategy": "ma_cross", "urgency": "normal",  // urgent=止损类, 优先处理
+    "reason": "均线金叉: MA3=11.05上穿MA25=10.98 | LLM辩论: 技术面转强",
+    "strategy": "ma_cross", "urgency": "normal",
     "status": "pending"
   }],
   "portfolio": { /* 持仓明细+健康分+集中度+盈亏/风险指标 */ },
   "market":    { /* 指数涨跌/市场情绪概况 */ },
   "jobs":      { "signal": "2026-07-26 15:30:02", "data_update": "..." },
-  "warnings":  ["..."]           // 数据滞后/任务失败等异常, 非空时优先告知用户
+  "warnings":  ["..."],            // 数据滞后/任务失败等异常, 非空时优先告知用户
+  "debates": [{                    // 当日多智能体辩论结果
+    "ts_code": "000001.SZ", "name": "平安银行",
+    "decision": "buy",             // buy/hold/reject
+    "confidence": 0.72,
+    "position_pct": 0.5, "stop_price": 10.58,
+    "risk_level": "medium",
+    "summary": "技术面金叉确认, 基本面稳健, 新闻中性偏多"
+  }],
+  "decision_changes": [{           // 决策变更检测 (与上次辩论对比)
+    "ts_code": "600036.SZ", "name": "招商银行",
+    "prev_decision": "buy", "curr_decision": "hold",
+    "prev_confidence": 0.65, "curr_confidence": 0.40,
+    "detail": "决策变更: 买入 → 持有; 置信度下降: 65% → 40%"
+  }],
+  "plan_status_summary": {         // 交易计划状态汇总
+    "pending": 2, "confirmed": 1, "executed": 0, "expired": 0, "total": 3
+  },
+  "task_completed": {              // 当日各任务是否已完成
+    "data_update": true, "signal": true, "report": false,
+    "intraday_monitor": false, "retention": false
+  },
+  "action_needed": [               // 需要用户操作的提示
+    "📋 有2条待确认的交易计划，请审阅后确认或忽略",
+    "🔄 检测到1个标的投资决策发生变化，请关注"
+  ]
 }
 ```
 
@@ -235,11 +272,61 @@ curl -X POST http://NAS_IP:8080/api/portfolio/sync \
 ```text
 每个交易日 15:35 调用 GET /api/agent/brief：
 1. 若 warnings 非空或 data_fresh=false，先向我报告异常，不要确认任何计划；
-2. 逐条分析 open_plans：结合 reason、portfolio 风险指标、market 情绪，
+2. 检查 task_completed.signal 是否为 true，确认信号已生成；
+3. 逐条分析 open_plans：结合 reason、debates 辩论结果、portfolio 风险指标、market 情绪，
    给出 执行/跳过 建议及理由，urgent（止损）计划优先；
-3. 经我同意后用 POST /api/plan/confirm 确认；未同意的不操作；
-4. 汇报今日持仓盈亏与健康分变化。
+4. 检查 decision_changes：如有决策变更，告知我哪些标的决策发生了变化及原因；
+5. 检查 plan_status_summary：如有 confirmed 状态的计划，提醒我反馈成交结果；
+6. 经我同意后用 POST /api/plan/confirm 确认；未同意的不操作；
+7. 汇报今日持仓盈亏与健康分变化。
+
+变更检测（可选）：
+GET /api/agent/changes?date=YYYYMMDD
+返回决策变更、计划状态变更、任务完成状态的完整报告。
 ```
+
+## 多智能体辩论系统
+
+当 LLM 配置启用时（`llm.enabled: true`），系统对每个买入信号自动启动多智能体辩论，对策略信号做二次验证：
+
+### 辩论流程
+
+```
+策略信号(买入) → 4分析师并行分析 → 多空研究员辩论 → 风险管理经理裁决
+                     ↓                    ↓                ↓
+              技术分析师           看涨研究员          决策: buy/hold/reject
+              基本面分析师         看跌研究员          仓位建议 + 止损价
+              新闻分析师                              风险等级 + 摘要
+              市场分析师
+```
+
+### 智能体角色
+
+| 角色 | 职责 | 输入 |
+|---|---|---|
+| 技术分析师 | MA/RSI/MACD/布林带/成交量分析 | 90日K线 |
+| 基本面分析师 | PE/PB/ROE/营收增长/负债率 | 基本面+财务数据 |
+| 新闻分析师 | 个股相关新闻情感分析 | 新闻库 |
+| 市场分析师 | 大盘趋势/市场情绪/板块轮动 | 指数K线 |
+| 看涨研究员 | 从分析师报告中提炼买入理由 | 4份分析师报告 |
+| 看跌研究员 | 从分析师报告中提炼风险因素 | 4份分析师报告 |
+| 风险管理经理 | 权衡多空论点，做出最终裁决 | 分析师报告+多空论点+持仓 |
+
+### 裁决结果
+
+- **buy**: 通过辩论验证，建议买入（可能调整仓位比例）
+- **hold**: 建议持有/观望，不执行买入
+- **reject**: 否决买入信号，不进入交易计划
+
+### 决策变更检测
+
+每次辩论结果落库后，系统自动与同一股票的上次辩论结果对比，检测以下变化：
+
+- 决策方向变更（如 buy → hold）
+- 置信度显著变化（>20%）
+- 风险等级变化
+
+变更结果通过 `/api/agent/changes` 接口查询，同时在飞书通知中提示。
 
 ## 数据自动清理
 
@@ -448,12 +535,13 @@ launchctl load ~/Library/LaunchAgents/com.jingzhe.trader.plist
 ```
 cmd/            server(常驻) / backtest / optimizer / dataloader
 internal/
+  agent/        多智能体辩论系统 (分析师/研究员/风险管理/辩论编排/变更检测)
   engine/       统一执行管道 Pipeline (回测=实盘)
   broker/       Broker接口: PaperBroker(模拟撮合) / QMTBridge
   risk/         风控: 止损止盈 / 仓位限制 / 小资金自适应 sizing
-  scheduler/    内置调度器 (job_run 防重/补跑/panic隔离)
+  scheduler/    内置调度器 (job_run 防重/补跑/panic隔离/增强通知)
   strategy/     策略与动态选择器
-  store/        SQLite 仓储 + retention 数据清理
+  store/        SQLite 仓储 + retention 数据清理 + 辩论结果存储
   quote/        盘中实时行情 (腾讯免费源 / QMT)
   notify/       飞书通知
   api/          HTTP API (鉴权/CORS/recover 中间件)

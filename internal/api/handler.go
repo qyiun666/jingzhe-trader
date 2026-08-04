@@ -12,6 +12,7 @@ import (
 
 	"github.com/jmoiron/sqlx"
 
+	"jingzhe-trader/internal/agent"
 	"jingzhe-trader/internal/analysis"
 	"jingzhe-trader/internal/broker"
 	"jingzhe-trader/internal/config"
@@ -29,9 +30,9 @@ import (
 
 // APIResponse 统一 API 响应格式
 type APIResponse struct {
-	Code int             `json:"code"`
-	Msg  string          `json:"msg"`
-	Data interface{}     `json:"data"`
+	Code int         `json:"code"`
+	Msg  string      `json:"msg"`
+	Data interface{} `json:"data"`
 }
 
 // DailyReportJSON 每日操盘报告 (JSON格式)
@@ -58,16 +59,16 @@ type MarketSnapshotJSON struct {
 
 // PortfolioJSON 持仓诊断
 type PortfolioJSON struct {
-	TotalAsset    float64                      `json:"total_asset"`
-	Cash          float64                      `json:"cash"`
-	MarketValue   float64                      `json:"market_value"`
-	DailyPnLPct   float64                      `json:"daily_pnl_pct"`
-	HealthScore   float64                      `json:"health_score"`
-	Concentration map[string]float64           `json:"concentration"`
-	SectorDist    []map[string]interface{}     `json:"sector_distribution"`
-	PnLSummary    map[string]interface{}       `json:"pnl_summary"`
-	RiskMetrics   map[string]interface{}       `json:"risk_metrics"`
-	Holdings      []map[string]interface{}     `json:"holdings"`
+	TotalAsset    float64                  `json:"total_asset"`
+	Cash          float64                  `json:"cash"`
+	MarketValue   float64                  `json:"market_value"`
+	DailyPnLPct   float64                  `json:"daily_pnl_pct"`
+	HealthScore   float64                  `json:"health_score"`
+	Concentration map[string]float64       `json:"concentration"`
+	SectorDist    []map[string]interface{} `json:"sector_distribution"`
+	PnLSummary    map[string]interface{}   `json:"pnl_summary"`
+	RiskMetrics   map[string]interface{}   `json:"risk_metrics"`
+	Holdings      []map[string]interface{} `json:"holdings"`
 }
 
 // RebalanceJSON 调仓计划
@@ -113,8 +114,8 @@ type StrategyJSON struct {
 
 // NewsJSON 新闻摘要
 type NewsJSON struct {
-	Sentiment   string                `json:"sentiment"`
-	RelatedNews []map[string]string   `json:"related_news"`
+	Sentiment   string              `json:"sentiment"`
+	RelatedNews []map[string]string `json:"related_news"`
 }
 
 // ActionItemJSON 操作项
@@ -131,17 +132,18 @@ type ActionItemJSON struct {
 
 // Service API 服务
 type Service struct {
-	cfg             *config.Config
-	db              *sqlx.DB
-	barRepo         *store.BarRepo
-	calRepo         *store.CalendarRepo
-	stockMap        map[string]string // ts_code -> name
-	brk             broker.Broker
-	dynamicSelector *strategy.DynamicSelector // 动态策略选择器
-	llmClient       *llm.Client                // LLM 客户端
-	llmNews         *llm.NewsAnalyzer          // LLM 新闻分析器
-	startTime       time.Time                  // 服务启动时间 (uptime用)
-	updateMu        sync.Mutex                 // 数据更新互斥 (防并发重入)
+	cfg                *config.Config
+	db                 *sqlx.DB
+	barRepo            *store.BarRepo
+	calRepo            *store.CalendarRepo
+	stockMap           map[string]string // ts_code -> name
+	brk                broker.Broker
+	dynamicSelector    *strategy.DynamicSelector // 动态策略选择器
+	llmClient          *llm.Client               // LLM 客户端
+	llmNews            *llm.NewsAnalyzer         // LLM 新闻分析器
+	debateOrchestrator *agent.DebateOrchestrator // 智能体辩论编排器
+	startTime          time.Time                 // 服务启动时间 (uptime用)
+	updateMu           sync.Mutex                // 数据更新互斥 (防并发重入)
 }
 
 // NewService 创建 API 服务
@@ -179,6 +181,16 @@ func NewService(cfg *config.Config) (*Service, error) {
 	svc.llmClient = llm.NewClient(llmCfg)
 	svc.llmNews = llm.NewNewsAnalyzer(svc.llmClient)
 
+	// 初始化智能体辩论编排器
+	svc.debateOrchestrator = agent.NewDebateOrchestrator(
+		svc.llmClient,
+		store.NewBarRepo(db),
+		store.NewBasicRepo(db),
+		store.NewFinaRepo(db),
+		store.NewNewsRepo(db),
+		store.NewDebateRepo(db),
+	)
+
 	return svc, nil
 }
 
@@ -202,6 +214,11 @@ func (s *Service) stockName(tsCode string) string {
 		return name
 	}
 	return tsCode
+}
+
+// DebateOrchestrator 返回智能体辩论编排器 (供调度器调用决策变更检测)
+func (s *Service) DebateOrchestrator() *agent.DebateOrchestrator {
+	return s.debateOrchestrator
 }
 
 // DB 返回底层数据库连接 (供调度器等外部组件复用同一连接)
@@ -513,10 +530,10 @@ func (s *Service) buildPortfolioJSON(
 		},
 		SectorDist: []map[string]interface{}{},
 		PnLSummary: map[string]interface{}{
-			"total_pnl": 0.0,
-			"win_count": 0,
+			"total_pnl":  0.0,
+			"win_count":  0,
 			"loss_count": 0,
-			"win_pct":   0.0,
+			"win_pct":    0.0,
 		},
 		RiskMetrics: map[string]interface{}{
 			"max_loss_pct": 0.0,
@@ -1295,6 +1312,7 @@ func parseFloatParam(r *http.Request, key string, defaultVal float64) float64 {
 	}
 	return n
 }
+
 // ==================== 仪表盘专用接口 ====================
 
 // HandleKline 处理 GET /api/kline?code=510050.SH&start=20260101&end=20260716

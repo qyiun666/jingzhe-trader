@@ -246,6 +246,7 @@ func (s *Scheduler) runDataUpdate(date string) error {
 }
 
 // runSignal 15:30 EOD 信号生成 → 次日交易计划落库
+// 增强通知: 无论有无计划都通知用户, 包含决策变更和状态汇总
 func (s *Scheduler) runSignal(date string) error {
 	plans, err := s.svc.GenerateTradePlans(date)
 	if err != nil {
@@ -261,10 +262,115 @@ func (s *Scheduler) runSignal(date string) error {
 		return fmt.Errorf("交易计划落库失败: %w", err)
 	}
 	logger.L().Infow("EOD交易计划生成完成", "date", date, "count", len(plans))
-	if len(plans) > 0 {
-		s.alert("📋 惊蛰交易计划", fmt.Sprintf("%s 生成 %d 条交易计划, 请通过 /api/plan 查看并确认", date, len(plans)))
-	}
+
+	// 增强通知: 无论有无计划都通知
+	s.notifySignalResult(date, plans)
 	return nil
+}
+
+// notifySignalResult 发送信号生成结果通知 (每次都通知, 包含决策变更检测)
+func (s *Scheduler) notifySignalResult(date string, plans []*store.TradePlan) {
+	var lines []string
+
+	// 计划汇总
+	buyCount := 0
+	sellCount := 0
+	urgentCount := 0
+	for _, p := range plans {
+		if p.Direction == "buy" {
+			buyCount++
+		} else {
+			sellCount++
+		}
+		if p.Urgency == store.PlanUrgencyUrgent {
+			urgentCount++
+		}
+	}
+
+	if len(plans) == 0 {
+		lines = append(lines, fmt.Sprintf("📅 %s 信号生成完成: 今日无交易计划", date))
+		lines = append(lines, "策略未触发买卖信号, 继续持有当前仓位")
+	} else {
+		lines = append(lines, fmt.Sprintf("📋 %s 信号生成完成: 共%d条计划 (买入%d/卖出%d", date, len(plans), buyCount, sellCount))
+		if urgentCount > 0 {
+			lines = append(lines, fmt.Sprintf("⚠️ 含%d条紧急止损计划", urgentCount))
+		}
+		lines = append(lines, ")")
+		// 列出前5条计划
+		showCount := len(plans)
+		if showCount > 5 {
+			showCount = 5
+		}
+		for i := 0; i < showCount; i++ {
+			p := plans[i]
+			icon := "🟢"
+			if p.Direction == "sell" {
+				icon = "🔴"
+			}
+			if p.Urgency == store.PlanUrgencyUrgent {
+				icon = "🚨"
+			}
+			lines = append(lines, fmt.Sprintf("%s %s %s %d股 @%.2f", icon, p.Name, p.Direction, p.Qty, p.RefPrice))
+		}
+		if len(plans) > 5 {
+			lines = append(lines, fmt.Sprintf("... 还有%d条, 详见 /api/plan", len(plans)-5))
+		}
+	}
+
+	// 决策变更检测
+	debateRepo := store.NewDebateRepo(s.db)
+	if todayDebates, err := debateRepo.GetByDate(date); err == nil && len(todayDebates) > 0 {
+		if s.svc.DebateOrchestrator() != nil && s.svc.DebateOrchestrator().IsEnabled() {
+			changes := s.svc.DebateOrchestrator().DetectDecisionChanges(todayDebates)
+			if len(changes) > 0 {
+				lines = append(lines, "")
+				lines = append(lines, fmt.Sprintf("🔄 决策变更检测: %d个标的决策发生变化", len(changes)))
+				showChanges := len(changes)
+				if showChanges > 3 {
+					showChanges = 3
+				}
+				for i := 0; i < showChanges; i++ {
+					lines = append(lines, fmt.Sprintf("  - %s: %s", changes[i].Name, changes[i].Detail))
+				}
+				if len(changes) > 3 {
+					lines = append(lines, fmt.Sprintf("  ... 还有%d项变更", len(changes)-3))
+				}
+			}
+		}
+	}
+
+	// 待处理计划提醒
+	if openPlans, err := s.planRepo.GetOpenPlans(); err == nil {
+		pending := 0
+		confirmed := 0
+		for _, p := range openPlans {
+			if p.Status == store.PlanStatusPending {
+				pending++
+			}
+			if p.Status == store.PlanStatusConfirmed {
+				confirmed++
+			}
+		}
+		if pending > 0 || confirmed > 0 {
+			lines = append(lines, "")
+			if pending > 0 {
+				lines = append(lines, fmt.Sprintf("⏸️ 待确认: %d条 (请审阅 /api/plan)", pending))
+			}
+			if confirmed > 0 {
+				lines = append(lines, fmt.Sprintf("⏳ 待反馈: %d条 (已确认等待成交反馈)", confirmed))
+			}
+		}
+	}
+
+	// 发送通知
+	msg := ""
+	for i, l := range lines {
+		if i > 0 {
+			msg += "\n"
+		}
+		msg += l
+	}
+	s.alert("📋 惊蛰交易信号", msg)
 }
 
 // runReconcile 15:35 对账 (仅 QMT 实盘): 本地记录 vs 券商
@@ -281,6 +387,7 @@ func (s *Scheduler) runReconcile(date string) error {
 }
 
 // runReport 15:45 日报生成 + 飞书推送
+// 增强通知: 日报推送后追加操作提醒
 func (s *Scheduler) runReport(date string) error {
 	daily, err := s.svc.RunDaily(date, s.svc.SelectStrategy(date))
 	if err != nil {
@@ -292,6 +399,31 @@ func (s *Scheduler) runReport(date string) error {
 	}
 	if err := s.notifier.SendCard(api.BuildFeishuDailyCard(daily)); err != nil {
 		return fmt.Errorf("推送日报失败: %w", err)
+	}
+
+	// 追加操作提醒: 检查是否有待处理计划
+	if openPlans, err := s.planRepo.GetOpenPlans(); err == nil && len(openPlans) > 0 {
+		pending := 0
+		confirmed := 0
+		for _, p := range openPlans {
+			if p.Status == store.PlanStatusPending {
+				pending++
+			}
+			if p.Status == store.PlanStatusConfirmed {
+				confirmed++
+			}
+		}
+		if pending > 0 || confirmed > 0 {
+			reminder := fmt.Sprintf("📊 日报已推送, 请查看:\n")
+			if pending > 0 {
+				reminder += fmt.Sprintf("⏸️ %d条计划待确认 (POST /api/plan/confirm)\n", pending)
+			}
+			if confirmed > 0 {
+				reminder += fmt.Sprintf("⏳ %d条计划待执行反馈 (POST /api/trade/confirm)\n", confirmed)
+			}
+			reminder += "完整数据: GET /api/agent/brief | 变更检测: GET /api/agent/changes"
+			s.alert("📌 惊蛰操作提醒", reminder)
+		}
 	}
 	return nil
 }

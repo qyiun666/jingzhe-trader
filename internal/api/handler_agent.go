@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"time"
 
+	"jingzhe-trader/internal/agent"
 	"jingzhe-trader/internal/broker"
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/notify"
@@ -80,6 +81,11 @@ func (s *Service) GenerateTradePlans(date string) ([]*store.TradePlan, error) {
 		}
 	}
 
+	// 智能体辩论增强 (LLM可用时对买入信号跑辩论)
+	if s.debateOrchestrator != nil && s.debateOrchestrator.IsEnabled() {
+		merged = s.debateOrchestrator.EnhanceSignals(date, merged, todayBars, positions, asset.TotalAsset, s.stockMap)
+	}
+
 	passed, rejections := rm.Check(merged, positions, asset.TotalAsset, s.loadRiskStocks(merged), date, todayBars)
 	for _, rej := range rejections {
 		logger.L().Infof("[计划生成] 风控拦截 %s: %s (%s)", rej.TsCode, rej.Reason, rej.Rule)
@@ -142,14 +148,28 @@ func (s *Service) signalsToPlans(date, strategyName string, signals []model.Sign
 
 // AgentBrief Agent 单次调用所需的全量上下文
 type AgentBrief struct {
-	Date         string             `json:"date"`           // 数据基准日期
-	DataLastDate string             `json:"data_last_date"` // 数据库最新行情日期
-	DataFresh    bool               `json:"data_fresh"`     // 数据是否新鲜
-	OpenPlans    []store.TradePlan  `json:"open_plans"`     // 待处理的交易计划
-	Portfolio    *PortfolioJSON     `json:"portfolio"`      // 持仓诊断
-	Market       *MarketSnapshotJSON `json:"market"`        // 市场概况
-	Jobs         map[string]string  `json:"jobs"`           // 各任务最近成功时间
-	Warnings     []string           `json:"warnings"`       // 数据/任务异常提示
+	Date             string                     `json:"date"`               // 数据基准日期
+	DataLastDate     string                     `json:"data_last_date"`     // 数据库最新行情日期
+	DataFresh        bool                       `json:"data_fresh"`         // 数据是否新鲜
+	OpenPlans        []store.TradePlan          `json:"open_plans"`         // 待处理的交易计划
+	Portfolio        *PortfolioJSON             `json:"portfolio"`          // 持仓诊断
+	Market           *MarketSnapshotJSON        `json:"market"`             // 市场概况
+	Jobs             map[string]string          `json:"jobs"`               // 各任务最近成功时间
+	Warnings         []string                   `json:"warnings"`           // 数据/任务异常提示
+	Debates          []store.DebateResult       `json:"debates"`            // 当日辩论结果
+	ActionNeeded     []string                   `json:"action_needed"`      // 需要用户操作的提示
+	DecisionChanges  []agent.DecisionChange     `json:"decision_changes"`   // 决策变更记录
+	PlanStatusSummary PlanStatusSummary         `json:"plan_status_summary"` // 交易计划状态汇总
+	TaskCompleted    map[string]bool            `json:"task_completed"`     // 当日各任务是否已完成
+}
+
+// PlanStatusSummary 交易计划状态汇总
+type PlanStatusSummary struct {
+	Pending   int `json:"pending"`    // 待确认
+	Confirmed int `json:"confirmed"`  // 已确认待执行
+	Executed  int `json:"executed"`   // 已执行
+	Expired   int `json:"expired"`    // 已过期
+	Total     int `json:"total"`      // 总计
 }
 
 // HandleAgentBrief GET /api/agent/brief
@@ -182,6 +202,12 @@ func (s *Service) HandleAgentBrief(w http.ResponseWriter, r *http.Request) {
 		brief.Warnings = append(brief.Warnings, "查询交易计划失败: "+perr.Error())
 	}
 
+	// 辩论结果
+	debateRepo := store.NewDebateRepo(s.db)
+	if debates, derr := debateRepo.GetByDate(lastDate); derr == nil {
+		brief.Debates = debates
+	}
+
 	// 持仓诊断与市场概况 (尽力而为)
 	if portfolio, perr := s.RunPositions(lastDate); perr == nil {
 		brief.Portfolio = portfolio
@@ -198,7 +224,104 @@ func (s *Service) HandleAgentBrief(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 决策变更检测
+	if s.debateOrchestrator != nil && s.debateOrchestrator.IsEnabled() && len(brief.Debates) > 0 {
+		brief.DecisionChanges = s.debateOrchestrator.DetectDecisionChanges(brief.Debates)
+	}
+
+	// 交易计划状态汇总
+	brief.PlanStatusSummary = s.buildPlanStatusSummary(brief.OpenPlans)
+
+	// 当日任务完成状态
+	brief.TaskCompleted = s.buildTaskCompletedStatus(today)
+
+	// 需要用户操作的提示
+	brief.ActionNeeded = s.buildActionNeededEnhanced(brief.OpenPlans, brief.DecisionChanges, brief.PlanStatusSummary)
+
 	writeJSON(w, http.StatusOK, brief)
+}
+
+// buildActionNeeded 构建需要用户操作的提示
+func (s *Service) buildActionNeeded(plans []store.TradePlan) []string {
+	var actions []string
+	pendingCount := 0
+	confirmedCount := 0
+	for _, p := range plans {
+		if p.Status == store.PlanStatusPending {
+			pendingCount++
+		}
+		if p.Status == store.PlanStatusConfirmed {
+			confirmedCount++
+		}
+	}
+	if pendingCount > 0 {
+		actions = append(actions, fmt.Sprintf("有%d条待确认的交易计划，请审阅后确认或忽略", pendingCount))
+	}
+	if confirmedCount > 0 {
+		actions = append(actions, fmt.Sprintf("有%d条已确认计划等待执行反馈，请在券商成交后反馈", confirmedCount))
+	}
+	return actions
+}
+
+// buildPlanStatusSummary 构建交易计划状态汇总
+func (s *Service) buildPlanStatusSummary(plans []store.TradePlan) PlanStatusSummary {
+	summary := PlanStatusSummary{Total: len(plans)}
+	for _, p := range plans {
+		switch p.Status {
+		case store.PlanStatusPending:
+			summary.Pending++
+		case store.PlanStatusConfirmed:
+			summary.Confirmed++
+		case store.PlanStatusExecuted:
+			summary.Executed++
+		case store.PlanStatusExpired:
+			summary.Expired++
+		}
+	}
+	return summary
+}
+
+// buildTaskCompletedStatus 构建当日任务完成状态
+func (s *Service) buildTaskCompletedStatus(today string) map[string]bool {
+	status := map[string]bool{}
+	jobRepo := store.NewJobRepo(s.db)
+	for _, name := range []string{"data_update", "signal", "report", "intraday_monitor", "retention"} {
+		done, err := jobRepo.HasSucceeded(name, today)
+		if err == nil {
+			status[name] = done
+		} else {
+			status[name] = false
+		}
+	}
+	return status
+}
+
+// buildActionNeededEnhanced 增强版操作提示 (包含决策变更)
+func (s *Service) buildActionNeededEnhanced(plans []store.TradePlan, changes []agent.DecisionChange, summary PlanStatusSummary) []string {
+	var actions []string
+
+	// 待确认计划
+	if summary.Pending > 0 {
+		actions = append(actions, fmt.Sprintf("📋 有%d条待确认的交易计划，请审阅后确认或忽略", summary.Pending))
+	}
+
+	// 已确认待执行
+	if summary.Confirmed > 0 {
+		actions = append(actions, fmt.Sprintf("⏳ 有%d条已确认计划等待执行反馈，请在券商成交后反馈", summary.Confirmed))
+	}
+
+	// 决策变更
+	changeCount := len(changes)
+	if changeCount > 0 {
+		actions = append(actions, fmt.Sprintf("🔄 检测到%d个标的投资决策发生变化，请关注", changeCount))
+	}
+
+	// 无操作提示
+	if len(actions) == 0 {
+		actions = append(actions, "✅ 当前无需操作，系统运行正常")
+	}
+
+	return actions
 }
 
 // HandlePlanList GET /api/plan?date=YYYYMMDD
