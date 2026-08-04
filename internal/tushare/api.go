@@ -178,6 +178,38 @@ func (c *Client) DailyByCode(tsCode, startDate, endDate string) ([]model.Bar, er
 	return result, nil
 }
 
+// IndexDaily 按交易日获取指数日线 (如 000300.SH 沪深300, 000001.SH 上证综指)
+func (c *Client) IndexDaily(tradeDate string) ([]model.Bar, error) {
+	params := map[string]interface{}{"trade_date": tradeDate}
+	rows, err := c.callAPI("index_daily", params, dailyFields)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]model.Bar, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, parseBar(row))
+	}
+	return result, nil
+}
+
+// IndexDailyByCode 按代码获取指数日线
+func (c *Client) IndexDailyByCode(tsCode, startDate, endDate string) ([]model.Bar, error) {
+	params := map[string]interface{}{
+		"ts_code":    tsCode,
+		"start_date": startDate,
+		"end_date":   endDate,
+	}
+	rows, err := c.callAPI("index_daily", params, dailyFields)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]model.Bar, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, parseBar(row))
+	}
+	return result, nil
+}
+
 // AdjFactor 获取复权因子
 // 当 tsCode 或 tradeDate 为空时对应参数不传, 由 Tushare 按默认处理
 func (c *Client) AdjFactor(tsCode, tradeDate string) ([]AdjFactor, error) {

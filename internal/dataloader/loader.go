@@ -74,6 +74,7 @@ func (l *Loader) Run(opts Options) error {
 	if err != nil {
 		return fmt.Errorf("查询交易日失败: %w", err)
 	}
+	l.syncIndexHistory(opts.StartDate, opts.EndDate)
 	l.syncDailyData(tradeCals)
 	l.syncOptional(opts, tradeCals)
 
@@ -205,6 +206,24 @@ func (l *Loader) syncOneDayExtras(calDate string) {
 			}
 		}
 	}
+
+	// 同步 watchlist 中的指数日线 (如 000300.SH 大盘过滤需要)
+	indexCodes := l.indexCodes()
+	if len(indexCodes) > 0 {
+		if idxBars, err := l.ts.IndexDaily(calDate); err == nil && len(idxBars) > 0 {
+			filtered := make([]model.Bar, 0, len(indexCodes))
+			for _, bar := range idxBars {
+				if indexCodes[bar.TsCode] {
+					filtered = append(filtered, bar)
+				}
+			}
+			if len(filtered) > 0 {
+				if err := l.barRepo.BatchInsert(filtered); err != nil {
+					logger.L().Errorf("存储 %s 指数日线失败: %v", calDate, err)
+				}
+			}
+		}
+	}
 }
 
 // SyncCalendarOnly 仅同步交易日历 (轻量级, 用于打破调度器日历死锁)
@@ -215,6 +234,36 @@ func (l *Loader) SyncCalendarOnly(start, end string) error {
 	}
 	l.syncCalendar(start, end)
 	return nil
+}
+
+// syncIndexHistory 同步 watchlist 中指数的历史日线 (按代码拉取, 不依赖交易日遍历)
+func (l *Loader) syncIndexHistory(start, end string) {
+	indexCodes := l.indexCodes()
+	if len(indexCodes) == 0 {
+		return
+	}
+	logger.L().Infof("=== 同步指数历史日线 (%d个) ===", len(indexCodes))
+	for code := range indexCodes {
+		bars, err := l.ts.DailyByCode(code, start, end)
+		if err != nil {
+			logger.L().Errorf("获取 %s 指数日线失败: %v", code, err)
+			continue
+		}
+		// DailyByCode 用的是 daily 接口, 指数需要 index_daily
+		// 这里直接用 IndexDailyByCode
+		if len(bars) == 0 {
+			bars, err = l.ts.IndexDailyByCode(code, start, end)
+			if err != nil {
+				logger.L().Errorf("获取 %s 指数日线(index)失败: %v", code, err)
+				continue
+			}
+		}
+		if err := l.barRepo.BatchInsert(bars); err != nil {
+			logger.L().Errorf("存储 %s 指数日线失败: %v", code, err)
+			continue
+		}
+		logger.L().Infof("  %s: %d 条", code, len(bars))
+	}
 }
 
 // watchCodes 获取关注股票代码集合(实例级缓存)
@@ -247,6 +296,24 @@ func (l *Loader) buildWatchCodeSet() map[string]bool {
 	if positions, err := l.portfolioRepo.GetAllPositions(); err == nil {
 		for _, p := range positions {
 			codeSet[p.TsCode] = true
+		}
+	}
+	return codeSet
+}
+
+// indexCodes 从 watchlist 中提取指数代码 (以 .SH 结尾且以 0/3 开头的通常是指数)
+// 000300.SH 沪深300, 000001.SH 上证综指, 399001.SZ 深证成指 等
+func (l *Loader) indexCodes() map[string]bool {
+	codeSet := make(map[string]bool)
+	for _, code := range l.cfg.Dataloader.Watchlist {
+		code = strings.TrimSpace(code)
+		if code == "" {
+			continue
+		}
+		// 指数代码: 000xxx.SH 或 399xxx.SZ
+		if (strings.HasPrefix(code, "000") || strings.HasPrefix(code, "399")) &&
+			(strings.HasSuffix(code, ".SH") || strings.HasSuffix(code, ".SZ")) {
+			codeSet[code] = true
 		}
 	}
 	return codeSet
