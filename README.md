@@ -137,7 +137,9 @@ curl http://127.0.0.1:8080/api/agent/brief         # Agent 全量上下文
 | 端点 | 说明 |
 |---|---|
 | `/api/agent/brief` | **Agent 首选**：计划+持仓+市场+健康度+辩论结果+决策变更+任务状态 一次拿全 |
+| `/api/agent/dashboard` | **Agent 仪表盘**：未读通知+今日通知+计划+辩论+变更+任务状态 汇总视图 |
 | `/api/agent/changes` | 决策变更检测：辩论结果对比 + 计划状态变更 + 任务完成状态 |
+| `/api/agent/alerts` | **通知存储**：飞书告警同时落库，Agent 可离线读取/标记已读 |
 | `/api/plan?date=` | 交易计划列表（不传 date 返回全部待处理） |
 | `/api/daily?date=` | 每日操盘报告（汇总） |
 | `/api/positions` | 持仓诊断 |
@@ -154,10 +156,46 @@ curl http://127.0.0.1:8080/api/agent/brief         # Agent 全量上下文
 | `/api/trade/confirm` | 人工成交后反馈 `{"ts_code","side","qty","price"}` |
 | `/api/portfolio/sync` | 同步真实持仓（`overwrite: false` 为增量 Upsert） |
 | `/api/system/update-data` | 手动触发数据更新 |
+| `/api/agent/alerts` | 标记通知已读 `{"id": 123}` 或 `{"all": true}` |
 
 ## Agent 接入指南（Hermes / 任意 AI Agent）
 
 本系统是 Agent 的“数据 + 执行后端”：调度器每个交易日自动完成数据更新→信号生成→盘中监控，结果全部落库；Agent 只需定时读取现成结果、审批计划、反馈成交，不需要自己算任何指标。
+
+### 前置配置：启用多智能体辩论
+
+在 `config.yaml` 中启用 LLM，辩论系统自动生效（不启用则仅用策略信号，跳过辩论）：
+
+```yaml
+# config.yaml
+llm:
+  enabled: true              # 改为 true 启用
+  api_key: ""                # 留空，用环境变量 LLM_API_KEY 注入
+  base_url: "https://api.deepseek.com/v1"  # DeepSeek 默认地址
+  model: "deepseek-chat"     # 或 deepseek-reasoner
+```
+
+```bash
+# 环境变量注入密钥（写入 NAS 的 .env 文件）
+export LLM_API_KEY=sk-your-deepseek-key
+```
+
+> LLM 启用后，每个买入信号会触发 4 位分析师 → 多空辩论 → 风险经理裁决，耗时约 10-30 秒/标的。未启用时系统正常运行，仅跳过辩论增强。
+
+### 通知存储机制
+
+调度器每次执行任务后的飞书通知**同时落库 SQLite**（`agent_alert` 表），即使飞书未配置或发送失败，Agent 也能通过 API 读取：
+
+```
+调度器任务完成 → alert() 方法
+  ├─ 1. 落库 agent_alert 表 (始终执行, 不受飞书配置影响)
+  └─ 2. 飞书推送 (可选, 失败不影响流程)
+         ↓
+Agent 轮询 GET /api/agent/alerts?unread_only=true
+  → 读取未读通知 → 通知用户 → POST /api/agent/alerts 标记已读
+```
+
+通知级别：`info`（常规） / `warning`（警告） / `urgent`（紧急/止损/崩溃） / `success`（成功）
 
 ### 鉴权
 
@@ -170,14 +208,21 @@ export JZ_API_TOKEN="your-random-token"    # 服务端: config 留空则从环�
 
 | 时间 | Agent 动作 | 说明 |
 |---|---|---|
-| 15:35 后 | `GET /api/agent/brief` | 调度器 15:10 更新数据、15:30 生成计划+辩论，此时结果已就绪 |
-| 15:35 后 | `GET /api/agent/changes` | 检查决策变更、计划状态变更、任务完成状态 |
+| 09:25-15:00 | `GET /api/agent/alerts?unread_only=true` | 盘中每 5 分钟轮询未读通知（止损告警等紧急通知） |
+| 15:35 后 | `GET /api/agent/dashboard` | 一次性获取：未读通知+计划+辩论+变更+任务状态 |
+| 15:35 后 | `GET /api/agent/brief` | 详细上下文（持仓诊断+市场概况+辩论结果） |
+| 15:35 后 | `GET /api/agent/changes` | 检查决策变更、计划状态变更 |
 | 审阅后 | `POST /api/plan/confirm` | 逐条确认要执行的计划 |
 | 成交后 | `POST /api/trade/confirm` | 人工/券商成交后反馈，保持持仓同步 |
-| 盘中（可选） | `GET /api/plan` | 盘中止损监控产生的 urgent 计划会实时出现在这里（同时飞书告警） |
+| 读取后 | `POST /api/agent/alerts` | 标记通知已读 `{"all": true}` |
 | 任意 | `GET /api/health` | 存活与任务健康度巡检 |
 
-> **通知机制**: 调度器每次执行任务后自动通过飞书推送结果通知（无论有无交易计划），包含计划汇总、决策变更检测、待处理计划提醒。用户收到通知后审阅并操作，Agent 下次执行时自动检查状态是否更新。
+> **24h 闭环工作流**:
+> 1. 系统常驻运行，调度器到点自动执行任务（数据更新→信号生成→辩论→日报→盘中监控→清理）
+> 2. 每次任务完成后，通知**同时落库 + 飞书推送**（无论有无交易计划都通知）
+> 3. Agent 轮询 `/api/agent/alerts` 读取通知 → 通知用户操作
+> 4. 用户操作后（确认计划/反馈成交），Agent 下次执行时检查 `task_completed` + `plan_status_summary` 确认状态已更新
+> 5. 决策变更自动检测：每次辩论结果与历史对比，变化通过 `/api/agent/changes` 查询
 
 ### 1. 读取全量上下文
 
@@ -283,7 +328,49 @@ curl -X POST http://NAS_IP:8080/api/portfolio/sync \
 变更检测（可选）：
 GET /api/agent/changes?date=YYYYMMDD
 返回决策变更、计划状态变更、任务完成状态的完整报告。
+
+通知读取（每次执行时检查）：
+GET /api/agent/alerts?unread_only=true
+→ 有未读通知时，按 level 排序（urgent > warning > info > success）通知用户
+→ 通知用户后: POST /api/agent/alerts {"all": true} 标记已读
+
+仪表盘（一次拿全）：
+GET /api/agent/dashboard
+→ 未读通知 + 今日通知 + 待处理计划 + 辩论结果 + 决策变更 + 任务状态
 ```
+
+### 5. 读取飞书通知存档（Agent 核心）
+
+调度器所有通知（信号/日报/止损/告警）都会落库，Agent 读取后通知用户：
+
+```bash
+# 获取未读通知
+curl http://NAS_IP:8080/api/agent/alerts?unread_only=true
+
+# 响应示例
+{
+  "alerts": [{
+    "id": 15, "trade_date": "20260804",
+    "job_name": "signal", "level": "info",
+    "title": "📋 惊蛰交易信号",
+    "content": "📅 20260804 信号生成完成: 今日无交易计划
+策略未触发买卖信号, 继续持有当前仓位",
+    "status": "unread", "created_at": "2026-08-04 15:30:12"
+  }],
+  "total": 1, "unread_count": 1
+}
+
+# 标记已读（通知用户后执行）
+curl -X POST http://NAS_IP:8080/api/agent/alerts   -H "Authorization: Bearer $JZ_API_TOKEN"   -H "Content-Type: application/json"   -d '{"all": true}'
+```
+
+### 6. Agent 仪表盘（一次拿全）
+
+```bash
+curl http://NAS_IP:8080/api/agent/dashboard
+```
+
+返回未读通知 + 今日通知 + 待处理计划 + 辩论结果 + 决策变更 + 任务完成状态 + 计划汇总，适合 Agent 首次拉取时一次性获取全量上下文。
 
 ## 多智能体辩论系统
 
@@ -327,6 +414,68 @@ GET /api/agent/changes?date=YYYYMMDD
 - 风险等级变化
 
 变更结果通过 `/api/agent/changes` 接口查询，同时在飞书通知中提示。
+
+## AI Agent 完整工作流
+
+以下是一个完整的 Agent 24h 运行周期，对应"系统常驻 → 到点执行 → 通知用户 → 用户操作 → 检查状态"的闭环：
+
+### 系统侧（自动，无需 Agent 介入）
+
+```
+00:00  系统常驻运行 (systemd 保活)
+09:25  调度器检查: 是否交易日?
+       └─ 是 → 盘中止损监控就绪 (每 5 分钟检查持仓)
+       └─ 否 → 跳过交易任务, 仅 16:30 数据清理
+09:30-15:00  盘中监控 (触发止损 → 紧急计划 + 告警落库 + 飞书推送)
+15:10  数据更新 (Tushare 行情入库)
+15:30  EOD信号生成 → 多智能体辩论 → 交易计划落库 → 通知落库 + 飞书推送
+15:35  对账 (仅 QMT 实盘)
+15:45  日报生成 + 飞书推送 + 操作提醒落库
+16:30  数据清理 + WAL checkpoint
+```
+
+### Agent 侧（定时轮询）
+
+```
+每 5 分钟 (09:25-15:00):
+  GET /api/agent/alerts?unread_only=true
+  → 有 urgent 通知 → 立即通知用户 (止损/告警)
+  → 有 info 通知 → 记录, 等收盘后汇总
+  → 通知用户后 POST /api/agent/alerts {"all": true}
+
+15:35 后 (收盘):
+  GET /api/agent/dashboard
+  → 检查 task_completed.signal == true (信号已生成)
+  → 检查 open_plans (待确认的交易计划)
+  → 检查 decision_changes (决策变更)
+  → 检查 unread alerts (当日所有通知)
+  → 汇总通知用户: "今日N条计划待确认, M个标的决策变更..."
+
+用户操作后:
+  → 用户确认计划 → POST /api/plan/confirm {"id": X}
+  → 用户成交反馈 → POST /api/trade/confirm {...}
+  → Agent 记录操作, 下次轮询时检查 plan_status_summary 确认状态更新
+
+次日 15:35:
+  GET /api/agent/changes?date=YYYYMMDD
+  → 对比昨日: 决策是否变化? 计划是否执行? 任务是否完成?
+  → 如有变化通知用户: "XX股票决策从买入变为持有..."
+```
+
+### 配置清单
+
+| 配置项 | 位置 | 说明 |
+|---|---|---|
+| `llm.enabled` | config.yaml | `true` 启用多智能体辩论 |
+| `llm.api_key` | 环境变量 `LLM_API_KEY` | DeepSeek API Key |
+| `llm.base_url` | config.yaml | DeepSeek API 地址 |
+| `llm.model` | config.yaml | `deepseek-chat` 或 `deepseek-reasoner` |
+| `feishu.webhook_url` | 环境变量 `FEISHU_WEBHOOK` | 飞书机器人 webhook（可选，通知始终落库） |
+| `server.api_token` | 环境变量 `JZ_API_TOKEN` | API 鉴权 token |
+| `scheduler.signal_time` | config.yaml | 信号生成时间 (默认 15:30) |
+| `scheduler.report_time` | config.yaml | 日报时间 (默认 15:45) |
+| `scheduler.intraday.enabled` | config.yaml | 盘中止损监控 (默认 true) |
+| `scheduler.intraday.interval_min` | config.yaml | 盘中监控间隔 (默认 5 分钟) |
 
 ## 数据自动清理
 

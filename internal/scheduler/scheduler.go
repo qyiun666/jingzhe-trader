@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
@@ -231,8 +232,58 @@ func (s *Scheduler) finishJob(jobID int64, status, errMsg string) {
 	}
 }
 
-// alert 飞书告警 (降级: 发送失败只打日志)
+// alert 飞书告警 + 落库 (Agent 可通过 /api/agent/alerts 读取)
+// 降级: 飞书发送失败只打日志, 不影响落库
 func (s *Scheduler) alert(title, text string) {
+	// 1. 落库 (无论飞书是否配置, 都存一份供 Agent 读取)
+	alertRepo := store.NewAlertRepo(s.db)
+	level := store.AlertLevelInfo
+	jobName := ""
+	today := time.Now().Format("20060102")
+
+	// 根据标题推断级别和来源
+	switch {
+	case strings.Contains(title, "🚨") || strings.Contains(title, "崩溃") || strings.Contains(title, "失败"):
+		level = store.AlertLevelUrgent
+	case strings.Contains(title, "⚠️"):
+		level = store.AlertLevelWarning
+	case strings.Contains(title, "✅"):
+		level = store.AlertLevelSuccess
+	}
+
+	// 从标题提取 job_name
+	for _, name := range []string{"信号", "日报", "对账", "止损", "计划", "提醒"} {
+		if strings.Contains(title, name) {
+			switch name {
+			case "信号":
+				jobName = "signal"
+			case "日报":
+				jobName = "report"
+			case "对账":
+				jobName = "reconcile"
+			case "止损":
+				jobName = "intraday_monitor"
+			case "计划":
+				jobName = "signal"
+			case "提醒":
+				jobName = "report"
+			}
+			break
+		}
+	}
+
+	alert := &store.AgentAlert{
+		TradeDate: today,
+		JobName:   jobName,
+		Level:     level,
+		Title:     title,
+		Content:   text,
+	}
+	if _, err := alertRepo.Insert(alert); err != nil {
+		logger.L().Warnw("通知落库失败", "title", title, "err", err)
+	}
+
+	// 2. 飞书发送 (失败不影响流程)
 	if err := s.notifier.SendText(title + "\n" + text); err != nil {
 		logger.L().Warnw("飞书告警发送失败", "err", err)
 	}

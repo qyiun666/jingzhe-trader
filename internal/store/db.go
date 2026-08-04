@@ -320,6 +320,21 @@ func migrate(db *sqlx.DB) error {
 			finished_at TEXT
 		);
 		CREATE INDEX IF NOT EXISTS idx_job_run_name_date ON job_run(job_name, trade_date);`,
+
+		// 智能体通知记录 (飞书告警同时落库, Agent 读取后通知用户)
+		`CREATE TABLE IF NOT EXISTS agent_alert (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			trade_date  TEXT NOT NULL,
+			job_name    TEXT NOT NULL,
+			level       TEXT NOT NULL DEFAULT 'info',
+			title       TEXT NOT NULL,
+			content     TEXT NOT NULL,
+			status      TEXT NOT NULL DEFAULT 'unread',
+			created_at  TEXT NOT NULL,
+			read_at     TEXT
+		);
+		CREATE INDEX IF NOT EXISTS idx_agent_alert_date ON agent_alert(trade_date);
+		CREATE INDEX IF NOT EXISTS idx_agent_alert_status ON agent_alert(status);`,
 	}
 
 	for _, s := range stmts {

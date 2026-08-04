@@ -96,8 +96,10 @@ func NewRouter(svc *Service) http.Handler {
 	mux.HandleFunc("/api/trade/confirm", svc.HandleTradeConfirm) // POST 交易确认
 
 	// Agent 专用接口
-	mux.HandleFunc("/api/agent/brief", svc.HandleAgentBrief)   // GET Agent全量上下文
-	mux.HandleFunc("/api/agent/changes", svc.HandleAgentChanges) // GET 决策变更检测
+	mux.HandleFunc("/api/agent/brief", svc.HandleAgentBrief)     // GET Agent全量上下文
+	mux.HandleFunc("/api/agent/changes", svc.HandleAgentChanges)  // GET 决策变更检测
+	mux.HandleFunc("/api/agent/alerts", svc.HandleAgentAlerts)    // GET/POST 通知(飞书告警副本)
+	mux.HandleFunc("/api/agent/dashboard", svc.HandleAgentDashboard) // GET Agent仪表盘汇总
 	mux.HandleFunc("/api/plan", svc.HandlePlanList)          // GET 交易计划列表
 	mux.HandleFunc("/api/plan/confirm", svc.HandlePlanConfirm) // POST 确认交易计划
 	mux.HandleFunc("/api/reconcile", svc.HandleReconcile)    // GET 持仓对账
