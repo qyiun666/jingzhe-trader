@@ -36,6 +36,10 @@ AI Agent（如 Hermes）只需定时 GET 只读 API 拿现成结果，POST 确�
                       │  统一执行管道 engine.Pipeline                      │
                       │   信号 → 智能体辩论 → 风控 → Broker下单 → 落库     │
                       │   (回测/模拟/实盘共用, 只换 Broker 实现)            │
+                      │                                                  │
+                      │  策略实例缓存 (避免重建丢失状态)                    │
+                      │  共享Repo (避免重复实例化)                          │
+                      │  新闻按股票池过滤 (优先展示相关新闻)                │
                       └───────────────────┬──────────────────────────────┘
                                           │ SQLite (WAL)
                       ┌───────────────────┴──────────────────────────────┐
@@ -60,11 +64,13 @@ AI Agent（如 Hermes）只需定时 GET 只读 API 拿现成结果，POST 确�
 - **回测即实盘** — 回测/模拟/实盘共用同一条 `信号 → 风控 → 下单 → 落库` 管道，回测结果不虚高
 - **风控内建** — 止损/止盈信号优先执行、单票/总仓位/板块敞口限制、含手续费的买入资金检查
 - **全自动闭环** — 内置调度器：数据更新 → EOD 信号 → 对账 → 日报飞书推送 → 盘中止损监控 → 数据自动清理
-- **常驻稳定** — 任务 panic 隔离、job_run 防重复/启动补跑、优雅关机、WAL checkpoint、goroutine 纪律
-- **多策略支持** — 均线交叉 / MACD / 布林带突破 / 多因子选股，动态策略选择器按市况切换
+- **常驻稳定** — 任务 panic 隔离、job_run 防重复/启动补跑、优雅关机（WaitGroup 等待任务收尾）、WAL checkpoint、goroutine 纪律
+- **多策略支持** — 均线交叉 / MACD / 布林带突破 / 多因子选股 / 日内做T，动态策略选择器按市况切换，策略实例缓存避免状态丢失
 - **LLM 辅助** — 集成 DeepSeek 等大模型深度分析新闻舆情（可选）
 - **多智能体辩论** — 4位分析师(技术/基本面/新闻/市场)并行分析 → 多空研究员辩论 → 风险管理经理裁决，对买入信号做二次验证（LLM 可用时自动启用）
 - **决策变更追踪** — 每次辩论结果与历史对比，自动检测决策方向、置信度、风险等级变化并通知
+- **新闻智能过滤** — 按配置股票池关键词优先展示相关新闻，不足时补充热点新闻
+- **共享仓储层** — Service 持有共享 Repo 实例，避免每次请求重复创建数据库访问对象
 
 ## 快速开始
 
@@ -89,9 +95,9 @@ cp config/config.example.yaml config/config.yaml
 
 ```bash
 export TUSHARE_TOKEN=你的tushare token       # 必需, 行情数据源
-export JZ_API_TOKEN=随机长字符串              # 推荐, API写接口鉴权
+export JZ_API_TOKEN=随机长字符串              # 推荐, API鉴权token
 export FEISHU_WEBHOOK=飞书机器人webhook       # 可选, 日报/告警推送
-export LLM_API_KEY=deepseek密钥              # 可选, 新闻分析
+export LLM_API_KEY=deepseek密钥              # 可选, 新闻分析+多智能体辩论
 export QMT_SIDECAR_TOKEN=随机长字符串         # QMT实盘时, sidecar鉴权
 ```
 
@@ -108,9 +114,10 @@ bin/backtest -config config/config.yaml            # 回测并生成HTML报告
 
 ```bash
 bin/server -config config/config.yaml
-# 默认监听 127.0.0.1:8080, 调度器自动运行
-curl http://127.0.0.1:8080/api/health              # 健康检查
-curl http://127.0.0.1:8080/api/agent/brief         # Agent 全量上下文
+# 监听端口取自 config.yaml 的 server.port (example 默认 11270)
+curl http://127.0.0.1:11270/api/health              # 健康检查 (无需鉴权)
+curl -H "Authorization: Bearer $JZ_API_TOKEN" \
+     http://127.0.0.1:11270/api/agent/brief         # Agent 全量上下文 (需鉴权)
 ```
 
 ## 小资金配置指南（1 万元档）
@@ -119,10 +126,10 @@ curl http://127.0.0.1:8080/api/agent/brief         # Agent 全量上下文
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `risk.max_position_pct` | 0.6 | 单票上限 60%（小资金必须集中） |
-| `risk.max_total_position_pct` | 1.0 | 总仓位可满仓 |
-| `risk.stop_loss_pct` | 0.05 | 止损 -5% |
-| `risk.take_profit_pct` | 0.10 | 止盈 +10% |
+| `risk.max_position_pct` | 0.4 | 单票上限 40%（小资金必须集中） |
+| `risk.max_total_position_pct` | 0.9 | 总仓位上限 90%（保留10%现金做T） |
+| `risk.stop_loss_pct` | 0.08 | 止损 -8% |
+| `risk.take_profit_pct` | 0.15 | 止盈 +15% |
 | `trading.min_trade_amount` | 3000 | 小资金降低门槛（0=自适应5000元太高，1万资金×40%仓位=4000<5000会被风控全部拦截）；设 3000 确保能成交 |
 | `trading.max_positions` | 0 | 0=自适应：<5万→2只，<20万→4只，否则6只 |
 | `trading.auto_execute` | false | 默认只生成计划，人/Agent 确认后执行 |
@@ -132,7 +139,22 @@ curl http://127.0.0.1:8080/api/agent/brief         # Agent 全量上下文
 
 ## API 一览
 
-只读接口（GET，无需 token）：
+### 鉴权规则
+
+配置 `server.api_token` 后（推荐），**所有 `/api/*` 路径（含 GET）都需要 Bearer token 鉴权**，仅以下两个端点豁免：
+
+| 豁免端点 | 原因 |
+|---|---|
+| `/api/health` | 健康检查（监控脚本用） |
+| `/` | 仪表盘 HTML 页面 |
+
+其余所有 API 请求需携带 `Authorization: Bearer <token>` 头：
+
+```bash
+curl -H "Authorization: Bearer $JZ_API_TOKEN" http://127.0.0.1:11270/api/agent/brief
+```
+
+### 只读接口（GET）
 
 | 端点 | 说明 |
 |---|---|
@@ -144,11 +166,15 @@ curl http://127.0.0.1:8080/api/agent/brief         # Agent 全量上下文
 | `/api/daily?date=` | 每日操盘报告（汇总） |
 | `/api/positions` | 持仓诊断 |
 | `/api/market` / `/api/news` / `/api/strategy` | 市场概况 / 新闻舆情 / 策略建议 |
+| `/api/news/llm?limit=5` | LLM 深度新闻分析（可选，需启用 LLM） |
+| `/api/strategy/status` | 动态策略选择器状态（当前策略/市场环境/置信度） |
 | `/api/reconcile?date=` | 本地 vs 券商对账 |
-| `/api/health` | uptime / goroutine数 / db大小 / 各任务最近成功时间 |
+| `/api/health` | uptime / goroutine数 / db大小 / 各任务最近成功时间（**无需鉴权**） |
 | `/api/system/status` | 数据新鲜度 / 持仓数 / 下一交易日 |
+| `/api/kline?code=&start=&end=` | K线数据 |
+| `/api/snapshots?limit=30` | 账户快照历史 |
 
-写接口（POST，配置 `server.api_token` 后需 `Authorization: Bearer <token>`）：
+### 写接口（POST）
 
 | 端点 | 说明 |
 |---|---|
@@ -156,11 +182,12 @@ curl http://127.0.0.1:8080/api/agent/brief         # Agent 全量上下文
 | `/api/trade/confirm` | 人工成交后反馈 `{"ts_code","side","qty","price"}` |
 | `/api/portfolio/sync` | 同步真实持仓（`overwrite: false` 为增量 Upsert） |
 | `/api/system/update-data` | 手动触发数据更新 |
+| `/api/strategy/switch` | 手动切换策略 `{"strategy": "ma_cross"}` 或 `?name=ma_cross` |
 | `/api/agent/alerts` | 标记通知已读 `{"id": 123}` 或 `{"all": true}` |
 
 ## Agent 接入指南（Hermes / 任意 AI Agent）
 
-本系统是 Agent 的“数据 + 执行后端”：调度器每个交易日自动完成数据更新→信号生成→盘中监控，结果全部落库；Agent 只需定时读取现成结果、审批计划、反馈成交，不需要自己算任何指标。
+本系统是 Agent 的"数据 + 执行后端"：调度器每个交易日自动完成数据更新→信号生成→盘中监控，结果全部落库；Agent 只需定时读取现成结果、审批计划、反馈成交，不需要自己算任何指标。
 
 ### 前置配置：启用多智能体辩论
 
@@ -201,7 +228,8 @@ Agent 轮询 GET /api/agent/alerts?unread_only=true
 
 ```bash
 export JZ_API_TOKEN="your-random-token"    # 服务端: config 留空则从环境变量 JZ_API_TOKEN 读取
-# Agent 侧所有 POST 请求带头: Authorization: Bearer $JZ_API_TOKEN  (GET 无需 token)
+# Agent 侧所有 /api/* 请求都需带头: Authorization: Bearer $JZ_API_TOKEN
+# 例外: GET /api/health 和 GET / 无需鉴权
 ```
 
 ### 推荐轮询节奏（交易日）
@@ -215,7 +243,7 @@ export JZ_API_TOKEN="your-random-token"    # 服务端: config 留空则从环�
 | 审阅后 | `POST /api/plan/confirm` | 逐条确认要执行的计划 |
 | 成交后 | `POST /api/trade/confirm` | 人工/券商成交后反馈，保持持仓同步 |
 | 读取后 | `POST /api/agent/alerts` | 标记通知已读 `{"all": true}` |
-| 任意 | `GET /api/health` | 存活与任务健康度巡检 |
+| 任意 | `GET /api/health` | 存活与任务健康度巡检（无需鉴权） |
 
 > **24h 闭环工作流**:
 > 1. 系统常驻运行，调度器到点自动执行任务（数据更新→信号生成→辩论→日报→盘中监控→清理）
@@ -227,7 +255,8 @@ export JZ_API_TOKEN="your-random-token"    # 服务端: config 留空则从环�
 ### 1. 读取全量上下文
 
 ```bash
-curl http://NAS_IP:8080/api/agent/brief
+curl -H "Authorization: Bearer $JZ_API_TOKEN" \
+     http://NAS_IP:11270/api/agent/brief
 ```
 
 响应字段（`data`）：
@@ -280,7 +309,7 @@ curl http://NAS_IP:8080/api/agent/brief
 ### 2. 确认执行计划
 
 ```bash
-curl -X POST http://NAS_IP:8080/api/plan/confirm \
+curl -X POST http://NAS_IP:11270/api/plan/confirm \
   -H "Authorization: Bearer $JZ_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"id": 12}'
@@ -295,7 +324,7 @@ curl -X POST http://NAS_IP:8080/api/plan/confirm \
 ### 3. 人工成交后反馈（保持账本一致）
 
 ```bash
-curl -X POST http://NAS_IP:8080/api/trade/confirm \
+curl -X POST http://NAS_IP:11270/api/trade/confirm \
   -H "Authorization: Bearer $JZ_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"ts_code":"000001.SZ","side":"buy","qty":500,"price":11.15}'
@@ -304,12 +333,33 @@ curl -X POST http://NAS_IP:8080/api/trade/confirm \
 ### 4. 首次接入：同步真实持仓
 
 ```bash
-curl -X POST http://NAS_IP:8080/api/portfolio/sync \
+curl -X POST http://NAS_IP:11270/api/portfolio/sync \
   -H "Authorization: Bearer $JZ_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"cash": 10392.74, "overwrite": true, "positions": [
         {"ts_code":"510050.SH","total_qty":500,"available_qty":500,"cost_price":3.059}
       ]}'
+```
+
+### 5. 手动切换策略
+
+```bash
+# 方式1: query param
+curl -X POST "http://NAS_IP:11270/api/strategy/switch?name=macd" \
+  -H "Authorization: Bearer $JZ_API_TOKEN"
+
+# 方式2: JSON body
+curl -X POST http://NAS_IP:11270/api/strategy/switch \
+  -H "Authorization: Bearer $JZ_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"strategy": "macd"}'
+```
+
+查看当前策略状态：
+
+```bash
+curl -H "Authorization: Bearer $JZ_API_TOKEN" \
+     http://NAS_IP:11270/api/strategy/status
 ```
 
 ### Agent 提示词建议（可直接复制进 Agent 的定时任务）
@@ -339,13 +389,14 @@ GET /api/agent/dashboard
 → 未读通知 + 今日通知 + 待处理计划 + 辩论结果 + 决策变更 + 任务状态
 ```
 
-### 5. 读取飞书通知存档（Agent 核心）
+### 6. 读取飞书通知存档（Agent 核心）
 
 调度器所有通知（信号/日报/止损/告警）都会落库，Agent 读取后通知用户：
 
 ```bash
 # 获取未读通知
-curl http://NAS_IP:8080/api/agent/alerts?unread_only=true
+curl -H "Authorization: Bearer $JZ_API_TOKEN" \
+     http://NAS_IP:11270/api/agent/alerts?unread_only=true
 
 # 响应示例
 {
@@ -353,21 +404,24 @@ curl http://NAS_IP:8080/api/agent/alerts?unread_only=true
     "id": 15, "trade_date": "20260804",
     "job_name": "signal", "level": "info",
     "title": "📋 惊蛰交易信号",
-    "content": "📅 20260804 信号生成完成: 今日无交易计划
-策略未触发买卖信号, 继续持有当前仓位",
+    "content": "📅 20260804 信号生成完成: 今日无交易计划\n策略未触发买卖信号, 继续持有当前仓位",
     "status": "unread", "created_at": "2026-08-04 15:30:12"
   }],
   "total": 1, "unread_count": 1
 }
 
 # 标记已读（通知用户后执行）
-curl -X POST http://NAS_IP:8080/api/agent/alerts   -H "Authorization: Bearer $JZ_API_TOKEN"   -H "Content-Type: application/json"   -d '{"all": true}'
+curl -X POST http://NAS_IP:11270/api/agent/alerts \
+  -H "Authorization: Bearer $JZ_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"all": true}'
 ```
 
-### 6. Agent 仪表盘（一次拿全）
+### 7. Agent 仪表盘（一次拿全）
 
 ```bash
-curl http://NAS_IP:8080/api/agent/dashboard
+curl -H "Authorization: Bearer $JZ_API_TOKEN" \
+     http://NAS_IP:11270/api/agent/dashboard
 ```
 
 返回未读通知 + 今日通知 + 待处理计划 + 辩论结果 + 决策变更 + 任务完成状态 + 计划汇总，适合 Agent 首次拉取时一次性获取全量上下文。
@@ -393,7 +447,7 @@ curl http://NAS_IP:8080/api/agent/dashboard
 |---|---|---|
 | 技术分析师 | MA/RSI/MACD/布林带/成交量分析 | 90日K线 |
 | 基本面分析师 | PE/PB/ROE/营收增长/负债率 | 基本面+财务数据 |
-| 新闻分析师 | 个股相关新闻情感分析 | 新闻库 |
+| 新闻分析师 | 个股相关新闻情感分析 | 新闻库（按股票池过滤） |
 | 市场分析师 | 大盘趋势/市场情绪/板块轮动 | 指数K线 |
 | 看涨研究员 | 从分析师报告中提炼买入理由 | 4份分析师报告 |
 | 看跌研究员 | 从分析师报告中提炼风险因素 | 4份分析师报告 |
@@ -404,6 +458,7 @@ curl http://NAS_IP:8080/api/agent/dashboard
 - **buy**: 通过辩论验证，建议买入（可能调整仓位比例）
 - **hold**: 建议持有/观望，不执行买入
 - **reject**: 否决买入信号，不进入交易计划
+- **sell**: 建议卖出（已持仓时）
 
 ### 决策变更检测
 
@@ -414,6 +469,37 @@ curl http://NAS_IP:8080/api/agent/dashboard
 - 风险等级变化
 
 变更结果通过 `/api/agent/changes` 接口查询，同时在飞书通知中提示。
+
+## 选股与新闻过滤机制
+
+### 选股逻辑
+
+系统**只在配置的股票池 + 当前持仓**中选股，不做全市场扫描：
+
+1. **股票池来源**：`config.yaml` 中 `universe.bluechip` + `universe.tech`（逗号分隔的股票代码）
+2. **持仓补充**：当前持仓的股票自动加入选股范围（即使不在配置池中）
+3. **行情过滤**：只有当日有行情数据的股票才会被策略扫描
+4. **数据加载器同步**：`dataloader.filter_mode: true` 时，只拉取股票池+持仓+关注列表的数据，大幅减少数据量
+
+```yaml
+# config.yaml 示例
+universe:
+  bluechip: "000725.SZ,002230.SZ,002415.SZ,002475.SZ,000001.SZ,600030.SH"
+  tech: "000725.SZ,002230.SZ,002415.SZ,002475.SZ"
+
+dataloader:
+  filter_mode: true          # 只拉股票池数据
+  watchlist: ["000300.SH"]   # 额外关注沪深300指数
+```
+
+### 新闻过滤逻辑
+
+新闻展示和分析按股票池优先过滤：
+
+1. **关键词匹配**：股票代码（如 `000001.SZ`）、6位代码（如 `000001`）、股票名称（如 `平安银行`）
+2. **优先展示**：与持仓/配置池相关的新闻排在前
+3. **热点补充**：相关新闻不足20条时，用近期热点新闻补充
+4. **LLM辩论**：新闻分析师只分析与当前标的相关的新闻
 
 ## AI Agent 完整工作流
 
@@ -471,11 +557,17 @@ curl http://NAS_IP:8080/api/agent/dashboard
 | `llm.base_url` | config.yaml | DeepSeek API 地址 |
 | `llm.model` | config.yaml | `deepseek-chat` 或 `deepseek-reasoner` |
 | `feishu.webhook_url` | 环境变量 `FEISHU_WEBHOOK` | 飞书机器人 webhook（可选，通知始终落库） |
-| `server.api_token` | 环境变量 `JZ_API_TOKEN` | API 鉴权 token |
+| `server.api_token` | 环境变量 `JZ_API_TOKEN` | API 鉴权 token（所有 /api/* 请求需携带） |
+| `server.port` | config.yaml | HTTP 监听端口（example 默认 11270，代码默认 8080） |
 | `scheduler.signal_time` | config.yaml | 信号生成时间 (默认 15:30) |
 | `scheduler.report_time` | config.yaml | 日报时间 (默认 15:45) |
 | `scheduler.intraday.enabled` | config.yaml | 盘中止损监控 (默认 true) |
 | `scheduler.intraday.interval_min` | config.yaml | 盘中监控间隔 (默认 5 分钟) |
+| `universe.bluechip` | config.yaml | 股票池-蓝筹（逗号分隔代码） |
+| `universe.tech` | config.yaml | 股票池-科技（逗号分隔代码） |
+| `dataloader.filter_mode` | config.yaml | `true` 只拉股票池数据（推荐） |
+| `trading.min_trade_amount` | config.yaml | 最小单笔交易金额（小资金设3000） |
+| `trading.auto_execute` | config.yaml | `true` 确认即下单（需QMT） |
 
 ## 数据自动清理
 
@@ -626,6 +718,9 @@ sqlite3 /opt/jingzhe-trader/data/jingzhe.db "SELECT COUNT(*) FROM daily_bar WHER
 
 # 6. 健康检查 cron 已生效
 grep jingzhe /var/log/syslog 2>/dev/null || tail -5 /opt/jingzhe-trader/logs/health_check.log
+
+# 7. 鉴权验证 (配置了 api_token 时)
+curl -s -H "Authorization: Bearer $JZ_API_TOKEN" http://127.0.0.1:11270/api/agent/brief | head
 ```
 
 ### 日常更新（NAS 拉取新代码 → 重新编译 → 重启）
@@ -635,17 +730,12 @@ grep jingzhe /var/log/syslog 2>/dev/null || tail -5 /opt/jingzhe-trader/logs/hea
 ```bash
 cd /opt/jingzhe-trader
 
-# 1. 拉取最新代码
-git pull origin main
-
-# 2. 重新编译 (停服前编译, 避免编译报错导致无可用二进制)
-go build -o bin/server     ./cmd/server
-go build -o bin/dataloader ./cmd/dataloader
-
-# 3. 重启服务 (systemd 会优雅关机: SIGTERM 等 15s → WAL checkpoint → 拉起新进程)
+# 一键更新 (拉取 + 编译 + 重启)
+git pull origin main && \
+go build -o bin/server ./cmd/server && \
 sudo systemctl restart jingzhe
 
-# 4. 验证
+# 验证
 sleep 3
 sudo systemctl status jingzhe
 curl -s http://127.0.0.1:11270/api/health
@@ -661,8 +751,10 @@ curl -s http://127.0.0.1:11270/api/health
 | 数据一直不更新 | 检查 Tushare token 是否过期；`./bin/dataloader -config config/config.yaml` 手动跑看报错 |
 | 今天不在交易日历 | 健康检查脚本会自动补；也可手动 `./bin/dataloader -config config/config.yaml` |
 | 周末调度器不工作 | 正常，调度器用系统时间判断周末，非交易日不执行数据/信号任务 |
-| API 返回 401 | GET 接口无需 token；POST 接口需 `Authorization: Bearer $JZ_API_TOKEN` |
+| API 返回 401 | 所有 `/api/*` 请求需 `Authorization: Bearer $JZ_API_TOKEN`（仅 `/api/health` 和 `/` 豁免） |
+| 策略信号丢失 | 策略实例已缓存，重启服务后会重新初始化；检查 `config.yaml` 股票池是否有当日行情 |
 | 磁盘空间告警 | 调度器每日 16:30 自动清理；紧急可 `sqlite3 data/jingzhe.db "VACUUM;"` |
+| LLM 辩论无结果 | 检查 `llm.enabled: true` 和 `LLM_API_KEY` 环境变量；LLM 不可用时自动降级为规则判断 |
 
 ### macOS (launchd)
 
@@ -688,13 +780,15 @@ internal/
   engine/       统一执行管道 Pipeline (回测=实盘)
   broker/       Broker接口: PaperBroker(模拟撮合) / QMTBridge
   risk/         风控: 止损止盈 / 仓位限制 / 小资金自适应 sizing
-  scheduler/    内置调度器 (job_run 防重/补跑/panic隔离/增强通知)
-  strategy/     策略与动态选择器
-  store/        SQLite 仓储 + retention 数据清理 + 辩论结果存储
+  scheduler/    内置调度器 (job_run 防重/补跑/panic隔离/WaitGroup优雅关闭/增强通知)
+  strategy/     策略与动态选择器 (实例缓存/SwitchTo手动切换)
+  store/        SQLite 仓储 (共享Repo/retention清理/辩论结果/通知存储)
   quote/        盘中实时行情 (腾讯免费源 / QMT)
   notify/       飞书通知
-  api/          HTTP API (鉴权/CORS/recover 中间件)
+  api/          HTTP API (全路径鉴权/CORS/recover中间件/策略缓存)
   dataloader/   Tushare 数据同步 (库化, CLI与调度器共用)
+  llm/          LLM 客户端 (DeepSeek兼容/新闻分析)
+  config/       配置管理 (环境变量覆盖敏感项)
 ```
 
 ## 免责声明
