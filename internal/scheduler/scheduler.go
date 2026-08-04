@@ -99,27 +99,35 @@ func (s *Scheduler) Start(ctx context.Context) {
 func (s *Scheduler) tick() {
 	now := time.Now()
 	today := now.Format("20060102")
+	weekday := now.Weekday()
 
-	// 日历死锁修复: 检查今天是否在交易日历中
-	// 如果日历中没有今天的记录(日历数据过期), 先同步日历再判断
-	hasCal, err := s.calRepo.HasDate(today)
-	if err != nil {
-		logger.L().Warnw("调度器: 查询日历失败", "err", err)
+	// 1. 系统时间判断周末: 周六周日直接跳过交易任务 (不依赖数据库)
+	if weekday == time.Saturday || weekday == time.Sunday {
+		logger.L().Infow("调度器: 今天是周末, 跳过交易任务", "date", today, "weekday", weekday)
+		s.maybeRunDaily(JobRetention, s.cfg.Retention.CleanupTime, now, today, func(date string) error {
+			return s.runRetention(date, false)
+		})
 		return
 	}
-	if !hasCal {
-		logger.L().Warnw("调度器: 今日不在交易日历中, 同步日历...", "date", today)
-		if err := s.svc.SyncCalendar(); err != nil {
-			logger.L().Errorw("调度器: 同步交易日历失败", "err", err)
-			return
-		}
-		logger.L().Info("调度器: 交易日历同步完成, 重新判断交易日")
-	}
 
-	isTradeDay, err := s.calRepo.IsTradeDay(today)
+	// 2. 工作日默认是交易日, 只有数据库明确记录为节假日才跳过
+	// 这样即使数据库日历过期或缺失, 工作日仍会正常执行任务
+	isTradeDay := true // 默认交易日
+	cal, err := s.calRepo.GetByDate(today)
 	if err != nil {
-		logger.L().Warnw("调度器: 判断交易日失败", "err", err)
-		return
+		logger.L().Warnw("调度器: 查询日历失败, 默认按交易日执行", "date", today, "err", err)
+	} else if cal != nil {
+		isTradeDay = cal.IsOpen == 1
+	} else {
+		// 数据库没有今天的记录 -> 默认按交易日执行, 后台异步同步日历(不阻塞任务)
+		logger.L().Infow("调度器: 日历数据缺失, 默认按交易日执行, 后台同步日历", "date", today)
+		go func() {
+			if err := s.svc.SyncCalendar(); err != nil {
+				logger.L().Warnw("调度器: 后台同步日历失败", "err", err)
+			} else {
+				logger.L().Info("调度器: 后台日历同步完成")
+			}
+		}()
 	}
 
 	if isTradeDay {
@@ -130,6 +138,8 @@ func (s *Scheduler) tick() {
 		}
 		s.maybeRunDaily(JobReport, s.cfg.Scheduler.ReportTime, now, today, s.runReport)
 		s.maybeRunIntraday(now, today)
+	} else {
+		logger.L().Infow("调度器: 今天是节假日(数据库确认), 跳过交易任务", "date", today)
 	}
 	// 数据清理每日执行 (非交易日仅做文件清理与WAL瘦身)
 	s.maybeRunDaily(JobRetention, s.cfg.Retention.CleanupTime, now, today, func(date string) error {
