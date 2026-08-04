@@ -115,7 +115,7 @@ curl http://127.0.0.1:8080/api/agent/brief         # Agent 全量上下文
 | `risk.max_total_position_pct` | 1.0 | 总仓位可满仓 |
 | `risk.stop_loss_pct` | 0.05 | 止损 -5% |
 | `risk.take_profit_pct` | 0.10 | 止盈 +10% |
-| `trading.min_trade_amount` | 0 | 0=自适应：最低佣金/0.1%（5元→5000元），低于该额的买入直接拒绝 |
+| `trading.min_trade_amount` | 3000 | 小资金降低门槛（0=自适应5000元太高，1万资金×40%仓位=4000<5000会被风控全部拦截）；设 3000 确保能成交 |
 | `trading.max_positions` | 0 | 0=自适应：<5万→2只，<20万→4只，否则6只 |
 | `trading.auto_execute` | false | 默认只生成计划，人/Agent 确认后执行 |
 | `cost.min_commission` | 5.0 | 按你的券商实际佣金档修改 |
@@ -250,12 +250,192 @@ curl -X POST http://NAS_IP:8080/api/portfolio/sync \
 - 日志保留 30 天，HTML 报告保留最近 30 个
 - 每日 `wal_checkpoint(TRUNCATE)`，每周日增量 vacuum 回收空间
 
-## 部署（开机自启 + 崩溃自动拉起）
+## NAS 部署（开机自启 + 崩溃自愈 + 数据保鲜）
 
-- **Linux (systemd)**：`scripts/jingzhe.service`，`systemctl enable --now jingzhe`
-- **macOS (launchd)**：`scripts/com.jingzhe.trader.plist`，`launchctl load`
+NAS 是长期运行的"数据 + 执行后端"。以下步骤以 Linux NAS（群晖/威联通通用）为例，完成**首次部署**和**日常更新**。
 
-进程意外退出由系统自动拉起，重启后调度器依据 `job_run` 表自动补跑当天漏掉的任务。
+### 首次部署
+
+#### 0. 前置依赖
+
+```bash
+# Go 1.21+ (编译用) 和 sqlite3 (健康检查脚本用)
+# 群晖: 套件中心装 Go; 威联通: entware-ng 装 golang sqlite3
+go version          # 确认 >= 1.21
+sqlite3 --version   # 确认已装
+```
+
+#### 1. 拉取代码并编译
+
+```bash
+cd /opt
+git clone https://github.com/qyiun666/jingzhe-trader.git
+cd jingzhe-trader
+
+# 编译全部二进制到 bin/
+go build -o bin/server     ./cmd/server
+go build -o bin/dataloader ./cmd/dataloader
+go build -o bin/backtest   ./cmd/backtest
+go build -o bin/optimizer  ./cmd/optimizer
+```
+
+> NAS 多为 ARM/x86 低功耗 CPU，建议**在性能更好的机器上交叉编译**后把 `bin/` 拷过去：
+> ```bash
+> # 在 Mac/Linux 开发机上编译 ARM64 NAS 版本
+> GOOS=linux GOARCH=arm64 go build -o bin/server ./cmd/server
+> scp bin/server  nas:/opt/jingzhe-trader/bin/
+> ```
+
+#### 2. 配置文件 + 环境变量
+
+```bash
+cp config/config.example.yaml config/config.yaml
+# 按需修改 config.yaml (股票池、资金量、策略参数)
+```
+
+**密钥一律走环境变量**，写入 `.env` 文件（systemd 会读取）：
+
+```bash
+cat > /opt/jingzhe-trader/.env <<'EOF'
+TUSHARE_TOKEN=你的tushare_token
+JZ_API_TOKEN=随机长字符串_用于API鉴权
+FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/xxx
+LLM_API_KEY=你的deepseek密钥
+EOF
+chmod 600 /opt/jingzhe-trader/.env      # 仅 owner 可读
+```
+
+#### 3. 首次拉取历史数据
+
+```bash
+cd /opt/jingzhe-trader
+./bin/dataloader -config config/config.yaml   # 首次约 10-20 分钟, 拉取 3 年数据
+```
+
+确认数据已入库：
+
+```bash
+sqlite3 data/jingzhe.db "SELECT COUNT(*) FROM daily_bar;"          # 应有数万条
+sqlite3 data/jingzhe.db "SELECT COUNT(*) FROM trade_cal;"          # 交易日历
+sqlite3 data/jingzhe.db "SELECT MAX(trade_date) FROM daily_bar;"   # 最新日期
+```
+
+#### 4. 安装 systemd 服务（开机自启 + 崩溃拉起）
+
+```bash
+# 修改 scripts/jingzhe.service 中的路径(若非 /opt/jingzhe-trader 需调整)
+sudo cp scripts/jingzhe.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now jingzhe        # 开机自启 + 立即启动
+
+# 验证
+sudo systemctl status jingzhe
+curl http://127.0.0.1:11270/api/health      # 返回 JSON 即正常
+```
+
+进程意外退出由 systemd 自动拉起（`Restart=always`），重启后调度器依据 `job_run` 表自动补跑当天漏掉的任务。
+
+#### 5. 安装健康检查脚本 + cron（数据保鲜 + 二次自愈）
+
+systemd 保证进程常驻，但无法发现**进程活着但数据过期/日历缺失**等问题。健康检查脚本每 10 分钟巡检并自愈：
+
+```bash
+# 赋予执行权限
+chmod +x /opt/jingzhe-trader/scripts/nas_health_check.sh
+
+# 加入 crontab (每 10 分钟执行)
+sudo crontab -e
+# 添加以下行:
+*/10 * * * * /opt/jingzhe-trader/scripts/nas_health_check.sh >> /opt/jingzhe-trader/logs/health_check.log 2>&1
+```
+
+健康检查脚本（`scripts/nas_health_check.sh`）做三件事：
+
+| 检查项 | 异常处理 |
+|---|---|
+| server 进程存活 | 挂了则自动 `nohup` 重启 |
+| API 可访问 (`/api/health`) | 不可达则告警 |
+| 数据新鲜度 + 交易日历 | 数据过期或日历缺失则自动触发 `dataloader` 补数据 |
+
+查看巡检日志：
+
+```bash
+tail -50 /opt/jingzhe-trader/logs/health_check.log
+```
+
+#### 6. 防火墙放行（远程访问）
+
+```bash
+# 仅放行局域网访问 API (11270 为默认端口, 见 config.yaml server.port)
+sudo iptables -A INPUT -p tcp --dport 11270 -s 192.168.1.0/24 -j ACCEPT
+```
+
+### 首次部署验证清单
+
+```bash
+# 1. 服务存活
+sudo systemctl is-active jingzhe              # → active
+
+# 2. API 正常
+curl -s http://127.0.0.1:11270/api/health | head
+
+# 3. 数据新鲜 (交易日当天 15:10 后应有当日数据)
+sqlite3 /opt/jingzhe-trader/data/jingzhe.db "SELECT MAX(trade_date) FROM daily_bar;"
+
+# 4. 交易日历完整 (今天应在日历中)
+sqlite3 /opt/jingzhe-trader/data/jingzhe.db "SELECT * FROM trade_cal WHERE cal_date='$(date +%Y%m%d)';"
+
+# 5. 指数数据存在 (大盘过滤策略需要)
+sqlite3 /opt/jingzhe-trader/data/jingzhe.db "SELECT COUNT(*) FROM daily_bar WHERE ts_code='000300.SH';"
+
+# 6. 健康检查 cron 已生效
+grep jingzhe /var/log/syslog 2>/dev/null || tail -5 /opt/jingzhe-trader/logs/health_check.log
+```
+
+### 日常更新（NAS 拉取新代码 → 重新编译 → 重启）
+
+当开发机推送了新代码（如策略调参、Bug 修复、新增指数同步），NAS 需执行以下更新流程：
+
+```bash
+cd /opt/jingzhe-trader
+
+# 1. 拉取最新代码
+git pull origin main
+
+# 2. 重新编译 (停服前编译, 避免编译报错导致无可用二进制)
+go build -o bin/server     ./cmd/server
+go build -o bin/dataloader ./cmd/dataloader
+
+# 3. 重启服务 (systemd 会优雅关机: SIGTERM 等 15s → WAL checkpoint → 拉起新进程)
+sudo systemctl restart jingzhe
+
+# 4. 验证
+sleep 3
+sudo systemctl status jingzhe
+curl -s http://127.0.0.1:11270/api/health
+```
+
+> **更新 config.yaml 时**：直接编辑后 `sudo systemctl restart jingzhe` 即可，无需重新编译。
+
+### 常见问题排查
+
+| 现象 | 排查 |
+|---|---|
+| 服务启动后立即退出 | `journalctl -u jingzhe -n 50` 看日志；多为 config.yaml 路径或 `.env` 缺失 |
+| 数据一直不更新 | 检查 Tushare token 是否过期；`./bin/dataloader -config config/config.yaml` 手动跑看报错 |
+| 今天不在交易日历 | 健康检查脚本会自动补；也可手动 `./bin/dataloader -config config/config.yaml` |
+| 周末调度器不工作 | 正常，调度器用系统时间判断周末，非交易日不执行数据/信号任务 |
+| API 返回 401 | GET 接口无需 token；POST 接口需 `Authorization: Bearer $JZ_API_TOKEN` |
+| 磁盘空间告警 | 调度器每日 16:30 自动清理；紧急可 `sqlite3 data/jingzhe.db "VACUUM;"` |
+
+### macOS (launchd)
+
+非 NAS 场景可用 launchd：
+
+```bash
+cp scripts/com.jingzhe.trader.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.jingzhe.trader.plist
+```
 
 ## QMT 实盘（可选，Windows）
 
