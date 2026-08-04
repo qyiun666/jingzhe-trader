@@ -99,6 +99,23 @@ func (s *Scheduler) Start(ctx context.Context) {
 func (s *Scheduler) tick() {
 	now := time.Now()
 	today := now.Format("20060102")
+
+	// 日历死锁修复: 检查今天是否在交易日历中
+	// 如果日历中没有今天的记录(日历数据过期), 先同步日历再判断
+	hasCal, err := s.calRepo.HasDate(today)
+	if err != nil {
+		logger.L().Warnw("调度器: 查询日历失败", "err", err)
+		return
+	}
+	if !hasCal {
+		logger.L().Warnw("调度器: 今日不在交易日历中, 同步日历...", "date", today)
+		if err := s.svc.SyncCalendar(); err != nil {
+			logger.L().Errorw("调度器: 同步交易日历失败", "err", err)
+			return
+		}
+		logger.L().Info("调度器: 交易日历同步完成, 重新判断交易日")
+	}
+
 	isTradeDay, err := s.calRepo.IsTradeDay(today)
 	if err != nil {
 		logger.L().Warnw("调度器: 判断交易日失败", "err", err)

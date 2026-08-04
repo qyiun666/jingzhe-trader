@@ -463,6 +463,14 @@ func (s *Service) UpdateData() error {
 	return dataloader.New(s.cfg, s.db).Run(opts)
 }
 
+// SyncCalendar 仅同步交易日历 (轻量级, 供调度器打破日历死锁)
+// 同步近一周到后一周的日历数据, 确保今天和近期日期都在日历中
+func (s *Service) SyncCalendar() error {
+	start := time.Now().AddDate(0, 0, -7).Format("20060102")
+	end := time.Now().AddDate(0, 0, 7).Format("20060102")
+	return dataloader.New(s.cfg, s.db).SyncCalendarOnly(start, end)
+}
+
 // ==================== LLM 深度新闻分析 ====================
 
 // HandleLLMNews 处理 GET /api/news/llm

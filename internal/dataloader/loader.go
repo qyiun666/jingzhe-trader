@@ -207,6 +207,16 @@ func (l *Loader) syncOneDayExtras(calDate string) {
 	}
 }
 
+// SyncCalendarOnly 仅同步交易日历 (轻量级, 用于打破调度器日历死锁)
+// 当调度器发现今日不在日历中时调用, 同步近期日历后即可正常判断交易日
+func (l *Loader) SyncCalendarOnly(start, end string) error {
+	if l.cfg.Tushare.Token == "" {
+		return fmt.Errorf("未配置 tushare.token (可用环境变量 TUSHARE_TOKEN)")
+	}
+	l.syncCalendar(start, end)
+	return nil
+}
+
 // watchCodes 获取关注股票代码集合(实例级缓存)
 func (l *Loader) watchCodes() map[string]bool {
 	if l.watchCache != nil {
