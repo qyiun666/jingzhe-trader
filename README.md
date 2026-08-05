@@ -41,6 +41,7 @@ AI Agent（如 Hermes）只需定时 GET 只读 API 拿现成结果，POST 确�
                       │  策略实例缓存 (避免重建丢失状态)                    │
                       │  共享Repo (避免重复实例化)                          │
                       │  新闻按股票池过滤 (优先展示相关新闻)                │
+                      │  陈旧数据清理 (选股池外的股票自动删除)            │
                       └───────────────────┬──────────────────────────────┘
                                           │ SQLite (WAL)
                       ┌───────────────────┴──────────────────────────────┐
@@ -478,23 +479,26 @@ curl -H "Authorization: Bearer $JZ_API_TOKEN" \
 
 ### 选股逻辑
 
-系统**只在配置的股票池 + 当前持仓**中选股，不做全市场扫描：
+系统**完全自动选股**，无需手动维护股票池：
 
-1. **股票池来源**：`config.yaml` 中 `universe.bluechip` + `universe.tech`（逗号分隔的股票代码）
-2. **持仓补充**：当前持仓的股票自动加入选股范围（即使不在配置池中）
-3. **行情过滤**：只有当日有行情数据的股票才会被策略扫描
-4. **数据加载器同步**：`dataloader.filter_mode: true` 时，只拉取股票池+持仓+关注列表的数据，大幅减少数据量
+1. **自动选股器**（`screener`）：每日 15:15 从全市场（4000+股票）多维度筛选 TopN 候选
+2. **持仓补充**：当前持仓的股票自动加入扫描范围（即使不在选股结果中）
+3. **手动配置（可选）**：`config.yaml` 中 `universe.bluechip` / `universe.tech` 可填写额外关注的股票，与选股结果合并
+4. **行情过滤**：只有当日有行情数据的股票才会被策略扫描
+5. **数据加载器**：`dataloader.filter_mode: true` 时，只拉取选股结果+持仓+watchlist 的数据，大幅减少数据量
 
 ```yaml
-# config.yaml 示例
+# config.yaml (universe 可选, 留空则完全依赖自动选股)
 universe:
-  bluechip: "000725.SZ,002230.SZ,002415.SZ,002475.SZ,000001.SZ,600030.SH"
-  tech: "000725.SZ,002230.SZ,002415.SZ,002475.SZ"
+  bluechip: ""
+  tech: ""
 
 dataloader:
-  filter_mode: true          # 只拉股票池数据
+  filter_mode: true          # 只拉选股结果+持仓的数据
   watchlist: ["000300.SH"]   # 额外关注沪深300指数
 ```
+
+> 启用 `screener.enabled: true` 后，无需手动填写股票池。系统每天自动发现新机会，旧的候选股票数据会被自动清理。
 
 ### 新闻过滤逻辑
 
@@ -625,8 +629,8 @@ curl -X POST -H "Authorization: Bearer $JZ_API_TOKEN" \
 | `scheduler.report_time` | config.yaml | 日报时间 (默认 15:45) |
 | `scheduler.intraday.enabled` | config.yaml | 盘中止损监控 (默认 true) |
 | `scheduler.intraday.interval_min` | config.yaml | 盘中监控间隔 (默认 5 分钟) |
-| `universe.bluechip` | config.yaml | 股票池-蓝筹（逗号分隔代码） |
-| `universe.tech` | config.yaml | 股票池-科技（逗号分隔代码） |
+| `universe.bluechip` | config.yaml | 手动股票池（可选，留空则完全依赖自动选股） |
+| `universe.tech` | config.yaml | 手动股票池（可选，留空则完全依赖自动选股） |
 | `dataloader.filter_mode` | config.yaml | `true` 只拉股票池数据（推荐） |
 | `trading.min_trade_amount` | config.yaml | 最小单笔交易金额（小资金设3000） |
 | `trading.auto_execute` | config.yaml | `true` 确认即下单（需QMT） |
@@ -645,6 +649,7 @@ curl -X POST -H "Authorization: Bearer $JZ_API_TOKEN" \
 - 回测记录只保留最近 20 个 run，**实盘记录（`live_*`）永久保留**
 - 日志保留 30 天，HTML 报告保留最近 30 个
 - 每日 `wal_checkpoint(TRUNCATE)`，每周日增量 vacuum 回收空间
+- **陈旧股票清理**：不在活跃股票池（选股结果+持仓+watchlist）中的股票，其 `daily_bar`/`daily_basic`/`stk_limit` 数据自动删除，防止选股轮换导致数据库膨胀
 
 ## NAS 部署（开机自启 + 崩溃自愈 + 数据保鲜）
 

@@ -219,7 +219,7 @@ func NewService(cfg *config.Config) (*Service, error) {
 	// 初始化自动选股器 (全市场筛选, 补充配置股票池)
 	tsClient := tushare.NewClient(cfg.Tushare)
 	screenerCfg := cfg.Screener
-	screenerCfg.ExcludeCodes = cfg.UniverseCodes() // 排除已在配置池中的
+	// 不再排除配置池, universe 可以为空 (全部依赖自动选股)
 	svc.screener = screener.New(tsClient, svc.stockRepo, svc.barRepo, svc.screenRepo, screenerCfg)
 
 	return svc, nil

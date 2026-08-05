@@ -595,7 +595,7 @@ func (s *Scheduler) runRetention(date string, fullClean bool) error {
 	if s.cfg.Log.FilePath != "" {
 		logDir = filepath.Dir(s.cfg.Log.FilePath)
 	}
-	return store.RunRetention(s.db, store.RetentionPolicy{
+	if err := store.RunRetention(s.db, store.RetentionPolicy{
 		BarYears:     rc.BarYears,
 		NewsDays:     rc.NewsDays,
 		PlanDays:     rc.PlanDays,
@@ -604,7 +604,19 @@ func (s *Scheduler) runRetention(date string, fullClean bool) error {
 		ReportFiles:  rc.ReportFiles,
 		LogDir:       logDir,
 		ReportDir:    "reports",
-	}, fullClean)
+	}, fullClean); err != nil {
+		logger.L().Warnw("数据保留清理失败", "err", err)
+	}
+
+	// 清理不在活跃股票池中的陈旧数据 (选股结果+持仓+watchlist 之外的股票)
+	if fullClean {
+		keepCodes := store.GetActiveStockCodes(s.db, s.cfg.Dataloader.Watchlist, s.cfg.UniverseCodes())
+		if err := store.CleanStaleStocks(s.db, keepCodes); err != nil {
+			logger.L().Warnw("陈旧股票数据清理失败", "err", err)
+		}
+	}
+
+	return nil
 }
 
 // ==================== 时间工具 ====================

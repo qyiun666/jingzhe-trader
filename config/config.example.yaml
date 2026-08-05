@@ -107,9 +107,12 @@ dataloader:
   enable_fund: true         # ETF/基金日线
   enable_cleanup: false     # 危险: 清理非关注股票历史数据, 需同时加 --confirm-cleanup
 
+# 股票池 (可选, 留空则完全依赖自动选股)
+# 手动填写的股票会与选股结果合并扫描
+# 如需手动指定, 填写逗号分隔的代码: "000725.SZ,002230.SZ,..."
 universe:
-  bluechip: "000725.SZ,002230.SZ,002415.SZ,002475.SZ,000001.SZ,600030.SH,002594.SZ,000625.SZ,601012.SH,601899.SH,601318.SH,000333.SZ,600036.SH,600276.SH"
-  tech: "000725.SZ,002230.SZ,002415.SZ,002475.SZ"
+  bluechip: ""
+  tech: ""
 
 # HTTP 服务
 server:

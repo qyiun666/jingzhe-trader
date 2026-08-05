@@ -276,7 +276,7 @@ func (l *Loader) watchCodes() map[string]bool {
 }
 
 // buildWatchCodeSet 构建关注的股票代码集合
-// 包含: 股票池(bluechip + tech) + watchlist 配置 + 当前持仓
+// 包含: 股票池(可选) + watchlist + 持仓 + 自动选股结果
 func (l *Loader) buildWatchCodeSet() map[string]bool {
 	codeSet := make(map[string]bool)
 	addCodes := func(csv string) {
@@ -297,6 +297,16 @@ func (l *Loader) buildWatchCodeSet() map[string]bool {
 		for _, p := range positions {
 			codeSet[p.TsCode] = true
 		}
+	}
+	// 合并自动选股结果 (选股器每日筛选的候选股票)
+	if rows, err := l.db.Queryx("SELECT DISTINCT ts_code FROM screen_result"); err == nil {
+		for rows.Next() {
+			var code string
+			if err := rows.Scan(&code); err == nil && code != "" {
+				codeSet[code] = true
+			}
+		}
+		rows.Close()
 	}
 	return codeSet
 }

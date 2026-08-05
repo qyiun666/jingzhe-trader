@@ -84,6 +84,115 @@ func cleanMarketData(db *sqlx.DB, p RetentionPolicy) error {
 	return nil
 }
 
+// CleanStaleStocks 清理不在活跃股票池中的陈旧行情数据
+// keepCodes: 需要保留的股票代码集合 (选股结果 + 持仓 + watchlist + universe)
+// 删除这些股票的 daily_bar, daily_basic, stk_limit 数据, 释放空间
+func CleanStaleStocks(db *sqlx.DB, keepCodes []string) error {
+	if len(keepCodes) == 0 {
+		return nil // 空集合不清理, 防止误删全表
+	}
+
+	// 查询库中所有不同的 ts_code
+	var allCodes []string
+	if err := db.Select(&allCodes, `SELECT DISTINCT ts_code FROM daily_bar`); err != nil {
+		return fmt.Errorf("查询库内股票代码失败: %w", err)
+	}
+
+	// 找出需要清理的代码 (不在保留集合中)
+	keepSet := make(map[string]bool, len(keepCodes))
+	for _, code := range keepCodes {
+		keepSet[code] = true
+	}
+	var staleCodes []string
+	for _, code := range allCodes {
+		if !keepSet[code] {
+			staleCodes = append(staleCodes, code)
+		}
+	}
+
+	if len(staleCodes) == 0 {
+		logger.L().Info("无陈旧股票数据需要清理")
+		return nil
+	}
+
+	logger.L().Infow("清理陈旧股票数据", "stale_count", len(staleCodes), "keep_count", len(keepCodes))
+
+	// 分批清理 (每批 100 个, 避免 SQL IN 子句过长)
+	batchSize := 100
+	var totalDeleted int64
+	for i := 0; i < len(staleCodes); i += batchSize {
+		end := i + batchSize
+		if end > len(staleCodes) {
+			end = len(staleCodes)
+		}
+		batch := staleCodes[i:end]
+
+		// 构造 IN (?, ?, ...) 占位符
+		placeholders := strings.Repeat("?,", len(batch))
+		placeholders = placeholders[:len(placeholders)-1] // 去掉末尾逗号
+		args := make([]interface{}, len(batch))
+		for j, code := range batch {
+			args[j] = code
+		}
+
+		for _, table := range []string{"daily_bar", "daily_basic", "stk_limit"} {
+			query := fmt.Sprintf(`DELETE FROM %s WHERE ts_code IN (%s)`, table, placeholders)
+			res, err := db.Exec(query, args...)
+			if err != nil {
+				logger.L().Warnw("清理陈旧数据失败", "table", table, "err", err)
+				continue
+			}
+			n, _ := res.RowsAffected()
+			totalDeleted += n
+		}
+	}
+
+	logger.L().Infow("陈旧股票数据清理完成", "deleted_rows", totalDeleted, "stale_stocks", len(staleCodes))
+	return nil
+}
+
+// GetActiveStockCodes 获取活跃股票代码集合 (选股结果 + 持仓 + watchlist)
+// 供 CleanStaleStocks 使用, 确保不误删在用股票的数据
+func GetActiveStockCodes(db *sqlx.DB, watchlist []string, universeCodes []string) []string {
+	codeSet := make(map[string]bool)
+
+	// 选股结果
+	var screenCodes []string
+	if err := db.Select(&screenCodes, "SELECT DISTINCT ts_code FROM screen_result"); err == nil {
+		for _, code := range screenCodes {
+			codeSet[code] = true
+		}
+	}
+
+	// 持仓
+	var posCodes []string
+	if err := db.Select(&posCodes, "SELECT DISTINCT ts_code FROM portfolio WHERE total_qty > 0"); err == nil {
+		for _, code := range posCodes {
+			codeSet[code] = true
+		}
+	}
+
+	// watchlist (指数等)
+	for _, code := range watchlist {
+		if code = strings.TrimSpace(code); code != "" {
+			codeSet[code] = true
+		}
+	}
+
+	// universe (如果手动配置了)
+	for _, code := range universeCodes {
+		if code = strings.TrimSpace(code); code != "" {
+			codeSet[code] = true
+		}
+	}
+
+	var result []string
+	for code := range codeSet {
+		result = append(result, code)
+	}
+	return result
+}
+
 // cleanBacktestRuns 只保留最近N个回测run的成交与快照
 // 实盘 runID (live_* 前缀) 永久保留 (审计需要)
 func cleanBacktestRuns(db *sqlx.DB, keepRuns int) error {
