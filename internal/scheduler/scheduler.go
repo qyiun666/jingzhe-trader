@@ -26,6 +26,7 @@ import (
 // 任务名常量 (job_run 表 / /api/health 健康度展示共用)
 const (
 	JobDataUpdate = "data_update"
+	JobScreener   = "screener"
 	JobSignal     = "signal"
 	JobReconcile  = "reconcile"
 	JobReport     = "report"
@@ -136,6 +137,7 @@ func (s *Scheduler) tick() {
 
 	if isTradeDay {
 		s.maybeRunDaily(JobDataUpdate, s.cfg.Scheduler.DataUpdateTime, now, today, s.runDataUpdate)
+		s.maybeRunDaily(JobScreener, s.cfg.Scheduler.ScreenerTime, now, today, s.runScreener)
 		s.maybeRunDaily(JobSignal, s.cfg.Scheduler.SignalTime, now, today, s.runSignal)
 		if s.cfg.Broker.Type == "qmt" {
 			s.maybeRunDaily(JobReconcile, reconcileTime(s.cfg.Scheduler.SignalTime), now, today, s.runReconcile)
@@ -299,6 +301,39 @@ func (s *Scheduler) alert(title, text string) {
 // runDataUpdate 15:10 数据更新 (进程内调用 dataloader)
 func (s *Scheduler) runDataUpdate(date string) error {
 	return s.svc.UpdateData()
+}
+
+// runScreener 15:15 自动选股 (数据更新后, 信号生成前)
+// 全市场筛选候选股票 → 同步历史K线 → 结果落库 → 通知
+func (s *Scheduler) runScreener(date string) error {
+	if s.svc.Screener() == nil {
+		return nil
+	}
+	results, err := s.svc.Screener().Screen(date)
+	if err != nil {
+		return fmt.Errorf("选股失败: %w", err)
+	}
+
+	// 通知
+	var lines []string
+	if len(results) == 0 {
+		lines = append(lines, fmt.Sprintf("📅 %s 全市场选股完成: 无符合条件的候选股票", date))
+	} else {
+		lines = append(lines, fmt.Sprintf("🔍 %s 全市场选股完成: 筛选出 %d 只候选股票", date, len(results)))
+		lines = append(lines, "前5名:")
+		for i, c := range results {
+			if i >= 5 {
+				break
+			}
+			lines = append(lines, fmt.Sprintf("  #%d %s %s  收盘%.2f 涨跌%.1f%% 换手%.1f%% PE=%.0f 评分%.1f",
+				i+1, c.TsCode, c.Name, c.Close, c.PctChg, c.TurnoverRate, c.PE_TTM, c.Score))
+		}
+		lines = append(lines, "候选股票已自动加入策略股票池, 15:30 信号生成时将一并扫描")
+	}
+	s.alert("🔍 惊蛰自动选股", strings.Join(lines, "\n"))
+
+	logger.L().Infow("选股任务完成", "date", date, "candidates", len(results))
+	return nil
 }
 
 // runSignal 15:30 EOD 信号生成 → 次日交易计划落库

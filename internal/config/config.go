@@ -27,12 +27,14 @@ type Config struct {
 	Scheduler  SchedulerConfig  `mapstructure:"scheduler"`
 	Trading    TradingConfig    `mapstructure:"trading"`
 	Retention  RetentionConfig  `mapstructure:"retention"`
+	Screener  ScreenerConfig  `mapstructure:"screener"`
 }
 
 // SchedulerConfig 内置调度器配置
 type SchedulerConfig struct {
 	Enabled        bool           `mapstructure:"enabled"`          // 是否启用调度器
 	DataUpdateTime string         `mapstructure:"data_update_time"` // 数据更新时间 HH:MM
+	ScreenerTime   string         `mapstructure:"screener_time"`    // 自动选股时间 HH:MM
 	SignalTime     string         `mapstructure:"signal_time"`      // EOD信号生成时间 HH:MM
 	ReportTime     string         `mapstructure:"report_time"`      // 日报生成时间 HH:MM
 	Intraday       IntradayConfig `mapstructure:"intraday"`         // 盘中监控
@@ -62,6 +64,22 @@ type RetentionConfig struct {
 	LogDays      int    `mapstructure:"log_days"`      // 日志文件保留天数
 	ReportFiles  int    `mapstructure:"report_files"`  // 保留最近N个报告文件
 	CleanupTime  string `mapstructure:"cleanup_time"`  // 每日清理时间 HH:MM
+}
+
+// ScreenerConfig 自动选股器配置
+type ScreenerConfig struct {
+	Enabled         bool     `mapstructure:"enabled"`          // 是否启用选股器
+	MaxCandidates   int      `mapstructure:"max_candidates"`   // 最大候选股票数
+	ExcludeCodes    []string `mapstructure:"exclude_codes"`    // 排除的股票代码 (配置池已有)
+	ExcludeST       bool     `mapstructure:"exclude_st"`       // 排除ST股
+	MinListDays     int      `mapstructure:"min_list_days"`    // 最小上市天数 (排除新股)
+	MinPrice        float64  `mapstructure:"min_price"`        // 最低股价
+	MaxPrice        float64  `mapstructure:"max_price"`        // 最高股价
+	MinTurnoverRate float64  `mapstructure:"min_turnover_rate"` // 最低换手率 %
+	MaxPE           float64  `mapstructure:"max_pe"`           // 最大PE_TTM
+	MaxPB           float64  `mapstructure:"max_pb"`           // 最大PB
+	MinCircMV       float64  `mapstructure:"min_circ_mv"`      // 最小流通市值 (万元)
+	MaxCircMV       float64  `mapstructure:"max_circ_mv"`      // 最大流通市值 (万元)
 }
 
 // DataloaderConfig 数据加载器配置
@@ -275,6 +293,7 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("dataloader.enable_cleanup", false)
 	v.SetDefault("scheduler.enabled", true)
 	v.SetDefault("scheduler.data_update_time", "15:10")
+	v.SetDefault("scheduler.screener_time", "15:15")
 	v.SetDefault("scheduler.signal_time", "15:30")
 	v.SetDefault("scheduler.report_time", "15:45")
 	v.SetDefault("scheduler.intraday.enabled", true)
@@ -291,6 +310,17 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("retention.log_days", 30)
 	v.SetDefault("retention.report_files", 30)
 	v.SetDefault("retention.cleanup_time", "16:30")
+	v.SetDefault("screener.enabled", false)
+	v.SetDefault("screener.max_candidates", 20)
+	v.SetDefault("screener.exclude_st", true)
+	v.SetDefault("screener.min_list_days", 60)
+	v.SetDefault("screener.min_price", 2.0)
+	v.SetDefault("screener.max_price", 100.0)
+	v.SetDefault("screener.min_turnover_rate", 1.0)
+	v.SetDefault("screener.max_pe", 80.0)
+	v.SetDefault("screener.max_pb", 10.0)
+	v.SetDefault("screener.min_circ_mv", 50000.0)
+	v.SetDefault("screener.max_circ_mv", 0.0)
 
 	if err := v.ReadInConfig(); err != nil {
 		return nil, fmt.Errorf("读取配置文件失败: %w", err)

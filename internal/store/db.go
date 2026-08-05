@@ -335,6 +335,25 @@ func migrate(db *sqlx.DB) error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_agent_alert_date ON agent_alert(trade_date);
 		CREATE INDEX IF NOT EXISTS idx_agent_alert_status ON agent_alert(status);`,
+
+		// 自动选股结果
+		`CREATE TABLE IF NOT EXISTS screen_result (
+			ts_code        TEXT NOT NULL,
+			name           TEXT,
+			trade_date     TEXT NOT NULL,
+			close          REAL,
+			pct_chg        REAL,
+			turnover_rate  REAL,
+			volume_ratio   REAL,
+			pe             REAL,
+			pe_ttm         REAL,
+			pb             REAL,
+			circ_mv        REAL,
+			score          REAL,
+			reason         TEXT,
+			PRIMARY KEY (ts_code, trade_date)
+		);
+		CREATE INDEX IF NOT EXISTS idx_screen_result_date ON screen_result(trade_date);`,
 	}
 
 	for _, s := range stmts {

@@ -120,6 +120,10 @@ func NewRouter(svc *Service) http.Handler {
 	mux.HandleFunc("/api/strategy/status", svc.HandleStrategyStatus) // GET 策略状态
 	mux.HandleFunc("/api/strategy/switch", svc.HandleStrategySwitch) // POST 手动切换策略
 
+	// 自动选股
+	mux.HandleFunc("/api/screener/results", svc.HandleScreenResults) // GET 选股结果
+	mux.HandleFunc("/api/screener/run", svc.HandleScreenRun)         // POST 手动触发选股
+
 	// 系统维护
 	mux.HandleFunc("/api/system/status", svc.HandleSystemStatus)    // GET 系统状态
 	mux.HandleFunc("/api/system/update-data", svc.HandleUpdateData) // POST 触发数据更新

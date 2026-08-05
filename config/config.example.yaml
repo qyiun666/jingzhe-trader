@@ -124,6 +124,7 @@ server:
 scheduler:
   enabled: true
   data_update_time: "15:10"  # 收盘后更新行情数据
+  screener_time: "15:15"     # 全市场自动选股 (数据更新后, 信号生成前)
   signal_time: "15:30"       # 生成次日交易计划
   report_time: "15:45"       # 日报生成+飞书推送
   intraday:
@@ -147,6 +148,22 @@ retention:
   log_days: 30               # 日志文件保留30天
   report_files: 30           # 保留最近30个报告HTML
   cleanup_time: "16:30"      # 每日清理时间
+
+# 自动选股 (全市场筛选, 补充配置股票池)
+# 每日 15:15 自动从全市场筛选候选股票, 结果自动加入策略股票池
+# 候选股票的历史K线会自动同步 (约6个月), 供策略均线计算
+screener:
+  enabled: true              # 是否启用 (false 则只用配置的固定股票池)
+  max_candidates: 20         # 最大候选数量 (TopN)
+  exclude_st: true           # 排除ST股
+  min_list_days: 60          # 排除上市不足60天的新股
+  min_price: 2.0             # 最低股价 (小资金避免买高价股)
+  max_price: 50.0            # 最高股价 (小资金单手不超过5000元)
+  min_turnover_rate: 1.0     # 最低换手率% (排除僵尸股)
+  max_pe: 50.0               # 最大PE_TTM (排除高估值, 0=不限)
+  max_pb: 5.0                # 最大PB (排除高估值)
+  min_circ_mv: 50000.0       # 最小流通市值(万元) ≈ 50亿
+  max_circ_mv: 0.0           # 最大流通市值(万元) 0=不限
 
 # 飞书通知
 feishu:

@@ -19,8 +19,10 @@ import (
 	"jingzhe-trader/internal/llm"
 	"jingzhe-trader/internal/market"
 	"jingzhe-trader/internal/model"
+	"jingzhe-trader/internal/screener"
 	"jingzhe-trader/internal/store"
 	"jingzhe-trader/internal/strategy"
+	"jingzhe-trader/internal/tushare"
 	"jingzhe-trader/pkg/logger"
 
 	"jingzhe-trader/web"
@@ -144,6 +146,8 @@ type Service struct {
 	planRepo           *store.PlanRepo
 	jobRepo            *store.JobRepo
 	stockRepo          *store.StockRepo
+	screenRepo         *store.ScreenRepo               // 选股结果仓库
+	screener           *screener.Screener               // 自动选股器
 	stockMap           map[string]string           // ts_code -> name
 	stockMapMu         sync.RWMutex                // 保护 stockMap 并发读写
 	brk                broker.Broker
@@ -177,6 +181,7 @@ func NewService(cfg *config.Config) (*Service, error) {
 		planRepo:       store.NewPlanRepo(db),
 		jobRepo:        store.NewJobRepo(db),
 		stockRepo:      store.NewStockRepo(db),
+		screenRepo:     store.NewScreenRepo(db),
 		strategyCache:  make(map[string]strategy.Strategy),
 		startTime:      time.Now(),
 	}
@@ -211,6 +216,12 @@ func NewService(cfg *config.Config) (*Service, error) {
 		svc.debateRepo,
 	)
 
+	// 初始化自动选股器 (全市场筛选, 补充配置股票池)
+	tsClient := tushare.NewClient(cfg.Tushare)
+	screenerCfg := cfg.Screener
+	screenerCfg.ExcludeCodes = cfg.UniverseCodes() // 排除已在配置池中的
+	svc.screener = screener.New(tsClient, svc.stockRepo, svc.barRepo, svc.screenRepo, screenerCfg)
+
 	return svc, nil
 }
 
@@ -242,6 +253,16 @@ func (s *Service) stockName(tsCode string) string {
 // DebateOrchestrator 返回智能体辩论编排器 (供调度器调用决策变更检测)
 func (s *Service) DebateOrchestrator() *agent.DebateOrchestrator {
 	return s.debateOrchestrator
+}
+
+// Screener 返回选股器实例 (供调度器调用)
+func (s *Service) Screener() *screener.Screener {
+	return s.screener
+}
+
+// ScreenRepo 返回选股结果仓库
+func (s *Service) ScreenRepo() *store.ScreenRepo {
+	return s.screenRepo
 }
 
 // DB 返回底层数据库连接 (供调度器等外部组件复用同一连接)
@@ -1165,6 +1186,17 @@ func (s *Service) runStrategy(
 		if !seen[code] && bars[code] != nil {
 			seen[code] = true
 			universe = append(universe, code)
+		}
+	}
+	// 合并自动选股结果 (选股器每日自动发现的候选股票)
+	if s.screenRepo != nil {
+		if screenedCodes, err := s.screenRepo.GetScreenedCodes(); err == nil {
+			for _, code := range screenedCodes {
+				if !seen[code] && bars[code] != nil {
+					seen[code] = true
+					universe = append(universe, code)
+				}
+			}
 		}
 	}
 	if len(universe) == 0 {

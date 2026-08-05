@@ -170,6 +170,7 @@ type AgentBrief struct {
 	Jobs             map[string]string          `json:"jobs"`               // 各任务最近成功时间
 	Warnings         []string                   `json:"warnings"`           // 数据/任务异常提示
 	Debates          []store.DebateResult       `json:"debates"`            // 当日辩论结果
+	ScreenResults    []store.ScreenResult       `json:"screen_results"`     // 最新选股结果
 	ActionNeeded     []string                   `json:"action_needed"`      // 需要用户操作的提示
 	DecisionChanges  []agent.DecisionChange     `json:"decision_changes"`   // 决策变更记录
 	PlanStatusSummary PlanStatusSummary         `json:"plan_status_summary"` // 交易计划状态汇总
@@ -217,6 +218,13 @@ func (s *Service) HandleAgentBrief(w http.ResponseWriter, r *http.Request) {
 	// 辩论结果
 	if debates, derr := s.debateRepo.GetByDate(lastDate); derr == nil {
 		brief.Debates = debates
+	}
+
+	// 选股结果
+	if s.screenRepo != nil {
+		if screenResults, err := s.screenRepo.GetLatest(); err == nil {
+			brief.ScreenResults = screenResults
+		}
 	}
 
 	// 持仓诊断与市场概况 (尽力而为)

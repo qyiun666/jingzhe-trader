@@ -22,6 +22,7 @@ AI Agent（如 Hermes）只需定时 GET 只读 API 拿现成结果，POST 确�
                       │                                                  │
   Tushare ──────────▶ │  调度器 (交易日自动执行, 每次任务后飞书通知)         │
   腾讯免费行情 ──────▶ │   15:10 数据更新 (进程内 dataloader)              │
+                      │   15:15 全市场选股 → 候选股票自动入池 + 历史K线同步  │
   QMT sidecar ◀─────▶ │   15:30 EOD信号 → 多智能体辩论 → trade_plan 表    │
                       │   15:35 对账 (QMT模式)                            │
                       │   15:45 日报生成 + 飞书推送 + 操作提醒              │
@@ -64,6 +65,7 @@ AI Agent（如 Hermes）只需定时 GET 只读 API 拿现成结果，POST 确�
 - **回测即实盘** — 回测/模拟/实盘共用同一条 `信号 → 风控 → 下单 → 落库` 管道，回测结果不虚高
 - **风控内建** — 止损/止盈信号优先执行、单票/总仓位/板块敞口限制、含手续费的买入资金检查
 - **全自动闭环** — 内置调度器：数据更新 → EOD 信号 → 对账 → 日报飞书推送 → 盘中止损监控 → 数据自动清理
+- **自动选股** — 每日全市场扫描（4000+股票），按换手率/量比/PE/PB/市值多维度筛选 TopN 候选，自动同步历史K线并加入策略股票池，无需手动维护选股范围
 - **常驻稳定** — 任务 panic 隔离、job_run 防重复/启动补跑、优雅关机（WaitGroup 等待任务收尾）、WAL checkpoint、goroutine 纪律
 - **多策略支持** — 均线交叉 / MACD / 布林带突破 / 多因子选股 / 日内做T，动态策略选择器按市况切换，策略实例缓存避免状态丢失
 - **LLM 辅助** — 集成 DeepSeek 等大模型深度分析新闻舆情（可选）
@@ -173,6 +175,7 @@ curl -H "Authorization: Bearer $JZ_API_TOKEN" http://127.0.0.1:11270/api/agent/b
 | `/api/system/status` | 数据新鲜度 / 持仓数 / 下一交易日 |
 | `/api/kline?code=&start=&end=` | K线数据 |
 | `/api/snapshots?limit=30` | 账户快照历史 |
+| `/api/screener/results` | 自动选股结果（最新或按日期查询） |
 
 ### 写接口（POST）
 
@@ -184,6 +187,7 @@ curl -H "Authorization: Bearer $JZ_API_TOKEN" http://127.0.0.1:11270/api/agent/b
 | `/api/system/update-data` | 手动触发数据更新 |
 | `/api/strategy/switch` | 手动切换策略 `{"strategy": "ma_cross"}` 或 `?name=ma_cross` |
 | `/api/agent/alerts` | 标记通知已读 `{"id": 123}` 或 `{"all": true}` |
+| `/api/screener/run` | 手动触发全市场选股（测试用，正常由调度器自动执行） |
 
 ## Agent 接入指南（Hermes / 任意 AI Agent）
 
@@ -501,6 +505,63 @@ dataloader:
 3. **热点补充**：相关新闻不足20条时，用近期热点新闻补充
 4. **LLM辩论**：新闻分析师只分析与当前标的相关的新闻
 
+## 自动选股系统
+
+当 `screener.enabled: true` 时，系统每日 15:15 自动从全市场（4000+股票）筛选候选股票，补充到策略股票池：
+
+### 选股流程
+
+```
+15:10 数据更新 (配置池+持仓的当日行情)
+15:15 全市场选股:
+  1. Tushare 拉取全市场 daily_basic (PE/PB/换手率/市值)
+  2. Tushare 拉取全市场 daily (涨跌幅)
+  3. 多维度筛选 (价格/换手率/PE/PB/市值/ST/新股)
+  4. 评分排序 (活跃度+资金关注度+估值吸引力)
+  5. Top N 候选 → 同步6个月历史K线 → 结果落库
+  6. 通知落库 + 飞书推送
+15:30 信号生成 (策略扫描: 配置池 + 持仓 + 选股候选)
+```
+
+### 筛选条件
+
+| 条件 | 默认值 | 说明 |
+|---|---|---|
+| `exclude_st` | true | 排除ST股 |
+| `min_list_days` | 60 | 排除上市不足60天的新股 |
+| `min_price` / `max_price` | 2 / 50 | 价格区间（小资金避免高价股） |
+| `min_turnover_rate` | 1.0% | 最低换手率（排除僵尸股） |
+| `max_pe` | 50 | 最大PE_TTM（排除负PE和过高估值） |
+| `max_pb` | 5.0 | 最大PB |
+| `min_circ_mv` | 50亿 | 最小流通市值（排除小盘垃圾股） |
+
+### 评分算法
+
+评分 = 换手率(30%) + 量比(30%) + 估值合理性(25%) + 涨跌幅(15%)
+
+- 换手率 1-10% 最佳（过高可能是炒作）
+- 量比 >1 表示放量（资金关注）
+- PE_TTM 10-30 最佳（估值合理）
+- 温和上涨 0-5% 最佳（避免接飞刀）
+
+### 查看选股结果
+
+```bash
+# 获取最新选股结果
+curl -H "Authorization: Bearer $JZ_API_TOKEN" \
+     http://NAS_IP:11270/api/screener/results
+
+# 按日期查询
+curl -H "Authorization: Bearer $JZ_API_TOKEN" \
+     "http://NAS_IP:11270/api/screener/results?date=20260805"
+
+# 手动触发选股 (测试用, 正常由调度器自动执行)
+curl -X POST -H "Authorization: Bearer $JZ_API_TOKEN" \
+     http://NAS_IP:11270/api/screener/run
+```
+
+> 选股候选自动加入策略股票池，15:30 信号生成时将与配置池、持仓一并扫描。候选股票的6个月历史K线会自动同步，策略可正常计算均线/MACD等指标。
+
 ## AI Agent 完整工作流
 
 以下是一个完整的 Agent 24h 运行周期，对应"系统常驻 → 到点执行 → 通知用户 → 用户操作 → 检查状态"的闭环：
@@ -514,6 +575,7 @@ dataloader:
        └─ 否 → 跳过交易任务, 仅 16:30 数据清理
 09:30-15:00  盘中监控 (触发止损 → 紧急计划 + 告警落库 + 飞书推送)
 15:10  数据更新 (Tushare 行情入库)
+15:15  全市场选股 → 候选股票入池 + 历史K线同步 + 通知落库
 15:30  EOD信号生成 → 多智能体辩论 → 交易计划落库 → 通知落库 + 飞书推送
 15:35  对账 (仅 QMT 实盘)
 15:45  日报生成 + 飞书推送 + 操作提醒落库
@@ -568,6 +630,12 @@ dataloader:
 | `dataloader.filter_mode` | config.yaml | `true` 只拉股票池数据（推荐） |
 | `trading.min_trade_amount` | config.yaml | 最小单笔交易金额（小资金设3000） |
 | `trading.auto_execute` | config.yaml | `true` 确认即下单（需QMT） |
+| `screener.enabled` | config.yaml | `true` 启用自动选股 |
+| `screener.max_candidates` | config.yaml | 最大候选股票数（默认20） |
+| `screener.min_price` / `max_price` | config.yaml | 价格区间过滤（小资金建议2-50元） |
+| `screener.min_turnover_rate` | config.yaml | 最低换手率%（默认1.0，排除僵尸股） |
+| `screener.max_pe` / `max_pb` | config.yaml | PE_TTM/PB 上限过滤 |
+| `scheduler.screener_time` | config.yaml | 选股执行时间（默认15:15） |
 
 ## 数据自动清理
 
