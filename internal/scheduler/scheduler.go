@@ -136,9 +136,9 @@ func (s *Scheduler) tick() {
 	}
 
 	if isTradeDay {
-		s.maybeRunDaily(JobDataUpdate, s.cfg.Scheduler.DataUpdateTime, now, today, s.runDataUpdate)
+		s.maybeRunDataUpdateWithRetry(now, today)
 		s.maybeRunDaily(JobScreener, s.cfg.Scheduler.ScreenerTime, now, today, s.runScreener)
-		s.maybeRunDaily(JobSignal, s.cfg.Scheduler.SignalTime, now, today, s.runSignal)
+		s.maybeRunDaily(JobSignal, s.cfg.Scheduler.SignalTime, now, today, s.runSignalWithFreshnessCheck)
 		if s.cfg.Broker.Type == "qmt" {
 			s.maybeRunDaily(JobReconcile, reconcileTime(s.cfg.Scheduler.SignalTime), now, today, s.runReconcile)
 		}
@@ -167,6 +167,38 @@ func (s *Scheduler) maybeRunDaily(name, at string, now time.Time, today string, 
 		return
 	}
 	s.runJob(name, today, fn)
+}
+
+// maybeRunDataUpdateWithRetry 数据更新支持多重试时间
+// 首次在 data_update_time 执行, 失败后在 signal_time 和 signal_time+30min 自动重试
+// 重试间隔通过 job_run 表的上次尝试时间判断, 避免同一窗口内重复执行
+func (s *Scheduler) maybeRunDataUpdateWithRetry(now time.Time, today string) {
+	if done, err := s.jobRepo.HasSucceeded(JobDataUpdate, today); err != nil || done {
+		return
+	}
+
+	// 重试时间点: 15:10 (首次) → 15:30 (信号前) → 16:00 (报告后)
+	retryTimes := []string{s.cfg.Scheduler.DataUpdateTime}
+	if s.cfg.Scheduler.SignalTime != "" && s.cfg.Scheduler.SignalTime != s.cfg.Scheduler.DataUpdateTime {
+		retryTimes = append(retryTimes, s.cfg.Scheduler.SignalTime)
+	}
+	if t, err := time.Parse("15:04", s.cfg.Scheduler.SignalTime); err == nil {
+		third := t.Add(30 * time.Minute).Format("15:04")
+		retryTimes = append(retryTimes, third)
+	}
+
+	for _, at := range retryTimes {
+		scheduled, err := parseClock(at, now)
+		if err != nil || now.Before(scheduled) {
+			continue
+		}
+		// 上次尝试在该重试时间之前 → 可以重试; 之后 → 跳过 (本窗口已尝试过)
+		lastAttempt, _ := s.jobRepo.LastAttemptStartedAt(JobDataUpdate, today)
+		if lastAttempt.IsZero() || lastAttempt.Before(scheduled) {
+			s.runJob(JobDataUpdate, today, s.runDataUpdate)
+			return
+		}
+	}
 }
 
 // maybeRunIntraday 盘中止损监控: 交易时段内每 interval_min 分钟一轮
@@ -334,6 +366,30 @@ func (s *Scheduler) runScreener(date string) error {
 
 	logger.L().Infow("选股任务完成", "date", date, "candidates", len(results))
 	return nil
+}
+
+// runSignalWithFreshnessCheck 信号生成前检查数据新鲜度, 不新鲜则阻塞等待数据更新完成
+// 场景: 15:10 数据更新失败 (Tushare 延迟), 15:30 信号生成时自动补拉
+func (s *Scheduler) runSignalWithFreshnessCheck(date string) error {
+	barRepo := store.NewBarRepo(s.db)
+	maxDate, err := barRepo.GetMaxTradeDate()
+	if err != nil {
+		logger.L().Warnw("信号任务: 查询数据新鲜度失败, 继续执行", "err", err)
+	} else if maxDate < date {
+		logger.L().Infow("信号任务: 检测到数据不新鲜, 触发阻塞式数据更新", "latest_data", maxDate, "expected", date)
+		s.alert("📅 惊蛰数据更新", fmt.Sprintf(
+			"信号生成前检测到数据不新鲜 (库内最新: %s, 期望: %s), 自动触发数据更新",
+			maxDate, date))
+		if err := s.svc.UpdateDataBlocking(); err != nil {
+			logger.L().Errorw("信号任务: 前置数据更新失败, 仍尝试生成信号", "err", err)
+			s.alert("⚠️ 惊蛰数据更新", fmt.Sprintf("信号生成前数据更新失败: %v, 将使用已有数据生成信号", err))
+		} else {
+			logger.L().Info("信号任务: 前置数据更新完成")
+		}
+	} else {
+		logger.L().Infow("信号任务: 数据新鲜度检查通过", "latest_data", maxDate)
+	}
+	return s.runSignal(date)
 }
 
 // runSignal 15:30 EOD 信号生成 → 次日交易计划落库

@@ -67,6 +67,23 @@ func (r *JobRepo) HasSucceeded(jobName, tradeDate string) (bool, error) {
 	return count > 0, nil
 }
 
+// LastAttemptStartedAt 返回指定任务当日最后一次尝试的开始时间 (用于重试间隔判断)
+// 无记录时返回零值和 nil error
+func (r *JobRepo) LastAttemptStartedAt(jobName, tradeDate string) (time.Time, error) {
+	var startedAt string
+	err := r.db.Get(&startedAt, `SELECT started_at FROM job_run
+		WHERE job_name = ? AND trade_date = ?
+		ORDER BY id DESC LIMIT 1`, jobName, tradeDate)
+	if err != nil {
+		return time.Time{}, nil // 无记录不算错误
+	}
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", startedAt, time.Local)
+	if err != nil {
+		return time.Time{}, nil
+	}
+	return t, nil
+}
+
 // LastSuccess 查询任务最近一次成功记录 (健康度展示)
 func (r *JobRepo) LastSuccess(jobName string) (*JobRun, error) {
 	var run JobRun

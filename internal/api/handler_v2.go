@@ -459,12 +459,24 @@ func (s *Service) HandleUpdateData(w http.ResponseWriter, r *http.Request) {
 }
 
 // UpdateData 进程内执行增量数据更新 (从库内最新日期补到今天); 同一时刻只允许一个更新任务
+// 非阻塞: 如果有其他更新在执行, 立即返回错误
 func (s *Service) UpdateData() error {
 	if !s.updateMu.TryLock() {
 		return fmt.Errorf("数据更新任务正在执行中, 请稍后重试")
 	}
 	defer s.updateMu.Unlock()
+	return s.doUpdateData()
+}
 
+// UpdateDataBlocking 阻塞版数据更新: 等待其他更新完成后执行 (供信号任务前置调用)
+func (s *Service) UpdateDataBlocking() error {
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+	return s.doUpdateData()
+}
+
+// doUpdateData 增量数据更新核心逻辑
+func (s *Service) doUpdateData() error {
 	opts := dataloader.Options{}
 	if maxDate, err := s.barRepo.GetMaxTradeDate(); err == nil && maxDate != "" {
 		opts.StartDate = maxDate // 增量: 从库内最新日期补起 (含当日, 幂等覆盖)
