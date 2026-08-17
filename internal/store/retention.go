@@ -51,9 +51,7 @@ func RunRetention(db *sqlx.DB, p RetentionPolicy, fullClean bool) error {
 		errs = append(errs, fmt.Sprintf("wal_checkpoint失败: %v", err))
 	}
 	if time.Now().Weekday() == time.Sunday {
-		if _, err := db.Exec(`PRAGMA incremental_vacuum`); err != nil {
-			errs = append(errs, fmt.Sprintf("incremental_vacuum失败: %v", err))
-		}
+		errs = append(errs, vacuumIfNeeded(db)...)
 	}
 
 	logDBSize(db, "清理后")
@@ -321,6 +319,56 @@ func keepNewestFiles(dir string, keep int) {
 			logger.L().Infow("删除旧报告", "path", f.path)
 		}
 	}
+}
+
+// vacuumIfNeeded 按需回收 SQLite 空闲页 (删除数据后文件不收缩的问题)
+//
+// 背景: PRAGMA auto_vacuum 只对新建数据库生效。历史库 auto_vacuum=0 时,
+// incremental_vacuum 是 no-op, 大量删除后文件空洞永不回收 (曾出现 1.4GB 文件仅 2% 有数据)。
+//
+// 策略:
+//   - auto_vacuum=0 的旧库: 先持久化 INCREMENTAL 设置, 再跑真 VACUUM 一次性重建文件;
+//     之后删除的页进入 freelist 可被自动复用, 周日只需 incremental_vacuum 增量回收
+//   - auto_vacuum=INCREMENTAL 的新库: 直接 incremental_vacuum
+//   - 空闲页占比 < 20% 时跳过 (VACUUM 重建成本高, 不值得)
+func vacuumIfNeeded(db *sqlx.DB) []string {
+	var errs []string
+	var autoVacuum int
+	if err := db.Get(&autoVacuum, "PRAGMA auto_vacuum"); err != nil {
+		return []string{fmt.Sprintf("查询auto_vacuum失败: %v", err)}
+	}
+
+	var freelist, pageCount int64
+	_ = db.Get(&freelist, "PRAGMA freelist_count")
+	_ = db.Get(&pageCount, "PRAGMA page_count")
+	freePct := 0.0
+	if pageCount > 0 {
+		freePct = float64(freelist) / float64(pageCount)
+	}
+	logger.L().Infow("SQLite空间检查", "auto_vacuum", autoVacuum, "freelist_pages", freelist, "page_count", pageCount, "free_pct", freePct)
+
+	if freePct < 0.2 {
+		logger.L().Info("空闲页占比低, 跳过空间回收")
+		return nil
+	}
+
+	if autoVacuum == 0 {
+		// 旧库: 设置 INCREMENTAL 需要 VACUUM 重建才持久化, 一次 VACUUM 同时完成回收+升级
+		logger.L().Infow("旧库(auto_vacuum=0)空洞高, 执行 VACUUM 重建 (耗时取决于库大小)", "free_pct", freePct)
+		if _, err := db.Exec("PRAGMA auto_vacuum = INCREMENTAL"); err != nil {
+			return []string{fmt.Sprintf("设置auto_vacuum失败: %v", err)}
+		}
+		if _, err := db.Exec("VACUUM"); err != nil {
+			return []string{fmt.Sprintf("VACUUM失败(需磁盘空闲≈库大小): %v", err)}
+		}
+		logger.L().Info("VACUUM 完成, 空间已回收, auto_vacuum=INCREMENTAL 已持久化")
+		return nil
+	}
+
+	if _, err := db.Exec("PRAGMA incremental_vacuum"); err != nil {
+		errs = append(errs, fmt.Sprintf("incremental_vacuum失败: %v", err))
+	}
+	return errs
 }
 
 // logDBSize 打印主要表行数与db文件大小, 便于观察清理效果
