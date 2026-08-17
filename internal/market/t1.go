@@ -53,6 +53,11 @@ func OnBuy(pos *model.Position, qty int, price float64, cost model.Cost) {
 	pos.TotalQty = oldQty + qty
 	pos.TodayBought += qty
 
+	// 维护持仓期间最高价 (移动止盈基准)
+	if price > pos.HighPrice {
+		pos.HighPrice = price
+	}
+
 	// 移动加权平均成本
 	if pos.TotalQty > 0 {
 		pos.CostPrice = (oldCostAmount + buyCostAmount) / float64(pos.TotalQty)

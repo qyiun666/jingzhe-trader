@@ -89,8 +89,12 @@ func (sl *StopLossManager) CheckSingle(pos *model.Position, currentPrice float64
 	if sl.takeProfitPct > 0 && pnlPct >= sl.takeProfitPct {
 		// 如果启用了移动止盈，使用移动止盈逻辑
 		if sl.trailingStop > 0 {
-			// 从最高点回撤超过 trailingStop 才触发
-			highPrice := pos.MarketPrice
+			// 从持仓期间真实最高价回撤超过 trailingStop 才触发
+			// (HighPrice 由买入/每日行情维护; 缺失时退回 max(成本价, 现价))
+			highPrice := pos.HighPrice
+			if highPrice < pos.CostPrice {
+				highPrice = pos.CostPrice
+			}
 			if highPrice < currentPrice {
 				highPrice = currentPrice
 			}

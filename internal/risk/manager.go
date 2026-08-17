@@ -10,10 +10,10 @@ import (
 
 // RejectReason 拒绝原因
 type RejectReason struct {
-	TsCode string      // 股票代码
+	TsCode string       // 股票代码
 	Signal model.Signal // 原始信号
-	Reason string      // 拒绝原因描述
-	Rule   string      // 触发的规则名
+	Reason string       // 拒绝原因描述
+	Rule   string       // 触发的规则名
 }
 
 // RiskManager 风控管理器
@@ -30,10 +30,14 @@ type RiskManager struct {
 
 // NewRiskManager 创建风控管理器
 func NewRiskManager(cfg config.RiskConfig) *RiskManager {
+	sl := NewStopLossManager(cfg.StopLossPct, cfg.TakeProfitPct)
+	if cfg.TrailingStopPct > 0 {
+		sl.SetTrailingStop(cfg.TrailingStopPct)
+	}
 	return &RiskManager{
 		cfg:             cfg,
 		positionLimiter: NewPositionLimiter(cfg.MaxPositionPct, cfg.MaxTotalPositionPct, cfg.MaxSectorPct),
-		stopLossManager: NewStopLossManager(cfg.StopLossPct, cfg.TakeProfitPct),
+		stopLossManager: sl,
 		exposureManager: NewExposureManager(cfg.MaxSectorPct),
 		blacklist:       NewBlacklist(cfg.ExcludeST, cfg.MinListDays),
 	}
@@ -65,9 +69,9 @@ func (rm *RiskManager) SetSizeLimits(limits SizeLimits) {
 }
 
 // checkSizeLimits 小资金资金管理检查 (仅针对买入信号)
-// 1. 单笔金额低于最小交易额时, 先尝试逐手上调数量达标 (整手取整误差补偿),
-//    上调后仍超单票仓位上限则拒绝 (避免最低佣金侵蚀)
-// 2. 新开仓超过最大持仓数时拒绝
+//  1. 单笔金额低于最小交易额时, 先尝试逐手上调数量达标 (整手取整误差补偿),
+//     上调后仍超单票仓位上限则拒绝 (避免最低佣金侵蚀)
+//  2. 新开仓超过最大持仓数时拒绝
 func (rm *RiskManager) checkSizeLimits(sig model.Signal, currentPrice, totalAsset float64,
 	positions map[string]*model.Position, newCodes map[string]bool) (model.Signal, *RejectReason) {
 

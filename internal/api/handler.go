@@ -16,6 +16,7 @@ import (
 	"jingzhe-trader/internal/analysis"
 	"jingzhe-trader/internal/broker"
 	"jingzhe-trader/internal/config"
+	"jingzhe-trader/internal/goal"
 	"jingzhe-trader/internal/llm"
 	"jingzhe-trader/internal/market"
 	"jingzhe-trader/internal/model"
@@ -146,19 +147,20 @@ type Service struct {
 	planRepo           *store.PlanRepo
 	jobRepo            *store.JobRepo
 	stockRepo          *store.StockRepo
-	screenRepo         *store.ScreenRepo               // 选股结果仓库
-	screener           *screener.Screener               // 自动选股器
-	stockMap           map[string]string           // ts_code -> name
-	stockMapMu         sync.RWMutex                // 保护 stockMap 并发读写
+	screenRepo         *store.ScreenRepo  // 选股结果仓库
+	screener           *screener.Screener // 自动选股器
+	stockMap           map[string]string  // ts_code -> name
+	stockMapMu         sync.RWMutex       // 保护 stockMap 并发读写
 	brk                broker.Broker
-	dynamicSelector    *strategy.DynamicSelector      // 动态策略选择器
-	strategyCache      map[string]strategy.Strategy    // 策略实例缓存 (避免每次重建丢失状态)
-	strategyCacheMu    sync.RWMutex                    // 保护策略缓存并发读写
-	llmClient          *llm.Client                      // LLM 客户端
-	llmNews            *llm.NewsAnalyzer                // LLM 新闻分析器
-	debateOrchestrator *agent.DebateOrchestrator        // 智能体辩论编排器
-	startTime          time.Time                        // 服务启动时间 (uptime用)
-	updateMu           sync.Mutex                       // 数据更新互斥 (防并发重入)
+	dynamicSelector    *strategy.DynamicSelector    // 动态策略选择器
+	strategyCache      map[string]strategy.Strategy // 策略实例缓存 (避免每次重建丢失状态)
+	strategyCacheMu    sync.RWMutex                 // 保护策略缓存并发读写
+	llmClient          *llm.Client                  // LLM 客户端
+	llmNews            *llm.NewsAnalyzer            // LLM 新闻分析器
+	debateOrchestrator *agent.DebateOrchestrator    // 智能体辩论编排器
+	startTime          time.Time                    // 服务启动时间 (uptime用)
+	updateMu           sync.Mutex                   // 数据更新互斥 (防并发重入)
+	goalTracker        *goal.Tracker                // 季度目标跟踪器 (nil=未启用)
 }
 
 // NewService 创建 API 服务
@@ -169,21 +171,24 @@ func NewService(cfg *config.Config) (*Service, error) {
 	}
 
 	svc := &Service{
-		cfg:            cfg,
-		db:             db,
-		barRepo:        store.NewBarRepo(db),
-		calRepo:        store.NewCalendarRepo(db),
-		basicRepo:      store.NewBasicRepo(db),
-		finaRepo:       store.NewFinaRepo(db),
-		newsRepo:       store.NewNewsRepo(db),
-		debateRepo:     store.NewDebateRepo(db),
-		alertRepo:      store.NewAlertRepo(db),
-		planRepo:       store.NewPlanRepo(db),
-		jobRepo:        store.NewJobRepo(db),
-		stockRepo:      store.NewStockRepo(db),
-		screenRepo:     store.NewScreenRepo(db),
-		strategyCache:  make(map[string]strategy.Strategy),
-		startTime:      time.Now(),
+		cfg:           cfg,
+		db:            db,
+		barRepo:       store.NewBarRepo(db),
+		calRepo:       store.NewCalendarRepo(db),
+		basicRepo:     store.NewBasicRepo(db),
+		finaRepo:      store.NewFinaRepo(db),
+		newsRepo:      store.NewNewsRepo(db),
+		debateRepo:    store.NewDebateRepo(db),
+		alertRepo:     store.NewAlertRepo(db),
+		planRepo:      store.NewPlanRepo(db),
+		jobRepo:       store.NewJobRepo(db),
+		stockRepo:     store.NewStockRepo(db),
+		screenRepo:    store.NewScreenRepo(db),
+		strategyCache: make(map[string]strategy.Strategy),
+		startTime:     time.Now(),
+	}
+	if cfg.Goal.Enabled {
+		svc.goalTracker = goal.NewTracker(cfg.Goal, store.NewTradeRepo(db), store.NewPortfolioRepo(db), liveSnapshotRunID)
 	}
 
 	// 加载股票名称映射
@@ -192,6 +197,24 @@ func NewService(cfg *config.Config) (*Service, error) {
 	// 初始化券商 (使用 paper broker)
 	costModel := market.NewCostModel(cfg.Cost)
 	svc.brk = broker.NewPaperBroker("api", cfg.Backtest.InitialCapital, costModel)
+
+	// 成交回调 → trades 表落库 (回测管道之外, 实盘成交的持久化入口; run_id=live)
+	// QMT 模式下由调度器对账任务 PollTrades 触发; paper 模式下由 RecordTrade/confirm 路径触发
+	tradeRepo := store.NewTradeRepo(db)
+	svc.brk.OnTrade(func(trade model.Trade) {
+		if trade.TsCode == "" || trade.Qty <= 0 {
+			return
+		}
+		if trade.RunID == "" {
+			trade.RunID = liveSnapshotRunID
+		}
+		if trade.TradeDate == "" {
+			trade.TradeDate = time.Now().Format("20060102")
+		}
+		if _, err := tradeRepo.InsertTrade(&trade); err != nil {
+			logger.L().Warnw("成交回调落库失败", "ts_code", trade.TsCode, "err", err)
+		}
+	})
 
 	// 初始化扩展功能（动态策略选择器、策略缓存、持仓恢复）
 	svc.initExtensions()
@@ -312,8 +335,11 @@ func (s *Service) RunDaily(date string, strategyName string) (*DailyReportJSON, 
 	// 5. 市场快照
 	marketSnapshot := s.buildMarketSnapshot(date, allBars, prevBars)
 
-	// 6. 策略信号
-	signals := s.runStrategy(date, strategyName, todayBars, positions, asset)
+	// 6. 策略信号 (日报场景策略失败降级为空信号并在日志中体现, 不阻断日报)
+	signals, sigErr := s.runStrategy(date, strategyName, todayBars, positions, asset)
+	if sigErr != nil {
+		logger.L().Errorf("[%s] 日报策略信号生成失败: %v", date, sigErr)
+	}
 
 	// 7. 持仓诊断
 	portfolioJSON := s.buildPortfolioJSON(positions, asset, todayBars)
@@ -426,7 +452,10 @@ func (s *Service) RunRebalance(date string, strategyName string) (*RebalanceJSON
 	positions, _ = s.brk.QueryPositions()
 	asset, _ = s.brk.QueryAsset()
 
-	signals := s.runStrategy(date, strategyName, todayBars, positions, asset)
+	signals, sigErr := s.runStrategy(date, strategyName, todayBars, positions, asset)
+	if sigErr != nil {
+		logger.L().Errorf("[%s] 调仓建议策略信号生成失败: %v", date, sigErr)
+	}
 	return s.buildRebalanceJSON(date, signals, positions, asset, todayBars), nil
 }
 
@@ -454,7 +483,10 @@ func (s *Service) RunStrategy(date string, strategyName string) (*StrategyJSON, 
 	positions, _ = s.brk.QueryPositions()
 	asset, _ = s.brk.QueryAsset()
 
-	signals := s.runStrategy(date, strategyName, todayBars, positions, asset)
+	signals, sigErr := s.runStrategy(date, strategyName, todayBars, positions, asset)
+	if sigErr != nil {
+		logger.L().Errorf("[%s] 策略建议信号生成失败: %v", date, sigErr)
+	}
 	return s.buildStrategyJSON(date, signals, todayBars, nil), nil
 }
 
@@ -1167,10 +1199,10 @@ func (s *Service) runStrategy(
 	bars map[string]*model.Bar,
 	positions map[string]*model.Position,
 	asset *broker.AssetInfo,
-) []model.Signal {
+) ([]model.Signal, error) {
 	strat, ok := s.getStrategy(strategyName)
 	if !ok {
-		return nil
+		return nil, fmt.Errorf("策略不存在: %s", strategyName)
 	}
 
 	// 股票池: 配置 universe + 持仓, 且当日有行情
@@ -1201,7 +1233,7 @@ func (s *Service) runStrategy(
 	}
 	if len(universe) == 0 {
 		logger.L().Warnf("[%s] 股票池为空(配置 universe 无当日行情), 策略跳过", date)
-		return nil
+		return nil, nil
 	}
 
 	barCtx := &strategy.BarContext{
@@ -1217,10 +1249,10 @@ func (s *Service) runStrategy(
 	// 直接调用 OnBar (策略已在 getStrategy 中初始化, 不再每次重置状态)
 	signals, err := strat.OnBar(context.Background(), barCtx)
 	if err != nil {
-		logger.L().Errorf("[%s] 策略 %s 执行失败: %v", date, strategyName, err)
-		return nil
+		// 策略执行失败不得静默: 上抛错误, 让信号任务失败并告警, 而不是产出"无计划"的假正常结果
+		return nil, fmt.Errorf("策略 %s 执行失败: %w", strategyName, err)
 	}
-	return signals
+	return signals, nil
 }
 
 // dbHistoryAdapter 基于数据库的历史数据适配器 (策略均线计算/持仓分析 Beta/VaR 用)
@@ -1241,6 +1273,8 @@ func (h *dbHistoryAdapter) GetBars(tsCode, endDate string, n int) ([]model.Bar, 
 	if len(bars) > n {
 		bars = bars[len(bars)-n:]
 	}
+	// 前复权, 与回测 DataProvider 保持同一口径, 避免除权日产生假信号
+	model.AdjustBarsForward(bars)
 	return bars, nil
 }
 

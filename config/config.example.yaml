@@ -5,6 +5,13 @@
 #   TUSHARE_TOKEN / LLM_API_KEY / JZ_API_TOKEN / FEISHU_WEBHOOK / QMT_SIDECAR_TOKEN
 # ============================================
 
+# 季度目标跟踪 (核心决策约束)
+goal:
+  enabled: true              # 启用季度目标跟踪
+  quarterly_target_pct: 0.15  # 季度收益目标 15%
+  max_drawdown_budget: 0.10   # 季度最大回撤预算 10% (回撤达70%收紧敞口, 达100%进入防守)
+  auto_adjust: true           # 自动调节风险敞口 (只收紧不放松; 目标达成自动锁利降仓)
+
 tushare:
   token: ""  # 留空, 用环境变量 TUSHARE_TOKEN 注入 (https://tushare.pro/register.html)
   base_url: "http://api.tushare.pro"
@@ -40,6 +47,7 @@ risk:
   max_sector_pct: 0.60         # 单板块最大仓位 60%
   stop_loss_pct: 0.05          # 止损 5%
   take_profit_pct: 0.10        # 基础止盈 10%
+  trailing_stop_pct: 0.05      # 移动止盈回撤5% (盈利达止盈线后按持仓期间最高价回撤退出, 让利润奔跑; 0=不启用)
   exclude_st: true
   min_list_days: 60
 

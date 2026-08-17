@@ -76,7 +76,7 @@ var dailyFields = []string{
 func (c *Client) StockBasic() ([]model.Stock, error) {
 	fields := []string{
 		"ts_code", "symbol", "name", "market", "exchange",
-		"is_st", "list_status", "list_date", "delist_date",
+		"is_st", "list_status", "list_date", "delist_date", "industry",
 	}
 	rows, err := c.callAPI("stock_basic", map[string]interface{}{}, fields)
 	if err != nil {
@@ -95,6 +95,7 @@ func (c *Client) StockBasic() ([]model.Stock, error) {
 			ListStatus: fieldStr(row, "list_status"),
 			ListDate:   fieldStr(row, "list_date"),
 			DelistDate: fieldStr(row, "delist_date"),
+			Industry:   fieldStr(row, "industry"),
 		}
 		result = append(result, s)
 	}

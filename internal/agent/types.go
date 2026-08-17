@@ -49,8 +49,15 @@ type ResearchArgument struct {
 	Confidence float64  `json:"confidence"`
 }
 
+// 决策变更类型
+const (
+	ChangeTypeDecision  = "decision"   // 真正的决策/置信度/风险等级变更
+	ChangeTypeNewSymbol = "new_symbol" // 新增标的(此前无辩论记录)
+)
+
 // DecisionChange 决策变更记录
 type DecisionChange struct {
+	Type           string  `json:"type"` // 变更类型: decision / new_symbol
 	TsCode         string  `json:"ts_code"`
 	Name           string  `json:"name"`
 	PrevDecision   string  `json:"prev_decision"`

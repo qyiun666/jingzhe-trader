@@ -26,6 +26,11 @@ type Metrics struct {
 	TradingDays      int     // 交易天数
 	Alpha            float64 // Alpha
 	Beta             float64 // Beta
+	CalmarRatio      float64 // 卡玛比率 (年化收益/最大回撤)
+	SortinoRatio     float64 // 索提诺比率 (下行波动, 无风险利率与夏普一致)
+	AnnualVolatility float64 // 年化波动率
+	MonthlyWinRate   float64 // 月胜率 (月收益>0的比例)
+	TotalTradeCost   float64 // 总交易成本 (佣金+印花税+过户费)
 }
 
 // CalculateMetrics 计算绩效指标
@@ -60,9 +65,22 @@ func CalculateMetrics(snapshots []model.AccountSnapshot, trades []model.Trade, b
 	if len(dailyReturns) > 1 {
 		avgReturn := mean(dailyReturns)
 		stdReturn := stdDev(dailyReturns)
+		dailyRiskFree := 0.02 / 252.0
 		if stdReturn > 0 {
-			dailyRiskFree := 0.02 / 252.0
 			m.SharpeRatio = (avgReturn - dailyRiskFree) / stdReturn * math.Sqrt(252)
+		}
+		// 年化波动率
+		m.AnnualVolatility = stdReturn * math.Sqrt(252)
+		// 索提诺比率: 仅统计相对无风险利率的下行波动
+		downsideSq := 0.0
+		for _, r := range dailyReturns {
+			if d := r - dailyRiskFree; d < 0 {
+				downsideSq += d * d
+			}
+		}
+		downsideDev := math.Sqrt(downsideSq / float64(len(dailyReturns)))
+		if downsideDev > 0 {
+			m.SortinoRatio = (avgReturn - dailyRiskFree) / downsideDev * math.Sqrt(252)
 		}
 	}
 
@@ -84,6 +102,14 @@ func CalculateMetrics(snapshots []model.AccountSnapshot, trades []model.Trade, b
 	}
 	m.MaxDrawdown = maxDD
 
+	// 卡玛比率 (年化收益/最大回撤)
+	if maxDD > 0 {
+		m.CalmarRatio = m.AnnualReturn / maxDD
+	}
+
+	// 月胜率 (按月收益>0的比例)
+	m.MonthlyWinRate = calcMonthlyWinRate(snapshots)
+
 	// 交易统计 (按卖出成交计算每笔盈亏)
 	// 需要配对买卖交易来计算盈亏, 这里简化处理: 按卖出时的盈亏
 	// 完整实现需要跟踪每笔买入的成本
@@ -97,6 +123,13 @@ func CalculateMetrics(snapshots []model.AccountSnapshot, trades []model.Trade, b
 	var profits []float64
 
 	for _, t := range trades {
+		// 累计交易成本 (佣金+印花税+过户费; 兼容仅有总费用字段的历史数据)
+		cost := t.Commission + t.StampTax + t.TransferFee
+		if cost == 0 {
+			cost = t.TotalCost
+		}
+		m.TotalTradeCost += cost
+
 		pair, ok := pairs[t.TsCode]
 		if !ok {
 			pair = &tradePair{}
@@ -196,6 +229,37 @@ func stdDev(values []float64) float64 {
 		sumSq += diff * diff
 	}
 	return math.Sqrt(sumSq / float64(len(values)-1))
+}
+
+// calcMonthlyWinRate 月胜率: 月末资产相对上月末资产上涨 (首日相对初始资产) 的月份占比
+func calcMonthlyWinRate(snapshots []model.AccountSnapshot) float64 {
+	if len(snapshots) == 0 {
+		return 0
+	}
+	var months []string
+	monthEndAsset := make(map[string]float64)
+	for _, s := range snapshots {
+		if len(s.TradeDate) < 6 {
+			continue
+		}
+		key := s.TradeDate[:6]
+		if _, ok := monthEndAsset[key]; !ok {
+			months = append(months, key)
+		}
+		monthEndAsset[key] = s.TotalAsset
+	}
+	if len(months) == 0 {
+		return 0
+	}
+	prevAsset := snapshots[0].TotalAsset
+	wins := 0
+	for _, k := range months {
+		if prevAsset > 0 && monthEndAsset[k] > prevAsset {
+			wins++
+		}
+		prevAsset = monthEndAsset[k]
+	}
+	return float64(wins) / float64(len(months))
 }
 
 func calculateBeta(portReturns, benchReturns []float64) float64 {

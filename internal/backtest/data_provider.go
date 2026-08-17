@@ -18,7 +18,7 @@ type DataProvider struct {
 func NewDataProvider(barRepo *store.BarRepo, universe []string, startDate, endDate string) (*DataProvider, error) {
 	dp := &DataProvider{
 		barsByCode: make(map[string][]model.Bar),
-		dateIndex:   make(map[string]map[string]int),
+		dateIndex:  make(map[string]map[string]int),
 	}
 
 	for _, tsCode := range universe {
@@ -29,20 +29,8 @@ func NewDataProvider(barRepo *store.BarRepo, universe []string, startDate, endDa
 		if len(bars) == 0 {
 			continue
 		}
-		// 计算前复权价 (使用最后一天的adj_factor作为基准)
-		if len(bars) > 0 && bars[len(bars)-1].AdjFactor > 0 {
-			lastAdj := bars[len(bars)-1].AdjFactor
-			for i := range bars {
-				if bars[i].AdjFactor > 0 {
-					ratio := bars[i].AdjFactor / lastAdj
-					bars[i].Open *= ratio
-					bars[i].High *= ratio
-					bars[i].Low *= ratio
-					bars[i].Close *= ratio
-					bars[i].PreClose *= ratio
-				}
-			}
-		}
+		// 前复权 (以最后一天有效因子为基准, 成交量反向调整; 因子缺失沿用上日)
+		model.AdjustBarsForward(bars)
 
 		idxMap := make(map[string]int, len(bars))
 		for i, b := range bars {
@@ -104,6 +92,30 @@ func (dp *DataProvider) GetBar(tsCode, date string) *model.Bar {
 		return nil
 	}
 	return &bars[idx]
+}
+
+// AdjRatio 返回指定日期复权因子相对最新因子的比值 (adj_date/adj_latest)
+// 用于将前复权价换算回原始价 (如涨跌停价比较), 无数据时返回 1
+func (dp *DataProvider) AdjRatio(tsCode, date string) float64 {
+	bars, ok := dp.barsByCode[tsCode]
+	if !ok || len(bars) == 0 {
+		return 1
+	}
+	lastAdj := 0.0
+	for i := len(bars) - 1; i >= 0; i-- {
+		if bars[i].AdjFactor > 0 {
+			lastAdj = bars[i].AdjFactor
+			break
+		}
+	}
+	if lastAdj <= 0 {
+		return 1
+	}
+	idxMap := dp.dateIndex[tsCode]
+	if idx, ok := idxMap[date]; ok && bars[idx].AdjFactor > 0 {
+		return bars[idx].AdjFactor / lastAdj
+	}
+	return 1
 }
 
 // GetNextBar 获取指定股票某日的下一日K线 (用于次日开盘价成交)

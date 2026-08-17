@@ -6,10 +6,13 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"jingzhe-trader/internal/agent"
 	"jingzhe-trader/internal/broker"
+	"jingzhe-trader/internal/engine"
+	"jingzhe-trader/internal/goal"
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/notify"
 	"jingzhe-trader/internal/report"
@@ -59,54 +62,68 @@ func (s *Service) GenerateTradePlans(date string) ([]*store.TradePlan, error) {
 	positions := s.getPositions()
 	asset := s.getAsset()
 
-	// 风控管理器: 与回测/实盘同一套配置
-	rm := risk.NewRiskManager(s.cfg.Risk)
+	// 风控管理器: 与回测/实盘同一套配置, 并按季度目标状态收紧 (只收紧不放松)
+	riskCfg := s.cfg.Risk
+	if adj, notes := s.goalAdjustedRisk(date); len(notes) > 0 {
+		riskCfg = adj
+		for _, n := range notes {
+			logger.L().Infof("[计划生成] 目标风控调节: %s", n)
+		}
+	}
+	rm := risk.NewRiskManager(riskCfg)
 	rm.SetSizeLimits(risk.SizeLimits{
 		MinTradeAmount: s.cfg.Trading.MinTradeAmount,
 		MaxPositions:   s.cfg.Trading.MaxPositions,
 		MinCommission:  s.cfg.Cost.MinCommission,
 	})
 
-	// 止损信号优先, 策略信号对同一股票的信号剔除
+	// 止损信号优先, 策略信号对同一股票的信号剔除 (与回测 Pipeline 共用同一套合并/检查/排序语义)
 	stopSignals := rm.CheckStopLoss(positions, todayBars)
-	stopCodes := make(map[string]bool, len(stopSignals))
-	for _, sig := range stopSignals {
-		stopCodes[sig.TsCode] = true
-	}
+	stopCodes := engine.StopCodesOf(stopSignals)
 	strategyName := s.SelectStrategy(date)
-	merged := append([]model.Signal{}, stopSignals...)
-	for _, sig := range s.runStrategy(date, strategyName, todayBars, positions, asset) {
-		if !stopCodes[sig.TsCode] {
-			merged = append(merged, sig)
-		}
+	stratSignals, err := s.runStrategy(date, strategyName, todayBars, positions, asset)
+	if err != nil {
+		return nil, err
 	}
+	merged := engine.MergeStrategySignals(date, stopSignals, stopCodes, stratSignals)
 
-	// 智能体辩论增强 (LLM可用时对买入信号跑辩论)
+	// 智能体辩论增强 (LLM可用时对买入信号跑辩论; 回测中可通过同款 hook 验证)
 	if s.debateOrchestrator != nil && s.debateOrchestrator.IsEnabled() {
 		merged = s.debateOrchestrator.EnhanceSignals(date, merged, todayBars, positions, asset.TotalAsset, s.stockMap)
 	}
 
-	passed, rejections := rm.Check(merged, positions, asset.TotalAsset, s.loadRiskStocks(merged), date, todayBars)
-	for _, rej := range rejections {
-		logger.L().Infof("[计划生成] 风控拦截 %s: %s (%s)", rej.TsCode, rej.Reason, rej.Rule)
-	}
+	passed, rejections := engine.CheckAndSortSignals(date, rm, merged, positions, asset.TotalAsset, s.loadRiskStocks(merged), todayBars)
 
-	// 卖出优先排序 (先卖释放资金再买), 与 engine.Pipeline 保持一致
-	sellFirstSort(passed)
+	// 升级告警: 止损信号被风控拦截 (如跌停无法卖出/持仓不足) 必须让用户知道, 不能静默丢失
+	s.escalateStopLossRejections(date, rejections, stopCodes)
 
 	return s.signalsToPlans(date, strategyName, passed, todayBars, stopCodes), nil
 }
 
-// sellFirstSort 卖出信号排前, 买入排后 (原地排序)
-func sellFirstSort(signals []model.Signal) {
-	for i := 0; i < len(signals); i++ {
-		for j := i + 1; j < len(signals); j++ {
-			if signals[i].Direction == model.DirBuy && signals[j].Direction == model.DirSell {
-				signals[i], signals[j] = signals[j], signals[i]
+// escalateStopLossRejections 止损类信号被风控拦截时写告警并记录错误日志
+// 场景: 连续跌停时止损单会被"跌停禁卖"拦截, 用户必须知道持仓仍暴露在风险中
+func (s *Service) escalateStopLossRejections(date string, rejections []engine.RejectInfo, stopCodes map[string]bool) {
+	for _, rej := range rejections {
+		if !stopCodes[rej.TsCode] {
+			continue // 只升级止损类拦截
+		}
+		logger.L().Errorf("[%s] 止损信号被风控拦截(无法执行): %s %s (%s)", date, rej.TsCode, rej.Reason, rej.Rule)
+		if s.alertRepo != nil {
+			_, err := s.alertRepo.Insert(&store.AgentAlert{
+				TradeDate: date,
+				JobName:   "signal",
+				Level:     store.AlertLevelUrgent,
+				Title:     "🚨 止损无法执行",
+				Content:   fmt.Sprintf("%s: %s (%s). 止损计划被风控拦截, 持仓仍暴露, 请人工关注!", rej.TsCode, rej.Reason, rej.Rule),
+			})
+			if err != nil {
+				logger.L().Warnw("止损拦截告警入库失败", "ts_code", rej.TsCode, "err", err)
 			}
 		}
 	}
 }
+
+// (sellFirstSort 已删除: 排序语义统一由 engine.CheckAndSortSignals 提供, 避免两套实现漂移)
 
 // loadRiskStocks 加载信号涉及股票的基本信息 (风控黑名单/ST过滤用)
 func (s *Service) loadRiskStocks(signals []model.Signal) map[string]*model.Stock {
@@ -118,7 +135,9 @@ func (s *Service) loadRiskStocks(signals []model.Signal) map[string]*model.Stock
 		if st, err := s.stockRepo.GetByCode(sig.TsCode); err == nil && st != nil {
 			stocks[sig.TsCode] = st
 		} else {
-			stocks[sig.TsCode] = &model.Stock{TsCode: sig.TsCode, ListStatus: "L"}
+			// 查不到股票信息的标的一律按"未上市"处理, 被黑名单拦截, 不默认放行
+			logger.L().Warnf("[风控] %s 无股票基本信息, 按黑名单拦截处理", sig.TsCode)
+			stocks[sig.TsCode] = &model.Stock{TsCode: sig.TsCode, ListStatus: "P"}
 		}
 	}
 	return stocks
@@ -161,29 +180,30 @@ func (s *Service) signalsToPlans(date, strategyName string, signals []model.Sign
 
 // AgentBrief Agent 单次调用所需的全量上下文
 type AgentBrief struct {
-	Date             string                     `json:"date"`               // 数据基准日期
-	DataLastDate     string                     `json:"data_last_date"`     // 数据库最新行情日期
-	DataFresh        bool                       `json:"data_fresh"`         // 数据是否新鲜
-	OpenPlans        []store.TradePlan          `json:"open_plans"`         // 待处理的交易计划
-	Portfolio        *PortfolioJSON             `json:"portfolio"`          // 持仓诊断
-	Market           *MarketSnapshotJSON        `json:"market"`             // 市场概况
-	Jobs             map[string]string          `json:"jobs"`               // 各任务最近成功时间
-	Warnings         []string                   `json:"warnings"`           // 数据/任务异常提示
-	Debates          []store.DebateResult       `json:"debates"`            // 当日辩论结果
-	ScreenResults    []store.ScreenResult       `json:"screen_results"`     // 最新选股结果
-	ActionNeeded     []string                   `json:"action_needed"`      // 需要用户操作的提示
-	DecisionChanges  []agent.DecisionChange     `json:"decision_changes"`   // 决策变更记录
-	PlanStatusSummary PlanStatusSummary         `json:"plan_status_summary"` // 交易计划状态汇总
-	TaskCompleted    map[string]bool            `json:"task_completed"`     // 当日各任务是否已完成
+	Date              string                 `json:"date"`                // 数据基准日期
+	DataLastDate      string                 `json:"data_last_date"`      // 数据库最新行情日期
+	DataFresh         bool                   `json:"data_fresh"`          // 数据是否新鲜
+	OpenPlans         []store.TradePlan      `json:"open_plans"`          // 待处理的交易计划
+	Portfolio         *PortfolioJSON         `json:"portfolio"`           // 持仓诊断
+	Market            *MarketSnapshotJSON    `json:"market"`              // 市场概况
+	Jobs              map[string]string      `json:"jobs"`                // 各任务最近成功时间
+	Warnings          []string               `json:"warnings"`            // 数据/任务异常提示
+	Debates           []store.DebateResult   `json:"debates"`             // 当日辩论结果
+	ScreenResults     []store.ScreenResult   `json:"screen_results"`      // 最新选股结果
+	ActionNeeded      []string               `json:"action_needed"`       // 需要用户操作的提示
+	DecisionChanges   []agent.DecisionChange `json:"decision_changes"`    // 决策变更记录
+	PlanStatusSummary PlanStatusSummary      `json:"plan_status_summary"` // 交易计划状态汇总
+	TaskCompleted     map[string]bool        `json:"task_completed"`      // 当日各任务是否已完成
+	Goal              *goal.Status           `json:"goal,omitempty"`           // 季度目标状态 (目标跟踪启用时)
 }
 
 // PlanStatusSummary 交易计划状态汇总
 type PlanStatusSummary struct {
-	Pending   int `json:"pending"`    // 待确认
-	Confirmed int `json:"confirmed"`  // 已确认待执行
-	Executed  int `json:"executed"`   // 已执行
-	Expired   int `json:"expired"`    // 已过期
-	Total     int `json:"total"`      // 总计
+	Pending   int `json:"pending"`   // 待确认
+	Confirmed int `json:"confirmed"` // 已确认待执行
+	Executed  int `json:"executed"`  // 已执行
+	Expired   int `json:"expired"`   // 已过期
+	Total     int `json:"total"`     // 总计
 }
 
 // HandleAgentBrief GET /api/agent/brief
@@ -233,6 +253,16 @@ func (s *Service) HandleAgentBrief(w http.ResponseWriter, r *http.Request) {
 	}
 	if market, merr := s.RunMarket(lastDate); merr == nil {
 		brief.Market = market
+	}
+
+	// 季度目标状态 (Agent 决策的核心约束之一)
+	if s.goalTracker != nil {
+		if st, gerr := s.GoalStatus(lastDate); gerr == nil {
+			brief.Goal = st
+			if st.Mode != goal.ModeNormal {
+				brief.Warnings = append(brief.Warnings, fmt.Sprintf("目标风控模式: %s — %s", st.ModeLabel, strings.Join(st.Notes, "; ")))
+			}
+		}
 	}
 
 	// 任务健康度

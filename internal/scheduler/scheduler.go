@@ -17,6 +17,7 @@ import (
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/notify"
 	"jingzhe-trader/internal/quote"
+	"jingzhe-trader/internal/goal"
 	"jingzhe-trader/internal/report"
 	"jingzhe-trader/internal/risk"
 	"jingzhe-trader/internal/store"
@@ -32,7 +33,11 @@ const (
 	JobReport     = "report"
 	JobIntraday   = "intraday_monitor"
 	JobRetention  = "retention"
+	JobSettleT1   = "settle_t1"
 )
+
+// settleT1Time T+1 持仓结转时间 (开盘前, 盘中监控启动前)
+const settleT1Time = "09:25"
 
 // tickInterval 调度检查周期: 每30秒检查一次是否有到点任务
 const tickInterval = 30 * time.Second
@@ -51,8 +56,8 @@ type Scheduler struct {
 	planRepo *store.PlanRepo
 	calRepo  *store.CalendarRepo
 
-	running      sync.Map  // job_name -> bool, 防止同名任务重叠执行
-	lastIntraday time.Time // 上一轮盘中监控时间
+	running      sync.Map       // job_name -> bool, 防止同名任务重叠执行
+	lastIntraday time.Time      // 上一轮盘中监控时间
 	jobWg        sync.WaitGroup // 等待所有 job goroutine 完成 (优雅关闭用)
 }
 
@@ -136,6 +141,7 @@ func (s *Scheduler) tick() {
 	}
 
 	if isTradeDay {
+		s.maybeRunDaily(JobSettleT1, settleT1Time, now, today, s.runSettleT1)
 		s.maybeRunDataUpdateWithRetry(now, today)
 		s.maybeRunDaily(JobScreener, s.cfg.Scheduler.ScreenerTime, now, today, s.runScreener)
 		s.maybeRunDaily(JobSignal, s.cfg.Scheduler.SignalTime, now, today, s.runSignalWithFreshnessCheck)
@@ -332,7 +338,38 @@ func (s *Scheduler) alert(title, text string) {
 
 // runDataUpdate 15:10 数据更新 (进程内调用 dataloader)
 func (s *Scheduler) runDataUpdate(date string) error {
-	return s.svc.UpdateData()
+	if err := s.svc.UpdateData(); err != nil {
+		return err
+	}
+	// 数据新鲜后记录实盘账户快照 (收益曲线; 失败不阻断主任务)
+	if err := s.svc.RecordLiveSnapshot(date); err != nil {
+		logger.L().Warnw("实盘账户快照记录失败", "date", date, "err", err)
+	}
+	// 季度目标评估: 风险模式变化时告警 (失败不阻断)
+	s.checkGoalMode(date)
+	return nil
+}
+
+// checkGoalMode 评估季度目标状态, 风险模式变化时飞书告警并记录
+func (s *Scheduler) checkGoalMode(date string) {
+	st, err := s.svc.GoalStatus(date)
+	if err != nil || st == nil {
+		return // 未启用目标跟踪
+	}
+	portRepo := store.NewPortfolioRepo(s.db)
+	lastMode, _ := portRepo.GetMeta("goal_risk_mode")
+	if st.Mode == lastMode {
+		return
+	}
+	portRepo.SetMeta("goal_risk_mode", st.Mode)
+	logger.L().Infow("季度目标风险模式切换", "date", date, "from", lastMode, "to", st.Mode,
+		"return", st.ReturnPct, "progress", st.Progress, "drawdown", st.DrawdownPct)
+	s.alert("🎯 惊蛰目标跟踪", fmt.Sprintf(
+		"%s 风险模式: %s → %s\n季度收益: %.2f%% (目标 %.1f%%, 进度 %.0f%%)\n回撤: %.2f%% (预算 %.1f%%, 消耗 %.0f%%)\n%s",
+		st.Quarter, goal.ModeLabel(lastMode), st.ModeLabel,
+		st.ReturnPct*100, st.TargetPct*100, st.Progress*100,
+		st.DrawdownPct*100, st.BudgetPct*100, st.BudgetConsumed*100,
+		strings.Join(st.Notes, "; ")))
 }
 
 // runScreener 15:15 自动选股 (数据更新后, 信号生成前)
@@ -374,18 +411,27 @@ func (s *Scheduler) runSignalWithFreshnessCheck(date string) error {
 	barRepo := store.NewBarRepo(s.db)
 	maxDate, err := barRepo.GetMaxTradeDate()
 	if err != nil {
-		logger.L().Warnw("信号任务: 查询数据新鲜度失败, 继续执行", "err", err)
-	} else if maxDate < date {
+		// 无法确认数据新鲜度时宁缺毋滥: 不用未知状态的数据做交易决策
+		s.alert("🚨 惊蛰信号中止", fmt.Sprintf("查询数据新鲜度失败: %v, 今日信号生成中止, 请检查数据库", err))
+		return fmt.Errorf("查询数据新鲜度失败, 中止信号生成: %w", err)
+	}
+	if maxDate < date {
 		logger.L().Infow("信号任务: 检测到数据不新鲜, 触发阻塞式数据更新", "latest_data", maxDate, "expected", date)
 		s.alert("📅 惊蛰数据更新", fmt.Sprintf(
 			"信号生成前检测到数据不新鲜 (库内最新: %s, 期望: %s), 自动触发数据更新",
 			maxDate, date))
 		if err := s.svc.UpdateDataBlocking(); err != nil {
-			logger.L().Errorw("信号任务: 前置数据更新失败, 仍尝试生成信号", "err", err)
-			s.alert("⚠️ 惊蛰数据更新", fmt.Sprintf("信号生成前数据更新失败: %v, 将使用已有数据生成信号", err))
-		} else {
-			logger.L().Info("信号任务: 前置数据更新完成")
+			// 硬失败: 陈旧数据生成的计划是错误决策的来源, 宁可今日无计划
+			s.alert("🚨 惊蛰信号中止", fmt.Sprintf("数据更新失败: %v, 今日信号生成中止 (不用陈旧数据做决策)", err))
+			return fmt.Errorf("前置数据更新失败, 中止信号生成: %w", err)
 		}
+		// 更新成功后再次校验: Tushare 延迟时更新"成功"也可能没有当日数据
+		if maxDate2, err := barRepo.GetMaxTradeDate(); err != nil || maxDate2 < date {
+			s.alert("🚨 惊蛰信号中止", fmt.Sprintf(
+				"数据更新后仍无当日数据 (库内最新: %s, 期望: %s), 今日信号生成中止, 请检查数据源", maxDate2, date))
+			return fmt.Errorf("数据更新后仍不新鲜 (最新: %s, 期望: %s), 中止信号生成", maxDate2, date)
+		}
+		logger.L().Info("信号任务: 前置数据更新完成")
 	} else {
 		logger.L().Infow("信号任务: 数据新鲜度检查通过", "latest_data", maxDate)
 	}
@@ -530,6 +576,10 @@ func (s *Scheduler) runReconcile(date string) error {
 	if !result.IsBalanced {
 		s.alert("⚠️ 惊蛰对账差异", report.GenerateReconcileReport(result))
 	}
+	// 成交回报轮询: 把券商端真实成交落库 (OnTrade 回调 → trades 表, run_id=live)
+	if err := brk.PollTrades(); err != nil {
+		logger.L().Warnw("成交回报轮询失败", "date", date, "err", err)
+	}
 	return nil
 }
 
@@ -575,9 +625,19 @@ func (s *Scheduler) runReport(date string) error {
 	return nil
 }
 
+// runSettleT1 每日 09:25 T+1 持仓结转 (昨日买入转为可卖)
+func (s *Scheduler) runSettleT1(date string) error {
+	if err := s.svc.SettleT1(date); err != nil {
+		s.alert("⚠️ 惊蛰T+1结转失败", fmt.Sprintf("%v, 今日可卖量可能不准确", err))
+		return err
+	}
+	return nil
+}
+
 // runIntradayMonitor 盘中止损监控: 实时价 → 止损检查 → 紧急卖出计划 + 飞书告警
 func (s *Scheduler) runIntradayMonitor(date string) error {
-	positions, err := store.NewPortfolioRepo(s.db).GetAllPositions()
+	portRepo := store.NewPortfolioRepo(s.db)
+	positions, err := portRepo.GetAllPositions()
 	if err != nil {
 		return fmt.Errorf("查询持仓失败: %w", err)
 	}
@@ -605,6 +665,9 @@ func (s *Scheduler) runIntradayMonitor(date string) error {
 	}
 
 	sl := risk.NewStopLossManager(s.cfg.Risk.StopLossPct, s.cfg.Risk.TakeProfitPct)
+	if s.cfg.Risk.TrailingStopPct > 0 {
+		sl.SetTrailingStop(s.cfg.Risk.TrailingStopPct)
+	}
 	for _, p := range positions {
 		price, ok := prices[p.TsCode]
 		if !ok || existing[p.TsCode] {
@@ -615,14 +678,25 @@ func (s *Scheduler) runIntradayMonitor(date string) error {
 			TotalQty:     p.TotalQty,
 			AvailableQty: p.AvailableQty,
 			CostPrice:    p.CostPrice,
+			HighPrice:    p.HighPrice,
+		}
+		// 盘中刷新持仓期间最高价 (移动止盈基准)
+		if price > p.HighPrice {
+			if err := portRepo.UpdateHighPrice(p.TsCode, price); err != nil {
+				logger.L().Warnw("更新持仓最高价失败", "ts_code", p.TsCode, "err", err)
+			}
 		}
 		triggered, reason := sl.CheckSingle(pos, price)
 		if !triggered {
 			continue
 		}
+		// 数量以可卖量为准并钳制到总持仓, 防止计划卖出量超过实际持仓导致拒单
 		qty := p.AvailableQty
 		if qty <= 0 {
 			qty = p.TotalQty // T+1 不可卖也先生成计划提示
+		}
+		if qty > p.TotalQty {
+			qty = p.TotalQty
 		}
 		plan := &store.TradePlan{
 			TradeDate: date,
@@ -638,8 +712,13 @@ func (s *Scheduler) runIntradayMonitor(date string) error {
 			logger.L().Errorw("紧急计划落库失败", "ts_code", p.TsCode, "err", err)
 			continue
 		}
-		s.alert("🚨 惊蛰盘中止损告警",
-			fmt.Sprintf("%s 现价 %.2f 触发: %s\n已生成紧急卖出计划(%d股), 请尽快确认", p.TsCode, price, reason, qty))
+		msg := fmt.Sprintf("%s 现价 %.2f 触发: %s\n已生成紧急卖出计划(%d股), 请尽快确认", p.TsCode, price, reason, qty)
+		// 跌停时止损单可能无法成交, 必须显式提示 (连续跌停场景用户容易无感知)
+		if limit, err := store.NewLimitRepo(s.db).GetByCodeAndDate(p.TsCode, date); err == nil && limit != nil &&
+			limit.DownLimit > 0 && price <= limit.DownLimit {
+			msg += fmt.Sprintf("\n⚠️ 现价已触及跌停价 %.2f, 卖出单可能无法成交, 请立即人工处理!", limit.DownLimit)
+		}
+		s.alert("🚨 惊蛰盘中止损告警", msg)
 	}
 	return nil
 }

@@ -57,17 +57,17 @@ func (r *TradeRepo) UpdateOrderStatus(id int64, status model.OrderStatus, filled
 
 const tradeInsertSQL = `INSERT INTO trades
 	(run_id, order_id, ts_code, side, price, qty, amount, commission, stamp_tax,
-	 transfer_fee, total_cost, trade_date, trade_time)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	 transfer_fee, total_cost, trade_date, trade_time, strategy)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 const tradeSelectCols = `id, run_id, order_id, ts_code, side, price, qty, amount, commission,
-	stamp_tax, transfer_fee, total_cost, trade_date, trade_time`
+	stamp_tax, transfer_fee, total_cost, trade_date, trade_time, strategy`
 
 // InsertTrade 插入成交记录, 返回自增主键 ID 并回填到 t.ID
 func (r *TradeRepo) InsertTrade(t *model.Trade) (int64, error) {
 	res, err := r.db.Exec(tradeInsertSQL,
 		t.RunID, t.OrderID, t.TsCode, int(t.Side), t.Price, t.Qty, t.Amount,
-		t.Commission, t.StampTax, t.TransferFee, t.TotalCost, t.TradeDate, t.TradeTime,
+		t.Commission, t.StampTax, t.TransferFee, t.TotalCost, t.TradeDate, t.TradeTime, t.Strategy,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("插入成交记录失败: %w", err)
@@ -88,6 +88,25 @@ func (r *TradeRepo) GetTradesByRunID(runID string) ([]model.Trade, error) {
 		return nil, fmt.Errorf("查询成交记录失败: %w", err)
 	}
 	return trades, nil
+}
+
+// GetLatestRunPerStrategy 返回每个策略最近一次运行的 run_id (绩效归因用)
+func (r *TradeRepo) GetLatestRunPerStrategy() (map[string]string, error) {
+	var rows []struct {
+		Strategy string `db:"strategy"`
+		RunID    string `db:"run_id"`
+	}
+	err := r.db.Select(&rows, `SELECT t.strategy, t.run_id FROM trades t
+		JOIN (SELECT strategy, MAX(id) AS mid FROM trades WHERE strategy <> '' AND strategy IS NOT NULL GROUP BY strategy) m
+		ON t.id = m.mid`)
+	if err != nil {
+		return nil, fmt.Errorf("查询策略最近运行失败: %w", err)
+	}
+	result := make(map[string]string, len(rows))
+	for _, row := range rows {
+		result[row.Strategy] = row.RunID
+	}
+	return result, nil
 }
 
 // 同一 run 重跑当日幂等覆盖 (配合 (run_id, trade_date) 唯一索引)

@@ -197,6 +197,7 @@ func (s *IntradayTStrategy) OnBar(_ context.Context, barCtx *BarContext) ([]mode
 		signal := model.Signal{
 			TsCode:    tsCode,
 			Direction: model.DirBuy, // 用 DirBuy 标记"建议做T"
+			Advice:    true,         // 仅建议, 不进成交管道 (做T需盘中人工/专门逻辑执行)
 			TargetQty: tQty,
 			Reason: fmt.Sprintf(
 				"日内做T建议: ATR振幅%.2f%%, 目标收益%.1f%%, 数量%d股, 预期盈利%.0f元",

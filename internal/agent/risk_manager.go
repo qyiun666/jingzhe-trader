@@ -53,7 +53,7 @@ func (rm *RiskManagerAgent) Judge(ctx *DebateContext, reports []*AnalysisReport,
 	if rm.llm == nil || !rm.llm.IsEnabled() {
 		return rm.fallbackJudge(ctx, reports, bull, bear), nil
 	}
-	resp, err := rm.llm.Chat(riskMgrSysPrompt, userPrompt)
+	resp, err := rm.llm.ChatWithCache(ctx.TradeDate, ctx.TsCode, "risk_manager", riskMgrSysPrompt, userPrompt)
 	if err != nil {
 		logger.L().Warnw("风险管理员LLM调用失败", "ts_code", ctx.TsCode, "err", err)
 		return rm.fallbackJudge(ctx, reports, bull, bear), nil

@@ -76,6 +76,7 @@ func (l *Loader) Run(opts Options) error {
 	}
 	l.syncIndexHistory(opts.StartDate, opts.EndDate)
 	l.syncDailyData(tradeCals)
+	l.backfillAdjFactors()
 	l.syncOptional(opts, tradeCals)
 
 	logger.L().Info("数据同步全部完成!")
@@ -113,16 +114,32 @@ func (l *Loader) syncStockList() {
 }
 
 // syncDailyData 按交易日同步日线/涨跌停/基本面/ETF
+// 除增量同步外, 每个交易日重拉最近 reSyncTradeDays 个交易日 (UPSERT覆盖),
+// 以吸收 tushare 对近期数据的更正 (分红/停复牌/行情修订)
 func (l *Loader) syncDailyData(tradeCals []model.TradeCal) {
 	logger.L().Info("=== 同步日线行情 ===")
 	lastDate, _ := l.barRepo.GetMaxTradeDate()
+	reSyncFrom := ""
+	if lastDate != "" {
+		if t, err := time.Parse("20060102", lastDate); err == nil {
+			reSyncFrom = t.AddDate(0, 0, -14).Format("20060102") // 自然日回退14天 ≈ 10个交易日
+		}
+	}
 	syncedCount := 0
+	reSyncedCount := 0
 
 	for _, cal := range tradeCals {
 		if lastDate != "" && cal.CalDate <= lastDate {
-			continue // 跳过已同步的日期
+			if reSyncFrom != "" && cal.CalDate >= reSyncFrom {
+				// 重拉窗口内: 覆盖式刷新近期数据 (吸收数据源更正)
+				reSyncedCount++
+				logger.L().Debugf("重拉 %s 日线(覆盖更正)...", cal.CalDate)
+			} else {
+				continue // 跳过历史日期
+			}
+		} else {
+			logger.L().Infof("同步 %s 日线...", cal.CalDate)
 		}
-		logger.L().Infof("同步 %s 日线...", cal.CalDate)
 
 		if !l.syncOneDayBars(cal.CalDate) {
 			continue
@@ -134,7 +151,32 @@ func (l *Loader) syncDailyData(tradeCals []model.TradeCal) {
 			logger.L().Infof("已同步 %d 个交易日", syncedCount)
 		}
 	}
-	logger.L().Infof("日线行情同步完成, 共 %d 个交易日", syncedCount)
+	logger.L().Infof("日线行情同步完成, 新增 %d 个交易日, 重拉覆盖 %d 个交易日", syncedCount, reSyncedCount)
+}
+
+// validateBars K线入库校验: 剔除明显错误的数据行 (价格非正/高低倒挂/成交量为负)
+// 返回有效行数; 剔除时记日志告警, 剔除比例过高时返回 false 让调用方放弃整日写入
+func validateBars(bars []model.Bar, calDate string) ([]model.Bar, bool) {
+	valid := bars[:0]
+	dropped := 0
+	for _, b := range bars {
+		if b.Close <= 0 || b.Open <= 0 || b.High < b.Low || b.Vol < 0 || b.High < b.Close || b.Low > b.Close {
+			dropped++
+			logger.L().Warnf("数据校验剔除异常K线 %s %s: O%.2f H%.2f L%.2f C%.2f V%.0f",
+				b.TsCode, b.TradeDate, b.Open, b.High, b.Low, b.Close, b.Vol)
+			continue
+		}
+		valid = append(valid, b)
+	}
+	if dropped > 0 {
+		logger.L().Warnf("%s 数据校验: 剔除 %d/%d 条异常K线", calDate, dropped, len(bars))
+	}
+	// 剔除比例超 5% 说明数据源整体异常, 不信任整日数据
+	if len(bars) > 20 && dropped*20 > len(bars) {
+		logger.L().Errorf("%s 异常K线比例过高 (%d/%d), 放弃整日写入", calDate, dropped, len(bars))
+		return nil, false
+	}
+	return valid, true
 }
 
 // syncOneDayBars 同步单日日线, 返回是否成功
@@ -142,6 +184,13 @@ func (l *Loader) syncOneDayBars(calDate string) bool {
 	bars, err := l.ts.Daily(calDate)
 	if err != nil {
 		logger.L().Errorf("获取 %s 日线失败: %v", calDate, err)
+		return false
+	}
+	// 合并当日复权因子 (daily 接口不返回, 需单独拉取; 失败不阻断, 由 backfillAdjFactors 兜底)
+	l.mergeAdjFactors(bars, calDate)
+	// 入库前校验
+	var ok bool
+	if bars, ok = validateBars(bars, calDate); !ok {
 		return false
 	}
 	if l.cfg.Dataloader.FilterMode {
@@ -224,6 +273,78 @@ func (l *Loader) syncOneDayExtras(calDate string) {
 			}
 		}
 	}
+}
+
+// mergeAdjFactors 拉取当日全市场复权因子并填入 bars
+func (l *Loader) mergeAdjFactors(bars []model.Bar, calDate string) {
+	factors, err := l.ts.AdjFactor("", calDate)
+	if err != nil {
+		logger.L().Warnf("获取 %s 复权因子失败(将依赖回填): %v", calDate, err)
+		return
+	}
+	factorMap := make(map[string]float64, len(factors))
+	for _, f := range factors {
+		factorMap[f.TsCode] = f.AdjFactor
+	}
+	for i := range bars {
+		if factor, ok := factorMap[bars[i].TsCode]; ok {
+			bars[i].AdjFactor = factor
+		}
+	}
+}
+
+// BackfillAdjFactors 对外暴露的复权因子回填入口 (CLI -adj / 运维手动触发用)
+func (l *Loader) BackfillAdjFactors() {
+	l.backfillAdjFactors()
+}
+
+// backfillAdjFactors 回填历史缺失的复权因子
+// daily 接口不返回因子, 历史数据的 adj_factor 为 0; 按股票逐只全量拉取回填
+// 指数/ETF 不在 stock_basic 中, 自动跳过 (ETF 分红少, 暂不处理)
+func (l *Loader) backfillAdjFactors() {
+	codes, err := l.barRepo.GetZeroAdjFactorCodes()
+	if err != nil {
+		logger.L().Errorf("查询缺失复权因子失败: %v", err)
+		return
+	}
+	if len(codes) == 0 {
+		return
+	}
+	// 只回填真实股票 (在 stock_basic 中存在的代码)
+	stockSet := make(map[string]bool)
+	if rows, err := l.db.Queryx("SELECT ts_code FROM stock_basic"); err == nil {
+		for rows.Next() {
+			var code string
+			if err := rows.Scan(&code); err == nil {
+				stockSet[code] = true
+			}
+		}
+		rows.Close()
+	}
+	logger.L().Infof("=== 回填复权因子 (%d 个代码待检查) ===", len(codes))
+	totalUpdated := 0
+	for _, code := range codes {
+		if !stockSet[code] {
+			continue
+		}
+		factors, err := l.ts.AdjFactor(code, "")
+		if err != nil {
+			logger.L().Warnf("获取 %s 复权因子失败: %v", code, err)
+			continue
+		}
+		factorMap := make(map[string]float64, len(factors))
+		for _, f := range factors {
+			factorMap[f.TradeDate] = f.AdjFactor
+		}
+		updated, err := l.barRepo.UpdateAdjFactors(code, factorMap)
+		if err != nil {
+			logger.L().Errorf("回填 %s 复权因子失败: %v", code, err)
+			continue
+		}
+		totalUpdated += updated
+		logger.L().Infof("  %s: 回填 %d 条复权因子", code, updated)
+	}
+	logger.L().Infof("复权因子回填完成, 共更新 %d 条", totalUpdated)
 }
 
 // SyncCalendarOnly 仅同步交易日历 (轻量级, 用于打破调度器日历死锁)

@@ -135,6 +135,7 @@ func (o *DebateOrchestrator) EnhanceSignals(date string, signals []model.Signal,
 				}
 			}
 			sig.Reason = fmt.Sprintf("%s | LLM辩论: %s", sig.Reason, result.Summary)
+			sig.Reason = appendStopPriceReason(sig.Reason, result.StopPrice)
 			sig.Strength = result.Confidence
 		}
 		enhanced = append(enhanced, sig)
@@ -158,6 +159,14 @@ func (o *DebateOrchestrator) buildContext(date, tsCode string, stockNames map[st
 		pos = p
 	}
 	return &DebateContext{TradeDate: date, TsCode: tsCode, Name: name, Bars: history, Position: pos, TotalAsset: totalAsset, MarketBars: marketBars}
+}
+
+// appendStopPriceReason 将风险管理员裁决的止损价附到买入信号原因中, 便于用户参考
+func appendStopPriceReason(reason string, stopPrice float64) string {
+	if stopPrice <= 0 {
+		return reason
+	}
+	return fmt.Sprintf("%s, 建议止损价%.2f", reason, stopPrice)
 }
 
 func dateMinusDays(date string, days int) string {

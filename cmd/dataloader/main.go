@@ -22,6 +22,7 @@ func main() {
 	syncMoneyFlow := flag.Bool("moneyflow", false, "同步个股资金流向")
 	syncTopList := flag.Bool("toplist", false, "同步龙虎榜数据")
 	syncFina := flag.Bool("fina", false, "同步财务指标数据(按报告期获取, 每季度采集一次)")
+	adjOnly := flag.Bool("adj", false, "仅回填复权因子(首次升级后跑一次, 修复历史adj_factor为0的数据)")
 	cleanup := flag.Bool("cleanup", false, "清理不在股票池和持仓中的股票数据(危险)")
 	confirmCleanup := flag.Bool("confirm-cleanup", false, "确认执行清理(与 -cleanup 配合, 双重保护)")
 	flag.Parse()
@@ -45,6 +46,12 @@ func main() {
 	defer db.Close()
 
 	loader := dataloader.New(cfg, db)
+
+	// 复权因子回填模式: 回填后退出
+	if *adjOnly {
+		loader.BackfillAdjFactors()
+		return
+	}
 
 	// 清理模式: 清理数据后退出 (需 enable_cleanup 配置 + --confirm-cleanup 双重确认)
 	if *cleanup {

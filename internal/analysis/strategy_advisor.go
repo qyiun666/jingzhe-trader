@@ -56,6 +56,15 @@ func AdviseStrategy(
 	candidates := getCandidateStrategies(marketCondition)
 
 	// 3. 对所有候选策略评分
+	// 无历史业绩数据时使用中性基准 (Sharpe=0, 胜率50%, 无近期动量, 回撤5%),
+	// 使推荐退化为"按市场环境选策略类型"而不是永远推荐空仓
+	neutralPerf := StrategyPerformance{
+		Sharpe:       0,
+		WinRate:      0.5,
+		Recent7Days:  0,
+		Recent30Days: 0,
+		MaxDrawdown:  0.05,
+	}
 	var scored []scoredStrategy
 	for _, name := range candidates {
 		if name == "空仓" {
@@ -65,10 +74,12 @@ func AdviseStrategy(
 			})
 			continue
 		}
-		if perf, ok := strategyPerformances[name]; ok {
-			score := calculateStrategyScore(perf, marketCondition)
-			scored = append(scored, scoredStrategy{name: name, score: score, perf: perf})
+		perf, ok := strategyPerformances[name]
+		if !ok {
+			perf = neutralPerf
 		}
+		score := calculateStrategyScore(perf, marketCondition)
+		scored = append(scored, scoredStrategy{name: name, score: score, perf: perf})
 	}
 
 	// 按评分降序排列

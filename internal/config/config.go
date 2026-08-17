@@ -11,23 +11,33 @@ import (
 
 // Config 全局配置
 type Config struct {
-	Tushare  TushareConfig  `mapstructure:"tushare"`
-	Database DatabaseConfig `mapstructure:"database"`
-	Cost     CostConfig     `mapstructure:"cost"`
-	Backtest BacktestConfig `mapstructure:"backtest"`
-	Risk     RiskConfig     `mapstructure:"risk"`
-	Log      LogConfig      `mapstructure:"log"`
-	Broker   BrokerConfig   `mapstructure:"broker"`
-	Strategy StrategyConfig `mapstructure:"strategy"`
-	Universe UniverseConfig `mapstructure:"universe"`
-	Server   ServerConfig   `mapstructure:"server"`
+	Tushare    TushareConfig    `mapstructure:"tushare"`
+	Database   DatabaseConfig   `mapstructure:"database"`
+	Cost       CostConfig       `mapstructure:"cost"`
+	Backtest   BacktestConfig   `mapstructure:"backtest"`
+	Risk       RiskConfig       `mapstructure:"risk"`
+	Log        LogConfig        `mapstructure:"log"`
+	Broker     BrokerConfig     `mapstructure:"broker"`
+	Strategy   StrategyConfig   `mapstructure:"strategy"`
+	Universe   UniverseConfig   `mapstructure:"universe"`
+	Server     ServerConfig     `mapstructure:"server"`
 	Feishu     FeishuConfig     `mapstructure:"feishu"`
 	LLM        LLMConfig        `mapstructure:"llm"`
 	Dataloader DataloaderConfig `mapstructure:"dataloader"`
 	Scheduler  SchedulerConfig  `mapstructure:"scheduler"`
 	Trading    TradingConfig    `mapstructure:"trading"`
 	Retention  RetentionConfig  `mapstructure:"retention"`
-	Screener  ScreenerConfig  `mapstructure:"screener"`
+	Screener   ScreenerConfig   `mapstructure:"screener"`
+	Goal       GoalConfig       `mapstructure:"goal"`
+}
+
+// GoalConfig 季度目标跟踪配置
+// 系统按日历季度跟踪收益目标进度与回撤预算, 超预算时自动收紧风险敞口
+type GoalConfig struct {
+	Enabled            bool    `mapstructure:"enabled"`              // 是否启用目标跟踪
+	QuarterlyTargetPct float64 `mapstructure:"quarterly_target_pct"` // 季度收益目标 (如 0.15=15%)
+	MaxDrawdownBudget  float64 `mapstructure:"max_drawdown_budget"`  // 季度内最大回撤预算 (如 0.10=10%)
+	AutoAdjust         bool    `mapstructure:"auto_adjust"`          // 是否自动调节风险敞口 (false=仅跟踪告警)
 }
 
 // SchedulerConfig 内置调度器配置
@@ -68,28 +78,28 @@ type RetentionConfig struct {
 
 // ScreenerConfig 自动选股器配置
 type ScreenerConfig struct {
-	Enabled         bool     `mapstructure:"enabled"`          // 是否启用选股器
-	MaxCandidates   int      `mapstructure:"max_candidates"`   // 最大候选股票数
-	ExcludeCodes    []string `mapstructure:"exclude_codes"`    // 排除的股票代码 (配置池已有)
-	ExcludeST       bool     `mapstructure:"exclude_st"`       // 排除ST股
-	MinListDays     int      `mapstructure:"min_list_days"`    // 最小上市天数 (排除新股)
-	MinPrice        float64  `mapstructure:"min_price"`        // 最低股价
-	MaxPrice        float64  `mapstructure:"max_price"`        // 最高股价
+	Enabled         bool     `mapstructure:"enabled"`           // 是否启用选股器
+	MaxCandidates   int      `mapstructure:"max_candidates"`    // 最大候选股票数
+	ExcludeCodes    []string `mapstructure:"exclude_codes"`     // 排除的股票代码 (配置池已有)
+	ExcludeST       bool     `mapstructure:"exclude_st"`        // 排除ST股
+	MinListDays     int      `mapstructure:"min_list_days"`     // 最小上市天数 (排除新股)
+	MinPrice        float64  `mapstructure:"min_price"`         // 最低股价
+	MaxPrice        float64  `mapstructure:"max_price"`         // 最高股价
 	MinTurnoverRate float64  `mapstructure:"min_turnover_rate"` // 最低换手率 %
-	MaxPE           float64  `mapstructure:"max_pe"`           // 最大PE_TTM
-	MaxPB           float64  `mapstructure:"max_pb"`           // 最大PB
-	MinCircMV       float64  `mapstructure:"min_circ_mv"`      // 最小流通市值 (万元)
-	MaxCircMV       float64  `mapstructure:"max_circ_mv"`      // 最大流通市值 (万元)
+	MaxPE           float64  `mapstructure:"max_pe"`            // 最大PE_TTM
+	MaxPB           float64  `mapstructure:"max_pb"`            // 最大PB
+	MinCircMV       float64  `mapstructure:"min_circ_mv"`       // 最小流通市值 (万元)
+	MaxCircMV       float64  `mapstructure:"max_circ_mv"`       // 最大流通市值 (万元)
 }
 
 // DataloaderConfig 数据加载器配置
 type DataloaderConfig struct {
-	FilterMode  bool     `mapstructure:"filter_mode"`  // 筛选模式: 只拉取股票池+持仓+关注列表的股票
-	Watchlist   []string `mapstructure:"watchlist"`    // 额外关注的股票代码列表
-	EnableLimit bool     `mapstructure:"enable_limit"`   // 是否同步涨跌停价
-	EnableBasic bool     `mapstructure:"enable_basic"`   // 是否同步每日基本面
-	EnableFund  bool     `mapstructure:"enable_fund"`    // 是否同步ETF/基金日线
-	EnableCleanup bool   `mapstructure:"enable_cleanup"` // 是否允许清理非关注股票数据(危险操作, 默认关闭)
+	FilterMode    bool     `mapstructure:"filter_mode"`    // 筛选模式: 只拉取股票池+持仓+关注列表的股票
+	Watchlist     []string `mapstructure:"watchlist"`      // 额外关注的股票代码列表
+	EnableLimit   bool     `mapstructure:"enable_limit"`   // 是否同步涨跌停价
+	EnableBasic   bool     `mapstructure:"enable_basic"`   // 是否同步每日基本面
+	EnableFund    bool     `mapstructure:"enable_fund"`    // 是否同步ETF/基金日线
+	EnableCleanup bool     `mapstructure:"enable_cleanup"` // 是否允许清理非关注股票数据(危险操作, 默认关闭)
 }
 
 // LLMConfig LLM 配置
@@ -130,10 +140,10 @@ type DatabaseConfig struct {
 }
 
 type CostConfig struct {
-	CommissionRate   float64 `mapstructure:"commission_rate"`
-	MinCommission    float64 `mapstructure:"min_commission"`
-	StampTaxRate     float64 `mapstructure:"stamp_tax_rate"`
-	TransferFeeRate  float64 `mapstructure:"transfer_fee_rate"`
+	CommissionRate  float64 `mapstructure:"commission_rate"`
+	MinCommission   float64 `mapstructure:"min_commission"`
+	StampTaxRate    float64 `mapstructure:"stamp_tax_rate"`
+	TransferFeeRate float64 `mapstructure:"transfer_fee_rate"`
 }
 
 type BacktestConfig struct {
@@ -151,6 +161,7 @@ type RiskConfig struct {
 	MaxSectorPct        float64 `mapstructure:"max_sector_pct"`
 	StopLossPct         float64 `mapstructure:"stop_loss_pct"`
 	TakeProfitPct       float64 `mapstructure:"take_profit_pct"`
+	TrailingStopPct     float64 `mapstructure:"trailing_stop_pct"` // 移动止盈回撤比例 (0=不启用; 启用后盈利达止盈线改按高点回撤退出)
 	ExcludeST           bool    `mapstructure:"exclude_st"`
 	MinListDays         int     `mapstructure:"min_list_days"`
 }
@@ -164,8 +175,8 @@ type LogConfig struct {
 
 // BrokerConfig 券商配置
 type BrokerConfig struct {
-	Type string       `mapstructure:"type"` // paper / qmt
-	QMT  QMTConfig    `mapstructure:"qmt"`
+	Type string    `mapstructure:"type"` // paper / qmt
+	QMT  QMTConfig `mapstructure:"qmt"`
 }
 
 // QMTConfig miniQMT 配置
@@ -202,11 +213,11 @@ type MACDConfig struct {
 
 // MultiFactorConfig 多因子策略配置
 type MultiFactorConfig struct {
-	TopN           int     `mapstructure:"top_n"`
-	RebalanceFreq  string  `mapstructure:"rebalance_freq"`
-	PositionPct    float64 `mapstructure:"position_pct"`
-	StopLossPct     float64 `mapstructure:"stop_loss_pct"`
-	TakeProfitPct  float64 `mapstructure:"take_profit_pct"`
+	TopN          int     `mapstructure:"top_n"`
+	RebalanceFreq string  `mapstructure:"rebalance_freq"`
+	PositionPct   float64 `mapstructure:"position_pct"`
+	StopLossPct   float64 `mapstructure:"stop_loss_pct"`
+	TakeProfitPct float64 `mapstructure:"take_profit_pct"`
 }
 
 // UniverseConfig 股票池配置

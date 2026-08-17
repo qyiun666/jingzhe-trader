@@ -11,6 +11,7 @@ type Stock struct {
 	ListStatus string `json:"list_status" db:"list_status"` // L上市 D退市 P暂停
 	ListDate   string `json:"list_date" db:"list_date"`     // 上市日期 YYYYMMDD
 	DelistDate string `json:"delist_date" db:"delist_date"` // 退市日期
+	Industry   string `json:"industry" db:"industry"`       // 行业分类 (申万/证监会, tushare stock_basic)
 }
 
 // Board 板块类型

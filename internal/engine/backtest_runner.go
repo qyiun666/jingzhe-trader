@@ -66,6 +66,8 @@ func NewBacktestRunner(cfg RunConfig, appCfg *config.Config) (*BacktestRunner, e
 	costModel := market.NewCostModel(appCfg.Cost)
 	pb := broker.NewPaperBroker("backtest", cfg.InitialCapital, costModel)
 	pb.SetMatchRules(cfg.Slippage, store.NewLimitRepo(db))
+	// 涨跌停检查口径: 前复权成交价换算回原始价比较
+	pb.SetAdjRatioFn(dataProvider.AdjRatio)
 
 	// 风控: 与实盘同一套配置, 保证回测结果反映真实约束
 	rm := risk.NewRiskManager(appCfg.Risk)
@@ -191,44 +193,61 @@ func (r *BacktestRunner) Run() (*backtest.BacktestResult, error) {
 	snapshots := r.pipeline.Snapshots()
 	trades := r.pipeline.Trades()
 
+	// 策略执行失败天数显著告警: 有失败日的回测结果不可信 (那些天只有止损信号在交易)
+	if days := r.pipeline.StrategyErrorDays(); days > 0 {
+		logger.L().Warnf("⚠️⚠️ 策略在 %d 个交易日执行失败, 本次回测结果不可信, 请先修复策略错误 ⚠️⚠️", days)
+	}
+
 	var benchReturns []float64
+	var benchSnapshots []backtest.BenchmarkSnapshot
 	if r.cfg.Benchmark != "" {
-		benchReturns = r.calcBenchmarkReturns()
+		benchReturns, benchSnapshots = r.calcBenchmarkReturns()
 	}
 	metrics := backtest.CalculateMetrics(snapshots, trades, benchReturns)
 
 	result := &backtest.BacktestResult{
-		RunID:          r.runID,
-		Metrics:        metrics,
-		Snapshots:      snapshots,
-		Trades:         trades,
-		StrategyName:   r.pipeline.cfg.Strategy.Name(),
-		Universe:       r.pipeline.cfg.Universe,
-		StartDate:      r.cfg.StartDate,
-		EndDate:        r.cfg.EndDate,
-		InitialCapital: r.cfg.InitialCapital,
+		RunID:              r.runID,
+		Metrics:            metrics,
+		Snapshots:          snapshots,
+		Trades:             trades,
+		StrategyName:       r.pipeline.cfg.Strategy.Name(),
+		Universe:           r.pipeline.cfg.Universe,
+		StartDate:          r.cfg.StartDate,
+		EndDate:            r.cfg.EndDate,
+		InitialCapital:     r.cfg.InitialCapital,
+		BenchmarkName:      r.cfg.Benchmark,
+		BenchmarkSnapshots: benchSnapshots,
 	}
 
 	r.printSummary(result)
 	return result, nil
 }
 
-// calcBenchmarkReturns 计算基准日收益率序列
-func (r *BacktestRunner) calcBenchmarkReturns() []float64 {
+// calcBenchmarkReturns 计算基准日收益率序列, 并顺带产出逐日基准净值 (归一化, 起点=1)
+func (r *BacktestRunner) calcBenchmarkReturns() ([]float64, []backtest.BenchmarkSnapshot) {
 	barRepo := store.NewBarRepo(r.db)
 	bars, err := barRepo.GetBars(r.cfg.Benchmark, r.cfg.StartDate, r.cfg.EndDate)
 	if err != nil || len(bars) < 2 {
-		return nil
+		return nil, nil
 	}
 	var returns []float64
-	var prevClose float64
+	snapshots := make([]backtest.BenchmarkSnapshot, 0, len(bars))
+	var prevClose, firstClose float64
 	for _, b := range bars {
+		if firstClose == 0 {
+			firstClose = b.Close
+		}
 		if prevClose > 0 {
 			returns = append(returns, (b.Close-prevClose)/prevClose)
 		}
 		prevClose = b.Close
+		nav := 1.0
+		if firstClose > 0 {
+			nav = b.Close / firstClose
+		}
+		snapshots = append(snapshots, backtest.BenchmarkSnapshot{TradeDate: b.TradeDate, Nav: nav})
 	}
-	return returns
+	return returns, snapshots
 }
 
 // printSummary 打印回测摘要

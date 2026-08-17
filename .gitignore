@@ -73,3 +73,6 @@ signals.json
 /dataloader
 /server
 /captain
+.gocache/
+.gomodcache/
+/optimizer

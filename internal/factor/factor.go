@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"jingzhe-trader/internal/model"
+	"jingzhe-trader/pkg/logger"
 )
 
 // Factor 因子接口
@@ -57,20 +58,31 @@ func Winsorize(values []float64, lower, upper float64) []float64 {
 		return values
 	}
 
-	// 复制并排序以计算分位数
-	sorted := make([]float64, len(values))
-	copy(sorted, values)
-	sort.Float64s(sorted)
+	// 只用有限值计算分位数 (NaN/Inf 不参与, 原样保留)
+	finite := make([]float64, 0, len(values))
+	for _, v := range values {
+		if !math.IsNaN(v) && !math.IsInf(v, 0) {
+			finite = append(finite, v)
+		}
+	}
+	if len(finite) == 0 {
+		result := make([]float64, len(values))
+		copy(result, values)
+		return result
+	}
+	sort.Float64s(finite)
 
 	// 计算 lower 分位数
-	lowerVal := quantile(sorted, lower)
+	lowerVal := quantile(finite, lower)
 	// 计算 upper 分位数
-	upperVal := quantile(sorted, upper)
+	upperVal := quantile(finite, upper)
 
 	// 缩尾处理
 	result := make([]float64, len(values))
 	for i, v := range values {
-		if v < lowerVal {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			result[i] = v // 无效值原样保留, 由下游 Rank 处理
+		} else if v < lowerVal {
 			result[i] = lowerVal
 		} else if v > upperVal {
 			result[i] = upperVal
@@ -110,39 +122,59 @@ func quantile(sorted []float64, p float64) float64 {
 }
 
 // Standardize 标准化 (z-score)
-// (x - mean) / std
+// (x - mean) / std; 非有限值(NaN/Inf)不参与统计, 输出保留 NaN 供下游识别
 func Standardize(values []float64) []float64 {
 	if len(values) == 0 {
 		return values
 	}
 
-	// 计算均值
+	// 只用有限值计算均值/标准差
 	var sum float64
+	n := 0
 	for _, v := range values {
-		sum += v
+		if !math.IsNaN(v) && !math.IsInf(v, 0) {
+			sum += v
+			n++
+		}
 	}
-	mean := sum / float64(len(values))
+	result := make([]float64, len(values))
+	if n == 0 {
+		for i := range result {
+			result[i] = math.NaN()
+		}
+		return result
+	}
+	mean := sum / float64(n)
 
-	// 计算标准差
 	var variance float64
 	for _, v := range values {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			continue
+		}
 		diff := v - mean
 		variance += diff * diff
 	}
-	variance /= float64(len(values))
+	variance /= float64(n)
 	std := math.Sqrt(variance)
 
 	// 标准化
-	result := make([]float64, len(values))
 	if std == 0 {
-		// 标准差为0时, 所有值设为0
-		for i := range result {
-			result[i] = 0
+		// 标准差为0时, 有限值设为0, 无效值保持 NaN
+		for i, v := range values {
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				result[i] = math.NaN()
+			} else {
+				result[i] = 0
+			}
 		}
 		return result
 	}
 	for i, v := range values {
-		result[i] = (v - mean) / std
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			result[i] = math.NaN()
+		} else {
+			result[i] = (v - mean) / std
+		}
 	}
 	return result
 }
@@ -158,14 +190,23 @@ func Rank(values []float64, higherBetter bool) map[string]float64 {
 		return map[string]float64{}
 	}
 
-	// 创建带索引的切片
+	// 分离有限值与无效值 (NaN/Inf): 无效值确定性地给 0 分
 	type indexed struct {
 		idx   int
 		value float64
 	}
-	items := make([]indexed, n)
+	items := make([]indexed, 0, n)
+	invalid := make([]int, 0)
 	for i, v := range values {
-		items[i] = indexed{idx: i, value: v}
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			invalid = append(invalid, i)
+		} else {
+			items = append(items, indexed{idx: i, value: v})
+		}
+	}
+	// 无效值占比过高时告警 (数据质量问题的早期信号)
+	if n > 0 && len(invalid)*5 > n {
+		logger.L().Warnf("[factor] Rank 输入无效值占比 %d/%d, 排名质量下降", len(invalid), n)
 	}
 
 	// 排序: higherBetter=true 时降序, false 时升序
@@ -179,14 +220,20 @@ func Rank(values []float64, higherBetter bool) map[string]float64 {
 	// 计算排名分数 (0-100)
 	// 第1名得100分, 最后1名得0分, 线性分布
 	result := make(map[string]float64, n)
-	if n == 1 {
-		result["0"] = 50.0
+	for _, i := range invalid {
+		result[itoa(i)] = 0
+	}
+	m := len(items)
+	if m == 0 {
 		return result
 	}
-
+	if m == 1 {
+		result[itoa(items[0].idx)] = 50.0
+		return result
+	}
 	for rank, item := range items {
 		// 排名从0开始, 分数从100线性降到0
-		score := 100.0 * (1.0 - float64(rank)/float64(n-1))
+		score := 100.0 * (1.0 - float64(rank)/float64(m-1))
 		result[itoa(item.idx)] = score
 	}
 	return result

@@ -476,9 +476,12 @@ def trades():
         raw_trades = _g_xt_trader.query_stock_trades(_g_account)
         result: List[Dict[str, Any]] = []
         for t in raw_trades or []:
+            # order_type: 成交回报用于成交落库归因, 23=买入 24=卖出 (同 order 接口语义)
+            t_order_type = _safe_int(getattr(t, "order_type", 0))
             result.append({
                 "order_id": str(getattr(t, "order_id", "")),
                 "stock_code": getattr(t, "stock_code", ""),
+                "order_type": "buy" if t_order_type == 23 else ("sell" if t_order_type == 24 else "unknown"),
                 "traded_volume": _safe_int(getattr(t, "traded_volume", 0)),
                 "traded_price": _safe_float(getattr(t, "traded_price", 0.0)),
                 "trade_time": getattr(t, "trade_time", ""),

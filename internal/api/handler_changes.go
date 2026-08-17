@@ -11,11 +11,11 @@ import (
 
 // ChangeReport 变更检测报告
 type ChangeReport struct {
-	Date             string                 `json:"date"`
-	DecisionChanges  []DecisionChangeJSON   `json:"decision_changes"`
-	PlanStatusChanges []PlanStatusChangeJSON `json:"plan_status_changes"`
-	TaskStatus       map[string]TaskStatusJSON `json:"task_status"`
-	Summary          string                 `json:"summary"`
+	Date              string                    `json:"date"`
+	DecisionChanges   []DecisionChangeJSON      `json:"decision_changes"`
+	PlanStatusChanges []PlanStatusChangeJSON    `json:"plan_status_changes"`
+	TaskStatus        map[string]TaskStatusJSON `json:"task_status"`
+	Summary           string                    `json:"summary"`
 }
 
 // DecisionChangeJSON 决策变更 (API 输出格式)
@@ -31,13 +31,13 @@ type DecisionChangeJSON struct {
 
 // PlanStatusChangeJSON 计划状态变更
 type PlanStatusChangeJSON struct {
-	ID        int64  `json:"id"`
-	TsCode    string `json:"ts_code"`
-	Name      string `json:"name"`
-	Direction string `json:"direction"`
-	OldStatus string `json:"old_status"`
-	NewStatus string `json:"new_status"`
-	Qty       int    `json:"qty"`
+	ID        int64   `json:"id"`
+	TsCode    string  `json:"ts_code"`
+	Name      string  `json:"name"`
+	Direction string  `json:"direction"`
+	OldStatus string  `json:"old_status"`
+	NewStatus string  `json:"new_status"`
+	Qty       int     `json:"qty"`
 	RefPrice  float64 `json:"ref_price"`
 }
 
@@ -65,10 +65,10 @@ func (s *Service) HandleAgentChanges(w http.ResponseWriter, r *http.Request) {
 	}
 
 	report := &ChangeReport{
-		Date:             date,
-		DecisionChanges:  []DecisionChangeJSON{},
+		Date:              date,
+		DecisionChanges:   []DecisionChangeJSON{},
 		PlanStatusChanges: []PlanStatusChangeJSON{},
-		TaskStatus:       map[string]TaskStatusJSON{},
+		TaskStatus:        map[string]TaskStatusJSON{},
 	}
 
 	// 1. 决策变更检测

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -62,11 +63,28 @@ type qmtConnectReq struct {
 
 // QMTBridge 通过 HTTP 调用 Python sidecar 连接 miniQMT 的桥接器
 type QMTBridge struct {
-	baseURL   string       // sidecar 地址，如 "http://127.0.0.1:16888"
-	token     string       // sidecar 鉴权 token (环境变量 QMT_SIDECAR_TOKEN)
-	client    *http.Client // HTTP 客户端
-	mu        sync.RWMutex // 保护 callbacks
-	callbacks []func(model.Trade)
+	baseURL    string       // sidecar 地址，如 "http://127.0.0.1:16888"
+	token      string       // sidecar 鉴权 token (环境变量 QMT_SIDECAR_TOKEN)
+	client     *http.Client // HTTP 客户端
+	mu         sync.RWMutex // 保护 callbacks/seenTrades
+	callbacks  []func(model.Trade)
+	seenTrades map[string]bool // 已回报成交去重 (order_id|code|vol|price)
+}
+
+// qmtTrade sidecar /trades 返回的成交记录
+type qmtTrade struct {
+	OrderID   string  `json:"order_id"`
+	StockCode string  `json:"stock_code"`
+	OrderType string  `json:"order_type"` // buy/sell/unknown
+	Volume    int     `json:"traded_volume"`
+	Price     float64 `json:"traded_price"`
+	TradeTime string  `json:"trade_time"`
+}
+
+type qmtTradesResp struct {
+	Success bool       `json:"success"`
+	Error   string     `json:"error"`
+	Trades  []qmtTrade `json:"trades"`
 }
 
 // NewQMTBridge 创建 QMTBridge 实例
@@ -77,7 +95,8 @@ func NewQMTBridge(baseURL string) *QMTBridge {
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		callbacks: make([]func(model.Trade), 0),
+		callbacks:  make([]func(model.Trade), 0),
+		seenTrades: make(map[string]bool),
 	}
 }
 
@@ -226,15 +245,85 @@ func (q *QMTBridge) QueryAsset() (*AssetInfo, error) {
 	}, nil
 }
 
-// OnTrade 注册成交回调
+// OnTrade 注册成交回调 (由 PollTrades 触发)
 func (q *QMTBridge) OnTrade(callback func(model.Trade)) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.callbacks = append(q.callbacks, callback)
 }
 
+// PollTrades 轮询券商端成交回报并触发 OnTrade 回调 (幂等, 已回报的去重)
+// 由调度器的对账任务在收盘后调用, 把 QMT 真实成交落库
+func (q *QMTBridge) PollTrades() error {
+	respBody, err := q.get("/trades")
+	if err != nil {
+		return fmt.Errorf("查询成交回报失败: %w", err)
+	}
+	var resp qmtTradesResp
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return fmt.Errorf("解析成交回报失败: %w", err)
+	}
+	if !resp.Success {
+		return fmt.Errorf("查询成交回报失败: %s", resp.Error)
+	}
+
+	var fired []model.Trade
+	q.mu.Lock()
+	for _, t := range resp.Trades {
+		if t.StockCode == "" || t.Volume <= 0 {
+			continue
+		}
+		key := fmt.Sprintf("%s|%s|%d|%.4f", t.OrderID, t.StockCode, t.Volume, t.Price)
+		if q.seenTrades[key] {
+			continue
+		}
+		side := model.SideBuy
+		switch t.OrderType {
+		case "buy":
+			side = model.SideBuy
+		case "sell":
+			side = model.SideSell
+		default:
+			// 方向未知: 标记已见并跳过不触发 (宁可漏报也不报错方向; 只告警一次避免刷屏)
+			q.seenTrades[key] = true
+			logger.L().Warnf("[QMTBridge] 成交回报方向未知, 跳过: %s %s", t.StockCode, t.OrderID)
+			continue
+		}
+		q.seenTrades[key] = true
+		orderID, _ := strconv.ParseInt(t.OrderID, 10, 64)
+		fired = append(fired, model.Trade{
+			RunID:     "live",
+			OrderID:   orderID,
+			TsCode:    t.StockCode,
+			Side:      side,
+			Price:     t.Price,
+			Qty:       t.Volume,
+			Amount:    t.Price * float64(t.Volume),
+			TradeTime: t.TradeTime,
+		})
+	}
+	q.mu.Unlock()
+
+	for _, tr := range fired {
+		logger.L().Infof("[QMTBridge] 成交回报 %s %s %d股 @%.2f", tr.TsCode, tr.Side, tr.Qty, tr.Price)
+		q.notifyTrade(tr)
+	}
+	return nil
+}
+
+// notifyTrade 锁外触发成交回调 (与 PaperBroker 语义一致)
+func (q *QMTBridge) notifyTrade(trade model.Trade) {
+	q.mu.RLock()
+	callbacks := make([]func(model.Trade), len(q.callbacks))
+	copy(callbacks, q.callbacks)
+	q.mu.RUnlock()
+	for _, cb := range callbacks {
+		cb(trade)
+	}
+}
+
 // SettleT1 T+1结算，QMT自身处理，此处为空实现
-func (q *QMTBridge) SettleT1() {
+func (q *QMTBridge) SettleT1(_ string) {
 	// QMT 券商端自行处理 T+1，无需桥接层干预
 }
 

@@ -7,15 +7,20 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"jingzhe-trader/internal/analysis"
+	"jingzhe-trader/internal/backtest"
 	"jingzhe-trader/internal/broker"
+	"jingzhe-trader/internal/config"
 	"jingzhe-trader/internal/dataloader"
+	"jingzhe-trader/internal/goal"
 	"jingzhe-trader/internal/llm"
 	"jingzhe-trader/internal/model"
-	"jingzhe-trader/internal/strategy"
 	"jingzhe-trader/internal/store"
+	"jingzhe-trader/internal/strategy"
+	"jingzhe-trader/pkg/logger"
 )
 
 // ==================== 持仓同步 ====================
@@ -125,6 +130,8 @@ func (s *Service) HandleSyncPortfolio(w http.ResponseWriter, r *http.Request) {
 					TsCode:       p.TsCode,
 					TotalQty:     p.TotalQty,
 					AvailableQty: p.AvailableQty,
+					TodayBought:  p.TodayBought,
+					HighPrice:    p.HighPrice,
 					CostPrice:    p.CostPrice,
 				}
 			}
@@ -160,15 +167,15 @@ func (s *Service) HandleGetPortfolio(w http.ResponseWriter, r *http.Request) {
 
 	// 转换为带名称的响应
 	type PositionDetail struct {
-		TsCode        string  `json:"ts_code"`
-		Name          string  `json:"name"`
-		TotalQty      int     `json:"total_qty"`
-		AvailableQty  int     `json:"available_qty"`
-		CostPrice     float64 `json:"cost_price"`
-		AvgPrice      float64 `json:"avg_price"`
-		MarketPrice   float64 `json:"market_price"`
-		MarketValue   float64 `json:"market_value"`
-		FloatingPnL   float64 `json:"floating_pnl"`
+		TsCode         string  `json:"ts_code"`
+		Name           string  `json:"name"`
+		TotalQty       int     `json:"total_qty"`
+		AvailableQty   int     `json:"available_qty"`
+		CostPrice      float64 `json:"cost_price"`
+		AvgPrice       float64 `json:"avg_price"`
+		MarketPrice    float64 `json:"market_price"`
+		MarketValue    float64 `json:"market_value"`
+		FloatingPnL    float64 `json:"floating_pnl"`
 		FloatingPnLPct float64 `json:"floating_pnl_pct"`
 	}
 
@@ -281,6 +288,124 @@ func (s *Service) HandleTradeConfirm(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// liveSnapshotRunID 实盘账户快照的 run_id (与回测 bt_* 区分)
+const liveSnapshotRunID = "live"
+
+// goalAdjustedRisk 返回按季度目标状态调节后的风控配置 (只收紧不放松)
+// 第二个返回值: 调整说明 (空=未调整或未启用)
+func (s *Service) goalAdjustedRisk(date string) (config.RiskConfig, []string) {
+	if s.goalTracker == nil {
+		return s.cfg.Risk, nil
+	}
+	asset := s.getAsset()
+	st, err := s.goalTracker.Status(date, asset.TotalAsset)
+	if err != nil {
+		logger.L().Warnf("[目标跟踪] 状态计算失败, 使用基础风控: %v", err)
+		return s.cfg.Risk, nil
+	}
+	adj, notes := s.goalTracker.AdjustRisk(s.cfg.Risk, st)
+	for _, n := range notes {
+		logger.L().Infof("[目标跟踪] %s %s", date, n)
+	}
+	return adj, notes
+}
+
+// GoalStatus 返回当前季度目标状态 (供 API 与调度器使用)
+func (s *Service) GoalStatus(date string) (*goal.Status, error) {
+	if s.goalTracker == nil {
+		return nil, fmt.Errorf("目标跟踪未启用 (goal.enabled=false)")
+	}
+	asset := s.getAsset()
+	return s.goalTracker.Status(date, asset.TotalAsset)
+}
+
+// HandleGoalStatus 处理 GET /api/goal/status
+func (s *Service) HandleGoalStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "仅支持 GET")
+		return
+	}
+	date := r.URL.Query().Get("date")
+	if date == "" {
+		date = time.Now().Format("20060102")
+	}
+	st, err := s.GoalStatus(date)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+// RecordLiveSnapshot 记录实盘每日账户快照 (收益曲线数据, 供日报/目标跟踪/复盘使用)
+// 数据更新成功后调用: 用当日收盘价更新市值 → 计算当日/累计盈亏 → 落 account_snapshot
+func (s *Service) RecordLiveSnapshot(date string) error {
+	bars, err := s.barRepo.GetBarsByDate(date)
+	if err != nil || len(bars) == 0 {
+		return fmt.Errorf("无当日行情, 跳过快照: %w", err)
+	}
+	barMap := make(map[string]*model.Bar, len(bars))
+	for i := range bars {
+		barMap[bars[i].TsCode] = &bars[i]
+	}
+	s.brk.UpdateMarketValue(barMap)
+	asset, err := s.brk.QueryAsset()
+	if err != nil {
+		return fmt.Errorf("查询资产失败: %w", err)
+	}
+
+	snap := model.AccountSnapshot{
+		TradeDate:   date,
+		TotalAsset:  asset.TotalAsset,
+		Cash:        asset.Cash,
+		MarketValue: asset.MarketValue,
+	}
+	tradeRepo := store.NewTradeRepo(s.db)
+	// 当日盈亏: 对比上一个实盘快照
+	if prev, err := tradeRepo.GetLatestAccountSnapshot(liveSnapshotRunID); err == nil && prev != nil && prev.TotalAsset > 0 {
+		snap.PnL = snap.TotalAsset - prev.TotalAsset
+		snap.PnLPct = snap.PnL / prev.TotalAsset
+	}
+	// 累计盈亏: 对比初始资金
+	portRepo := store.NewPortfolioRepo(s.db)
+	initial := s.cfg.Backtest.InitialCapital
+	if v, _ := portRepo.GetMeta("initial_capital"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			initial = f
+		}
+	}
+	if initial > 0 {
+		snap.TotalPnL = snap.TotalAsset - initial
+		snap.TotalPnLPct = snap.TotalPnL / initial
+	}
+	if err := tradeRepo.InsertAccountSnapshot(liveSnapshotRunID, snap); err != nil {
+		return fmt.Errorf("快照落库失败: %w", err)
+	}
+	logger.L().Infof("[实盘快照] %s 总资产 %.2f 当日盈亏 %.2f (%.2f%%) 累计 %.2f%%",
+		date, snap.TotalAsset, snap.PnL, snap.PnLPct*100, snap.TotalPnLPct*100)
+	return nil
+}
+
+// PollBrokerTrades 轮询券商端成交回报 (QMT 模式由对账任务调用, paper 模式无操作)
+func (s *Service) PollBrokerTrades() error {
+	if qb, ok := s.brk.(*broker.QMTBridge); ok {
+		return qb.PollTrades()
+	}
+	return nil
+}
+
+// SettleT1 每日开盘前结转: 内存 broker 与 DB 持仓的 T+1 交收 (昨日买入转为可卖)
+func (s *Service) SettleT1(date string) error {
+	if pb, ok := s.brk.(*broker.PaperBroker); ok {
+		pb.SettleT1(date)
+	}
+	if err := store.NewPortfolioRepo(s.db).SettleT1(); err != nil {
+		return err
+	}
+	logger.L().Infof("[T+1结算] %s 持仓结转完成", date)
+	return nil
+}
+
 // applyTradeToPortfolio 将成交同步到内存持仓与数据库 (trade/confirm 与 plan/confirm 共用)
 func (s *Service) applyTradeToPortfolio(tsCode string, side model.Side, qty int, price float64) *broker.AssetInfo {
 	// 1. 更新 PaperBroker 内存持仓
@@ -297,6 +422,7 @@ func (s *Service) applyTradeToPortfolio(tsCode string, side model.Side, qty int,
 
 	if side == model.SideBuy {
 		// 买入: 更新或新增持仓, 加权平均成本
+		// T+1: 今日买入计入 today_bought, 不计入可卖量, 次日开盘结转后可卖
 		newQty := pos.TotalQty + qty
 		newCost := pos.CostPrice
 		if newQty > 0 && pos.TotalQty > 0 {
@@ -305,30 +431,56 @@ func (s *Service) applyTradeToPortfolio(tsCode string, side model.Side, qty int,
 		} else if pos.TotalQty == 0 {
 			newCost = price
 		}
+		highPrice := pos.HighPrice
+		if price > highPrice {
+			highPrice = price // 买入价也可能是持仓期新高
+		}
 		portRepo.UpsertPosition(store.PortfolioSyncItem{
 			TsCode:       tsCode,
 			TotalQty:     newQty,
 			AvailableQty: pos.AvailableQty, // T+1: 今日买入明日可卖
+			TodayBought:  pos.TodayBought + qty,
+			HighPrice:    highPrice,
 			CostPrice:    newCost,
 			AvgPrice:     newCost,
 		})
 	} else {
-		// 卖出: 减少持仓, 清仓则删除记录
+		// 卖出: 减少持仓与可卖量, 清仓则删除记录
 		newQty := pos.TotalQty - qty
+		newAvail := pos.AvailableQty - qty
+		if newAvail < 0 {
+			newAvail = 0
+		}
 		if newQty <= 0 {
 			portRepo.RemovePosition(tsCode)
 		} else {
 			portRepo.UpsertPosition(store.PortfolioSyncItem{
 				TsCode:       tsCode,
 				TotalQty:     newQty,
-				AvailableQty: pos.AvailableQty,
+				AvailableQty: newAvail,
+				TodayBought:  pos.TodayBought,
+				HighPrice:    pos.HighPrice,
 				CostPrice:    pos.CostPrice,
 				AvgPrice:     pos.AvgPrice,
 			})
 		}
 	}
 
-	// 3. 查询更新后的资产并持久化 cash
+	// 3. 成交落库 (绩效归因/收益曲线的数据源, 与回测 trades 同表区分 run_id)
+	if _, err := store.NewTradeRepo(s.db).InsertTrade(&model.Trade{
+		RunID:     liveSnapshotRunID,
+		TsCode:    tsCode,
+		Side:      side,
+		Price:     price,
+		Qty:       qty,
+		Amount:    price * float64(qty),
+		TradeDate: time.Now().Format("20060102"),
+		TradeTime: time.Now().Format("20060102 150405"),
+	}); err != nil {
+		logger.L().Warnw("成交落库失败", "ts_code", tsCode, "err", err)
+	}
+
+	// 4. 查询更新后的资产并持久化 cash
 	asset, _ := s.brk.QueryAsset()
 	if asset != nil {
 		portRepo.SetMeta("cash", fmt.Sprintf("%.2f", asset.Cash))
@@ -341,15 +493,87 @@ func (s *Service) applyTradeToPortfolio(tsCode string, side model.Side, qty int,
 // ==================== 动态策略 ====================
 
 // advisorAdapter 将 analysis.AdviseStrategy 包装为 strategy.StrategyAdvisor 接口
-type advisorAdapter struct{}
+// 输入真实数据:
+//   - 沪深300近30个交易日收益序列 (市场环境判断基于趋势而非单日涨跌)
+//   - 各策略最近一次回测run的绩效 (夏普/胜率/回撤, 来自 trades 归因, 缓存1小时)
+type advisorAdapter struct {
+	barRepo   *store.BarRepo
+	tradeRepo *store.TradeRepo
+	mu        sync.Mutex
+	cache     map[string]analysis.StrategyPerformance
+	cachedAt  time.Time
+}
 
 func (a *advisorAdapter) Advise(date string, indexBars map[string]*model.Bar) *strategy.AdvisorResult {
-	advice := analysis.AdviseStrategy(date, indexBars, nil, nil)
+	recentReturns := a.recentIndexReturns(date)
+	advice := analysis.AdviseStrategy(date, indexBars, recentReturns, a.strategyPerformances())
 	return &strategy.AdvisorResult{
 		RecommendedStrategy: advice.RecommendedStrategy,
 		MarketCondition:     advice.MarketCondition,
 		Confidence:          advice.Confidence,
 	}
+}
+
+// strategyPerformances 各策略最近一次回测run的真实绩效 (缓存1小时, 回测数据静态)
+func (a *advisorAdapter) strategyPerformances() map[string]analysis.StrategyPerformance {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if time.Since(a.cachedAt) < time.Hour && a.cache != nil {
+		return a.cache
+	}
+	out := make(map[string]analysis.StrategyPerformance)
+	if a.tradeRepo != nil {
+		runs, err := a.tradeRepo.GetLatestRunPerStrategy()
+		if err != nil {
+			logger.L().Warnw("策略业绩查询失败, 使用中性基准", "err", err)
+		} else {
+			for strat, runID := range runs {
+				snaps, err1 := a.tradeRepo.GetAccountSnapshotsByRunID(runID)
+				trades, err2 := a.tradeRepo.GetTradesByRunID(runID)
+				if err1 != nil || err2 != nil || len(snaps) < 2 || len(trades) == 0 {
+					continue
+				}
+				m := backtest.CalculateMetrics(snaps, trades, nil)
+				out[strat] = analysis.StrategyPerformance{
+					Name:        strat,
+					TotalReturn: m.TotalReturn,
+					Sharpe:      m.SharpeRatio,
+					MaxDrawdown: m.MaxDrawdown,
+					WinRate:     m.WinRate,
+				}
+			}
+		}
+	}
+	a.cache = out
+	a.cachedAt = time.Now()
+	return out
+}
+
+// recentIndexReturns 沪深300最近30个交易日的日收益率序列 (前复权口径, 与策略一致)
+func (a *advisorAdapter) recentIndexReturns(date string) []float64 {
+	if a == nil || a.barRepo == nil {
+		return nil
+	}
+	bars, err := a.barRepo.GetBars("000300.SH", "", date)
+	if err != nil {
+		return nil
+	}
+	if len(bars) < 2 {
+		return nil
+	}
+	// 取最近30根
+	if len(bars) > 30 {
+		bars = bars[len(bars)-30:]
+	}
+	// 前复权后再算收益率, 与 DataProvider 同口径
+	model.AdjustBarsForward(bars)
+	returns := make([]float64, 0, len(bars)-1)
+	for i := 1; i < len(bars); i++ {
+		if bars[i-1].Close > 0 {
+			returns = append(returns, bars[i].Close/bars[i-1].Close-1)
+		}
+	}
+	return returns
 }
 
 // HandleStrategyStatus 处理 GET /api/strategy/status
@@ -406,12 +630,12 @@ func (s *Service) HandleStrategySwitch(w http.ResponseWriter, r *http.Request) {
 // SystemStatus 系统状态
 type SystemStatus struct {
 	Healthy        bool   `json:"healthy"`
-	LastDataDate   string `json:"last_data_date"`  // 数据库中最新的行情日期
+	LastDataDate   string `json:"last_data_date"` // 数据库中最新的行情日期
 	Today          string `json:"today"`
-	DataFresh      bool   `json:"data_fresh"`      // 数据是否是最新的
+	DataFresh      bool   `json:"data_fresh"` // 数据是否是最新的
 	Uptime         string `json:"uptime"`
-	PortfolioCount int    `json:"portfolio_count"` // 持仓数量
-	NextMarketOpen string `json:"next_market_open"`// 下一个交易日
+	PortfolioCount int    `json:"portfolio_count"`  // 持仓数量
+	NextMarketOpen string `json:"next_market_open"` // 下一个交易日
 }
 
 // HandleSystemStatus 处理 GET /api/system/status
@@ -577,9 +801,12 @@ func (s *Service) HandleLLMNews(w http.ResponseWriter, r *http.Request) {
 
 // initExtensions 初始化扩展功能（在 NewService 中调用）
 func (s *Service) initExtensions() {
-	// 初始化动态策略选择器
+	// 初始化动态策略选择器 (advisor 带真实指数收益序列)
 	reg := strategy.DefaultRegistry()
-	s.dynamicSelector = strategy.NewDynamicSelector(reg, &advisorAdapter{})
+	s.dynamicSelector = strategy.NewDynamicSelector(reg, &advisorAdapter{
+		barRepo:   s.barRepo,
+		tradeRepo: store.NewTradeRepo(s.db),
+	})
 
 	// 预热策略缓存: 为每个已注册策略创建并初始化实例, 避免运行时重建丢失内部状态
 	for _, name := range reg.Names() {
@@ -611,6 +838,8 @@ func (s *Service) restorePortfolioFromDB() {
 			TsCode:       p.TsCode,
 			TotalQty:     p.TotalQty,
 			AvailableQty: p.AvailableQty,
+			TodayBought:  p.TodayBought,
+			HighPrice:    p.HighPrice,
 			CostPrice:    p.CostPrice,
 		}
 	}

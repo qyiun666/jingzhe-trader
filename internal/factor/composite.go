@@ -96,7 +96,10 @@ func (cf *CompositeFactor) Compute(ctx context.Context, date string, universe []
 
 		for i, fw := range cf.factors {
 			score := factorScores[i][code]
-			factorMap[fw.Factor.Name()] = factorValues[i][code] // 保存原始因子值
+			raw := factorValues[i][code]
+			if !math.IsNaN(raw) && !math.IsInf(raw, 0) {
+				factorMap[fw.Factor.Name()] = raw // 保存原始因子值 (无效值不存, 避免 JSON 序列化失败)
+			}
 			compositeScore += score * fw.Weight
 		}
 

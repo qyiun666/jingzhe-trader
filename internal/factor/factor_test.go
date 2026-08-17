@@ -186,7 +186,7 @@ func TestRank_SingleValue(t *testing.T) {
 
 // mockDataProvider 模拟数据提供者
 type mockDataProvider struct {
-	dailyBasics   map[string][]model.DailyBasic   // date -> []DailyBasic
+	dailyBasics   map[string][]model.DailyBasic    // date -> []DailyBasic
 	finaIndicator map[string][]model.FinaIndicator // tsCode -> []FinaIndicator
 	stocks        map[string]*model.Stock          // tsCode -> Stock
 	bars          map[string][]model.Bar           // tsCode -> []Bar
@@ -270,9 +270,44 @@ func TestPEFactor(t *testing.T) {
 		t.Errorf("PE=10的分数应该高于PE=20")
 	}
 
-	// 亏损股PE为负, 应该得最低分
-	if !math.IsInf(result["000003.SZ"], -1) {
-		t.Errorf("亏损股应该得负无穷分, got %v", result["000003.SZ"])
+	// 亏损股PE为负, 无效值用 NaN 表示 (由下游 Rank 给最低分0)
+	if !math.IsNaN(result["000003.SZ"]) {
+		t.Errorf("亏损股应为 NaN, got %v", result["000003.SZ"])
+	}
+}
+
+// TestRank_WithNaN 回归测试: 含 NaN/Inf 的输入不得污染整体排名
+// (历史 bug: 亏损股 -Inf 导致 Standardize 全列 NaN, 排名变垃圾)
+func TestRank_WithNaN(t *testing.T) {
+	values := []float64{3.0, 1.0, math.NaN(), 2.0, math.Inf(-1)}
+	scores := Rank(values, true)
+	// NaN 和 -Inf 必须确定性得 0 分
+	if scores["2"] != 0 || scores["4"] != 0 {
+		t.Errorf("无效值应得0分: NaN=%v -Inf=%v", scores["2"], scores["4"])
+	}
+	// 有限值排名不受影响: 3.0 > 2.0 > 1.0
+	if !(scores["0"] > scores["3"] && scores["3"] > scores["1"]) {
+		t.Errorf("有限值排名被无效值污染: %v", scores)
+	}
+}
+
+// TestCompositePipeline_WithNaN 回归测试: 缩尾→标准化→排名全链路含 NaN 不崩溃
+func TestCompositePipeline_WithNaN(t *testing.T) {
+	values := []float64{5, 3, math.NaN(), 8, 1, math.Inf(-1), 4, 6, 7, 2, 9, 10, 11, 12, 13}
+	w := Winsorize(values, 0.05, 0.95)
+	s := Standardize(w)
+	scores := Rank(s, true)
+	// 有限值必须拿到有限分
+	for i, v := range values {
+		score := scores[itoa(i)]
+		if math.IsNaN(score) || math.IsInf(score, 0) {
+			t.Fatalf("排名分数出现非有限值: idx=%d raw=%v score=%v", i, v, score)
+		}
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			if score != 0 {
+				t.Errorf("无效值应得0分: idx=%d score=%v", i, score)
+			}
+		}
 	}
 }
 

@@ -12,6 +12,8 @@ type PortfolioSyncItem struct {
 	TsCode       string  `json:"ts_code" db:"ts_code"`
 	TotalQty     int     `json:"total_qty" db:"total_qty"`
 	AvailableQty int     `json:"available_qty" db:"available_qty"`
+	TodayBought  int     `json:"today_bought" db:"today_bought"` // 今日买入量 (T+1: 次日结转时可卖)
+	HighPrice    float64 `json:"high_price" db:"high_price"`     // 持仓期间历史最高价 (移动止盈用)
 	CostPrice    float64 `json:"cost_price" db:"cost_price"`
 	AvgPrice     float64 `json:"avg_price" db:"avg_price"`
 	UpdatedAt    string  `json:"updated_at" db:"updated_at"`
@@ -29,15 +31,17 @@ func NewPortfolioRepo(db *sqlx.DB) *PortfolioRepo {
 }
 
 const portfolioInsertSQL = `INSERT INTO portfolio
-	(ts_code, total_qty, available_qty, cost_price, avg_price, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?)`
+	(ts_code, total_qty, available_qty, today_bought, high_price, cost_price, avg_price, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 
 const portfolioUpsertSQL = `INSERT INTO portfolio
-	(ts_code, total_qty, available_qty, cost_price, avg_price, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?)
+	(ts_code, total_qty, available_qty, today_bought, high_price, cost_price, avg_price, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(ts_code) DO UPDATE SET
 		total_qty     = excluded.total_qty,
 		available_qty = excluded.available_qty,
+		today_bought  = excluded.today_bought,
+		high_price    = excluded.high_price,
 		cost_price    = excluded.cost_price,
 		avg_price     = excluded.avg_price,
 		updated_at    = excluded.updated_at`
@@ -71,7 +75,7 @@ func (r *PortfolioRepo) SyncPortfolio(positions []PortfolioSyncItem) error {
 				updatedAt = now
 			}
 			if _, err := stmt.Exec(
-				p.TsCode, p.TotalQty, p.AvailableQty,
+				p.TsCode, p.TotalQty, p.AvailableQty, p.TodayBought, p.HighPrice,
 				p.CostPrice, p.AvgPrice, updatedAt,
 			); err != nil {
 				return fmt.Errorf("插入持仓失败(ts_code=%s): %w", p.TsCode, err)
@@ -89,7 +93,7 @@ func (r *PortfolioRepo) UpsertPosition(pos PortfolioSyncItem) error {
 		updatedAt = time.Now().Format("2006-01-02 15:04:05")
 	}
 	_, err := r.db.Exec(portfolioUpsertSQL,
-		pos.TsCode, pos.TotalQty, pos.AvailableQty,
+		pos.TsCode, pos.TotalQty, pos.AvailableQty, pos.TodayBought, pos.HighPrice,
 		pos.CostPrice, pos.AvgPrice, updatedAt,
 	)
 	if err != nil {
@@ -111,7 +115,7 @@ func (r *PortfolioRepo) RemovePosition(tsCode string) error {
 func (r *PortfolioRepo) GetAllPositions() ([]PortfolioSyncItem, error) {
 	var positions []PortfolioSyncItem
 	err := r.db.Select(&positions,
-		`SELECT ts_code, total_qty, available_qty, cost_price, avg_price, updated_at
+		`SELECT ts_code, total_qty, available_qty, today_bought, high_price, cost_price, avg_price, updated_at
 		 FROM portfolio ORDER BY ts_code ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("查询所有持仓失败: %w", err)
@@ -123,7 +127,7 @@ func (r *PortfolioRepo) GetAllPositions() ([]PortfolioSyncItem, error) {
 func (r *PortfolioRepo) GetPosition(tsCode string) (*PortfolioSyncItem, error) {
 	var pos PortfolioSyncItem
 	err := r.db.Get(&pos,
-		`SELECT ts_code, total_qty, available_qty, cost_price, avg_price, updated_at
+		`SELECT ts_code, total_qty, available_qty, today_bought, high_price, cost_price, avg_price, updated_at
 		 FROM portfolio WHERE ts_code = ?`, tsCode)
 	if err != nil {
 		if isNoRowsErr(err) {
@@ -132,6 +136,24 @@ func (r *PortfolioRepo) GetPosition(tsCode string) (*PortfolioSyncItem, error) {
 		return nil, fmt.Errorf("查询持仓失败(ts_code=%s): %w", tsCode, err)
 	}
 	return &pos, nil
+}
+
+// SettleT1 每日开盘前结转: 昨日买入转为可卖, today_bought 清零
+func (r *PortfolioRepo) SettleT1() error {
+	_, err := r.db.Exec("UPDATE portfolio SET available_qty = total_qty, today_bought = 0")
+	if err != nil {
+		return fmt.Errorf("T+1持仓结转失败: %w", err)
+	}
+	return nil
+}
+
+// UpdateHighPrice 更新持仓期间历史最高价 (仅在新高时上调, 移动止盈用)
+func (r *PortfolioRepo) UpdateHighPrice(tsCode string, price float64) error {
+	_, err := r.db.Exec("UPDATE portfolio SET high_price = MAX(high_price, ?) WHERE ts_code = ?", price, tsCode)
+	if err != nil {
+		return fmt.Errorf("更新持仓最高价失败(ts_code=%s): %w", tsCode, err)
+	}
+	return nil
 }
 
 // SetMeta 设置持仓元数据（如 initial_capital）

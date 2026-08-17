@@ -23,11 +23,11 @@ func NewDB(path string) (*sqlx.DB, error) {
 
 	// SQLite 性能与并发优化
 	pragmas := []string{
-		"PRAGMA journal_mode=WAL;",          // 写前日志, 提升并发读写
-		"PRAGMA synchronous=NORMAL;",        // WAL 模式下安全且更快
-		"PRAGMA busy_timeout=5000;",         // 锁等待 5 秒
-		"PRAGMA foreign_keys=ON;",           // 开启外键约束
-		"PRAGMA auto_vacuum=INCREMENTAL;",   // 支持增量回收空间 (配合定期清理)
+		"PRAGMA journal_mode=WAL;",        // 写前日志, 提升并发读写
+		"PRAGMA synchronous=NORMAL;",      // WAL 模式下安全且更快
+		"PRAGMA busy_timeout=5000;",       // 锁等待 5 秒
+		"PRAGMA foreign_keys=ON;",         // 开启外键约束
+		"PRAGMA auto_vacuum=INCREMENTAL;", // 支持增量回收空间 (配合定期清理)
 	}
 	for _, p := range pragmas {
 		if _, err := db.Exec(p); err != nil {
@@ -259,6 +259,7 @@ func migrate(db *sqlx.DB) error {
 			ts_code        TEXT PRIMARY KEY,
 			total_qty      INTEGER NOT NULL DEFAULT 0,
 			available_qty  INTEGER NOT NULL DEFAULT 0,
+			today_bought   INTEGER NOT NULL DEFAULT 0,
 			cost_price     REAL NOT NULL DEFAULT 0,
 			avg_price      REAL NOT NULL DEFAULT 0,
 			updated_at     TEXT NOT NULL
@@ -379,6 +380,33 @@ func migrateLegacy(db *sqlx.DB) error {
 	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_account_snapshot_run_date
 		ON account_snapshot(run_id, trade_date)`); err != nil {
 		return fmt.Errorf("创建快照唯一索引失败: %w", err)
+	}
+	// portfolio 表补充 today_bought 列 (T+1 台账, 旧库升级)
+	if err := ensureColumn(db, "portfolio", "today_bought", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	// portfolio 表补充 high_price 列 (移动止盈历史最高价, 旧库升级)
+	if err := ensureColumn(db, "portfolio", "high_price", "REAL NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	// trades 表补充 strategy 列 (绩效归因: 每笔成交来源策略, 旧库升级)
+	if err := ensureColumn(db, "trades", "strategy", "TEXT"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ensureColumn 若列不存在则 ALTER TABLE 添加 (SQLite 不支持 IF NOT EXISTS 加列, 先查 PRAGMA)
+func ensureColumn(db *sqlx.DB, table, column, def string) error {
+	var count int
+	if err := db.Get(&count, `SELECT COUNT(1) FROM pragma_table_info(?) WHERE name = ?`, table, column); err != nil {
+		return fmt.Errorf("查询表结构失败(%s.%s): %w", table, column, err)
+	}
+	if count > 0 {
+		return nil
+	}
+	if _, err := db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, def)); err != nil {
+		return fmt.Errorf("添加列失败(%s.%s): %w", table, column, err)
 	}
 	return nil
 }

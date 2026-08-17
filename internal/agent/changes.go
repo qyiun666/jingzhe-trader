@@ -27,8 +27,9 @@ func (o *DebateOrchestrator) DetectDecisionChanges(todayResults []store.DebateRe
 	for _, curr := range todayResults {
 		prev, exists := prevMap[curr.TsCode]
 		if !exists {
-			// 新增的辩论标的
+			// 新增的辩论标的, 单独标记为 new_symbol, 不与真正的决策变更混在同级
 			changes = append(changes, DecisionChange{
+				Type:           ChangeTypeNewSymbol,
 				TsCode:         curr.TsCode,
 				Name:           curr.Name,
 				PrevDecision:   "",
@@ -71,6 +72,7 @@ func (o *DebateOrchestrator) DetectDecisionChanges(todayResults []store.DebateRe
 
 		if changed {
 			changes = append(changes, DecisionChange{
+				Type:           ChangeTypeDecision,
 				TsCode:         curr.TsCode,
 				Name:           curr.Name,
 				PrevDecision:   prev.Decision,
@@ -114,13 +116,28 @@ func absFloat(f float64) float64 {
 }
 
 // FormatChangesForNotify 格式化决策变更列表为通知文本
+// 新增标的(new_symbol)与真正的决策变更(decision)分组展示, 避免混淆
 func FormatChangesForNotify(changes []DecisionChange) string {
 	if len(changes) == 0 {
 		return "无决策变更"
 	}
-	var lines []string
+	var decisionLines, newSymbolLines []string
 	for _, c := range changes {
-		lines = append(lines, fmt.Sprintf("- %s: %s", c.Name, c.Detail))
+		line := fmt.Sprintf("- %s: %s", c.Name, c.Detail)
+		if c.Type == ChangeTypeNewSymbol {
+			newSymbolLines = append(newSymbolLines, line)
+		} else {
+			decisionLines = append(decisionLines, line)
+		}
+	}
+	var lines []string
+	if len(decisionLines) > 0 {
+		lines = append(lines, "【决策变更】")
+		lines = append(lines, decisionLines...)
+	}
+	if len(newSymbolLines) > 0 {
+		lines = append(lines, "【新增标的】")
+		lines = append(lines, newSymbolLines...)
 	}
 	return strings.Join(lines, "\n")
 }

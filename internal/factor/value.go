@@ -36,8 +36,9 @@ func (f *PEFactor) Compute(ctx context.Context, date string, universe []string, 
 		}
 		pe := b.PE_TTM
 		if pe <= 0 {
-			// 亏损股PE为负, 给予最低分 (用一个很小的负数表示)
-			result[b.TsCode] = math.Inf(-1)
+			// 亏损股PE为负: 无效值用 NaN 表示, 下游 Rank 给最低分(0)
+			// (历史上用 -Inf 会污染 Winsorize/Standardize 使整列 NaN)
+			result[b.TsCode] = math.NaN()
 		} else {
 			// PE越低越好, 取倒数或取负值
 			// 这里取 -PE, PE越小, -PE越大, 排名越靠前
@@ -77,8 +78,8 @@ func (f *PBFactor) Compute(ctx context.Context, date string, universe []string, 
 		}
 		pb := b.PB
 		if pb <= 0 {
-			// 负PB的股票 (资不抵债), 给予最低分
-			result[b.TsCode] = math.Inf(-1)
+			// 负PB的股票 (资不抵债): 无效值用 NaN 表示, 下游 Rank 给最低分(0)
+			result[b.TsCode] = math.NaN()
 		} else {
 			// PB越低越好, 取负值
 			result[b.TsCode] = -pb

@@ -2,12 +2,25 @@ package llm
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 )
+
+const (
+	// maxAttempts 最大尝试次数(含首次请求), 即最多重试 2 次
+	maxAttempts = 3
+	// maxTokens 输出上限, 过小容易导致 LLM 返回的 JSON 被截断
+	maxTokens = 2048
+)
+
+// retryBackoffBase 重试退避基数(指数退避: base, 2*base), 测试可调小以加速
+var retryBackoffBase = time.Second
 
 // Client LLM 客户端
 // 支持 OpenAI 兼容接口 (DeepSeek, 通义千问, 智谱等)
@@ -17,6 +30,7 @@ type Client struct {
 	model      string
 	httpClient *http.Client
 	enabled    bool
+	cache      sync.Map // 进程内缓存: key=date+symbol+role+输入hash, value=响应内容
 }
 
 // Config LLM 配置
@@ -84,6 +98,7 @@ type ChatCompletionResponse struct {
 // Chat 发送聊天请求
 // systemPrompt: 系统提示词，定义角色和输出格式
 // userPrompt: 用户提示词，包含具体的任务内容
+// 仅对网络错误 / 5xx / 429 做指数退避重试(最多 maxAttempts 次), 4xx 等业务错误不重试
 func (c *Client) Chat(systemPrompt, userPrompt string) (string, error) {
 	if !c.enabled {
 		return "", fmt.Errorf("LLM 未启用")
@@ -96,7 +111,7 @@ func (c *Client) Chat(systemPrompt, userPrompt string) (string, error) {
 			{Role: "user", Content: userPrompt},
 		},
 		Temperature: 0.3, // 分析类任务用低温度，保证输出稳定
-		MaxTokens:   1024,
+		MaxTokens:   maxTokens,
 	}
 
 	bodyBytes, err := json.Marshal(reqBody)
@@ -104,42 +119,87 @@ func (c *Client) Chat(systemPrompt, userPrompt string) (string, error) {
 		return "", fmt.Errorf("序列化请求失败: %w", err)
 	}
 
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			// 指数退避: 第1次重试等 base, 第2次等 2*base
+			time.Sleep(retryBackoffBase << (attempt - 1))
+		}
+		content, retryable, err := c.doChatRequest(bodyBytes)
+		if err == nil {
+			return content, nil
+		}
+		lastErr = err
+		if !retryable {
+			// 4xx 等业务错误重试无意义, 直接返回
+			return "", err
+		}
+	}
+	return "", lastErr
+}
+
+// ChatWithCache 带进程内缓存的聊天请求
+// key = 日期 + 股票代码 + 角色 + 输入内容hash, 同日同股票同角色且输入相同时直接命中缓存, 不重复调用 LLM
+// 仅缓存成功响应; 进程内有效, 进程重启后自动失效
+func (c *Client) ChatWithCache(tradeDate, tsCode, role, systemPrompt, userPrompt string) (string, error) {
+	if !c.enabled {
+		return "", fmt.Errorf("LLM 未启用")
+	}
+	sum := sha256.Sum256([]byte(systemPrompt + "\x00" + userPrompt))
+	key := fmt.Sprintf("%s|%s|%s|%s", tradeDate, tsCode, role, hex.EncodeToString(sum[:]))
+	if v, ok := c.cache.Load(key); ok {
+		return v.(string), nil
+	}
+	resp, err := c.Chat(systemPrompt, userPrompt)
+	if err != nil {
+		return "", err
+	}
+	actual, _ := c.cache.LoadOrStore(key, resp)
+	return actual.(string), nil
+}
+
+// doChatRequest 执行单次聊天请求
+// 返回 retryable=true 表示网络错误 / 5xx / 429, 可安全重试; 4xx 及响应解析错误不重试
+func (c *Client) doChatRequest(bodyBytes []byte) (string, bool, error) {
 	url := c.baseURL + "/chat/completions"
 	req, err := http.NewRequest("POST", url, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return "", fmt.Errorf("创建请求失败: %w", err)
+		return "", false, fmt.Errorf("创建请求失败: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("请求 LLM 接口失败: %w", err)
+		// 网络层错误(连接失败/超时等), 可重试
+		return "", true, fmt.Errorf("请求 LLM 接口失败: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("读取响应失败: %w", err)
+		return "", true, fmt.Errorf("读取响应失败: %w", err)
 	}
 
 	// 非 2xx 响应直接报错 (避免将 HTML 错误页误报为"解析失败")
+	// 429(限流) 与 5xx(服务端错误) 可重试, 其余 4xx 不重试
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("LLM HTTP %d: %s", resp.StatusCode, string(respBody))
+		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
+		return "", retryable, fmt.Errorf("LLM HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var result ChatCompletionResponse
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return "", fmt.Errorf("解析响应失败: %w, 原始内容: %s", err, string(respBody))
+		return "", false, fmt.Errorf("解析响应失败: %w, 原始内容: %s", err, string(respBody))
 	}
 
 	if result.Error != nil {
-		return "", fmt.Errorf("LLM 错误: %s", result.Error.Message)
+		return "", false, fmt.Errorf("LLM 错误: %s", result.Error.Message)
 	}
 
 	if len(result.Choices) == 0 {
-		return "", fmt.Errorf("无响应内容")
+		return "", false, fmt.Errorf("无响应内容")
 	}
 
-	return result.Choices[0].Message.Content, nil
+	return result.Choices[0].Message.Content, false, nil
 }

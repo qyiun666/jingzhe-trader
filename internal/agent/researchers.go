@@ -25,7 +25,7 @@ func (r *BullResearcher) Research(ctx *DebateContext, reports []*AnalysisReport)
 请作为看涨研究员，从上述报告中找出支持买入的理由，输出JSON:
 {"side": "bull", "sentiment": 0到1, "arguments": ["理由1","理由2","理由3"], "confidence": 0到1}`,
 		ctx.TsCode, ctx.Name, ctx.TradeDate, posStr(ctx.Position), formatReports(reports))
-	return callResearcherLLM(r.llm, ctx.TsCode, "bull", bullSysPrompt, userPrompt)
+	return callResearcherLLM(r.llm, ctx.TsCode, ctx.TradeDate, "bull", bullSysPrompt, userPrompt)
 }
 
 type BearResearcher struct{ llm *llm.Client }
@@ -44,14 +44,14 @@ func (r *BearResearcher) Research(ctx *DebateContext, reports []*AnalysisReport)
 请作为看跌研究员，从上述报告中找出风险和看空理由，输出JSON:
 {"side": "bear", "sentiment": -1到0, "arguments": ["理由1","理由2","理由3"], "confidence": 0到1}`,
 		ctx.TsCode, ctx.Name, ctx.TradeDate, posStr(ctx.Position), formatReports(reports))
-	return callResearcherLLM(r.llm, ctx.TsCode, "bear", bearSysPrompt, userPrompt)
+	return callResearcherLLM(r.llm, ctx.TsCode, ctx.TradeDate, "bear", bearSysPrompt, userPrompt)
 }
 
-func callResearcherLLM(client *llm.Client, tsCode, side, sysPrompt, userPrompt string) (*ResearchArgument, error) {
+func callResearcherLLM(client *llm.Client, tsCode, tradeDate, side, sysPrompt, userPrompt string) (*ResearchArgument, error) {
 	if client == nil || !client.IsEnabled() {
 		return &ResearchArgument{Side: side, Sentiment: 0, Arguments: []string{"LLM未启用"}, Confidence: 0.3}, nil
 	}
-	resp, err := client.Chat(sysPrompt, userPrompt)
+	resp, err := client.ChatWithCache(tradeDate, tsCode, side, sysPrompt, userPrompt)
 	if err != nil {
 		logger.L().Warnw("研究员LLM调用失败", "side", side, "ts_code", tsCode, "err", err)
 		return &ResearchArgument{Side: side, Sentiment: 0, Arguments: []string{"LLM调用失败"}, Confidence: 0.2}, nil

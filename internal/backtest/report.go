@@ -33,6 +33,90 @@ func GenerateHTMLReport(result *BacktestResult, outputPath string) error {
 		navData += fmt.Sprintf(`["%s",%.2f,%.4f]`, date, snap.TotalAsset, snap.TotalPnLPct)
 	}
 
+	// 与基准对比区块 (有基准逐日净值时生成): 策略/基准净值均归一化到1起点, 按交易日对齐
+	benchSection := ""
+	benchScript := ""
+	if len(result.BenchmarkSnapshots) > 0 && len(result.Snapshots) > 0 {
+		benchName := result.BenchmarkName
+		if benchName == "" {
+			benchName = "基准"
+		}
+		benchNavByDate := make(map[string]float64, len(result.BenchmarkSnapshots))
+		for _, b := range result.BenchmarkSnapshots {
+			benchNavByDate[b.TradeDate] = b.Nav
+		}
+		initialAsset := result.Snapshots[0].TotalAsset
+		var cmpData string
+		lastBench := 0.0
+		firstBench := 0.0
+		for _, snap := range result.Snapshots {
+			if v, ok := benchNavByDate[snap.TradeDate]; ok {
+				lastBench = v // 基准当日缺失时沿用前一交易日净值
+				if firstBench == 0 {
+					firstBench = v
+				}
+			}
+			if firstBench == 0 {
+				continue // 首个基准净值出现之前的数据点跳过
+			}
+			if cmpData != "" {
+				cmpData += ","
+			}
+			stratNav := snap.TotalAsset / initialAsset
+			cmpData += fmt.Sprintf(`["%s",%.4f,%.4f]`, formatDisplayDate(snap.TradeDate), stratNav, lastBench/firstBench)
+		}
+		benchReturn := 0.0
+		if firstBench > 0 {
+			benchReturn = lastBench/firstBench - 1
+		}
+		excessReturn := m.TotalReturn - benchReturn
+
+		benchSection = fmt.Sprintf(`
+<div class="section">
+<h2>与基准对比 (%s)</h2>
+<div class="summary">
+<div class="card"><div class="label">策略收益率</div><div class="value %s">%.2f%%</div></div>
+<div class="card"><div class="label">基准收益率</div><div class="value %s">%.2f%%</div></div>
+<div class="card"><div class="label">超额收益 (策略-基准)</div><div class="value %s">%.2f%%</div></div>
+</div>
+<canvas id="benchChart"></canvas>
+</div>`,
+			benchName,
+			returnClass(m.TotalReturn), m.TotalReturn*100,
+			returnClass(benchReturn), benchReturn*100,
+			returnClass(excessReturn), excessReturn*100,
+		)
+
+		benchScript = fmt.Sprintf(`
+const cmpData = [%s];
+const bctx = document.getElementById('benchChart').getContext('2d');
+new Chart(bctx, {
+  type: 'line',
+  data: {
+    labels: cmpData.map(d => d[0]),
+    datasets: [{
+      label: '策略净值',
+      data: cmpData.map(d => d[1]),
+      borderColor: '#3498db',
+      fill: false,
+      tension: 0.1
+    },{
+      label: '基准净值(%s)',
+      data: cmpData.map(d => d[2]),
+      borderColor: '#95a5a6',
+      fill: false,
+      tension: 0.1
+    }]
+  },
+  options: {
+    responsive: true,
+    scales: {
+      y: { type: 'linear', position: 'left', title: { text: '归一化净值', display: true } }
+    }
+  }
+});`, cmpData, benchName)
+	}
+
 	// 生成交易明细
 	var tradeRows string
 	for _, t := range result.Trades {
@@ -70,7 +154,7 @@ th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #eee; }
 th { background: #f8f8f8; font-weight: 600; color: #555; }
 .buy { color: #e74c3c; }
 .sell { color: #27ae60; }
-#chart { width: 100%%; height: 400px; margin-top: 10px; }
+#chart, #benchChart { width: 100%%; height: 400px; margin-top: 10px; }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
@@ -89,10 +173,15 @@ th { background: #f8f8f8; font-weight: 600; color: #555; }
 <div class="card"><div class="label">总收益率</div><div class="value %s">%.2f%%</div></div>
 <div class="card"><div class="label">年化收益</div><div class="value %s">%.2f%%</div></div>
 <div class="card"><div class="label">夏普比率</div><div class="value">%.2f</div></div>
+<div class="card"><div class="label">索提诺比率</div><div class="value">%.2f</div></div>
+<div class="card"><div class="label">卡玛比率</div><div class="value">%.2f</div></div>
 <div class="card"><div class="label">最大回撤</div><div class="value negative">%.2f%%</div></div>
+<div class="card"><div class="label">年化波动率</div><div class="value">%.2f%%</div></div>
 <div class="card"><div class="label">胜率</div><div class="value">%.2f%%</div></div>
+<div class="card"><div class="label">月胜率</div><div class="value">%.2f%%</div></div>
 <div class="card"><div class="label">盈亏比</div><div class="value">%.2f</div></div>
 <div class="card"><div class="label">交易次数</div><div class="value">%d</div></div>
+<div class="card"><div class="label">总交易成本</div><div class="value">¥%.2f</div></div>
 <div class="card"><div class="label">Alpha</div><div class="value">%.4f</div></div>
 <div class="card"><div class="label">Beta</div><div class="value">%.4f</div></div>
 </div>
@@ -101,7 +190,7 @@ th { background: #f8f8f8; font-weight: 600; color: #555; }
 <h2>净值曲线</h2>
 <canvas id="chart"></canvas>
 </div>
-
+%s
 <div class="section">
 <h2>交易明细 (%d 笔)</h2>
 <table>
@@ -147,6 +236,7 @@ new Chart(ctx, {
     }
   }
 });
+%s
 </script>
 </body>
 </html>`,
@@ -157,14 +247,21 @@ new Chart(ctx, {
 		returnClass(m.TotalReturn), m.TotalReturn*100,
 		returnClass(m.AnnualReturn), m.AnnualReturn*100,
 		m.SharpeRatio,
+		m.SortinoRatio,
+		m.CalmarRatio,
 		m.MaxDrawdown*100,
+		m.AnnualVolatility*100,
 		m.WinRate*100,
+		m.MonthlyWinRate*100,
 		m.ProfitLossRatio,
 		m.TotalTrades,
+		m.TotalTradeCost,
 		m.Alpha, m.Beta,
+		benchSection,
 		len(result.Trades),
 		tradeRows,
 		navData,
+		benchScript,
 	)
 
 	_, err = f.WriteString(html)

@@ -3,6 +3,7 @@ package broker
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"jingzhe-trader/internal/market"
 	"jingzhe-trader/internal/model"
@@ -12,9 +13,9 @@ import (
 // paperAccount PaperBroker 内部账户管理
 // 不依赖 backtest 包, 独立实现以避免循环导入
 type paperAccount struct {
-	cash       float64
-	positions  map[string]*model.Position
-	costModel  *market.CostModel
+	cash      float64
+	positions map[string]*model.Position
+	costModel *market.CostModel
 }
 
 func newPaperAccount(initialCapital float64, costModel *market.CostModel) *paperAccount {
@@ -49,6 +50,9 @@ func (pa *paperAccount) updateMarketValue(bars map[string]*model.Bar) {
 		}
 		pos.MarketPrice = bar.Close
 		pos.MarketValue = bar.Close * float64(pos.TotalQty)
+		if bar.Close > pos.HighPrice {
+			pos.HighPrice = bar.Close // 维护持仓期间最高价 (移动止盈基准)
+		}
 		if pos.CostPrice > 0 {
 			pos.FloatingPnL = pos.MarketValue - pos.CostPrice*float64(pos.TotalQty)
 			pos.FloatingPnLPct = pos.FloatingPnL / (pos.CostPrice * float64(pos.TotalQty))
@@ -123,6 +127,17 @@ type PaperBroker struct {
 	limitRepo   LimitProvider // 涨跌停价查询, 可为nil
 	currentDate string
 	nextDate    string
+	// pendingFills 次日/未来成交的待入账成交单 (T日信号按T+1开盘价成交, T+1开盘结算时才入账)
+	pending []pendingFill
+	// adjRatioFn 返回前复权因子比值 (adj_fillDate/adj_latest), 用于将复权成交价换算回原始价与涨跌停价比较; nil 时不换算
+	adjRatioFn func(tsCode, tradeDate string) float64
+}
+
+// pendingFill 待入账的成交单 (价格已在下单日按撮合规则确定, 到成交日才入账户)
+type pendingFill struct {
+	orderID string
+	req     OrderRequest
+	price   float64 // 含滑点且取整后的成交价
 }
 
 // NewPaperBroker 创建纸面交易券商
@@ -143,6 +158,13 @@ func (pb *PaperBroker) SetMatchRules(slippage float64, limitRepo LimitProvider) 
 	pb.limitRepo = limitRepo
 }
 
+// SetAdjRatioFn 设置复权因子比值函数 (回测中 DataProvider 提供), 用于涨跌停检查的价格口径换算
+func (pb *PaperBroker) SetAdjRatioFn(fn func(tsCode, tradeDate string) float64) {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+	pb.adjRatioFn = fn
+}
+
 func (pb *PaperBroker) Name() string { return pb.name }
 
 // SetTradeDate 设置当前交易日和下一交易日 (回测引擎调用)
@@ -153,10 +175,11 @@ func (pb *PaperBroker) SetTradeDate(current, next string) {
 	pb.nextDate = next
 }
 
-// PlaceOrder 下单, 按撮合规则立即成交或拒绝
+// PlaceOrder 下单, 按撮合规则成交或拒绝
+// FillDate 晚于当前交易日时登记为待成交单, 到成交日的 SettleT1 才真正入账 (模拟次日开盘价成交)
 func (pb *PaperBroker) PlaceOrder(req OrderRequest) (string, error) {
-	orderID, trade, err := pb.matchOrder(req)
-	if err != nil {
+	orderID, trade, pending, err := pb.matchOrder(req)
+	if err != nil || pending {
 		return orderID, err
 	}
 	// 锁外通知, 避免回调内再访问 broker 导致死锁
@@ -164,8 +187,8 @@ func (pb *PaperBroker) PlaceOrder(req OrderRequest) (string, error) {
 	return orderID, nil
 }
 
-// matchOrder 锁内完成撮合全流程
-func (pb *PaperBroker) matchOrder(req OrderRequest) (string, model.Trade, error) {
+// matchOrder 锁内完成撮合全流程; pending=true 表示已登记为待成交单(未入账)
+func (pb *PaperBroker) matchOrder(req OrderRequest) (string, model.Trade, bool, error) {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
@@ -174,11 +197,11 @@ func (pb *PaperBroker) matchOrder(req OrderRequest) (string, model.Trade, error)
 
 	if req.Side != model.SideBuy && req.Side != model.SideSell {
 		pb.oms.RejectOrder(orderID, "未知方向")
-		return orderID, model.Trade{}, fmt.Errorf("未知方向")
+		return orderID, model.Trade{}, false, fmt.Errorf("未知方向")
 	}
 	if req.Price <= 0 {
 		pb.oms.RejectOrder(orderID, "委托价无效")
-		return orderID, model.Trade{}, fmt.Errorf("委托价无效")
+		return orderID, model.Trade{}, false, fmt.Errorf("委托价无效")
 	}
 
 	// 应用滑点并取整价格
@@ -193,9 +216,27 @@ func (pb *PaperBroker) matchOrder(req OrderRequest) (string, model.Trade, error)
 	// 涨跌停检查: 涨停不买, 跌停不卖
 	if err := pb.checkPriceLimit(req, price); err != nil {
 		pb.oms.RejectOrder(orderID, err.Error())
-		return orderID, model.Trade{}, err
+		return orderID, model.Trade{}, false, err
 	}
 
+	// 未来日成交: 登记待成交单, 到成交日 SettleT1 时才做资金/持仓检查并入账
+	// currentDate 为空(未走回测循环的直接调用)时按立即成交处理, 避免单子永久挂起
+	if pb.currentDate != "" && req.FillDate != "" && req.FillDate > pb.currentDate {
+		pf := pendingFill{orderID: orderID, req: req, price: price}
+		pf.req.Price = price
+		pb.pending = append(pb.pending, pf)
+		return orderID, model.Trade{}, true, nil
+	}
+
+	trade, err := pb.executeAtMarket(orderID, req, price)
+	if err != nil {
+		return orderID, model.Trade{}, false, err
+	}
+	return orderID, trade, false, nil
+}
+
+// executeAtMarket 立即执行买卖 (调用方须持锁); 失败时拒绝订单
+func (pb *PaperBroker) executeAtMarket(orderID string, req OrderRequest, price float64) (model.Trade, error) {
 	var trade model.Trade
 	var err error
 	if req.Side == model.SideBuy {
@@ -205,29 +246,51 @@ func (pb *PaperBroker) matchOrder(req OrderRequest) (string, model.Trade, error)
 	}
 	if err != nil {
 		pb.oms.RejectOrder(orderID, err.Error())
-		return orderID, model.Trade{}, err
+		return model.Trade{}, err
 	}
-
 	pb.oms.FillOrder(orderID, trade)
 	pb.account.cleanEmpty()
-	return orderID, trade, nil
+	return trade, nil
 }
 
 // checkPriceLimit 涨跌停检查
+// 成交价可能是前复权价, 而涨跌停价是原始价: 先按复权因子比换算回原始价再比较
+// 无涨跌停数据时, 用成交日昨收价按板块规则自算兜底 (不再直接放行)
 func (pb *PaperBroker) checkPriceLimit(req OrderRequest, price float64) error {
-	if pb.limitRepo == nil {
-		return nil
-	}
 	fillDate := req.FillDate
 	if fillDate == "" {
 		fillDate = pb.currentDate
 	}
-	limit, err := pb.limitRepo.GetByCodeAndDate(req.TsCode, fillDate)
-	if err != nil || limit == nil {
-		return nil // 无涨跌停数据时不拦截
+	ratio := 1.0
+	if pb.adjRatioFn != nil {
+		if r := pb.adjRatioFn(req.TsCode, fillDate); r > 0 {
+			ratio = r
+		}
 	}
-	if err := market.CheckLimit(req.Side, price, limit.UpLimit, limit.DownLimit); err != nil {
-		return fmt.Errorf("涨跌停限制: %w", err)
+	rawPrice := market.RoundPrice(price / ratio)
+
+	if pb.limitRepo != nil {
+		if limit, err := pb.limitRepo.GetByCodeAndDate(req.TsCode, fillDate); err == nil && limit != nil {
+			if err := market.CheckLimit(req.Side, rawPrice, limit.UpLimit, limit.DownLimit); err != nil {
+				return fmt.Errorf("涨跌停限制: %w", err)
+			}
+			return nil
+		}
+	}
+
+	// 无涨跌停数据: 自算兜底
+	if req.PreClose <= 0 {
+		return nil // 无昨收价无法自算, 放行
+	}
+	rawPreClose := req.PreClose / ratio
+	date, err := time.Parse("20060102", fillDate)
+	if err != nil {
+		return nil
+	}
+	up := market.CalcUpLimit(rawPreClose, req.TsCode, req.IsST, date)
+	down := market.CalcDownLimit(rawPreClose, req.TsCode, req.IsST, date)
+	if err := market.CheckLimit(req.Side, rawPrice, up, down); err != nil {
+		return fmt.Errorf("涨跌停限制(自算): %w", err)
 	}
 	return nil
 }
@@ -302,6 +365,7 @@ func (pb *PaperBroker) buildTrade(req OrderRequest, side model.Side, price float
 		TotalCost:   cost.Total(),
 		TradeDate:   tradeDate,
 		TradeTime:   tradeDate + " 093000",
+		Strategy:    req.Strategy,
 	}
 }
 
@@ -344,8 +408,39 @@ func (pb *PaperBroker) OnTrade(callback func(model.Trade)) {
 	pb.tradeCallbacks = append(pb.tradeCallbacks, callback)
 }
 
-func (pb *PaperBroker) SettleT1() {
+// SettleT1 每日开盘前结算:
+//  1. 昨日买入转入可卖 (T+1 交收)
+//  2. 成交日 <= date 的待成交单按下单时确定的成交价入账 (次开盘价成交模型)
+//
+// 入账时做资金/可卖检查, 失败拒绝并记日志 (如卖出回款未到时买入资金不足)
+func (pb *PaperBroker) SettleT1(date string) {
+	pb.mu.Lock()
 	pb.account.settleT1()
+
+	var filled []model.Trade
+	if len(pb.pending) > 0 {
+		remaining := pb.pending[:0]
+		for _, pf := range pb.pending {
+			if pf.req.FillDate > date {
+				remaining = append(remaining, pf)
+				continue
+			}
+			trade, err := pb.executeAtMarket(pf.orderID, pf.req, pf.price)
+			if err != nil {
+				logger.L().Warnf("[PaperBroker] 待成交单入账失败 %s %s 成交日%s: %v",
+					pf.req.TsCode, pf.req.Side, pf.req.FillDate, err)
+				continue
+			}
+			filled = append(filled, trade)
+		}
+		pb.pending = remaining
+	}
+	pb.mu.Unlock()
+
+	// 锁外通知成交
+	for _, trade := range filled {
+		pb.notifyTrade(trade)
+	}
 }
 
 func (pb *PaperBroker) notifyTrade(trade model.Trade) {

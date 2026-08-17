@@ -21,10 +21,12 @@ AI Agent（如 Hermes）只需定时 GET 只读 API 拿现成结果，POST 确�
                       │                cmd/server (24h常驻)               │
                       │                                                  │
   Tushare ──────────▶ │  调度器 (交易日自动执行, 每次任务后飞书通知)         │
-  腾讯免费行情 ──────▶ │   15:10 数据更新 (进程内 dataloader)              │
+  腾讯免费行情 ──────▶ │   09:25 T+1持仓结转 (昨日买入转可卖)                │
+                      │   15:10 数据更新 (进程内 dataloader) + 实盘账户快照  │
+                      │         + 季度目标评估 (模式切换飞书告警)            │
                       │   15:15 全市场选股 → 候选股票自动入池 + 历史K线同步  │
   QMT sidecar ◀─────▶ │   15:30 EOD信号 → 多智能体辩论 → trade_plan 表    │
-                      │   15:35 对账 (QMT模式)                            │
+                      │   15:35 对账 (QMT模式) + 成交回报轮询落库           │
                       │   15:45 日报生成 + 飞书推送 + 操作提醒              │
                       │   盘中每5分钟 实时价止损监控 → 紧急计划+告警         │
                       │   16:30 数据保留清理 + WAL checkpoint              │
@@ -60,6 +62,28 @@ AI Agent（如 Hermes）只需定时 GET 只读 API 拿现成结果，POST 确�
 
 详细用法见下方 [Agent 接入指南](#agent-接入指南hermes--任意-ai-agent)。
 
+## 季度目标跟踪（核心决策约束）
+
+系统按**日历季度**跟踪收益目标与回撤预算，超预算时**自动收紧风险敞口**（只收紧不放松）：
+
+| 配置项 (config.yaml goal 段) | 默认 | 说明 |
+|---|---|---|
+| `goal.enabled` | true | 启用目标跟踪 |
+| `goal.quarterly_target_pct` | 0.15 | 季度收益目标 15% |
+| `goal.max_drawdown_budget` | 0.10 | 季度最大回撤预算 10% |
+| `goal.auto_adjust` | true | 自动调节风险敞口 |
+
+**自动调节规则**：
+- 回撤预算消耗 ≥70% → 总仓位上限 ×0.6（收紧）
+- 回撤预算耗尽 → 总仓位压至 20% + 止损收紧至 5%（防守模式）
+- 季度目标提前达成 → 总仓位 ×0.5（锁利，保住胜利果实）
+
+每日数据更新后自动评估，**风险模式切换时飞书告警**；状态可随时查询：
+`GET /api/goal/status`；`GET /api/agent/brief` 返回的 `goal` 字段是 Agent 决策的核心约束。
+
+> 目标跟踪的数据源是每日实盘账户快照（account_snapshot，run_id=live）。升级后首个季度
+> 从运行第一天起自动积累，季初基准取季度开始前最后一个快照，无快照时退回初始资金。
+
 ## 核心特点
 
 - **小资金友好** — 1 万本金即可运行；按资金量级自适应持仓数与最小交易额（5 元最低佣金下默认单笔 ≥5000 元保证费率 ≤0.1%）
@@ -68,6 +92,9 @@ AI Agent（如 Hermes）只需定时 GET 只读 API 拿现成结果，POST 确�
 - **全自动闭环** — 内置调度器：数据更新 → EOD 信号 → 对账 → 日报飞书推送 → 盘中止损监控 → 数据自动清理
 - **自动选股** — 每日全市场扫描（4000+股票），按换手率/量比/PE/PB/市值多维度筛选 TopN 候选，自动同步历史K线并加入策略股票池，无需手动维护选股范围
 - **常驻稳定** — 任务 panic 隔离、job_run 防重复/启动补跑、优雅关机（WaitGroup 等待任务收尾）、WAL checkpoint、goroutine 纪律
+- **季度目标跟踪** — 日历季度收益目标 + 回撤预算，超预算自动收紧风险敞口（只收紧不放松），目标达成自动锁利降仓，模式切换飞书告警
+- **数据可信** — 全链路前复权（历史库升级后 `dataloader -adj` 回填）、真实 T+1 交收、涨跌停/滑点/最低佣金建模、入库校验、近期数据自动重拉吸收更正
+- **成交归因** — 每笔成交记录来源策略（trades.strategy），动态策略选择器按各策略最近回测真实绩效 + 沪深300趋势推荐，3 日迟滞防抖
 - **多策略支持** — 均线交叉 / MACD / 布林带突破 / 多因子选股 / 日内做T，动态策略选择器按市况切换，策略实例缓存避免状态丢失
 - **LLM 辅助** — 集成 DeepSeek 等大模型深度分析新闻舆情（可选）
 - **多智能体辩论** — 4位分析师(技术/基本面/新闻/市场)并行分析 → 多空研究员辩论 → 风险管理经理裁决，对买入信号做二次验证（LLM 可用时自动启用）
@@ -110,8 +137,14 @@ export QMT_SIDECAR_TOKEN=随机长字符串         # QMT实盘时, sidecar鉴�
 
 ```bash
 bin/dataloader -config config/config.yaml          # 首次约拉3年数据
-bin/backtest -config config/config.yaml            # 回测并生成HTML报告
+bin/dataloader -config config/config.yaml -adj     # 历史库升级后回填复权因子 (一次性)
+bin/backtest -config config/config.yaml            # 回测并生成HTML报告 (前复权+真实T+1+滑点+涨跌停)
+bin/optimizer -config config/config.yaml -walkforward -folds 3   # 样本外验证参数寻优
 ```
+
+> **复权说明**：系统全链路使用前复权价格（回测与实盘同一口径），数据同步自动合并复权因子；
+> 历史库首次升级后需跑一次 `-adj` 回填，否则策略信号在除权日会失真。
+> 除权除息、T+1 交收、涨跌停、最低佣金均已建模，回测结果可信后再决策。
 
 ### 4. 启动常驻服务
 
@@ -133,6 +166,8 @@ curl -H "Authorization: Bearer $JZ_API_TOKEN" \
 | `risk.max_total_position_pct` | 0.9 | 总仓位上限 90%（保留10%现金做T） |
 | `risk.stop_loss_pct` | 0.08 | 止损 -8% |
 | `risk.take_profit_pct` | 0.15 | 止盈 +15% |
+| `risk.trailing_stop_pct` | 0.05 | 移动止盈：盈利达止盈线后，从持仓期间最高价回撤 5% 退出（让利润奔跑；0=不启用） |
+| `goal.*` | 见目标章节 | 季度目标 + 回撤预算 + 自动收紧风险敞口 |
 | `trading.min_trade_amount` | 3000 | 小资金降低门槛（0=自适应5000元太高，1万资金×40%仓位=4000<5000会被风控全部拦截）；设 3000 确保能成交 |
 | `trading.max_positions` | 0 | 0=自适应：<5万→2只，<20万→4只，否则6只 |
 | `trading.auto_execute` | false | 默认只生成计划，人/Agent 确认后执行 |
@@ -170,7 +205,8 @@ curl -H "Authorization: Bearer $JZ_API_TOKEN" http://127.0.0.1:11270/api/agent/b
 | `/api/positions` | 持仓诊断 |
 | `/api/market` / `/api/news` / `/api/strategy` | 市场概况 / 新闻舆情 / 策略建议 |
 | `/api/news/llm?limit=5` | LLM 深度新闻分析（可选，需启用 LLM） |
-| `/api/strategy/status` | 动态策略选择器状态（当前策略/市场环境/置信度） |
+| `/api/strategy/status` | 动态策略选择器状态（当前策略/市场环境/置信度/推荐/是否防守） |
+| `/api/goal/status` | 季度目标状态（收益/进度/回撤/预算消耗/风险模式） |
 | `/api/reconcile?date=` | 本地 vs 券商对账 |
 | `/api/health` | uptime / goroutine数 / db大小 / 各任务最近成功时间（**无需鉴权**） |
 | `/api/system/status` | 数据新鲜度 / 持仓数 / 下一交易日 |
@@ -303,6 +339,12 @@ curl -H "Authorization: Bearer $JZ_API_TOKEN" \
   "task_completed": {              // 当日各任务是否已完成
     "data_update": true, "signal": true, "report": false,
     "intraday_monitor": false, "retention": false
+  },
+  "goal": {                        // 季度目标状态 (目标跟踪启用时, Agent 决策核心约束)
+    "quarter": "2026Q3", "return_pct": -0.05, "target_pct": 0.15,
+    "progress": -0.33, "drawdown_pct": 0.06, "budget_consumed": 0.6,
+    "mode": "normal", "mode_label": "正常",
+    "notes": ["..."]
   },
   "action_needed": [               // 需要用户操作的提示
     "📋 有2条待确认的交易计划，请审阅后确认或忽略",
@@ -640,6 +682,24 @@ curl -X POST -H "Authorization: Bearer $JZ_API_TOKEN" \
 | `screener.min_turnover_rate` | config.yaml | 最低换手率%（默认1.0，排除僵尸股） |
 | `screener.max_pe` / `max_pb` | config.yaml | PE_TTM/PB 上限过滤 |
 | `scheduler.screener_time` | config.yaml | 选股执行时间（默认15:15） |
+
+## 数据口径（AI 决策前必读）
+
+所有行情与回测数据遵循同一口径，理解这些约定才能正确解读信号与回测：
+
+| 口径 | 约定 |
+|---|---|
+| 价格 | **前复权**（以最新复权因子为基准）。回测与实盘策略信号同一口径；涨跌停价比较时自动换算回原始价 |
+| 成交 | 默认**次日开盘价**成交（`backtest.fill_price: next_open`），含双向滑点（默认 0.02%） |
+| 交收 | **真实 T+1**：T 日信号 T+1 开盘成交，T+2 起可卖；回测与实盘台账一致（每日 09:25 结转） |
+| 限制 | 涨停禁买、跌停禁卖（无涨跌停数据时按板块规则自算兜底）；停牌自动顺延到复牌日成交 |
+| 费用 | 佣金（含最低 5 元）+ 卖出印花税 + 双向过户费；买入资金检查含费 |
+| 复权因子 | tushare `adj_factor` 每日自动合并；历史库升级后需跑一次 `bin/dataloader -adj` 回填 |
+| 数据更正 | 每个交易日自动重拉最近 ~10 个交易日覆盖刷新，吸收 tushare 修订 |
+| 财务因子 | 按公告日（ann_date）point-in-time 过滤，无前视 |
+
+**绩效归因**：`trades.strategy` 记录每笔成交的来源策略（回测 run 与实盘 live 同表区分 run_id）；
+动态策略选择器据此给每个策略评分，结合沪深300 近 30 日趋势推荐，连续 3 日同向才切换。
 
 ## 数据自动清理
 

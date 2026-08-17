@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"fmt"
-	"sort"
 	"sync"
 
 	"jingzhe-trader/internal/backtest"
@@ -19,19 +18,19 @@ import (
 // PipelineConfig 执行管道配置
 // 回测/模拟/实盘共用, 区别仅在于注入的 Broker 实现
 type PipelineConfig struct {
-	Broker      broker.Broker
-	Strategy    strategy.Strategy
-	Risk        *risk.RiskManager
-	Data        *backtest.DataProvider
-	Calendar    *market.Calendar
-	Universe    []string
-	StartDate   string
-	EndDate     string
-	RunID       string                  // 运行批次ID (bt_* 回测 / live_* 实盘)
-	TradeRepo   *store.TradeRepo        // 成交/快照持久化, nil 时不落库
-	FillMode    string                  // "next_open"(默认) 或 "close"
-	Stocks      map[string]*model.Stock // 股票信息(风控用), nil 时按universe构建默认值
-	DryRun      bool                    // true=只生成信号不下单 (交易计划模式)
+	Broker    broker.Broker
+	Strategy  strategy.Strategy
+	Risk      *risk.RiskManager
+	Data      *backtest.DataProvider
+	Calendar  *market.Calendar
+	Universe  []string
+	StartDate string
+	EndDate   string
+	RunID     string                  // 运行批次ID (bt_* 回测 / live_* 实盘)
+	TradeRepo *store.TradeRepo        // 成交/快照持久化, nil 时不落库
+	FillMode  string                  // "next_open"(默认) 或 "close"
+	Stocks    map[string]*model.Stock // 股票信息(风控用), nil 时按universe构建默认值
+	DryRun    bool                    // true=只生成信号不下单 (交易计划模式)
 }
 
 // Pipeline 统一执行管道
@@ -44,6 +43,8 @@ type Pipeline struct {
 	snapshots []model.AccountSnapshot
 	// DryRun 模式下收集的通过风控的信号
 	planSignals []PlanSignal
+	// strategyErrDays 策略执行失败的天数 (OnBar 报错不应静默吞掉)
+	strategyErrDays int
 }
 
 // PlanSignal 交易计划信号 (DryRun 模式产出)
@@ -98,8 +99,8 @@ func (p *Pipeline) Run() error {
 
 // runDay 执行单个交易日
 func (p *Pipeline) runDay(date, nextDate string) {
-	// 1. T+1 结算
-	p.cfg.Broker.SettleT1()
+	// 1. T+1 结算 (昨日买入转为可卖 + 到期的次日成交单入账)
+	p.cfg.Broker.SettleT1(date)
 
 	// 2. 构建当日行情
 	bars := make(map[string]*model.Bar)
@@ -141,9 +142,8 @@ func (p *Pipeline) collectSignals(date string, bars map[string]*model.Bar,
 
 	// 全局止损/止盈信号 (对所有持仓生效, 与策略无关)
 	stopSignals := p.cfg.Risk.CheckStopLoss(positions, bars)
-	stopCodes := make(map[string]bool, len(stopSignals))
+	stopCodes := StopCodesOf(stopSignals)
 	for _, s := range stopSignals {
-		stopCodes[s.TsCode] = true
 		logger.L().Infof("[%s] 全局风控信号 %s: %s", date, s.TsCode, s.Reason)
 	}
 
@@ -159,36 +159,21 @@ func (p *Pipeline) collectSignals(date string, bars map[string]*model.Bar,
 	}
 	stratSignals, err := p.cfg.Strategy.OnBar(context.Background(), barCtx)
 	if err != nil {
-		logger.L().Errorf("[%s] 策略执行出错: %v", date, err)
+		p.strategyErrDays++
+		logger.L().Errorf("[%s] 策略 %s 执行出错(第%d天): %v", date, p.cfg.Strategy.Name(), p.strategyErrDays, err)
 		stratSignals = nil
 	}
 
-	// 合并: 止损信号优先, 策略对同一股票的信号剔除避免重复
-	merged := make([]model.Signal, 0, len(stopSignals)+len(stratSignals))
-	merged = append(merged, stopSignals...)
-	for _, s := range stratSignals {
-		if !stopCodes[s.TsCode] {
-			merged = append(merged, s)
-		}
-	}
-
-	// 风控检查
-	passed, rejections := p.cfg.Risk.Check(merged, positions, asset.TotalAsset, p.stocks, date, bars)
-	for _, rej := range rejections {
-		logger.L().Warnf("[%s] 风控拦截 %s: %s (%s)", date, rej.TsCode, rej.Reason, rej.Rule)
-	}
-
-	// 卖出排在买入前, 先释放资金
-	sort.SliceStable(passed, func(i, j int) bool {
-		return passed[i].Direction == model.DirSell && passed[j].Direction != model.DirSell
-	})
+	// 合并 (剔除重复/建议信号) → 风控检查 → 卖单优先排序 (与实盘共用同一套语义)
+	merged := MergeStrategySignals(date, stopSignals, stopCodes, stratSignals)
+	passed, _ := CheckAndSortSignals(date, p.cfg.Risk, merged, positions, asset.TotalAsset, p.stocks, bars)
 	return passed
 }
 
 // executeSignals 执行通过风控的信号
 func (p *Pipeline) executeSignals(date, nextDate string, signals []model.Signal, bars map[string]*model.Bar) {
 	for _, sig := range signals {
-		fillPrice, fillDate := p.resolveFillPrice(sig.TsCode, date, nextDate)
+		fillPrice, fillDate, fillBar := p.resolveFillPrice(sig.TsCode, date, nextDate)
 		if fillPrice <= 0 {
 			logger.L().Debugf("[%s] %s 无有效成交价, 跳过", date, sig.TsCode)
 			continue
@@ -221,24 +206,31 @@ func (p *Pipeline) executeSignals(date, nextDate string, signals []model.Signal,
 			Strategy: p.cfg.Strategy.Name(),
 			FillDate: fillDate,
 		}
+		if fillBar != nil {
+			req.PreClose = fillBar.PreClose
+		}
+		if st := p.stocks[sig.TsCode]; st != nil {
+			req.IsST = st.IsST
+		}
 		if _, err := p.cfg.Broker.PlaceOrder(req); err != nil {
 			logger.L().Debugf("[%s] 下单未成交 %s: %v", date, sig.TsCode, err)
 		}
 	}
 }
 
-// resolveFillPrice 按成交模式确定成交价与成交日
-// next_open: 次日开盘价 (无次日数据时回退当日收盘); close: 当日收盘价
-func (p *Pipeline) resolveFillPrice(tsCode, date, nextDate string) (float64, string) {
+// resolveFillPrice 按成交模式确定成交价、成交日与成交K线
+// next_open: 次日开盘价, 成交日取该股票的下一根K线日期 (停牌时自动顺延到复牌日);
+// 无次日数据(回测末尾)回退当日收盘; close: 当日收盘价
+func (p *Pipeline) resolveFillPrice(tsCode, date, nextDate string) (float64, string, *model.Bar) {
 	if p.cfg.FillMode != "close" && nextDate != "" {
 		if bar := p.cfg.Data.GetNextBar(tsCode, date); bar != nil && bar.Open > 0 {
-			return bar.Open, nextDate
+			return bar.Open, bar.TradeDate, bar
 		}
 	}
 	if bar := p.cfg.Data.GetBar(tsCode, date); bar != nil && bar.Close > 0 {
-		return bar.Close, date
+		return bar.Close, date, bar
 	}
-	return 0, ""
+	return 0, "", nil
 }
 
 // onTrade 成交回调: 补充RunID, 持久化, 记入内存
@@ -302,6 +294,11 @@ func (p *Pipeline) Trades() []model.Trade {
 	result := make([]model.Trade, len(p.trades))
 	copy(result, p.trades)
 	return result
+}
+
+// StrategyErrorDays 返回策略执行失败的天数 (0=策略全程正常)
+func (p *Pipeline) StrategyErrorDays() int {
+	return p.strategyErrDays
 }
 
 // PlanSignals 获取 DryRun 模式收集的交易计划信号

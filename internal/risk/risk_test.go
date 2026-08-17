@@ -391,13 +391,13 @@ func TestCheckSingle_NoPosition(t *testing.T) {
 // TestTrailingStop 测试移动止盈
 func TestTrailingStop(t *testing.T) {
 	sl := NewStopLossManager(0.05, 0.10) // 止盈10%
-	sl.SetTrailingStop(0.05)              // 移动止盈回撤5%
+	sl.SetTrailingStop(0.05)             // 移动止盈回撤5%
 
 	pos := &model.Position{
-		TsCode:      "000001.SZ",
-		TotalQty:    1000,
-		CostPrice:   10.0,
-		MarketPrice: 12.0, // 最高价 12 元（盈利20%）
+		TsCode:    "000001.SZ",
+		TotalQty:  1000,
+		CostPrice: 10.0,
+		HighPrice: 12.0, // 持仓期间最高价 12 元（曾盈利20%）
 	}
 
 	// 从高点回撤 6%，应触发移动止盈
@@ -408,6 +408,12 @@ func TestTrailingStop(t *testing.T) {
 	}
 	if reason == "" {
 		t.Error("应返回移动止盈原因")
+	}
+
+	// 现价创新高时不触发 (回撤为0)
+	triggered, _ = sl.CheckSingle(pos, 11.9)
+	if triggered {
+		t.Error("接近高点但未达回撤阈值不应触发移动止盈")
 	}
 }
 

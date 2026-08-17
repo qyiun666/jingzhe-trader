@@ -19,9 +19,15 @@ func NewBarRepo(db *sqlx.DB) *BarRepo {
 }
 
 const (
-	barInsertSQL = `INSERT OR REPLACE INTO daily_bar
+	// UPSERT: 行情字段覆盖, adj_factor 在新值为 0(未获取)时保留已有因子, 防止日常同步把回填的因子抹掉
+	barInsertSQL = `INSERT INTO daily_bar
 		(ts_code, trade_date, open, high, low, close, pre_close, change, pct_chg, vol, amount, adj_factor)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(ts_code, trade_date) DO UPDATE SET
+		open=excluded.open, high=excluded.high, low=excluded.low, close=excluded.close,
+		pre_close=excluded.pre_close, change=excluded.change, pct_chg=excluded.pct_chg,
+		vol=excluded.vol, amount=excluded.amount,
+		adj_factor=COALESCE(NULLIF(excluded.adj_factor, 0), daily_bar.adj_factor)`
 	barSelectCols = `ts_code, trade_date, open, high, low, close, pre_close, change, pct_chg, vol, amount, adj_factor`
 )
 
@@ -74,6 +80,48 @@ func (r *BarRepo) GetBarsByDate(tradeDate string) ([]model.Bar, error) {
 		return nil, fmt.Errorf("查询日线失败: %w", err)
 	}
 	return bars, nil
+}
+
+// UpdateAdjFactors 批量更新指定股票的复权因子, 返回更新行数
+func (r *BarRepo) UpdateAdjFactors(tsCode string, factors map[string]float64) (int, error) {
+	if len(factors) == 0 {
+		return 0, nil
+	}
+	tx, err := r.db.Beginx()
+	if err != nil {
+		return 0, fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Preparex(`UPDATE daily_bar SET adj_factor = ? WHERE ts_code = ? AND trade_date = ?`)
+	if err != nil {
+		return 0, fmt.Errorf("预编译更新语句失败: %w", err)
+	}
+	defer stmt.Close()
+	updated := 0
+	for date, factor := range factors {
+		if factor <= 0 {
+			continue
+		}
+		res, err := stmt.Exec(factor, tsCode, date)
+		if err != nil {
+			return updated, fmt.Errorf("更新复权因子失败(ts_code=%s date=%s): %w", tsCode, date, err)
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			updated += int(n)
+		}
+	}
+	return updated, tx.Commit()
+}
+
+// GetZeroAdjFactorCodes 获取 daily_bar 中存在复权因子缺失(0或NULL)的股票代码
+func (r *BarRepo) GetZeroAdjFactorCodes() ([]string, error) {
+	var codes []string
+	err := r.db.Select(&codes, `SELECT DISTINCT ts_code FROM daily_bar
+		WHERE adj_factor IS NULL OR adj_factor = 0`)
+	if err != nil {
+		return nil, fmt.Errorf("查询缺失复权因子的股票失败: %w", err)
+	}
+	return codes, nil
 }
 
 // GetMaxTradeDate 获取 daily_bar 中最大的交易日(无数据返回空字符串)

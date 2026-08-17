@@ -36,9 +36,8 @@ func (em *ExposureManager) SectorExposure(positions map[string]*model.Position,
 			continue
 		}
 
-		// 获取板块名称
-		board := model.DetectBoard(tsCode)
-		sectorName := boardName(board)
+		// 敞口分类: 优先行业 (stock_basic.industry), 缺失时按交易所板块兜底
+		sectorName := sectorOf(stocks[tsCode], tsCode)
 
 		// 计算市值
 		marketValue := pos.MarketValue
@@ -54,6 +53,14 @@ func (em *ExposureManager) SectorExposure(positions map[string]*model.Position,
 	}
 
 	return exposure
+}
+
+// sectorOf 返回股票所属行业; 行业信息缺失时回退到交易所板块
+func sectorOf(stock *model.Stock, tsCode string) string {
+	if stock != nil && stock.Industry != "" {
+		return stock.Industry
+	}
+	return boardName(model.DetectBoard(tsCode))
 }
 
 // CheckSectorLimit 检查买入信号是否突破板块限制
@@ -76,18 +83,16 @@ func (em *ExposureManager) CheckSectorLimit(signal model.Signal, positions map[s
 		return fmt.Errorf("参数无效: 总资产或价格或买入数量不合法")
 	}
 
-	// 获取信号股票的板块
-	board := model.DetectBoard(signal.TsCode)
-	sectorName := boardName(board)
+	// 获取信号股票的行业 (缺失时回退交易所板块)
+	sectorName := sectorOf(stocks[signal.TsCode], signal.TsCode)
 
-	// 计算当前板块敞口
+	// 计算当前行业敞口
 	currentSectorValue := 0.0
 	for tsCode, pos := range positions {
 		if pos == nil || pos.TotalQty <= 0 {
 			continue
 		}
-		b := model.DetectBoard(tsCode)
-		if b == board {
+		if sectorOf(stocks[tsCode], tsCode) == sectorName {
 			if pos.MarketValue > 0 {
 				currentSectorValue += pos.MarketValue
 			} else if pos.MarketPrice > 0 {

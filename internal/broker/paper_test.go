@@ -82,3 +82,86 @@ func TestQueryAsset_DeepCopy(t *testing.T) {
 		t.Error("QueryAsset 未深拷贝持仓, 外部修改污染了内部状态")
 	}
 }
+
+// TestPendingFill_T1Settlement 次日成交模型:
+// T日下单(FillDate=T+1) → 下单日不入账 → T+1结算时入账且当日不可卖 → T+2起可卖
+func TestPendingFill_T1Settlement(t *testing.T) {
+	pb := NewPaperBroker("test", 10000, testCostModel())
+	pb.SetTradeDate("20240102", "20240103")
+
+	// T日下单, FillDate=T+1: 应立即返回成功但不入账
+	if _, err := pb.PlaceOrder(OrderRequest{
+		TsCode: "000001.SZ", Side: model.SideBuy, Qty: 900, Price: 10.0, FillDate: "20240103",
+	}); err != nil {
+		t.Fatalf("下单失败: %v", err)
+	}
+	asset, _ := pb.QueryAsset()
+	if len(asset.Positions) != 0 {
+		t.Fatal("T日下单不应立即入账持仓")
+	}
+	if asset.Cash != 10000 {
+		t.Fatalf("T日现金不应变动, 实际 %.2f", asset.Cash)
+	}
+
+	// T+1 开盘结算: 成交入账, 当日买入不可卖 (TodayBought)
+	pb.SettleT1("20240103")
+	asset, _ = pb.QueryAsset()
+	pos := asset.Positions["000001.SZ"]
+	if pos == nil || pos.TotalQty != 900 {
+		t.Fatalf("T+1结算后应有900股持仓, 实际 %+v", pos)
+	}
+	if pos.AvailableQty != 0 {
+		t.Fatalf("T+1当日买入不可卖, 可卖应为0, 实际 %d", pos.AvailableQty)
+	}
+	if asset.Cash >= 10000 {
+		t.Fatalf("T+1成交后现金应已扣减, 实际 %.2f", asset.Cash)
+	}
+
+	// T+1 当日卖出应被 T+1 规则拒绝
+	pb.SetTradeDate("20240103", "20240104")
+	if _, err := pb.PlaceOrder(OrderRequest{
+		TsCode: "000001.SZ", Side: model.SideSell, Qty: 900, Price: 10.5, FillDate: "20240103",
+	}); err == nil {
+		t.Fatal("T+1当日卖出当日买入的持仓应被拒绝")
+	}
+
+	// T+2 结算后可卖
+	pb.SettleT1("20240104")
+	pb.SetTradeDate("20240104", "20240107")
+	if _, err := pb.PlaceOrder(OrderRequest{
+		TsCode: "000001.SZ", Side: model.SideSell, Qty: 900, Price: 10.5, FillDate: "20240104",
+	}); err != nil {
+		t.Fatalf("T+2卖出应成功: %v", err)
+	}
+	asset, _ = pb.QueryAsset()
+	if len(asset.Positions) != 0 {
+		t.Fatal("卖出后应无持仓")
+	}
+}
+
+// TestPendingFill_InsufficientCashAtFill 待成交单入账日资金不足时应拒单
+func TestPendingFill_InsufficientCashAtFill(t *testing.T) {
+	pb := NewPaperBroker("test", 5000, testCostModel())
+	pb.SetTradeDate("20240102", "20240103")
+	if _, err := pb.PlaceOrder(OrderRequest{
+		TsCode: "000001.SZ", Side: model.SideBuy, Qty: 400, Price: 10.0, FillDate: "20240103",
+	}); err != nil {
+		t.Fatalf("下单失败: %v", err)
+	}
+	// 下单后(成交前)现金被其他方式占用: 模拟当天另一笔即日买入
+	if _, err := pb.PlaceOrder(OrderRequest{
+		TsCode: "600519.SH", Side: model.SideBuy, Qty: 300, Price: 10.0, FillDate: "20240102",
+	}); err != nil {
+		t.Fatalf("即日买入失败: %v", err)
+	}
+	// T+1 结算: 现金只剩约 2000, 买 400 股(约4005元)不够 → 降档或拒单, 不得透支
+	pb.SettleT1("20240103")
+	asset, _ := pb.QueryAsset()
+	if asset.Cash < 0 {
+		t.Fatalf("待成交单入账后现金不得为负, 实际 %.2f", asset.Cash)
+	}
+	pos := asset.Positions["000001.SZ"]
+	if pos != nil && pos.TotalQty > 200 {
+		t.Fatalf("资金不足时应降档到可承受数量, 实际 %d 股", pos.TotalQty)
+	}
+}

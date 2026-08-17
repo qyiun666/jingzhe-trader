@@ -9,6 +9,9 @@ package main
 //   go run ./cmd/optimizer -config config/config.yaml -strategy ma_cross \
 //       -start 20240101 -end 20260715 -capital 10000
 //
+// Walk-Forward 样本外验证 (切 K 段, 每段前 2/3 训练选参, 后 1/3 样本外评估):
+//   go run ./cmd/optimizer -config config/config.yaml -walkforward -folds 3
+//
 // 说明:
 //   - 回测引擎内部已计算好 Metrics (CalculateMetrics), 这里直接读取 result.Metrics
 //   - ma_cross 策略 Init 用 v.(float64) 解析参数, 因此 short/long 必须传 float64
@@ -24,7 +27,6 @@ import (
 	"time"
 
 	"jingzhe-trader/internal/config"
-	"jingzhe-trader/internal/engine"
 	"jingzhe-trader/pkg/logger"
 )
 
@@ -50,6 +52,8 @@ func main() {
 	capital := flag.Float64("capital", 10000, "初始资金")
 	universeStr := flag.String("universe", "", "股票池(逗号分隔, 缺省用配置 universe)")
 	topN := flag.Int("top", 10, "输出前N个最优结果")
+	walkForward := flag.Bool("walkforward", false, "启用 walk-forward 样本外验证模式")
+	folds := flag.Int("folds", 3, "walk-forward 分段数 (仅 -walkforward 时生效)")
 	flag.Parse()
 
 	// 1. 加载配置
@@ -74,27 +78,27 @@ func main() {
 	}
 
 	// 4. 定义参数搜索网格
-	shortPeriods := []int{3, 5, 7, 10}
-	longPeriods := []int{10, 15, 20, 25, 30}
-	positionPcts := []float64{0.25, 0.30, 0.35, 0.40}
+	grid := paramGrid{
+		ShortPeriods: []int{3, 5, 7, 10},
+		LongPeriods:  []int{10, 15, 20, 25, 30},
+		PositionPcts: []float64{0.25, 0.30, 0.35, 0.40},
+	}
+
+	// Walk-Forward 样本外验证模式: 切窗后在每段训练窗网格搜索、测试窗样本外评估
+	if *walkForward {
+		runWalkForward(cfg, *strategyName, *startDate, *endDate, *capital, universe, grid, *folds)
+		return
+	}
 
 	// 统计有效组合数 (剔除 short >= long 的组合)
-	total := 0
-	for _, sp := range shortPeriods {
-		for _, lp := range longPeriods {
-			if sp >= lp {
-				continue
-			}
-			total += len(positionPcts)
-		}
-	}
+	total := len(grid.combos())
 
 	fmt.Printf("========== 参数网格搜索 ==========\n")
 	fmt.Printf("策略:     %s\n", *strategyName)
 	fmt.Printf("区间:     %s ~ %s\n", *startDate, *endDate)
 	fmt.Printf("资金:     %.0f\n", *capital)
 	fmt.Printf("股票池:   %d 只\n", len(universe))
-	fmt.Printf("网格:     short%v x long%v x pos%v\n", shortPeriods, longPeriods, positionPcts)
+	fmt.Printf("网格:     short%v x long%v x pos%v\n", grid.ShortPeriods, grid.LongPeriods, grid.PositionPcts)
 	fmt.Printf("有效组合: %d (已剔除 short>=long)\n", total)
 	fmt.Printf("==================================\n\n")
 
@@ -103,67 +107,11 @@ func main() {
 	idx := 0
 	start := time.Now()
 
-	for _, sp := range shortPeriods {
-		for _, lp := range longPeriods {
-			// 短均线必须小于长均线, 否则无意义
-			if sp >= lp {
-				continue
-			}
-			for _, pp := range positionPcts {
-				idx++
-				fmt.Printf("\r[%d/%d] 测试: short=%-2d long=%-2d pos=%.0f%% ...", idx, total, sp, lp, pp*100)
-
-				// 构建回测配置
-				// 注意: ma_cross 策略 Init 用 v.(float64) 解析参数, 必须传 float64 类型
-				btCfg := engine.RunConfig{
-					StartDate:      *startDate,
-					EndDate:        *endDate,
-					InitialCapital: *capital,
-					Universe:       universe,
-					Benchmark:      cfg.Backtest.Benchmark,
-					Slippage:       cfg.Backtest.Slippage,
-					FillPrice:      cfg.Backtest.FillPrice,
-					StrategyName:   *strategyName,
-					StrategyParams: map[string]interface{}{
-						"short_period": float64(sp),
-						"long_period":  float64(lp),
-						"position_pct": pp,
-					},
-					Silent: true, // 静默模式: 不打印单次回测摘要
-				}
-
-				runner, err := engine.NewBacktestRunner(btCfg, cfg)
-				if err != nil {
-					results = append(results, OptResult{
-						ShortPeriod: sp, LongPeriod: lp, PositionPct: pp, Err: err,
-					})
-					continue
-				}
-
-				result, err := runner.Run()
-				_ = runner.Close() // 释放数据库连接, 避免批量回测时连接泄漏
-				if err != nil {
-					results = append(results, OptResult{
-						ShortPeriod: sp, LongPeriod: lp, PositionPct: pp, Err: err,
-					})
-					continue
-				}
-
-				// 回测引擎内部已计算好指标, 直接读取
-				m := result.Metrics
-				results = append(results, OptResult{
-					ShortPeriod:  sp,
-					LongPeriod:   lp,
-					PositionPct:  pp,
-					TotalReturn:  m.TotalReturn,
-					AnnualReturn: m.AnnualReturn,
-					Sharpe:       m.SharpeRatio,
-					MaxDrawdown:  m.MaxDrawdown,
-					TradeCount:   m.TotalTrades,
-					WinRate:      m.WinRate,
-				})
-			}
-		}
+	for _, c := range grid.combos() {
+		sp, lp, pp := c[0].(int), c[1].(int), c[2].(float64)
+		idx++
+		fmt.Printf("\r[%d/%d] 测试: short=%-2d long=%-2d pos=%.0f%% ...", idx, total, sp, lp, pp*100)
+		results = append(results, runSingleBacktest(cfg, *strategyName, *startDate, *endDate, *capital, universe, sp, lp, pp))
 	}
 
 	elapsed := time.Since(start)

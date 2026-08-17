@@ -89,4 +89,5 @@ type Trade struct {
 	TotalCost   float64 `json:"total_cost" db:"total_cost"`   // 总费用
 	TradeDate   string  `json:"trade_date" db:"trade_date"`
 	TradeTime   string  `json:"trade_time" db:"trade_time"`
+	Strategy    string  `json:"strategy" db:"strategy"`      // 来源策略 (绩效归因用)
 }

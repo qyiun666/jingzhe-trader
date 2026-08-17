@@ -51,7 +51,7 @@ MA5: %.2f  MA20: %.2f  (MA5%sMA20)
 		ma5, ma20, crossStr(ma5, ma20),
 		volRatio,
 		ctx.TotalAsset, posStr(ctx.Position))
-	return callLLMCommon(a.llm, ctx.TsCode, "technical", technicalSysPrompt, userPrompt)
+	return callLLMCommon(a.llm, ctx.TsCode, ctx.TradeDate, "technical", technicalSysPrompt, userPrompt)
 }
 
 type FundamentalAnalyst struct {
@@ -91,7 +91,7 @@ func (a *FundamentalAnalyst) Analyze(ctx *DebateContext) (*AnalysisReport, error
 		safeFinaFloat(fina, "EPS"), safeFinaFloat(fina, "ROE"),
 		safeFinaFloat(fina, "GrossProfitMargin"), safeFinaFloat(fina, "NetProfitMargin"),
 		safeFinaFloat(fina, "DebtToAssets"), safeFinaFloat(fina, "NetProfitYoy"))
-	return callLLMCommon(a.llm, ctx.TsCode, "fundamental", fundamentalSysPrompt, userPrompt)
+	return callLLMCommon(a.llm, ctx.TsCode, ctx.TradeDate, "fundamental", fundamentalSysPrompt, userPrompt)
 }
 
 type NewsAnalyst struct {
@@ -111,7 +111,8 @@ func (a *NewsAnalyst) Analyze(ctx *DebateContext) (*AnalysisReport, error) {
 	}
 	relevant := filterRelevantNews(news, ctx.Name, ctx.TsCode)
 	if len(relevant) == 0 {
-		relevant = news[:min(5, len(news))]
+		// 无相关新闻时明确输出, 不拿全局热点充数(无关新闻会误导后续辩论)
+		return &AnalysisReport{Agent: a.Name(), TsCode: ctx.TsCode, Confidence: 0.2, KeyPoints: []string{"无相关新闻"}}, nil
 	}
 	userPrompt := fmt.Sprintf(`股票: %s (%s)  日期: %s
 近期新闻:
@@ -120,7 +121,7 @@ func (a *NewsAnalyst) Analyze(ctx *DebateContext) (*AnalysisReport, error) {
 请分析新闻对%s的影响，输出JSON:
 {"sentiment": -1到1, "key_points": ["要点1","要点2"], "risks": ["风险1"], "confidence": 0到1}`,
 		ctx.TsCode, ctx.Name, ctx.TradeDate, formatNews(relevant), ctx.Name)
-	return callLLMCommon(a.llm, ctx.TsCode, "news", newsSysPrompt, userPrompt)
+	return callLLMCommon(a.llm, ctx.TsCode, ctx.TradeDate, "news", newsSysPrompt, userPrompt)
 }
 
 type MarketAnalyst struct {
@@ -147,14 +148,14 @@ func (a *MarketAnalyst) Analyze(ctx *DebateContext) (*AnalysisReport, error) {
 请分析当前市场环境对该股的影响，输出JSON:
 {"sentiment": -1到1, "key_points": ["要点1","要点2"], "risks": ["风险1"], "confidence": 0到1}`,
 		ctx.TsCode, ctx.Name, ctx.TradeDate, indexText.String(), safeBarPctChg(ctx.Bars))
-	return callLLMCommon(a.llm, ctx.TsCode, "market", marketSysPrompt, userPrompt)
+	return callLLMCommon(a.llm, ctx.TsCode, ctx.TradeDate, "market", marketSysPrompt, userPrompt)
 }
 
-func callLLMCommon(client *llm.Client, tsCode, agentType, sysPrompt, userPrompt string) (*AnalysisReport, error) {
+func callLLMCommon(client *llm.Client, tsCode, tradeDate, agentType, sysPrompt, userPrompt string) (*AnalysisReport, error) {
 	if client == nil || !client.IsEnabled() {
 		return &AnalysisReport{Agent: agentType, TsCode: tsCode, Confidence: 0.3, KeyPoints: []string{"LLM未启用"}}, nil
 	}
-	resp, err := client.Chat(sysPrompt, userPrompt)
+	resp, err := client.ChatWithCache(tradeDate, tsCode, agentType, sysPrompt, userPrompt)
 	if err != nil {
 		logger.L().Warnw("分析师LLM调用失败", "agent", agentType, "ts_code", tsCode, "err", err)
 		return &AnalysisReport{Agent: agentType, TsCode: tsCode, Confidence: 0.2, KeyPoints: []string{"LLM调用失败"}}, nil
