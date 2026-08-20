@@ -83,35 +83,20 @@ AI Agent（如 Hermes）只需定时 GET 只读 API 拿现成结果，POST 确�
                GET /api/agent/changes (决策变更检测)
 ```
 
-### Agent 对接流程
-
-1. `GET /api/agent/brief` — 一次拿到全量上下文：待处理交易计划、持仓诊断、账户、市场概况、数据新鲜度、任务健康度
-2. Agent/人审阅计划后 `POST /api/plan/confirm {"id": 123}` 确认
-3. `trading.auto_execute=true` 且 `broker.type=qmt` 时确认即真实下单，否则仅标记 confirmed 由人工执行后 `POST /api/trade/confirm` 反馈成交
-
-详细用法见下方 [Agent 接入指南](#agent-接入指南hermes--任意-ai-agent)。
-
 ## 季度目标跟踪（核心决策约束）
 
-系统按**日历季度**跟踪收益目标与回撤预算，超预算时**自动收紧风险敞口**（只收紧不放松）：
+按**日历季度**跟踪收益目标与回撤预算，超预算时**自动收紧风险敞口**（只收紧不放松）：
 
-| 配置项 (config.yaml goal 段) | 默认 | 说明 |
+| 配置项 | 默认 | 说明 |
 |---|---|---|
 | `goal.enabled` | true | 启用目标跟踪 |
 | `goal.quarterly_target_pct` | 0.15 | 季度收益目标 15% |
 | `goal.max_drawdown_budget` | 0.10 | 季度最大回撤预算 10% |
 | `goal.auto_adjust` | true | 自动调节风险敞口 |
 
-**自动调节规则**：
-- 回撤预算消耗 ≥70% → 总仓位上限 ×0.6（收紧）
-- 回撤预算耗尽 → 总仓位压至 20% + 止损收紧至 5%（防守模式）
-- 季度目标提前达成 → 总仓位 ×0.5（锁利，保住胜利果实）
+**自动调节规则**：回撤预算消耗 ≥70% → 总仓位 ×0.6 收紧；预算耗尽 → 仓位压至 20% + 止损 5%（防守）；目标提前达成 → 仓位 ×0.5 锁利。
 
-每日数据更新后自动评估，**风险模式切换时飞书告警**；状态可随时查询：
-`GET /api/goal/status`；`GET /api/agent/brief` 返回的 `goal` 字段是 Agent 决策的核心约束。
-
-> 目标跟踪的数据源是每日实盘账户快照（account_snapshot，run_id=live）。升级后首个季度
-> 从运行第一天起自动积累，季初基准取季度开始前最后一个快照，无快照时退回初始资金。
+每日数据更新后自动评估，**风险模式切换时飞书告警**；状态可查 `GET /api/goal/status`，`/api/agent/brief` 的 `goal` 字段是 Agent 决策核心约束。数据源为每日实盘账户快照（account_snapshot，run_id=live），季初基准取季度开始前最后一个快照，无快照时退回初始资金。
 
 ## 核心特点
 
@@ -119,17 +104,13 @@ AI Agent（如 Hermes）只需定时 GET 只读 API 拿现成结果，POST 确�
 - **回测即实盘** — 回测/模拟/实盘共用同一条 `信号 → 风控 → 下单 → 落库` 管道，回测结果不虚高
 - **风控内建** — 止损/止盈信号优先执行、单票/总仓位/板块敞口限制、含手续费的买入资金检查
 - **全自动闭环** — 内置调度器：数据更新 → EOD 信号 → 对账 → 日报飞书推送 → 盘中止损监控 → 数据自动清理
-- **自动选股** — 每日全市场扫描（4000+股票），按换手率/量比/PE/PB/市值多维度筛选 TopN 候选，自动同步历史K线并加入策略股票池，无需手动维护选股范围
-- **常驻稳定** — 任务 panic 隔离、job_run 防重复/启动补跑、优雅关机（WaitGroup 等待任务收尾）、WAL checkpoint、goroutine 纪律
-- **季度目标跟踪** — 日历季度收益目标 + 回撤预算，超预算自动收紧风险敞口（只收紧不放松），目标达成自动锁利降仓，模式切换飞书告警
-- **数据可信** — 全链路前复权（历史库升级后 `dataloader -adj` 回填）、真实 T+1 交收、涨跌停/滑点/最低佣金建模、入库校验、近期数据自动重拉吸收更正
-- **成交归因** — 每笔成交记录来源策略（trades.strategy），动态策略选择器按各策略最近回测真实绩效 + 沪深300趋势推荐，3 日迟滞防抖
-- **多策略支持** — 均线交叉 / MACD / 布林带突破 / 多因子选股 / 日内做T，动态策略选择器按市况切换，策略实例缓存避免状态丢失
-- **DeepSeek 辅助** — 仅集成 DeepSeek API 分析新闻舆情（可选，LLM 失败时明确告警不降级）
-- **多智能体辩论** — 4位分析师(技术/基本面/新闻/市场)并行分析 → 多空研究员辩论 → 风险管理经理裁决，对买入信号做二次验证（LLM 可用时自动启用，失败时明确告警而非静默降级）
-- **决策变更追踪** — 每次辩论结果与历史对比，自动检测决策方向、置信度、风险等级变化并通知
-- **新闻智能过滤** — 按配置股票池关键词优先展示相关新闻，不足时补充热点新闻
-- **共享仓储层** — Service 持有共享 Repo 实例，避免每次请求重复创建数据库访问对象
+- **自动选股** — 每日全市场扫描（4000+股票），多维度筛选 TopN 候选自动入池，无需手动维护股票池
+- **常驻稳定** — 任务 panic 隔离、job_run 防重复/启动补跑、优雅关机、WAL checkpoint、共享仓储实例
+- **季度目标跟踪** — 日历季度收益目标 + 回撤预算，超预算自动收紧风险敞口（只收紧不放松），模式切换飞书告警
+- **数据可信** — 全链路前复权、真实 T+1 交收、涨跌停/滑点/最低佣金建模、近期数据自动重拉吸收更正
+- **多策略支持** — 均线交叉 / MACD / 布林带突破 / 多因子选股 / 日内做T，按市况动态切换，成交归因到策略
+- **DeepSeek 多智能体辩论** — 仅支持 DeepSeek：4位分析师并行 → 多空辩论 → 风险经理裁决，二次验证买入信号 + 决策变更追踪（LLM 失败时明确告警不降级）
+- **新闻智能过滤** — 按股票池关键词优先展示相关新闻，不足时热点补充
 
 ## 快速开始
 
@@ -305,6 +286,22 @@ export JZ_API_TOKEN="your-random-token"    # 服务端: config 留空则从环�
 # 例外: GET /api/health 和 GET / 无需鉴权
 ```
 
+### 系统每日时间线（自动执行，Agent 无需介入）
+
+| 时间 | 任务 |
+|---|---|
+| 00:00-09:25 | 常驻运行（systemd 保活），调度器每 30 秒检查到点任务 |
+| 09:25 | T+1 持仓结转 + 盘中止损监控就绪 |
+| 09:30-15:00 | 盘中监控（每 5 分钟，触发止损 → 紧急计划 + 告警） |
+| 15:10 | 数据更新（Tushare 行情入库）+ 实盘账户快照 + 季度目标评估 |
+| 15:15 | 全市场自动选股 → 候选入池 + 历史K线同步 |
+| 15:30 | EOD 信号生成 → 多智能体辩论 → 交易计划落库 |
+| 15:35 | 对账（仅 QMT 实盘） |
+| 15:45 | 日报生成 + 飞书推送 |
+| 16:30 | 数据保留清理 + WAL checkpoint |
+
+所有任务完成后通知**同时落库 + 飞书推送**（无论有无交易计划）；Agent 下次执行时检查 `task_completed` + `plan_status_summary` 确认状态已更新。
+
 ### 推荐轮询节奏（交易日）
 
 | 时间 | Agent 动作 | 说明 |
@@ -318,13 +315,6 @@ export JZ_API_TOKEN="your-random-token"    # 服务端: config 留空则从环�
 | 读取后 | `POST /api/agent/alerts` | 标记通知已读 `{"all": true}` |
 | 任意 | `GET /api/health` | 存活与任务健康度巡检（无需鉴权） |
 
-> **24h 闭环工作流**:
-> 1. 系统常驻运行，调度器到点自动执行任务（数据更新→信号生成→辩论→日报→盘中监控→清理）
-> 2. 每次任务完成后，通知**同时落库 + 飞书推送**（无论有无交易计划都通知）
-> 3. Agent 轮询 `/api/agent/alerts` 读取通知 → 通知用户操作
-> 4. 用户操作后（确认计划/反馈成交），Agent 下次执行时检查 `task_completed` + `plan_status_summary` 确认状态已更新
-> 5. 决策变更自动检测：每次辩论结果与历史对比，变化通过 `/api/agent/changes` 查询
-
 ### 1. 读取全量上下文
 
 ```bash
@@ -337,46 +327,33 @@ curl -H "Authorization: Bearer $JZ_API_TOKEN" \
 ```jsonc
 {
   "date": "20260726",             // 数据基准日
-  "data_last_date": "20260724",   // 库内最新行情日
-  "data_fresh": true,              // false 时应提醒用户数据滞后, 不宜盲信计划
+  "data_fresh": true,              // false → 数据滞后, 不宜盲信计划
   "open_plans": [{                 // 待处理交易计划 (pending/confirmed)
     "id": 12, "trade_date": "20260726",
     "ts_code": "000001.SZ", "name": "平安银行",
     "direction": "buy", "qty": 500, "ref_price": 11.13,
     "reason": "均线金叉: MA3=11.05上穿MA25=10.98 | LLM辩论: 技术面转强",
-    "strategy": "ma_cross", "urgency": "normal",
-    "status": "pending"
+    "strategy": "ma_cross", "urgency": "normal", "status": "pending"
   }],
-  "portfolio": { /* 持仓明细+健康分+集中度+盈亏/风险指标 */ },
+  "portfolio": { /* 持仓明细+健康分+集中度+盈亏 */ },
   "market":    { /* 指数涨跌/市场情绪概况 */ },
-  "jobs":      { "signal": "2026-07-26 15:30:02", "data_update": "..." },
-  "warnings":  ["..."],            // 数据滞后/任务失败等异常, 非空时优先告知用户
-  "debates": [{                    // 当日多智能体辩论结果
-    "ts_code": "000001.SZ", "name": "平安银行",
-    "decision": "buy",             // buy/hold/reject
-    "confidence": 0.72,
+  "jobs":      { "signal": "2026-07-26 15:30:02" },
+  "warnings":  ["..."],           // 异常, 非空时优先告知用户
+  "debates": [{                    // 多智能体辩论结果
+    "ts_code": "000001.SZ", "decision": "buy", "confidence": 0.72,
     "position_pct": 0.5, "stop_price": 10.58,
-    "risk_level": "medium",
-    "summary": "技术面金叉确认, 基本面稳健, 新闻中性偏多"
+    "risk_level": "medium", "summary": "技术面金叉确认..."
   }],
-  "decision_changes": [{           // 决策变更检测 (与上次辩论对比)
-    "ts_code": "600036.SZ", "name": "招商银行",
-    "prev_decision": "buy", "curr_decision": "hold",
+  "decision_changes": [{           // 与上次辩论对比
+    "ts_code": "600036.SZ", "prev_decision": "buy", "curr_decision": "hold",
     "prev_confidence": 0.65, "curr_confidence": 0.40,
     "detail": "决策变更: 买入 → 持有; 置信度下降: 65% → 40%"
   }],
-  "plan_status_summary": {         // 交易计划状态汇总
-    "pending": 2, "confirmed": 1, "executed": 0, "expired": 0, "total": 3
-  },
-  "task_completed": {              // 当日各任务是否已完成
-    "data_update": true, "signal": true, "report": false,
-    "intraday_monitor": false, "retention": false
-  },
-  "goal": {                        // 季度目标状态 (目标跟踪启用时, Agent 决策核心约束)
+  "plan_status_summary": { "pending": 2, "confirmed": 1, "executed": 0, "total": 3 },
+  "task_completed": { "data_update": true, "signal": true, "report": false },
+  "goal": {                        // 季度目标, Agent 决策核心约束
     "quarter": "2026Q3", "return_pct": -0.05, "target_pct": 0.15,
-    "progress": -0.33, "drawdown_pct": 0.06, "budget_consumed": 0.6,
-    "mode": "normal", "mode_label": "正常",
-    "notes": ["..."]
+    "drawdown_pct": 0.06, "budget_consumed": 0.6, "mode": "normal"
   },
   "action_needed": [               // 需要用户操作的提示
     "📋 有2条待确认的交易计划，请审阅后确认或忽略",
@@ -423,49 +400,29 @@ curl -X POST http://NAS_IP:11270/api/portfolio/sync \
 ### 5. 手动切换策略
 
 ```bash
-# 方式1: query param
 curl -X POST "http://NAS_IP:11270/api/strategy/switch?name=macd" \
   -H "Authorization: Bearer $JZ_API_TOKEN"
-
-# 方式2: JSON body
-curl -X POST http://NAS_IP:11270/api/strategy/switch \
-  -H "Authorization: Bearer $JZ_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"strategy": "macd"}'
-```
-
-查看当前策略状态：
-
-```bash
 curl -H "Authorization: Bearer $JZ_API_TOKEN" \
-     http://NAS_IP:11270/api/strategy/status
+     http://NAS_IP:11270/api/strategy/status   # 查看当前策略状态
 ```
 
 ### Agent 提示词建议（可直接复制进 Agent 的定时任务）
 
 ```text
 每个交易日 15:35 调用 GET /api/agent/brief：
-1. 若 warnings 非空或 data_fresh=false，先向我报告异常，不要确认任何计划；
-2. 检查 task_completed.signal 是否为 true，确认信号已生成；
-3. 逐条分析 open_plans：结合 reason、debates 辩论结果、portfolio 风险指标、market 情绪，
-   给出 执行/跳过 建议及理由，urgent（止损）计划优先；
-4. 检查 decision_changes：如有决策变更，告知我哪些标的决策发生了变化及原因；
-5. 检查 plan_status_summary：如有 confirmed 状态的计划，提醒我反馈成交结果；
-6. 经我同意后用 POST /api/plan/confirm 确认；未同意的不操作；
+1. warnings 非空或 data_fresh=false → 先报告异常，不确认任何计划；
+2. task_completed.signal 非 true → 信号未生成，不确认计划；
+3. 逐条分析 open_plans（结合 debates/portfolio/market），urgent 计划优先，给出执行/跳过建议；
+4. decision_changes 非空 → 告知用户决策变化及原因；
+5. plan_status_summary 有 confirmed → 提醒反馈成交；
+6. 经我同意后 POST /api/plan/confirm 确认；
 7. 汇报今日持仓盈亏与健康分变化。
 
-变更检测（可选）：
-GET /api/agent/changes?date=YYYYMMDD
-返回决策变更、计划状态变更、任务完成状态的完整报告。
-
 通知读取（每次执行时检查）：
-GET /api/agent/alerts?unread_only=true
-→ 有未读通知时，按 level 排序（urgent > warning > info > success）通知用户
-→ 通知用户后: POST /api/agent/alerts {"all": true} 标记已读
+GET /api/agent/alerts?unread_only=true → 按 level 排序（urgent > warning > info > success）通知用户 → 通知后 POST /api/agent/alerts {"all": true} 标记已读
 
 仪表盘（一次拿全）：
-GET /api/agent/dashboard
-→ 未读通知 + 今日通知 + 待处理计划 + 辩论结果 + 决策变更 + 任务状态
+GET /api/agent/dashboard → 未读通知 + 今日通知 + 待处理计划 + 辩论结果 + 决策变更 + 任务状态
 ```
 
 ### 6. 读取飞书通知存档（Agent 核心）
@@ -473,23 +430,11 @@ GET /api/agent/dashboard
 调度器所有通知（信号/日报/止损/告警）都会落库，Agent 读取后通知用户：
 
 ```bash
-# 获取未读通知
+# 获取未读通知 (响应含 alerts[]: id/job_name/level/title/content/status)
 curl -H "Authorization: Bearer $JZ_API_TOKEN" \
      http://NAS_IP:11270/api/agent/alerts?unread_only=true
 
-# 响应示例
-{
-  "alerts": [{
-    "id": 15, "trade_date": "20260804",
-    "job_name": "signal", "level": "info",
-    "title": "📋 惊蛰交易信号",
-    "content": "📅 20260804 信号生成完成: 今日无交易计划\n策略未触发买卖信号, 继续持有当前仓位",
-    "status": "unread", "created_at": "2026-08-04 15:30:12"
-  }],
-  "total": 1, "unread_count": 1
-}
-
-# 标记已读（通知用户后执行）
+# 通知用户后标记已读
 curl -X POST http://NAS_IP:11270/api/agent/alerts \
   -H "Authorization: Bearer $JZ_API_TOKEN" \
   -H "Content-Type: application/json" \
@@ -503,7 +448,7 @@ curl -H "Authorization: Bearer $JZ_API_TOKEN" \
      http://NAS_IP:11270/api/agent/dashboard
 ```
 
-返回未读通知 + 今日通知 + 待处理计划 + 辩论结果 + 决策变更 + 任务完成状态 + 计划汇总，适合 Agent 首次拉取时一次性获取全量上下文。
+返回未读通知 + 今日通知 + 待处理计划 + 辩论结果 + 决策变更 + 任务状态 + 计划汇总，适合首次拉取。
 
 ## 多智能体辩论系统
 
@@ -534,10 +479,7 @@ curl -H "Authorization: Bearer $JZ_API_TOKEN" \
 
 ### 裁决结果
 
-- **buy**: 通过辩论验证，建议买入（可能调整仓位比例）
-- **hold**: 建议持有/观望，不执行买入
-- **reject**: 否决买入信号，不进入交易计划
-- **sell**: 建议卖出（已持仓时）
+- **buy** 通过辩论验证建议买入（可能调整仓位） | **hold** 持有/观望 | **reject** 否决买入信号 | **sell** 建议卖出（已持仓时）
 
 ### 决策变更检测
 
@@ -549,43 +491,9 @@ curl -H "Authorization: Bearer $JZ_API_TOKEN" \
 
 变更结果通过 `/api/agent/changes` 接口查询，同时在飞书通知中提示。
 
-## 选股与新闻过滤机制
+## 自动选股与新闻过滤
 
-### 选股逻辑
-
-系统**完全自动选股**，无需手动维护股票池：
-
-1. **自动选股器**（`screener`）：每日 15:15 从全市场（4000+股票）多维度筛选 TopN 候选
-2. **持仓补充**：当前持仓的股票自动加入扫描范围（即使不在选股结果中）
-3. **手动配置（可选）**：`config.yaml` 中 `universe.bluechip` / `universe.tech` 可填写额外关注的股票，与选股结果合并
-4. **行情过滤**：只有当日有行情数据的股票才会被策略扫描
-5. **数据加载器**：`dataloader.filter_mode: true` 时，只拉取选股结果+持仓+watchlist 的数据，大幅减少数据量
-
-```yaml
-# config.yaml (universe 可选, 留空则完全依赖自动选股)
-universe:
-  bluechip: ""
-  tech: ""
-
-dataloader:
-  filter_mode: true          # 只拉选股结果+持仓的数据
-  watchlist: ["000300.SH"]   # 额外关注沪深300指数
-```
-
-> 启用 `screener.enabled: true` 后，无需手动填写股票池。系统每天自动发现新机会，旧的候选股票数据会被自动清理。
-
-### 新闻过滤逻辑
-
-新闻展示和分析按股票池优先过滤：
-
-1. **关键词匹配**：股票代码（如 `000001.SZ`）、6位代码（如 `000001`）、股票名称（如 `平安银行`）
-2. **优先展示**：与持仓/配置池相关的新闻排在前
-3. **热点补充**：相关新闻不足20条时，用近期热点新闻补充
-4. **LLM辩论**：新闻分析师只分析与当前标的相关的新闻
-
-## 自动选股系统
-
-当 `screener.enabled: true` 时，系统每日 15:15 自动从全市场（4000+股票）筛选候选股票，补充到策略股票池：
+系统**完全自动选股**，无需手动维护股票池：启用 `screener.enabled: true` 后，每日 15:15 自动从全市场（4000+股票）筛选 TopN 候选，同步 6 个月历史K线并自动加入策略股票池（15:30 信号生成时与配置池、持仓一并扫描）。当前持仓自动加入扫描范围；`universe.bluechip` / `universe.tech` 可手动补充关注股票（可选，留空则完全依赖自动选股）；`dataloader.filter_mode: true` 时只拉选股结果+持仓+watchlist 的数据，大幅减少数据量。
 
 ### 选股流程
 
@@ -622,6 +530,10 @@ dataloader:
 - PE_TTM 10-30 最佳（估值合理）
 - 温和上涨 0-5% 最佳（避免接飞刀）
 
+### 新闻过滤
+
+新闻按股票池优先过滤：关键词匹配（代码/6位代码/名称）→ 相关新闻排前 → 不足 20 条时热点补充；新闻分析师只分析与当前标的相关的新闻。
+
 ### 查看选股结果
 
 ```bash
@@ -629,91 +541,12 @@ dataloader:
 curl -H "Authorization: Bearer $JZ_API_TOKEN" \
      http://NAS_IP:11270/api/screener/results
 
-# 按日期查询
+# 按日期查询 / 手动触发选股 (测试用, 正常由调度器自动执行)
 curl -H "Authorization: Bearer $JZ_API_TOKEN" \
      "http://NAS_IP:11270/api/screener/results?date=20260805"
-
-# 手动触发选股 (测试用, 正常由调度器自动执行)
 curl -X POST -H "Authorization: Bearer $JZ_API_TOKEN" \
      http://NAS_IP:11270/api/screener/run
 ```
-
-> 选股候选自动加入策略股票池，15:30 信号生成时将与配置池、持仓一并扫描。候选股票的6个月历史K线会自动同步，策略可正常计算均线/MACD等指标。
-
-## AI Agent 完整工作流
-
-以下是一个完整的 Agent 24h 运行周期，对应"系统常驻 → 到点执行 → 通知用户 → 用户操作 → 检查状态"的闭环：
-
-### 系统侧（自动，无需 Agent 介入）
-
-```
-00:00  系统常驻运行 (systemd 保活)
-09:25  调度器检查: 是否交易日?
-       └─ 是 → 盘中止损监控就绪 (每 5 分钟检查持仓)
-       └─ 否 → 跳过交易任务, 仅 16:30 数据清理
-09:30-15:00  盘中监控 (触发止损 → 紧急计划 + 告警落库 + 飞书推送)
-15:10  数据更新 (Tushare 行情入库)
-15:15  全市场选股 → 候选股票入池 + 历史K线同步 + 通知落库
-15:30  EOD信号生成 → 多智能体辩论 → 交易计划落库 → 通知落库 + 飞书推送
-15:35  对账 (仅 QMT 实盘)
-15:45  日报生成 + 飞书推送 + 操作提醒落库
-16:30  数据清理 + WAL checkpoint
-```
-
-### Agent 侧（定时轮询）
-
-```
-每 5 分钟 (09:25-15:00):
-  GET /api/agent/alerts?unread_only=true
-  → 有 urgent 通知 → 立即通知用户 (止损/告警)
-  → 有 info 通知 → 记录, 等收盘后汇总
-  → 通知用户后 POST /api/agent/alerts {"all": true}
-
-15:35 后 (收盘):
-  GET /api/agent/dashboard
-  → 检查 task_completed.signal == true (信号已生成)
-  → 检查 open_plans (待确认的交易计划)
-  → 检查 decision_changes (决策变更)
-  → 检查 unread alerts (当日所有通知)
-  → 汇总通知用户: "今日N条计划待确认, M个标的决策变更..."
-
-用户操作后:
-  → 用户确认计划 → POST /api/plan/confirm {"id": X}
-  → 用户成交反馈 → POST /api/trade/confirm {...}
-  → Agent 记录操作, 下次轮询时检查 plan_status_summary 确认状态更新
-
-次日 15:35:
-  GET /api/agent/changes?date=YYYYMMDD
-  → 对比昨日: 决策是否变化? 计划是否执行? 任务是否完成?
-  → 如有变化通知用户: "XX股票决策从买入变为持有..."
-```
-
-### 配置清单
-
-| 配置项 | 位置 | 说明 |
-|---|---|---|
-| `llm.enabled` | config.yaml | `true` 启用多智能体辩论 |
-| `llm.api_key` | 环境变量 `LLM_API_KEY` | DeepSeek API Key（仅支持 DeepSeek） |
-| `llm.base_url` | config.yaml | DeepSeek API 地址 |
-| `llm.model` | config.yaml | `deepseek-chat` 或 `deepseek-reasoner` |
-| `feishu.webhook_url` | 环境变量 `FEISHU_WEBHOOK` | 飞书机器人 webhook（可选，通知始终落库） |
-| `server.api_token` | 环境变量 `JZ_API_TOKEN` | API 鉴权 token（所有 /api/* 请求需携带） |
-| `server.port` | config.yaml | HTTP 监听端口（example 默认 11270，代码默认 8080） |
-| `scheduler.signal_time` | config.yaml | 信号生成时间 (默认 15:30) |
-| `scheduler.report_time` | config.yaml | 日报时间 (默认 15:45) |
-| `scheduler.intraday.enabled` | config.yaml | 盘中止损监控 (默认 true) |
-| `scheduler.intraday.interval_min` | config.yaml | 盘中监控间隔 (默认 5 分钟) |
-| `universe.bluechip` | config.yaml | 手动股票池（可选，留空则完全依赖自动选股） |
-| `universe.tech` | config.yaml | 手动股票池（可选，留空则完全依赖自动选股） |
-| `dataloader.filter_mode` | config.yaml | `true` 只拉股票池数据（推荐） |
-| `trading.min_trade_amount` | config.yaml | 最小单笔交易金额（小资金设3000） |
-| `trading.auto_execute` | config.yaml | `true` 确认即下单（需QMT） |
-| `screener.enabled` | config.yaml | `true` 启用自动选股 |
-| `screener.max_candidates` | config.yaml | 最大候选股票数（默认20） |
-| `screener.min_price` / `max_price` | config.yaml | 价格区间过滤（小资金建议2-50元） |
-| `screener.min_turnover_rate` | config.yaml | 最低换手率%（默认1.0，排除僵尸股） |
-| `screener.max_pe` / `max_pb` | config.yaml | PE_TTM/PB 上限过滤 |
-| `scheduler.screener_time` | config.yaml | 选股执行时间（默认15:15） |
 
 ## 数据口径（AI 决策前必读）
 
@@ -866,26 +699,11 @@ sudo iptables -A INPUT -p tcp --dport 11270 -s 192.168.1.0/24 -j ACCEPT
 ### 首次部署验证清单
 
 ```bash
-# 1. 服务存活
-sudo systemctl is-active jingzhe              # → active
-
-# 2. API 正常
-curl -s http://127.0.0.1:11270/api/health | head
-
-# 3. 数据新鲜 (交易日当天 15:10 后应有当日数据)
-sqlite3 /opt/jingzhe-trader/data/jingzhe.db "SELECT MAX(trade_date) FROM daily_bar;"
-
-# 4. 交易日历完整 (今天应在日历中)
-sqlite3 /opt/jingzhe-trader/data/jingzhe.db "SELECT * FROM trade_cal WHERE cal_date='$(date +%Y%m%d)';"
-
-# 5. 指数数据存在 (大盘过滤策略需要)
-sqlite3 /opt/jingzhe-trader/data/jingzhe.db "SELECT COUNT(*) FROM daily_bar WHERE ts_code='000300.SH';"
-
-# 6. 健康检查 cron 已生效
-grep jingzhe /var/log/syslog 2>/dev/null || tail -5 /opt/jingzhe-trader/logs/health_check.log
-
-# 7. 鉴权验证 (配置了 api_token 时)
-curl -s -H "Authorization: Bearer $JZ_API_TOKEN" http://127.0.0.1:11270/api/agent/brief | head
+sudo systemctl is-active jingzhe              # → active (服务存活)
+curl -s http://127.0.0.1:11270/api/health | head   # API 正常
+sqlite3 /opt/jingzhe-trader/data/jingzhe.db "SELECT MAX(trade_date) FROM daily_bar;"   # 数据新鲜
+sqlite3 /opt/jingzhe-trader/data/jingzhe.db "SELECT COUNT(*) FROM daily_bar WHERE ts_code='000300.SH';"  # 指数数据存在
+curl -s -H "Authorization: Bearer $JZ_API_TOKEN" http://127.0.0.1:11270/api/agent/brief | head  # 鉴权验证
 ```
 
 ### 日常更新（NAS 拉取新代码 → 重新编译 → 重启）
