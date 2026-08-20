@@ -221,10 +221,14 @@ func NewService(cfg *config.Config) (*Service, error) {
 
 	// 初始化 LLM 客户端和新闻分析器
 	llmCfg := llm.Config{
-		APIKey:  cfg.LLM.APIKey,
-		BaseURL: cfg.LLM.BaseURL,
-		Model:   cfg.LLM.Model,
-		Enabled: cfg.LLM.Enabled,
+		APIKey:         cfg.LLM.APIKey,
+		BaseURL:        cfg.LLM.BaseURL,
+		Model:          cfg.LLM.Model,
+		Enabled:        cfg.LLM.Enabled,
+		Temperature:    cfg.LLM.Temperature,
+		MaxTokens:      cfg.LLM.MaxTokens,
+		TimeoutSeconds: cfg.LLM.TimeoutSeconds,
+		JSONMode:       &cfg.LLM.JSONMode,
 	}
 	svc.llmClient = llm.NewClient(llmCfg)
 	svc.llmNews = llm.NewNewsAnalyzer(svc.llmClient)

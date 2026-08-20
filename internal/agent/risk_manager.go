@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"jingzhe-trader/internal/llm"
-	"jingzhe-trader/pkg/logger"
 )
 
 type RiskManagerAgent struct {
@@ -51,12 +50,11 @@ func (rm *RiskManagerAgent) Judge(ctx *DebateContext, reports []*AnalysisReport,
 		posStr(ctx.Position), ctx.TotalAsset,
 		reportsText, bullText, bearText)
 	if rm.llm == nil || !rm.llm.IsEnabled() {
-		return rm.fallbackJudge(ctx, reports, bull, bear), nil
+		return nil, fmt.Errorf("LLM 未启用")
 	}
 	resp, err := rm.llm.ChatWithCache(ctx.TradeDate, ctx.TsCode, "risk_manager", riskMgrSysPrompt, userPrompt)
 	if err != nil {
-		logger.L().Warnw("风险管理员LLM调用失败", "ts_code", ctx.TsCode, "err", err)
-		return rm.fallbackJudge(ctx, reports, bull, bear), nil
+		return nil, fmt.Errorf("LLM 调用失败: %w", err)
 	}
 	resp = stripJSON(resp)
 	var raw struct {
@@ -71,8 +69,7 @@ func (rm *RiskManagerAgent) Judge(ctx *DebateContext, reports []*AnalysisReport,
 		Summary     string   `json:"summary"`
 	}
 	if err := json.Unmarshal([]byte(resp), &raw); err != nil {
-		logger.L().Warnw("风险管理员响应解析失败", "ts_code", ctx.TsCode, "raw", resp[:min(200, len(resp))])
-		return rm.fallbackJudge(ctx, reports, bull, bear), nil
+		return nil, fmt.Errorf("响应解析失败: %w, raw: %s", err, resp[:min(200, len(resp))])
 	}
 	result := &DebateResult{
 		TradeDate:   ctx.TradeDate,
@@ -107,7 +104,7 @@ func (rm *RiskManagerAgent) fallbackJudge(ctx *DebateContext, reports []*Analysi
 		avgSentiment /= float64(len(reports))
 	}
 
-	// 结合多空研究员情绪
+	// 结合多空研究员情绪 (bull∈[0,1], bear∈[-1,0], 已在 callResearcherLLM 中 clamp)
 	bullSentiment := 0.0
 	if bull != nil {
 		bullSentiment = bull.Sentiment
@@ -118,17 +115,20 @@ func (rm *RiskManagerAgent) fallbackJudge(ctx *DebateContext, reports []*Analysi
 	}
 	blended := (avgSentiment + bullSentiment + bearSentiment) / 3.0
 
+	// 阈值标定与 prompt 决策标准 (LLM 路径) 对齐:
+	// LLM: avg>0.3 + bull>0.4 → buy; avg<-0.2 + bear<-0.3 → sell/reject
+	// 降级路径无 bull/bear 明细, 用 blended 近似; 阈值取保守值 (宁缺毋滥)
 	decision := "hold"
 	positionPct := 0.0
-	if blended > 0.1 {
+	if blended > 0.15 {
 		decision = "buy"
 		positionPct = 0.3
-	} else if blended < -0.1 {
+	} else if blended < -0.15 {
 		decision = "reject"
 	}
 
 	// 已持仓且情绪极差时建议卖出
-	if ctx.Position != nil && blended < -0.3 {
+	if ctx.Position != nil && blended < -0.35 {
 		decision = "sell"
 	}
 
@@ -179,14 +179,32 @@ func formatArguments(arg *ResearchArgument) string {
 	return sb.String()
 }
 
-const riskMgrSysPrompt = `你是专业的风险管理经理。你需要权衡看涨和看跌研究员的论点，做出最终投资决策。
-决策规则：
-- buy: 看涨理由充分，风险可控
-- sell: 看跌理由充分，应及时卖出
-- hold: 多空不明，维持现状
-- reject: 风险过高，不应买入
+const riskMgrSysPrompt = `你是专业的风险管理经理，负责最终投资决策。你需要权衡多空双方论点，结合当前持仓和资金状况，做出审慎决策。
 
-仓位建议(position_pct)不超过0.6(60%)。
+决策规则：
+- buy: 看涨理由充分（≥2个分析师偏多），技术面+基本面共振，风险可控
+- sell: 看跌理由充分，技术面破位或基本面恶化，已持仓时应及时卖出
+- hold: 多空不明，维持现状（已持仓继续持有，未持仓继续观望）
+- reject: 风险过高（技术面+基本面同时恶化），不应买入
+
+仓位管理（小资金1万级别）：
+- position_pct: 0.3-0.4 为标准仓位，0.5-0.6 为重仓（需高置信度）
+- 单票不超过总资产60%，保留至少10%现金
+- 已有持仓时，新买入信号应降低仓位（避免过度集中）
+- stop_price: 建议设在支撑位下方3-5%或成本价下方8%
+
+风险考量：
+- A股T+1，买入后当日无法卖出，需承担隔夜风险
+- 涨跌停限制可能导致无法及时止损
+- 小资金交易成本占比高，频繁交易侵蚀本金
+- 若多空分歧大（bull和bear情绪接近），降低置信度
+
+决策标准：
+- 4个分析师平均sentiment > 0.3 + 看涨研究员 > 0.4 → 倾向buy
+- 4个分析师平均sentiment < -0.2 + 看跌研究员 < -0.3 → 倾向sell/reject
+- 已持仓+情绪转负 → 建议 sell
+- summary: 必须包含决策核心理由（如"技术面多头+估值合理，建议小仓位买入"）
+
 必须输出合法JSON。`
 
 // marshalStrList 将字符串列表序列化为 JSON 字符串

@@ -19,10 +19,10 @@ func NewStockRepo(db *sqlx.DB) *StockRepo {
 }
 
 const stockInsertSQL = `INSERT OR REPLACE INTO stock_basic
-	(ts_code, symbol, name, market, exchange, is_st, list_status, list_date, delist_date)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	(ts_code, symbol, name, market, exchange, is_st, list_status, list_date, delist_date, industry)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
-const stockSelectCols = `ts_code, symbol, name, market, exchange, is_st, list_status, list_date, delist_date`
+const stockSelectCols = `ts_code, symbol, name, market, exchange, is_st, list_status, list_date, delist_date, industry`
 
 // BatchInsert 批量插入股票基本信息(已存在则覆盖)
 func (r *StockRepo) BatchInsert(stocks []model.Stock) error {
@@ -48,7 +48,7 @@ func (r *StockRepo) BatchInsert(stocks []model.Stock) error {
 		}
 		if _, err := stmt.Exec(
 			s.TsCode, s.Symbol, s.Name, s.Market, s.Exchange,
-			isST, s.ListStatus, s.ListDate, s.DelistDate,
+			isST, s.ListStatus, s.ListDate, s.DelistDate, s.Industry,
 		); err != nil {
 			return fmt.Errorf("插入股票信息失败(ts_code=%s): %w", s.TsCode, err)
 		}

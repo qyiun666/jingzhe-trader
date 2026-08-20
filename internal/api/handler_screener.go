@@ -12,10 +12,15 @@ func (s *Service) HandleScreenResults(w http.ResponseWriter, r *http.Request) {
 	date := r.URL.Query().Get("date")
 	var results []store.ScreenResult
 	var err error
+	var resultDate string
 	if date != "" {
 		results, err = s.screenRepo.GetByDate(date)
+		resultDate = date
 	} else {
 		results, err = s.screenRepo.GetLatest()
+		if len(results) > 0 {
+			resultDate = results[0].TradeDate
+		}
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "查询选股结果失败: "+err.Error())
@@ -25,6 +30,7 @@ func (s *Service) HandleScreenResults(w http.ResponseWriter, r *http.Request) {
 		results = []store.ScreenResult{}
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"date":    resultDate,
 		"count":   len(results),
 		"results": results,
 	})

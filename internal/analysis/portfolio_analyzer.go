@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"jingzhe-trader/internal/indicator"
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/strategy"
 )
@@ -368,8 +369,8 @@ func (pa *PortfolioAnalysis) calculateBeta(
 	}
 
 	// 计算协方差和方差
-	marketMean := mean(marketReturns)
-	portMean := mean(portfolioReturns)
+	marketMean := indicator.Mean(marketReturns)
+	portMean := indicator.Mean(portfolioReturns)
 
 	var cov, marketVar float64
 	minLen := len(portfolioReturns)
@@ -529,16 +530,4 @@ func (pa *PortfolioAnalysis) generateSummary(posList []posWeight) {
 	}
 
 	pa.Summary = strings.Join(parts, "; ")
-}
-
-// mean 计算平均值
-func mean(data []float64) float64 {
-	if len(data) == 0 {
-		return 0
-	}
-	var sum float64
-	for _, v := range data {
-		sum += v
-	}
-	return sum / float64(len(data))
 }

@@ -137,6 +137,49 @@ func TestChatMaxTokens(t *testing.T) {
 	}
 }
 
+// TestChatJSONMode 显式开启 json_mode 时请求体应携带 response_format=json_object
+func TestChatJSONMode(t *testing.T) {
+	var gotFormat *ResponseFormat
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req ChatCompletionRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		gotFormat = req.ResponseFormat
+		writeOKResponse(w, "ok")
+	}))
+	defer srv.Close()
+
+	client := NewClient(Config{APIKey: "test-key", BaseURL: srv.URL, Model: "test-model", Enabled: true, JSONMode: boolPtr(true)})
+	if _, err := client.Chat("sys", "user"); err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	if gotFormat == nil || gotFormat.Type != "json_object" {
+		t.Errorf("json_mode 开启时 response_format 应为 json_object, 实际 %+v", gotFormat)
+	}
+}
+
+// TestChatJSONModeDisabled 关闭 json_mode 时请求体不携带 response_format
+func TestChatJSONModeDisabled(t *testing.T) {
+	var gotFormat *ResponseFormat
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req ChatCompletionRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		gotFormat = req.ResponseFormat
+		writeOKResponse(w, "ok")
+	}))
+	defer srv.Close()
+
+	client := NewClient(Config{APIKey: "test-key", BaseURL: srv.URL, Model: "test-model", Enabled: true, JSONMode: boolPtr(false)})
+	if _, err := client.Chat("sys", "user"); err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	if gotFormat != nil {
+		t.Errorf("json_mode 关闭时不应携带 response_format, 实际 %+v", gotFormat)
+	}
+}
+
+// boolPtr 构造 bool 指针
+func boolPtr(v bool) *bool { return &v }
+
 // TestChatWithCache 同日同股票同角色同输入应命中缓存, 不重复调用 LLM
 func TestChatWithCache(t *testing.T) {
 	fastBackoff(t)

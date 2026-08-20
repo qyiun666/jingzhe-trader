@@ -207,6 +207,8 @@ func CalculateMetrics(snapshots []model.AccountSnapshot, trades []model.Trade, b
 	return m
 }
 
+// mean 计算算术平均值 (空输入返回 0)
+// 注意: 与 indicator.Mean 语义一致但空输入处理不同 (indicator 返回 NaN); 保留本地实现避免样本统计链路行为变化
 func mean(values []float64) float64 {
 	if len(values) == 0 {
 		return 0
@@ -218,6 +220,8 @@ func mean(values []float64) float64 {
 	return sum / float64(len(values))
 }
 
+// stdDev 计算样本标准差 (除以 n-1)
+// 注意: 样本统计语义与 indicator.StdDev (总体方差, 除以 n) 不同, 保留本地实现, 禁止混用
 func stdDev(values []float64) float64 {
 	if len(values) < 2 {
 		return 0

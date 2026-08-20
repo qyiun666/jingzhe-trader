@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 )
@@ -42,7 +43,11 @@ const (
 )
 
 // SaveResults 保存选股结果 (先删旧的再插新的)
+// 空结果时不执行删除, 保留上一日数据供 API 回查与信号新鲜度判断 (避免静默回退过期股票池)
 func (r *ScreenRepo) SaveResults(date string, results []ScreenResult) error {
+	if len(results) == 0 {
+		return nil
+	}
 	tx, err := r.db.Beginx()
 	if err != nil {
 		return fmt.Errorf("开启事务失败: %w", err)
@@ -98,20 +103,34 @@ func (r *ScreenRepo) GetLatest() ([]ScreenResult, error) {
 	return r.GetByDate(date)
 }
 
-// GetScreenedCodes 获取最新选股代码列表 (供策略合并股票池用)
-func (r *ScreenRepo) GetScreenedCodes() ([]string, error) {
-	var date string
+// GetLatestDate 获取最新一次选股结果的日期 (无数据返回空字符串)
+func (r *ScreenRepo) GetLatestDate() (string, error) {
+	var date sql.NullString
 	err := r.db.Get(&date, "SELECT MAX(trade_date) FROM screen_result")
-	if err == sql.ErrNoRows || date == "" {
-		return nil, nil
+	if err != nil {
+		return "", fmt.Errorf("查询最新选股日期失败: %w", err)
 	}
+	if !date.Valid {
+		return "", nil
+	}
+	return date.String, nil
+}
+
+// GetScreenedCodes 获取最新选股代码列表 (供策略合并股票池用)
+// 仅返回当日选股结果, 过期返回空列表 (避免空候选日静默使用过期股票池)
+func (r *ScreenRepo) GetScreenedCodes() ([]string, error) {
+	latestDate, err := r.GetLatestDate()
 	if err != nil {
 		return nil, fmt.Errorf("查询最新选股日期失败: %w", err)
 	}
-
+	today := time.Now().Format("20060102")
+	if latestDate != today {
+		// 选股结果过期, 返回空列表 (不合并过期股票池)
+		return []string{}, nil
+	}
 	var codes []string
 	err = r.db.Select(&codes,
-		"SELECT ts_code FROM screen_result WHERE trade_date = ? ORDER BY score DESC", date)
+		"SELECT ts_code FROM screen_result WHERE trade_date = ? ORDER BY score DESC", latestDate)
 	if err != nil {
 		return nil, fmt.Errorf("查询选股代码列表失败: %w", err)
 	}

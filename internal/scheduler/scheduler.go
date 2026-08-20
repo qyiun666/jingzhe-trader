@@ -435,6 +435,31 @@ func (s *Scheduler) runSignalWithFreshnessCheck(date string) error {
 	} else {
 		logger.L().Infow("信号任务: 数据新鲜度检查通过", "latest_data", maxDate)
 	}
+
+	// 选股结果新鲜度检查: 选股器启用时, 检查当日选股任务是否已成功
+	// 失败时不中止整个信号 (卖出/风控计划照常生成), 仅跳过选股池合并 (买入侧)
+	if s.cfg.Screener.Enabled {
+		screenRepo := s.svc.ScreenRepo()
+		if screenRepo == nil {
+			logger.L().Warnw("选股结果仓库未初始化, 跳过选股池合并", "date", date)
+		} else {
+			// 检查当日选股任务是否已成功 (避免竞态: screener 未完成时 signal 提前检查)
+			if done, err := s.jobRepo.HasSucceeded(JobScreener, date); err != nil {
+				logger.L().Warnw("查询选股任务状态失败, 跳过选股池合并", "date", date, "err", err)
+			} else if !done {
+				logger.L().Warnw("选股任务尚未成功, 跳过选股池合并", "date", date)
+				s.alert("⚠️ 惊蛰选股池跳过", fmt.Sprintf("选股任务尚未成功, 信号生成跳过选股池合并 (卖出/风控计划照常)"))
+			} else {
+				latestScreenDate, err := screenRepo.GetLatestDate()
+				if err != nil {
+					logger.L().Warnw("查询选股结果新鲜度失败, 跳过选股池合并", "date", date, "err", err)
+				} else if latestScreenDate != date {
+					logger.L().Warnw("选股结果过期, 跳过选股池合并", "date", date, "latest", latestScreenDate)
+					s.alert("⚠️ 惊蛰选股池跳过", fmt.Sprintf("选股结果过期 (最新: %s, 期望: %s), 跳过选股池合并", latestScreenDate, date))
+				}
+			}
+		}
+	}
 	return s.runSignal(date)
 }
 

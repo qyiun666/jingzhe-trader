@@ -106,10 +106,14 @@ type DataloaderConfig struct {
 // 用于新闻深度分析和选股辅助，不直接做交易决策
 // 默认关闭，不影响系统核心功能
 type LLMConfig struct {
-	Enabled bool   `mapstructure:"enabled"`  // 是否启用 LLM
-	APIKey  string `mapstructure:"api_key"`  // API Key
-	BaseURL string `mapstructure:"base_url"` // API 地址，默认 DeepSeek
-	Model   string `mapstructure:"model"`    // 模型名称，默认 deepseek-chat
+	Enabled        bool    `mapstructure:"enabled"`         // 是否启用 LLM
+	APIKey         string  `mapstructure:"api_key"`         // API Key
+	BaseURL        string  `mapstructure:"base_url"`        // API 地址，默认 DeepSeek
+	Model          string  `mapstructure:"model"`           // 模型名称，默认 deepseek-chat
+	Temperature    float64 `mapstructure:"temperature"`     // 采样温度, 默认 0.3
+	MaxTokens      int     `mapstructure:"max_tokens"`      // 输出上限, 默认 2048
+	TimeoutSeconds int     `mapstructure:"timeout_seconds"` // HTTP 超时秒数, 默认 30
+	JSONMode       bool    `mapstructure:"json_mode"`       // 强制 JSON 输出 (response_format), 默认 true
 }
 
 // ServerConfig HTTP 服务配置
@@ -297,6 +301,10 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("llm.enabled", false)
 	v.SetDefault("llm.base_url", "https://api.deepseek.com/v1")
 	v.SetDefault("llm.model", "deepseek-chat")
+	v.SetDefault("llm.temperature", 0.3)
+	v.SetDefault("llm.max_tokens", 2048)
+	v.SetDefault("llm.timeout_seconds", 30)
+	v.SetDefault("llm.json_mode", false) // 仅 DeepSeek 支持, 默认关闭
 	v.SetDefault("dataloader.filter_mode", false)
 	v.SetDefault("dataloader.enable_limit", true)
 	v.SetDefault("dataloader.enable_basic", true)

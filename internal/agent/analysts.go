@@ -3,12 +3,13 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 
+	"jingzhe-trader/internal/indicator"
 	"jingzhe-trader/internal/llm"
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/store"
-	"jingzhe-trader/pkg/logger"
 )
 
 type TechnicalAnalyst struct {
@@ -29,17 +30,34 @@ func (a *TechnicalAnalyst) Analyze(ctx *DebateContext) (*AnalysisReport, error) 
 	}
 	last := bars[len(bars)-1]
 	closes := extractCloses(bars)
-	ma5 := sma(closes, 5)
-	ma20 := sma(closes, 20)
+	ma5 := lastValid(indicator.SMA(closes, 5))
+	ma20 := lastValid(indicator.SMA(closes, 20))
 	volRatio := 0.0
 	if len(bars) > 6 && avgVol(bars[len(bars)-6:len(bars)-1], 5) > 0 {
 		volRatio = last.Vol / avgVol(bars[len(bars)-6:len(bars)-1], 5)
 	}
+	rsi := lastValid(indicator.RSI(closes, 14))
+	
+	// 处理数据不足的情况
+	ma5Str := "N/A"
+	ma20Str := "N/A"
+	crossIndicator := "未知"
+	if !math.IsNaN(ma5) && !math.IsNaN(ma20) {
+		ma5Str = fmt.Sprintf("%.2f", ma5)
+		ma20Str = fmt.Sprintf("%.2f", ma20)
+		crossIndicator = crossStr(ma5, ma20)
+	}
+	rsiStr := "N/A"
+	if !math.IsNaN(rsi) {
+		rsiStr = fmt.Sprintf("%.1f", rsi)
+	}
+	
 	userPrompt := fmt.Sprintf(`股票: %s (%s)  日期: %s
 近5日K线:
 %s
 最新收盘: %.2f  前收: %.2f  涨跌幅: %.2f%%
-MA5: %.2f  MA20: %.2f  (MA5%sMA20)
+MA5: %s  MA20: %s  (MA5%sMA20)
+RSI(14): %s  (RSI>70超买, <30超卖)
 成交量比(5日均量): %.2f
 总资产: %.0f  持仓: %s
 
@@ -48,7 +66,8 @@ MA5: %.2f  MA20: %.2f  (MA5%sMA20)
 		ctx.TsCode, ctx.Name, ctx.TradeDate,
 		formatRecentBars(bars, 5),
 		last.Close, last.PreClose, last.PctChg,
-		ma5, ma20, crossStr(ma5, ma20),
+		ma5Str, ma20Str, crossIndicator,
+		rsiStr,
 		volRatio,
 		ctx.TotalAsset, posStr(ctx.Position))
 	return callLLMCommon(a.llm, ctx.TsCode, ctx.TradeDate, "technical", technicalSysPrompt, userPrompt)
@@ -153,20 +172,18 @@ func (a *MarketAnalyst) Analyze(ctx *DebateContext) (*AnalysisReport, error) {
 
 func callLLMCommon(client *llm.Client, tsCode, tradeDate, agentType, sysPrompt, userPrompt string) (*AnalysisReport, error) {
 	if client == nil || !client.IsEnabled() {
-		return &AnalysisReport{Agent: agentType, TsCode: tsCode, Confidence: 0.3, KeyPoints: []string{"LLM未启用"}}, nil
+		return nil, fmt.Errorf("LLM 未启用")
 	}
 	resp, err := client.ChatWithCache(tradeDate, tsCode, agentType, sysPrompt, userPrompt)
 	if err != nil {
-		logger.L().Warnw("分析师LLM调用失败", "agent", agentType, "ts_code", tsCode, "err", err)
-		return &AnalysisReport{Agent: agentType, TsCode: tsCode, Confidence: 0.2, KeyPoints: []string{"LLM调用失败"}}, nil
+		return nil, fmt.Errorf("LLM 调用失败: %w", err)
 	}
 	resp = stripJSON(resp)
 	var report AnalysisReport
 	report.Agent = agentType
 	report.TsCode = tsCode
 	if err := json.Unmarshal([]byte(resp), &report); err != nil {
-		logger.L().Warnw("分析师响应解析失败", "agent", agentType, "ts_code", tsCode, "raw", resp[:min(200, len(resp))])
-		return &AnalysisReport{Agent: agentType, TsCode: tsCode, Confidence: 0.2, KeyPoints: []string{"响应解析失败"}}, nil
+		return nil, fmt.Errorf("响应解析失败: %w, raw: %s", err, resp[:min(200, len(resp))])
 	}
 	return &report, nil
 }
@@ -187,15 +204,16 @@ func extractCloses(bars []model.Bar) []float64 {
 	return closes
 }
 
-func sma(values []float64, period int) float64 {
-	if len(values) < period {
-		return 0
+// lastValid 返回切片中最后一个非 NaN 值, 全 NaN 或空时返回 0
+// 用于取 indicator 系列指标 (前 period 个为 NaN) 的最新有效值
+// lastValid 返回切片中最后一个非 NaN 值, 无有效值时返回 NaN (调用方判断数据不足)
+func lastValid(values []float64) float64 {
+	for i := len(values) - 1; i >= 0; i-- {
+		if !math.IsNaN(values[i]) {
+			return values[i]
+		}
 	}
-	sum := 0.0
-	for i := len(values) - period; i < len(values); i++ {
-		sum += values[i]
-	}
-	return sum / float64(period)
+	return math.NaN()
 }
 
 func avgVol(bars []model.Bar, n int) float64 {
@@ -316,18 +334,87 @@ func min(a, b int) int {
 	return b
 }
 
-const technicalSysPrompt = `你是专业的A股技术分析师。基于K线、均线、量价数据分析股票短期走势。
-重点关注：趋势方向、均线交叉、量价配合、支撑阻力位。
+const technicalSysPrompt = `你是专业的A股技术分析师，擅长通过K线形态、均线系统和量价关系判断短期走势。
+
+分析框架：
+1. 趋势判断：MA5与MA20的多空排列，价格在均线之上为多头，之下为空头
+2. 量价配合：放量上涨=资金入场，缩量下跌=抛压减轻，放量下跌=主力出逃
+3. K线形态：近5日K线的实体长短、上下影线、连续阳/阴线
+4. 支撑阻力：近期高低点形成的关键位
+
+A股特性：
+- T+1交易，当日买入次日才能卖出
+- 涨跌停±10%（ST股±5%），涨停封板买不进，跌停封板卖不出
+- 量比>1.5为明显放量，>3为异常放量（需警惕）
+- 换手率<1%为僵尸股，>10%可能游资炒作
+
+评分标准：
+- sentiment: -1(极度看空)到1(极度看多)，0.3以上为偏多，-0.3以下为偏空
+- confidence: 0到1，数据不足时给0.2-0.4
+- key_points: 2-3条具体技术分析结论
+- risks: 1-2条技术面风险
+
 必须输出合法JSON，格式：{"sentiment": float, "key_points": [], "risks": [], "confidence": float}`
 
-const fundamentalSysPrompt = `你是专业的A股基本面分析师。基于PE/PB/ROE等财务指标分析股票估值和成长性。
-重点关注：估值水平、盈利能力、成长性、财务安全。
+const fundamentalSysPrompt = `你是专业的A股基本面分析师，擅长通过财务指标评估股票的估值合理性和成长潜力。
+
+分析框架：
+1. 估值水平：PE_TTM<15低估，15-30合理，>50偏贵（科技股可适当放宽）
+2. 盈利能力：ROE>15%优秀，毛利率>40%有护城河，净利率>20%盈利强
+3. 成长性：营收增速>20%高成长，净利润同比>30%业绩拐点
+4. 财务安全：资产负债率<50%稳健，>70%风险较高
+5. PB<1破净（可能价值陷阱），PB 1-3合理
+
+注意事项：
+- PE为负说明亏损，直接给低sentiment
+- 低PE不一定是好事，可能是周期股顶点或价值陷阱
+- 高PE不一定是坏事，高成长股值得溢价
+- 结合行业属性判断估值合理性
+
+评分标准：
+- sentiment: -1到1，PE合理+ROE高+成长性好=0.5以上
+- key_points: 具体数值支撑的结论
+- risks: 财务风险提示
+
 必须输出合法JSON，格式：{"sentiment": float, "key_points": [], "risks": [], "confidence": float}`
 
-const newsSysPrompt = `你是专业的A股新闻舆情分析师。分析新闻对股票的影响。
-重点关注：政策影响、行业事件、公司公告、市场情绪。
+const newsSysPrompt = `你是专业的A股新闻舆情分析师，擅长解读财经新闻对个股的短期影响。
+
+分析框架：
+1. 政策影响：行业政策、监管动态、财政货币政策对股票的直接影响
+2. 公司公告：业绩预告、重大资产重组、股份回购、高管增减持
+3. 行业事件：产业链上下游变化、行业拐点、技术突破
+4. 市场情绪：机构研报评级变化、北向资金动向、龙虎榜数据
+
+判断标准：
+- 利好：政策支持、业绩超预期、大单买入、机构增持
+- 利空：监管处罚、业绩不及预期、大股东减持、诉讼仲裁
+- 中性：例行公告、常规调研、信息披露
+
+注意：
+- 只分析与该股票直接相关的新闻，不发散到行业整体
+- 新闻有时效性，3天内的新闻权重高于1周前的
+- 如果没有相关新闻，明确说"无相关新闻"，不要编造
+
 必须输出合法JSON，格式：{"sentiment": float, "key_points": [], "risks": [], "confidence": float}`
 
-const marketSysPrompt = `你是专业的A股市场分析师。分析大盘环境对个股的影响。
-重点关注：指数趋势、市场情绪、系统性风险、板块轮动。
+const marketSysPrompt = `你是专业的A股市场宏观分析师，擅长判断大盘环境对个股的系统性影响。
+
+分析框架：
+1. 指数趋势：沪深300/上证综指/深证成指的涨跌反映市场整体强弱
+2. 市场情绪：大涨说明情绪乐观，大跌说明恐慌，需结合个股属性判断
+3. 系统性风险：大盘连续下跌时即使个股优秀也难独善其身
+4. 板块轮动：当前市场风格（大盘/小盘、价值/成长）对个股的影响
+
+判断规则：
+- 大盘涨+个股涨 = 正常，顺势
+- 大盘跌+个股涨 = 个股独立行情，需关注持续性
+- 大盘涨+个股跌 = 个股弱于大盘，需警惕
+- 大盘跌+个股跌 = 系统性风险，不影响个股基本面判断
+
+注意：
+- 大盘涨跌±1%以内为震荡，对个股影响有限
+- 大盘±2%以上才需要调整sentiment
+- 不要因为大盘短期波动而大幅改变个股长期看法
+
 必须输出合法JSON，格式：{"sentiment": float, "key_points": [], "risks": [], "confidence": float}`

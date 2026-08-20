@@ -15,30 +15,41 @@ import (
 const (
 	// maxAttempts 最大尝试次数(含首次请求), 即最多重试 2 次
 	maxAttempts = 3
-	// maxTokens 输出上限, 过小容易导致 LLM 返回的 JSON 被截断
-	maxTokens = 2048
+	// defaultMaxTokens 输出上限默认值, 过小容易导致 LLM 返回的 JSON 被截断
+	defaultMaxTokens = 2048
+	// defaultTemperature 分析类任务默认低温度, 保证输出稳定
+	defaultTemperature = 0.3
+	// defaultTimeoutSeconds HTTP 请求超时默认值
+	defaultTimeoutSeconds = 30
 )
 
 // retryBackoffBase 重试退避基数(指数退避: base, 2*base), 测试可调小以加速
 var retryBackoffBase = time.Second
 
 // Client LLM 客户端
-// 支持 OpenAI 兼容接口 (DeepSeek, 通义千问, 智谱等)
+// 仅支持 DeepSeek API (OpenAI 兼容接口)
 type Client struct {
-	apiKey     string
-	baseURL    string
-	model      string
-	httpClient *http.Client
-	enabled    bool
-	cache      sync.Map // 进程内缓存: key=date+symbol+role+输入hash, value=响应内容
+	apiKey      string
+	baseURL     string
+	model       string
+	httpClient  *http.Client
+	enabled     bool
+	temperature float64
+	maxTokens   int
+	jsonMode    bool
+	cache       sync.Map // 进程内缓存: key=date+symbol+role+输入hash, value=响应内容
 }
 
 // Config LLM 配置
 type Config struct {
-	APIKey  string `mapstructure:"api_key"`
-	BaseURL string `mapstructure:"base_url"` // 默认 "https://api.deepseek.com/v1"
-	Model   string `mapstructure:"model"`    // 默认 "deepseek-chat"
-	Enabled bool   `mapstructure:"enabled"`
+	APIKey         string  `mapstructure:"api_key"`
+	BaseURL        string  `mapstructure:"base_url"` // 默认 "https://api.deepseek.com/v1"
+	Model          string  `mapstructure:"model"`    // 默认 "deepseek-chat"
+	Enabled        bool    `mapstructure:"enabled"`
+	Temperature    float64 `mapstructure:"temperature"`     // 默认 0.3
+	MaxTokens      int     `mapstructure:"max_tokens"`      // 默认 2048
+	TimeoutSeconds int     `mapstructure:"timeout_seconds"` // 默认 30
+	JSONMode       *bool   `mapstructure:"json_mode"`       // nil 表示默认 false, 强制 JSON 输出 (仅 DeepSeek 支持)
 }
 
 // NewClient 创建 LLM 客户端
@@ -55,12 +66,31 @@ func NewClient(cfg Config) *Client {
 	if model == "" {
 		model = "deepseek-chat"
 	}
+	temperature := cfg.Temperature
+	if temperature < 0 {
+		temperature = defaultTemperature
+	}
+	maxTokens := cfg.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = defaultMaxTokens
+	}
+	timeout := cfg.TimeoutSeconds
+	if timeout <= 0 {
+		timeout = defaultTimeoutSeconds
+	}
+	jsonMode := false // 默认关闭, 仅 DeepSeek 支持
+	if cfg.JSONMode != nil {
+		jsonMode = *cfg.JSONMode
+	}
 	return &Client{
-		apiKey:  cfg.APIKey,
-		baseURL: baseURL,
-		model:   model,
+		apiKey:      cfg.APIKey,
+		baseURL:     baseURL,
+		model:       model,
+		temperature: temperature,
+		maxTokens:   maxTokens,
+		jsonMode:    jsonMode,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: time.Duration(timeout) * time.Second,
 		},
 		enabled: true,
 	}
@@ -79,10 +109,16 @@ type ChatMessage struct {
 
 // ChatCompletionRequest 请求体
 type ChatCompletionRequest struct {
-	Model       string        `json:"model"`
-	Messages    []ChatMessage `json:"messages"`
-	Temperature float64       `json:"temperature"`
-	MaxTokens   int           `json:"max_tokens"`
+	Model          string          `json:"model"`
+	Messages       []ChatMessage   `json:"messages"`
+	Temperature    float64         `json:"temperature"`
+	MaxTokens      int             `json:"max_tokens"`
+	ResponseFormat *ResponseFormat `json:"response_format,omitempty"`
+}
+
+// ResponseFormat 响应格式约束 (OpenAI 兼容 json_object mode)
+type ResponseFormat struct {
+	Type string `json:"type"`
 }
 
 // ChatCompletionResponse 响应体
@@ -110,8 +146,13 @@ func (c *Client) Chat(systemPrompt, userPrompt string) (string, error) {
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userPrompt},
 		},
-		Temperature: 0.3, // 分析类任务用低温度，保证输出稳定
-		MaxTokens:   maxTokens,
+		Temperature: c.temperature,
+		MaxTokens:   c.maxTokens,
+	}
+	if c.jsonMode {
+		// 强制 JSON 输出, 避免分析结果被 markdown 代码块或散文包裹
+		// 前置条件: prompt 中需包含 "json" 字样 (所有内置 prompt 均已满足)
+		reqBody.ResponseFormat = &ResponseFormat{Type: "json_object"}
 	}
 
 	bodyBytes, err := json.Marshal(reqBody)

@@ -393,6 +393,10 @@ func migrateLegacy(db *sqlx.DB) error {
 	if err := ensureColumn(db, "trades", "strategy", "TEXT"); err != nil {
 		return err
 	}
+	// stock_basic 表补充 industry 列 (行业分散: 真实行业分组, 旧库升级)
+	if err := ensureColumn(db, "stock_basic", "industry", "TEXT"); err != nil {
+		return err
+	}
 	return nil
 }
 

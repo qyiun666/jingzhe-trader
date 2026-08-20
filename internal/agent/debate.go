@@ -50,12 +50,12 @@ func (o *DebateOrchestrator) Debate(ctx *DebateContext) (*DebateResult, error) {
 	bullArg, err := o.bull.Research(ctx, reports)
 	if err != nil {
 		logger.L().Warnw("看涨研究员失败", "ts_code", ctx.TsCode, "err", err)
-		bullArg = &ResearchArgument{Side: "bull", Sentiment: 0, Confidence: 0.2}
+		bullArg = &ResearchArgument{Side: "bull", Sentiment: 0, Confidence: 0.1}
 	}
 	bearArg, err := o.bear.Research(ctx, reports)
 	if err != nil {
 		logger.L().Warnw("看跌研究员失败", "ts_code", ctx.TsCode, "err", err)
-		bearArg = &ResearchArgument{Side: "bear", Sentiment: 0, Confidence: 0.2}
+		bearArg = &ResearchArgument{Side: "bear", Sentiment: 0, Confidence: 0.1}
 	}
 	result, err := o.riskMgr.Judge(ctx, reports, bullArg, bearArg)
 	if err != nil || result == nil {

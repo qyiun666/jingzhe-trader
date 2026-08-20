@@ -11,6 +11,35 @@
 
 专为**小资金**（1 万本金起）优化，强调**低频、集中、精准**的交易风格，用冷酷的规则代替冲动的人性。
 
+---
+
+## NAS AI 快速参考
+
+> 你是惊蛰交易系统的 AI 助手。系统 24h 常驻 NAS，自动完成数据→选股→信号→日报→监控全链路。你只需读 API 拿结果、审批计划、反馈成交。
+
+**部署**: `git clone` → 环境变量(`.env`) → `go build` → `systemd` 自启 → cron 健康检查
+
+**密钥**: 全部走环境变量（`TUSHARE_TOKEN` / `LLM_API_KEY` / `JZ_API_TOKEN` / `FEISHU_WEBHOOK`），config.yaml 已 gitignore 不提交
+
+**核心 API**（均需 `Authorization: Bearer $JZ_API_TOKEN`）:
+
+| 端点 | 用途 |
+|---|---|
+| `GET /api/agent/brief` | 全量上下文：计划+持仓+辩论+变更+任务状态 |
+| `GET /api/agent/dashboard` | 一次拿全：通知+计划+辩论+变更+任务 |
+| `GET /api/agent/alerts?unread_only=true` | 未读通知（盘中止损告警等） |
+| `POST /api/plan/confirm` | 确认计划 `{"id": 123}` |
+| `POST /api/trade/confirm` | 反馈成交 `{"ts_code","side","qty","price"}` |
+| `GET /api/health` | 存活检查（无需鉴权） |
+
+**每日节奏**: 15:35 后拉 `dashboard` → 审阅计划 → 确认后 `confirm` → 成交后反馈
+
+**异常处理**: `warnings` 非空或 `data_fresh=false` → 先报告异常，不确认计划；LLM 不可用时辩论自动跳过，不影响信号生成
+
+详细操作见下方 [Agent 接入指南](#agent-接入指南hermes--任意-ai-agent)。
+
+---
+
 ## 架构
 
 `cmd/server` 是唯一常驻进程，内置调度器在交易日自动完成全链路，结果全部落 SQLite。
@@ -96,8 +125,8 @@ AI Agent（如 Hermes）只需定时 GET 只读 API 拿现成结果，POST 确�
 - **数据可信** — 全链路前复权（历史库升级后 `dataloader -adj` 回填）、真实 T+1 交收、涨跌停/滑点/最低佣金建模、入库校验、近期数据自动重拉吸收更正
 - **成交归因** — 每笔成交记录来源策略（trades.strategy），动态策略选择器按各策略最近回测真实绩效 + 沪深300趋势推荐，3 日迟滞防抖
 - **多策略支持** — 均线交叉 / MACD / 布林带突破 / 多因子选股 / 日内做T，动态策略选择器按市况切换，策略实例缓存避免状态丢失
-- **LLM 辅助** — 集成 DeepSeek 等大模型深度分析新闻舆情（可选）
-- **多智能体辩论** — 4位分析师(技术/基本面/新闻/市场)并行分析 → 多空研究员辩论 → 风险管理经理裁决，对买入信号做二次验证（LLM 可用时自动启用）
+- **DeepSeek 辅助** — 仅集成 DeepSeek API 分析新闻舆情（可选，LLM 失败时明确告警不降级）
+- **多智能体辩论** — 4位分析师(技术/基本面/新闻/市场)并行分析 → 多空研究员辩论 → 风险管理经理裁决，对买入信号做二次验证（LLM 可用时自动启用，失败时明确告警而非静默降级）
 - **决策变更追踪** — 每次辩论结果与历史对比，自动检测决策方向、置信度、风险等级变化并通知
 - **新闻智能过滤** — 按配置股票池关键词优先展示相关新闻，不足时补充热点新闻
 - **共享仓储层** — Service 持有共享 Repo 实例，避免每次请求重复创建数据库访问对象
@@ -120,6 +149,8 @@ go build -o bin/optimizer ./cmd/optimizer
 ```bash
 cp config/config.example.yaml config/config.yaml
 ```
+
+> **安全模型**: `config/config.yaml` 已在 `.gitignore` 中，**永远不会提交到 Git**。所有密钥（Tushare Token、DeepSeek Key、API Token、飞书 Webhook）一律通过环境变量注入，源码和配置文件均不含任何密钥。部署时创建 `.env` 文件（同样 gitignore），systemd/cron 自动读取。
 
 **密钥一律走环境变量，不要写进配置文件**（配置文件中的同名项会被环境变量覆盖）：
 
@@ -232,15 +263,16 @@ curl -H "Authorization: Bearer $JZ_API_TOKEN" http://127.0.0.1:11270/api/agent/b
 
 ### 前置配置：启用多智能体辩论
 
-在 `config.yaml` 中启用 LLM，辩论系统自动生效（不启用则仅用策略信号，跳过辩论）：
+在 `config.yaml` 中启用 LLM，辩论系统自动生效（不启用则仅用策略信号，跳过辩论）。**仅支持 DeepSeek API**（OpenAI 兼容接口）：
 
 ```yaml
 # config.yaml
 llm:
   enabled: true              # 改为 true 启用
   api_key: ""                # 留空，用环境变量 LLM_API_KEY 注入
-  base_url: "https://api.deepseek.com/v1"  # DeepSeek 默认地址
-  model: "deepseek-chat"     # 或 deepseek-reasoner
+  base_url: "https://api.deepseek.com/v1"  # DeepSeek API 地址
+  model: "deepseek-chat"     # deepseek-chat 或 deepseek-reasoner
+  json_mode: true            # DeepSeek 支持 response_format: json_object
 ```
 
 ```bash
@@ -248,7 +280,7 @@ llm:
 export LLM_API_KEY=sk-your-deepseek-key
 ```
 
-> LLM 启用后，每个买入信号会触发 4 位分析师 → 多空辩论 → 风险经理裁决，耗时约 10-30 秒/标的。未启用时系统正常运行，仅跳过辩论增强。
+> LLM 启用后，每个买入信号触发 4 位分析师 → 多空辩论 → 风险经理裁决，耗时约 10-30 秒/标的。**LLM 调用失败时明确告警（ Warn 日志），不会静默降级为虚假分析**；未启用时系统正常运行，仅跳过辩论增强。
 
 ### 通知存储机制
 
@@ -475,7 +507,7 @@ curl -H "Authorization: Bearer $JZ_API_TOKEN" \
 
 ## 多智能体辩论系统
 
-当 LLM 配置启用时（`llm.enabled: true`），系统对每个买入信号自动启动多智能体辩论，对策略信号做二次验证：
+当 LLM 配置启用时（`llm.enabled: true`），系统对每个买入信号自动启动多智能体辩论，对策略信号做二次验证。**仅支持 DeepSeek API**；LLM 调用失败时明确告警，不会静默降级为虚假分析结果；未启用时跳过辩论，直接用策略信号生成计划。
 
 ### 辩论流程
 
@@ -661,7 +693,7 @@ curl -X POST -H "Authorization: Bearer $JZ_API_TOKEN" \
 | 配置项 | 位置 | 说明 |
 |---|---|---|
 | `llm.enabled` | config.yaml | `true` 启用多智能体辩论 |
-| `llm.api_key` | 环境变量 `LLM_API_KEY` | DeepSeek API Key |
+| `llm.api_key` | 环境变量 `LLM_API_KEY` | DeepSeek API Key（仅支持 DeepSeek） |
 | `llm.base_url` | config.yaml | DeepSeek API 地址 |
 | `llm.model` | config.yaml | `deepseek-chat` 或 `deepseek-reasoner` |
 | `feishu.webhook_url` | 环境变量 `FEISHU_WEBHOOK` | 飞书机器人 webhook（可选，通知始终落库） |
@@ -887,7 +919,7 @@ curl -s http://127.0.0.1:11270/api/health
 | API 返回 401 | 所有 `/api/*` 请求需 `Authorization: Bearer $JZ_API_TOKEN`（仅 `/api/health` 和 `/` 豁免） |
 | 策略信号丢失 | 策略实例已缓存，重启服务后会重新初始化；检查 `config.yaml` 股票池是否有当日行情 |
 | 磁盘空间告警 | 调度器每日 16:30 自动清理；紧急可 `sqlite3 data/jingzhe.db "VACUUM;"` |
-| LLM 辩论无结果 | 检查 `llm.enabled: true` 和 `LLM_API_KEY` 环境变量；LLM 不可用时自动降级为规则判断 |
+| LLM 辩论无结果 | 检查 `llm.enabled: true` 和 `LLM_API_KEY` 环境变量；仅支持 DeepSeek API；LLM 失败时会输出 Warn 日志而非静默降级 |
 
 ### macOS (launchd)
 
@@ -920,7 +952,7 @@ internal/
   notify/       飞书通知
   api/          HTTP API (全路径鉴权/CORS/recover中间件/策略缓存)
   dataloader/   Tushare 数据同步 (库化, CLI与调度器共用)
-  llm/          LLM 客户端 (DeepSeek兼容/新闻分析)
+  llm/          LLM 客户端 (仅 DeepSeek/新闻分析/带缓存)
   config/       配置管理 (环境变量覆盖敏感项)
 ```
 

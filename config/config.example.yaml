@@ -188,3 +188,7 @@ llm:
   api_key: ""                # 留空, 用环境变量 LLM_API_KEY 注入
   base_url: "https://api.deepseek.com/v1"
   model: "deepseek-chat"
+  temperature: 0.3            # 采样温度, 分析类任务低温度保证输出稳定
+  max_tokens: 2048            # 输出上限, 过小会导致 JSON 被截断
+  timeout_seconds: 30         # HTTP 请求超时
+  json_mode: true             # 强制 JSON 输出 (response_format), 不支持的兼容端点可关闭
