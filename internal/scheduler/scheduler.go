@@ -42,6 +42,9 @@ const settleT1Time = "09:25"
 // tickInterval 调度检查周期: 每30秒检查一次是否有到点任务
 const tickInterval = 30 * time.Second
 
+// jobRetryCooldown 任务失败后的冷却期: 失败任务30分钟内不重试, 避免每30秒重试刷爆告警表
+const jobRetryCooldown = 30 * time.Minute
+
 // Scheduler 内置调度器
 // 交易日自动执行: 数据更新 → EOD信号生成 → 对账 → 日报推送 → 数据清理; 盘中定时止损监控
 // 标准库 time.Ticker 实现, 所有任务经 runJob wrapper (recover + job_run 记录 + 启动补跑)
@@ -170,6 +173,10 @@ func (s *Scheduler) maybeRunDaily(name, at string, now time.Time, today string, 
 		return
 	}
 	if done, err := s.jobRepo.HasSucceeded(name, today); err != nil || done {
+		return
+	}
+	// 失败冷却: 上次尝试失败且在冷却期内不重试, 避免无退避重试刷爆告警
+	if last, _ := s.jobRepo.LastAttemptStartedAt(name, today); !last.IsZero() && now.Sub(last) < jobRetryCooldown {
 		return
 	}
 	s.runJob(name, today, fn)

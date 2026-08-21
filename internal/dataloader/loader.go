@@ -186,6 +186,11 @@ func (l *Loader) syncOneDayBars(calDate string) bool {
 		logger.L().Errorf("获取 %s 日线失败: %v", calDate, err)
 		return false
 	}
+	// 当日无数据视为未同步成功: 数据源延迟时返回空, 若按成功记录会跳过重试窗口造成"假成功"
+	if len(bars) == 0 {
+		logger.L().Warnf("获取 %s 日线为空 (数据源可能未更新), 本次同步视为失败以触发重试", calDate)
+		return false
+	}
 	// 合并当日复权因子 (daily 接口不返回, 需单独拉取; 失败不阻断, 由 backfillAdjFactors 兜底)
 	l.mergeAdjFactors(bars, calDate)
 	// 入库前校验
@@ -249,10 +254,14 @@ func (l *Loader) syncOneDayExtras(calDate string) {
 	}
 
 	if l.cfg.Dataloader.EnableFund {
-		if fundBars, err := l.ts.FundDaily(calDate); err == nil && len(fundBars) > 0 {
-			if err := l.barRepo.BatchInsert(fundBars); err != nil {
-				logger.L().Errorf("存储 %s ETF日线失败: %v", calDate, err)
-			}
+		fundBars, err := l.ts.FundDaily(calDate)
+		if err != nil {
+			logger.L().Errorf("获取 %s ETF日线失败: %v", calDate, err)
+		} else if len(fundBars) == 0 {
+			// 空结果必须留痕: 曾因静默跳过导致持仓ETF缺当日数据被误判停牌/低估
+			logger.L().Warnf("获取 %s ETF日线为空 (数据源延迟或未更新), 持仓ETF估值将停留上一交易日", calDate)
+		} else if err := l.barRepo.BatchInsert(fundBars); err != nil {
+			logger.L().Errorf("存储 %s ETF日线失败: %v", calDate, err)
 		}
 	}
 

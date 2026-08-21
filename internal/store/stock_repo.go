@@ -22,7 +22,8 @@ const stockInsertSQL = `INSERT OR REPLACE INTO stock_basic
 	(ts_code, symbol, name, market, exchange, is_st, list_status, list_date, delist_date, industry)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
-const stockSelectCols = `ts_code, symbol, name, market, exchange, is_st, list_status, list_date, delist_date, industry`
+// industry 列存在 NULL (如部分北交所股票), 用 COALESCE 兜底避免 Scan 报错
+const stockSelectCols = `ts_code, symbol, name, market, exchange, is_st, list_status, list_date, delist_date, COALESCE(industry, '') AS industry`
 
 // BatchInsert 批量插入股票基本信息(已存在则覆盖)
 func (r *StockRepo) BatchInsert(stocks []model.Stock) error {

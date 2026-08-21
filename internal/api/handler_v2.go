@@ -197,9 +197,16 @@ func (s *Service) HandleGetPortfolio(w http.ResponseWriter, r *http.Request) {
 			CostPrice:    p.CostPrice,
 			AvgPrice:     p.AvgPrice,
 		}
+		price := 0.0
 		if close, ok := barMap[p.TsCode]; ok && close > 0 {
-			detail.MarketPrice = close
-			detail.MarketValue = close * float64(p.TotalQty)
+			price = close
+		} else if p.CostPrice > 0 {
+			// 当日无行情(停牌/数据缺失)时用成本价兜底, 避免估值置0导致总资产/回撤误报
+			price = p.CostPrice
+		}
+		if price > 0 {
+			detail.MarketPrice = price
+			detail.MarketValue = price * float64(p.TotalQty)
 			if p.CostPrice > 0 {
 				detail.FloatingPnL = detail.MarketValue - p.CostPrice*float64(p.TotalQty)
 				detail.FloatingPnLPct = detail.FloatingPnL / (p.CostPrice * float64(p.TotalQty))
