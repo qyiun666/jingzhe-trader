@@ -25,8 +25,6 @@ import (
 	"jingzhe-trader/internal/strategy"
 	"jingzhe-trader/internal/tushare"
 	"jingzhe-trader/pkg/logger"
-
-	"jingzhe-trader/web"
 )
 
 // ==================== JSON 响应结构 ====================
@@ -1502,21 +1500,44 @@ func (s *Service) HandleKline(w http.ResponseWriter, r *http.Request) {
 		end = time.Now().Format("20060102")
 	}
 
-	bars, err := s.barRepo.GetBars(code, start, end)
+	bars, err := s.GetKline(code, start, end)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	writeJSON(w, http.StatusOK, bars)
+}
+
+// GetKline returns K-line bars for a stock in a date range.
+func (s *Service) GetKline(code, start, end string) ([]model.Bar, error) {
+	if code == "" {
+		return nil, fmt.Errorf("code 参数不能为空")
+	}
+	if start == "" {
+		start = "20200101"
+	}
+	if end == "" {
+		end = time.Now().Format("20060102")
+	}
+	bars, err := s.barRepo.GetBars(code, start, end)
+	if err != nil {
+		return nil, err
+	}
 	if bars == nil {
 		bars = []model.Bar{}
 	}
-	writeJSON(w, http.StatusOK, bars)
+	return bars, nil
 }
 
 // HandleSnapshots 处理 GET /api/snapshots?limit=30
 func (s *Service) HandleSnapshots(w http.ResponseWriter, r *http.Request) {
 	limit := parseIntParam(r, "limit", 30)
+	writeJSON(w, http.StatusOK, s.BuildSnapshots(limit))
+}
 
+// BuildSnapshots returns historical account snapshots, generating a live one
+// when the database has no snapshot records.
+func (s *Service) BuildSnapshots(limit int) []model.AccountSnapshot {
 	var snaps []model.AccountSnapshot
 	query := `SELECT trade_date, total_asset, cash, market_value, pnl, pnl_pct, total_pnl, total_pnl_pct
 	          FROM account_snapshot ORDER BY trade_date DESC LIMIT ?`
@@ -1567,15 +1588,7 @@ func (s *Service) HandleSnapshots(w http.ResponseWriter, r *http.Request) {
 	for i, j := 0, len(snaps)-1; i < j; i, j = i+1, j-1 {
 		snaps[i], snaps[j] = snaps[j], snaps[i]
 	}
-	writeJSON(w, http.StatusOK, snaps)
+	return snaps
 }
 
-// HandleDashboard 处理 GET / → 返回嵌入的仪表盘 HTML
-func (s *Service) HandleDashboard(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		writeError(w, http.StatusNotFound, "not found")
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write(web.DashboardHTML)
-}
+

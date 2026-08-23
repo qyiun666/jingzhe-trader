@@ -15,24 +15,24 @@
 
 ## NAS AI 快速参考
 
-> 你是惊蛰交易系统的 AI 助手。系统 24h 常驻 NAS，自动完成数据→选股→信号→日报→监控全链路。你只需读 API 拿结果、审批计划、反馈成交。
+> 你是惊蛰交易系统的 AI 助手。系统 24h 常驻 NAS，自动完成数据→选股→信号→日报→监控全链路。你只需通过 MCP 调用工具读结果、审批计划、反馈成交。
 
 **部署**: `git clone` → 环境变量(`.env`) → `go build` → `systemd` 自启 → cron 健康检查
 
 **密钥**: 全部走环境变量（`TUSHARE_TOKEN` / `LLM_API_KEY` / `JZ_API_TOKEN` / `FEISHU_WEBHOOK`），config.yaml 已 gitignore 不提交
 
-**核心 API**（均需 `Authorization: Bearer $JZ_API_TOKEN`）:
+**核心 MCP 工具**（`get_*` 为读工具，其余为写工具）：
 
-| 端点 | 用途 |
+| 工具 | 用途 |
 |---|---|
-| `GET /api/agent/brief` | 全量上下文：计划+持仓+辩论+变更+任务状态 |
-| `GET /api/agent/dashboard` | 一次拿全：通知+计划+辩论+变更+任务 |
-| `GET /api/agent/alerts?unread_only=true` | 未读通知（盘中止损告警等） |
-| `POST /api/plan/confirm` | 确认计划 `{"id": 123}` |
-| `POST /api/trade/confirm` | 反馈成交 `{"ts_code","side","qty","price"}` |
-| `GET /api/health` | 存活检查（无需鉴权） |
+| `get_agent_brief` | 全量上下文：计划+持仓+辩论+变更+任务状态 |
+| `get_agent_dashboard` | 一次拿全：通知+计划+辩论+变更+任务 |
+| `get_agent_alerts` | 未读通知（盘中止损告警等） |
+| `confirm_plan` | 确认计划 `{"id": 123}` |
+| `confirm_trade` | 反馈成交 `{"ts_code","side","qty","price"}` |
+| `get_health` / `GET /health` | 存活检查（无需鉴权） |
 
-**每日节奏**: 15:35 后拉 `dashboard` → 审阅计划 → 确认后 `confirm` → 成交后反馈
+**每日节奏**: 15:35 后拉 `get_agent_dashboard` → 审阅计划 → `confirm_plan` → 成交后 `confirm_trade`
 
 **异常处理**: `warnings` 非空或 `data_fresh=false` → 先报告异常，不确认计划；LLM 不可用时辩论自动跳过，不影响信号生成
 
@@ -43,7 +43,7 @@
 ## 架构
 
 `cmd/server` 是唯一常驻进程，内置调度器在交易日自动完成全链路，结果全部落 SQLite。
-AI Agent（如 Hermes）只需定时 GET 只读 API 拿现成结果，POST 确认执行。
+AI Agent（如 Hermes / Claude / Cursor）通过 **MCP over Streamable HTTP** 读取结果、审批计划、反馈成交。
 
 ```
                       ┌──────────────────────────────────────────────────┐
@@ -76,11 +76,11 @@ AI Agent（如 Hermes）只需定时 GET 只读 API 拿现成结果，POST 确�
                       └───────────────────┬──────────────────────────────┘
                                           │ SQLite (WAL)
                       ┌───────────────────┴──────────────────────────────┐
-                      │              HTTP API (Bearer 鉴权)               │
+                      │         MCP over Streamable HTTP (鉴权)           │
                       └───────────────────┬──────────────────────────────┘
                                           │
-     Agent/人: GET /api/agent/brief → POST /api/plan/confirm
-               GET /api/agent/changes (决策变更检测)
+     Agent/人: get_agent_brief → confirm_plan → confirm_trade
+               get_agent_changes (决策变更检测)
 ```
 
 ## 季度目标跟踪（核心决策约束）
@@ -96,7 +96,7 @@ AI Agent（如 Hermes）只需定时 GET 只读 API 拿现成结果，POST 确�
 
 **自动调节规则**：回撤预算消耗 ≥70% → 总仓位 ×0.6 收紧；预算耗尽 → 仓位压至 20% + 止损 5%（防守）；目标提前达成 → 仓位 ×0.5 锁利。
 
-每日数据更新后自动评估，**风险模式切换时飞书告警**；状态可查 `GET /api/goal/status`，`/api/agent/brief` 的 `goal` 字段是 Agent 决策核心约束。数据源为每日实盘账户快照（account_snapshot，run_id=live），季初基准取季度开始前最后一个快照，无快照时退回初始资金。
+每日数据更新后自动评估，**风险模式切换时飞书告警**；状态可查 `get_goal_status`，`get_agent_brief` 返回的 `goal` 字段是 Agent 决策核心约束。数据源为每日实盘账户快照（account_snapshot，run_id=live)，季初基准取季度开始前最后一个快照，无快照时退回初始资金。
 
 ## 核心特点
 
@@ -163,9 +163,9 @@ bin/optimizer -config config/config.yaml -walkforward -folds 3   # 样本外验�
 ```bash
 bin/server -config config/config.yaml
 # 监听端口取自 config.yaml 的 server.port (example 默认 11270)
-curl http://127.0.0.1:11270/api/health              # 健康检查 (无需鉴权)
-curl -H "Authorization: Bearer $JZ_API_TOKEN" \
-     http://127.0.0.1:11270/api/agent/brief         # Agent 全量上下文 (需鉴权)
+curl http://127.0.0.1:11270/health              # 健康检查 (无需鉴权)
+# MCP 端点: http://127.0.0.1:11270/mcp
+# 在支持 MCP 的客户端（Claude/Cursor/任意 MCP inspector）中配置以上 URL
 ```
 
 ## 小资金配置指南（1 万元档）
@@ -187,56 +187,60 @@ curl -H "Authorization: Bearer $JZ_API_TOKEN" \
 
 资金量变大后无需改代码：把 `backtest.initial_capital` 改成实际资金，自适应参数自动放宽；也可以手动指定 `trading.*` 覆盖自适应。
 
-## API 一览
+## MCP 接口一览
 
-### 鉴权规则
+系统对外暴露 **MCP over Streamable HTTP**，端点为 `http://<host>:<port>/mcp`。
+配置 `server.api_token` 后，所有 MCP 请求需携带 `Authorization: Bearer <token>` 请求头；仅 `/health` 健康检查端点无需鉴权。
 
-配置 `server.api_token` 后（推荐），**所有 `/api/*` 路径（含 GET）都需要 Bearer token 鉴权**，仅以下两个端点豁免：
+### 连接信息
 
-| 豁免端点 | 原因 |
+| 项 | 默认值/说明 |
 |---|---|
-| `/api/health` | 健康检查（监控脚本用） |
-| `/` | 仪表盘 HTML 页面 |
+| 传输 | Streamable HTTP (`POST /mcp`, `GET /mcp`) |
+| 地址 | `http://127.0.0.1:11270/mcp`（端口由 `server.port` 控制） |
+| 鉴权 | `Authorization: Bearer $JZ_API_TOKEN` |
+| 健康检查 | `GET /health`（无需鉴权，供 systemd/cron 使用） |
 
-其余所有 API 请求需携带 `Authorization: Bearer <token>` 头：
+### 读工具（get_*）
 
-```bash
-curl -H "Authorization: Bearer $JZ_API_TOKEN" http://127.0.0.1:11270/api/agent/brief
-```
-
-### 只读接口（GET）
-
-| 端点 | 说明 |
+| 工具 | 说明 |
 |---|---|
-| `/api/agent/brief` | **Agent 首选**：计划+持仓+市场+健康度+辩论结果+决策变更+任务状态 一次拿全 |
-| `/api/agent/dashboard` | **Agent 仪表盘**：未读通知+今日通知+计划+辩论+变更+任务状态 汇总视图 |
-| `/api/agent/changes` | 决策变更检测：辩论结果对比 + 计划状态变更 + 任务完成状态 |
-| `/api/agent/alerts` | **通知存储**：飞书告警同时落库，Agent 可离线读取/标记已读 |
-| `/api/plan?date=` | 交易计划列表（不传 date 返回全部待处理） |
-| `/api/daily?date=` | 每日操盘报告（汇总） |
-| `/api/positions` | 持仓诊断 |
-| `/api/market` / `/api/news` / `/api/strategy` | 市场概况 / 新闻舆情 / 策略建议 |
-| `/api/news/llm?limit=5` | LLM 深度新闻分析（可选，需启用 LLM） |
-| `/api/strategy/status` | 动态策略选择器状态（当前策略/市场环境/置信度/推荐/是否防守） |
-| `/api/goal/status` | 季度目标状态（收益/进度/回撤/预算消耗/风险模式） |
-| `/api/reconcile?date=` | 本地 vs 券商对账 |
-| `/api/health` | uptime / goroutine数 / db大小 / 各任务最近成功时间（**无需鉴权**） |
-| `/api/system/status` | 数据新鲜度 / 持仓数 / 下一交易日 |
-| `/api/kline?code=&start=&end=` | K线数据 |
-| `/api/snapshots?limit=30` | 账户快照历史 |
-| `/api/screener/results` | 自动选股结果（最新或按日期查询） |
+| `get_agent_brief` | **Agent 首选**：计划+持仓+市场+健康度+辩论结果+决策变更+任务状态 一次拿全 |
+| `get_agent_dashboard` | **Agent 仪表盘**：未读通知+今日通知+计划+辩论+变更+任务状态 汇总视图 |
+| `get_agent_changes` | 决策变更检测：辩论结果对比 + 计划状态变更 + 任务完成状态 |
+| `get_agent_alerts` | 通知存储：飞书告警同时落库，Agent 可离线读取/标记已读 |
+| `get_plans` | 交易计划列表（不传 date 返回全部待处理） |
+| `get_daily_report` | 每日操盘报告（汇总） |
+| `get_positions` | 持仓诊断 |
+| `get_portfolio` | 原始持仓明细 |
+| `get_market` / `get_daily_report` / `get_strategy_status` | 市场概况 / 每日报告 / 策略建议 |
+| `get_goal_status` | 季度目标状态（收益/进度/回撤/预算消耗/风险模式） |
+| `get_health` | 服务健康状态 |
+| `get_system_status` | 数据新鲜度 / 持仓数 / 下一交易日 |
+| `get_kline` | K线数据 |
+| `get_snapshots` | 账户快照历史 |
+| `get_screener_results` | 自动选股结果（最新或按日期查询） |
 
-### 写接口（POST）
+### 写工具
 
-| 端点 | 说明 |
+| 工具 | 说明 |
 |---|---|
-| `/api/plan/confirm` | 确认交易计划 `{"id": 123}` |
-| `/api/trade/confirm` | 人工成交后反馈 `{"ts_code","side","qty","price"}` |
-| `/api/portfolio/sync` | 同步真实持仓（`overwrite: false` 为增量 Upsert） |
-| `/api/system/update-data` | 手动触发数据更新 |
-| `/api/strategy/switch` | 手动切换策略 `{"strategy": "ma_cross"}` 或 `?name=ma_cross` |
-| `/api/agent/alerts` | 标记通知已读 `{"id": 123}` 或 `{"all": true}` |
-| `/api/screener/run` | 手动触发全市场选股（测试用，正常由调度器自动执行） |
+| `confirm_plan` | 确认交易计划 `{"id": 123}` |
+| `confirm_trade` | 人工成交后反馈 `{"ts_code","side","qty","price"}` |
+| `sync_portfolio` | 同步真实持仓（`overwrite: false` 为增量 Upsert） |
+| `update_data` | 手动触发数据更新 |
+| `switch_strategy` | 手动切换策略 `{"strategy": "ma_cross"}` |
+| `mark_alerts_read` | 标记通知已读 `{"id": 123}` 或 `{"all": true}` |
+| `run_screener` | 手动触发全市场选股（测试用，正常由调度器自动执行） |
+
+### 资源
+
+部分常用数据同时以 MCP Resource 形式暴露：
+
+| 资源 URI | 说明 |
+|---|---|
+| `jingzhe://health` | 服务健康状态 JSON |
+| `jingzhe://agent/brief` | Agent 全量上下文 JSON |
 
 ## Agent 接入指南（Hermes / 任意 AI Agent）
 
@@ -265,15 +269,15 @@ export LLM_API_KEY=sk-your-deepseek-key
 
 ### 通知存储机制
 
-调度器每次执行任务后的飞书通知**同时落库 SQLite**（`agent_alert` 表），即使飞书未配置或发送失败，Agent 也能通过 API 读取：
+调度器每次执行任务后的飞书通知**同时落库 SQLite**（`agent_alert` 表），即使飞书未配置或发送失败，Agent 也能通过 MCP 读取：
 
 ```
 调度器任务完成 → alert() 方法
   ├─ 1. 落库 agent_alert 表 (始终执行, 不受飞书配置影响)
   └─ 2. 飞书推送 (可选, 失败不影响流程)
          ↓
-Agent 轮询 GET /api/agent/alerts?unread_only=true
-  → 读取未读通知 → 通知用户 → POST /api/agent/alerts 标记已读
+Agent 调用 get_agent_alerts {"unread_only": true}
+  → 读取未读通知 → 通知用户 → mark_alerts_read {"all": true} 标记已读
 ```
 
 通知级别：`info`（常规） / `warning`（警告） / `urgent`（紧急/止损/崩溃） / `success`（成功）
@@ -282,8 +286,8 @@ Agent 轮询 GET /api/agent/alerts?unread_only=true
 
 ```bash
 export JZ_API_TOKEN="your-random-token"    # 服务端: config 留空则从环境变量 JZ_API_TOKEN 读取
-# Agent 侧所有 /api/* 请求都需带头: Authorization: Bearer $JZ_API_TOKEN
-# 例外: GET /api/health 和 GET / 无需鉴权
+# MCP 客户端需要在请求头中携带: Authorization: Bearer $JZ_API_TOKEN
+# 例外: GET /health 无需鉴权
 ```
 
 ### 系统每日时间线（自动执行，Agent 无需介入）
@@ -306,20 +310,21 @@ export JZ_API_TOKEN="your-random-token"    # 服务端: config 留空则从环�
 
 | 时间 | Agent 动作 | 说明 |
 |---|---|---|
-| 09:25-15:00 | `GET /api/agent/alerts?unread_only=true` | 盘中每 5 分钟轮询未读通知（止损告警等紧急通知） |
-| 15:35 后 | `GET /api/agent/dashboard` | 一次性获取：未读通知+计划+辩论+变更+任务状态 |
-| 15:35 后 | `GET /api/agent/brief` | 详细上下文（持仓诊断+市场概况+辩论结果） |
-| 15:35 后 | `GET /api/agent/changes` | 检查决策变更、计划状态变更 |
-| 审阅后 | `POST /api/plan/confirm` | 逐条确认要执行的计划 |
-| 成交后 | `POST /api/trade/confirm` | 人工/券商成交后反馈，保持持仓同步 |
-| 读取后 | `POST /api/agent/alerts` | 标记通知已读 `{"all": true}` |
-| 任意 | `GET /api/health` | 存活与任务健康度巡检（无需鉴权） |
+| 09:25-15:00 | `get_agent_alerts {"unread_only": true}` | 盘中每 5 分钟轮询未读通知（止损告警等紧急通知） |
+| 15:35 后 | `get_agent_dashboard` | 一次性获取：未读通知+计划+辩论+变更+任务状态 |
+| 15:35 后 | `get_agent_brief` | 详细上下文（持仓诊断+市场概况+辩论结果） |
+| 15:35 后 | `get_agent_changes` | 检查决策变更、计划状态变更 |
+| 审阅后 | `confirm_plan {"id": 123}` | 逐条确认要执行的计划 |
+| 成交后 | `confirm_trade {...}` | 人工/券商成交后反馈，保持持仓同步 |
+| 读取后 | `mark_alerts_read {"all": true}` | 标记通知已读 |
+| 任意 | `get_health` / `GET /health` | 存活与任务健康度巡检 |
 
 ### 1. 读取全量上下文
 
-```bash
-curl -H "Authorization: Bearer $JZ_API_TOKEN" \
-     http://NAS_IP:11270/api/agent/brief
+调用 MCP 工具：
+
+```
+get_agent_brief
 ```
 
 响应字段（`data`）：
@@ -364,11 +369,8 @@ curl -H "Authorization: Bearer $JZ_API_TOKEN" \
 
 ### 2. 确认执行计划
 
-```bash
-curl -X POST http://NAS_IP:11270/api/plan/confirm \
-  -H "Authorization: Bearer $JZ_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"id": 12}'
+```
+confirm_plan {"id": 12}
 ```
 
 - `broker.type=paper`（默认）：模拟盘立即成交并更新持仓，飞书推送成交回执
@@ -379,73 +381,60 @@ curl -X POST http://NAS_IP:11270/api/plan/confirm \
 
 ### 3. 人工成交后反馈（保持账本一致）
 
-```bash
-curl -X POST http://NAS_IP:11270/api/trade/confirm \
-  -H "Authorization: Bearer $JZ_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"ts_code":"000001.SZ","side":"buy","qty":500,"price":11.15}'
+```
+confirm_trade {"ts_code":"000001.SZ","side":"buy","qty":500,"price":11.15}
 ```
 
 ### 4. 首次接入：同步真实持仓
 
-```bash
-curl -X POST http://NAS_IP:11270/api/portfolio/sync \
-  -H "Authorization: Bearer $JZ_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"cash": 10392.74, "overwrite": true, "positions": [
-        {"ts_code":"510050.SH","total_qty":500,"available_qty":500,"cost_price":3.059}
-      ]}'
+```
+sync_portfolio {"cash": 10392.74, "overwrite": true, "positions": [
+  {"ts_code":"510050.SH","total_qty":500,"available_qty":500,"cost_price":3.059}
+]}
 ```
 
 ### 5. 手动切换策略
 
-```bash
-curl -X POST "http://NAS_IP:11270/api/strategy/switch?name=macd" \
-  -H "Authorization: Bearer $JZ_API_TOKEN"
-curl -H "Authorization: Bearer $JZ_API_TOKEN" \
-     http://NAS_IP:11270/api/strategy/status   # 查看当前策略状态
+```
+switch_strategy {"strategy": "macd"}
+get_strategy_status
 ```
 
 ### Agent 提示词建议（可直接复制进 Agent 的定时任务）
 
 ```text
-每个交易日 15:35 调用 GET /api/agent/brief：
+每个交易日 15:35 调用 get_agent_brief：
 1. warnings 非空或 data_fresh=false → 先报告异常，不确认任何计划；
 2. task_completed.signal 非 true → 信号未生成，不确认计划；
 3. 逐条分析 open_plans（结合 debates/portfolio/market），urgent 计划优先，给出执行/跳过建议；
 4. decision_changes 非空 → 告知用户决策变化及原因；
 5. plan_status_summary 有 confirmed → 提醒反馈成交；
-6. 经我同意后 POST /api/plan/confirm 确认；
+6. 经我同意后 confirm_plan {"id": 123} 确认；
 7. 汇报今日持仓盈亏与健康分变化。
 
 通知读取（每次执行时检查）：
-GET /api/agent/alerts?unread_only=true → 按 level 排序（urgent > warning > info > success）通知用户 → 通知后 POST /api/agent/alerts {"all": true} 标记已读
+get_agent_alerts {"unread_only": true} → 按 level 排序（urgent > warning > info > success）通知用户 → 通知后 mark_alerts_read {"all": true} 标记已读
 
 仪表盘（一次拿全）：
-GET /api/agent/dashboard → 未读通知 + 今日通知 + 待处理计划 + 辩论结果 + 决策变更 + 任务状态
+get_agent_dashboard → 未读通知 + 今日通知 + 待处理计划 + 辩论结果 + 决策变更 + 任务状态
 ```
 
 ### 6. 读取飞书通知存档（Agent 核心）
 
 调度器所有通知（信号/日报/止损/告警）都会落库，Agent 读取后通知用户：
 
-```bash
+```
 # 获取未读通知 (响应含 alerts[]: id/job_name/level/title/content/status)
-curl -H "Authorization: Bearer $JZ_API_TOKEN" \
-     http://NAS_IP:11270/api/agent/alerts?unread_only=true
+get_agent_alerts {"unread_only": true}
 
 # 通知用户后标记已读
-curl -X POST http://NAS_IP:11270/api/agent/alerts \
-  -H "Authorization: Bearer $JZ_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"all": true}'
+mark_alerts_read {"all": true}
 ```
 
 ### 7. Agent 仪表盘（一次拿全）
 
-```bash
-curl -H "Authorization: Bearer $JZ_API_TOKEN" \
-     http://NAS_IP:11270/api/agent/dashboard
+```
+get_agent_dashboard
 ```
 
 返回未读通知 + 今日通知 + 待处理计划 + 辩论结果 + 决策变更 + 任务状态 + 计划汇总，适合首次拉取。
@@ -489,7 +478,7 @@ curl -H "Authorization: Bearer $JZ_API_TOKEN" \
 - 置信度显著变化（>20%）
 - 风险等级变化
 
-变更结果通过 `/api/agent/changes` 接口查询，同时在飞书通知中提示。
+变更结果通过 `get_agent_changes` 查询，同时在飞书通知中提示。
 
 ## 自动选股与新闻过滤
 
@@ -536,16 +525,13 @@ curl -H "Authorization: Bearer $JZ_API_TOKEN" \
 
 ### 查看选股结果
 
-```bash
+```
 # 获取最新选股结果
-curl -H "Authorization: Bearer $JZ_API_TOKEN" \
-     http://NAS_IP:11270/api/screener/results
+get_screener_results
 
 # 按日期查询 / 手动触发选股 (测试用, 正常由调度器自动执行)
-curl -H "Authorization: Bearer $JZ_API_TOKEN" \
-     "http://NAS_IP:11270/api/screener/results?date=20260805"
-curl -X POST -H "Authorization: Bearer $JZ_API_TOKEN" \
-     http://NAS_IP:11270/api/screener/run
+get_screener_results {"date": "20260805"}
+run_screener
 ```
 
 ## 数据口径（AI 决策前必读）
@@ -656,7 +642,7 @@ sudo systemctl enable --now jingzhe        # 开机自启 + 立即启动
 
 # 验证
 sudo systemctl status jingzhe
-curl http://127.0.0.1:11270/api/health      # 返回 JSON 即正常
+curl http://127.0.0.1:11270/health      # 返回 JSON 即正常
 ```
 
 进程意外退出由 systemd 自动拉起（`Restart=always`），重启后调度器依据 `job_run` 表自动补跑当天漏掉的任务。
@@ -680,7 +666,7 @@ sudo crontab -e
 | 检查项 | 异常处理 |
 |---|---|
 | server 进程存活 | 挂了则自动 `nohup` 重启 |
-| API 可访问 (`/api/health`) | 不可达则告警 |
+| API 可访问 (`/health`) | 不可达则告警 |
 | 数据新鲜度 + 交易日历 | 数据过期或日历缺失则自动触发 `dataloader` 补数据 |
 
 查看巡检日志：
@@ -700,10 +686,10 @@ sudo iptables -A INPUT -p tcp --dport 11270 -s 192.168.1.0/24 -j ACCEPT
 
 ```bash
 sudo systemctl is-active jingzhe              # → active (服务存活)
-curl -s http://127.0.0.1:11270/api/health | head   # API 正常
+curl -s http://127.0.0.1:11270/health | head   # MCP 服务正常
 sqlite3 /opt/jingzhe-trader/data/jingzhe.db "SELECT MAX(trade_date) FROM daily_bar;"   # 数据新鲜
 sqlite3 /opt/jingzhe-trader/data/jingzhe.db "SELECT COUNT(*) FROM daily_bar WHERE ts_code='000300.SH';"  # 指数数据存在
-curl -s -H "Authorization: Bearer $JZ_API_TOKEN" http://127.0.0.1:11270/api/agent/brief | head  # 鉴权验证
+# 通过 MCP 客户端调用 get_agent_brief 验证鉴权
 ```
 
 ### 日常更新（NAS 拉取新代码 → 重新编译 → 重启）
@@ -721,7 +707,7 @@ sudo systemctl restart jingzhe
 # 验证
 sleep 3
 sudo systemctl status jingzhe
-curl -s http://127.0.0.1:11270/api/health
+curl -s http://127.0.0.1:11270/health
 ```
 
 > **更新 config.yaml 时**：直接编辑后 `sudo systemctl restart jingzhe` 即可，无需重新编译。
@@ -734,7 +720,7 @@ curl -s http://127.0.0.1:11270/api/health
 | 数据一直不更新 | 检查 Tushare token 是否过期；`./bin/dataloader -config config/config.yaml` 手动跑看报错 |
 | 今天不在交易日历 | 健康检查脚本会自动补；也可手动 `./bin/dataloader -config config/config.yaml` |
 | 周末调度器不工作 | 正常，调度器用系统时间判断周末，非交易日不执行数据/信号任务 |
-| API 返回 401 | 所有 `/api/*` 请求需 `Authorization: Bearer $JZ_API_TOKEN`（仅 `/api/health` 和 `/` 豁免） |
+| MCP 返回 401 | MCP 请求需 `Authorization: Bearer $JZ_API_TOKEN`（仅 `/health` 豁免） |
 | 策略信号丢失 | 策略实例已缓存，重启服务后会重新初始化；检查 `config.yaml` 股票池是否有当日行情 |
 | 磁盘空间告警 | 调度器每日 16:30 自动清理；紧急可 `sqlite3 data/jingzhe.db "VACUUM;"` |
 | LLM 辩论无结果 | 检查 `llm.enabled: true` 和 `LLM_API_KEY` 环境变量；仅支持 DeepSeek API；LLM 失败时会输出 Warn 日志而非静默降级 |
@@ -768,7 +754,8 @@ internal/
   store/        SQLite 仓储 (共享Repo/retention清理/辩论结果/通知存储)
   quote/        盘中实时行情 (腾讯免费源 / QMT)
   notify/       飞书通知
-  api/          HTTP API (全路径鉴权/CORS/recover中间件/策略缓存)
+  api/          业务服务层 (被 MCP 层复用)
+  mcp/          MCP over Streamable HTTP 对外接口
   dataloader/   Tushare 数据同步 (库化, CLI与调度器共用)
   llm/          LLM 客户端 (仅 DeepSeek/新闻分析/带缓存)
   config/       配置管理 (环境变量覆盖敏感项)

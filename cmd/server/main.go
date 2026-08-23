@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -14,6 +15,7 @@ import (
 
 	"jingzhe-trader/internal/api"
 	"jingzhe-trader/internal/config"
+	"jingzhe-trader/internal/mcp"
 	"jingzhe-trader/internal/scheduler"
 )
 
@@ -40,8 +42,9 @@ func main() {
 		log.Fatalf("初始化 API 服务失败: %v", err)
 	}
 
-	// 创建路由
-	handler := api.NewRouter(svc)
+	// 创建 MCP 服务器 (对外接口为 MCP over Streamable HTTP)
+	mcpServer := mcp.NewServer(svc, cfg)
+	handler := mcpServer.Handler()
 
 	// 配置 HTTP 服务器 (默认仅本机监听, 由配置 server.host 控制)
 	host := cfg.Server.Host
@@ -49,6 +52,10 @@ func main() {
 		host = "127.0.0.1"
 	}
 	addr := host + ":" + serverPort
+
+	// 包装 MCP handler: 提供 /health 给 systemd/cron, 并对 /mcp 复用 Bearer 鉴权
+	handler = withHealthAndAuth(handler, svc, cfg.Server.APIToken)
+
 	srv := &http.Server{
 		Addr:         addr,
 		Handler:      handler,
@@ -106,4 +113,32 @@ func main() {
 		log.Printf("关闭数据库异常: %v", err)
 	}
 	log.Println("服务已停止")
+}
+
+// withHealthAndAuth wraps the MCP handler with a lightweight /health endpoint
+// and reuses the existing Bearer token auth for the MCP endpoint.
+func withHealthAndAuth(next http.Handler, svc *api.Service, token string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			writeJSON(w, http.StatusOK, svc.BuildHealthStatus())
+			return
+		}
+		if token != "" && r.URL.Path == "/mcp" {
+			auth := r.Header.Get("Authorization")
+			if auth != "Bearer "+token {
+				w.WriteHeader(http.StatusUnauthorized)
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func writeJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.WriteHeader(status)
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(data)
 }

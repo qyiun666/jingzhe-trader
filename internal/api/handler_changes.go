@@ -52,12 +52,16 @@ type TaskStatusJSON struct {
 // 返回当日决策变更、计划状态变更和任务完成状态
 func (s *Service) HandleAgentChanges(w http.ResponseWriter, r *http.Request) {
 	date := r.URL.Query().Get("date")
+	writeJSON(w, http.StatusOK, s.BuildAgentChanges(date))
+}
+
+// BuildAgentChanges builds the change report for the given date.
+func (s *Service) BuildAgentChanges(date string) *ChangeReport {
 	if date == "" {
 		// 默认使用数据库最新行情日期
 		lastDate, err := s.barRepo.GetMaxTradeDate()
 		if err != nil || lastDate == "" {
-			writeError(w, http.StatusInternalServerError, "无法确定日期且数据库无行情数据")
-			return
+			return &ChangeReport{Summary: "无法确定日期且数据库无行情数据"}
 		}
 		date = lastDate
 	} else {
@@ -144,5 +148,5 @@ func (s *Service) HandleAgentChanges(w http.ResponseWriter, r *http.Request) {
 		date, len(report.DecisionChanges), pendingCount, confirmedCount, executedCount,
 		report.TaskStatus["signal"].Completed)
 
-	writeJSON(w, http.StatusOK, report)
+	return report
 }

@@ -209,14 +209,18 @@ type PlanStatusSummary struct {
 // HandleAgentBrief GET /api/agent/brief
 // 一次返回 Agent 决策所需全部上下文
 func (s *Service) HandleAgentBrief(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.BuildAgentBrief())
+}
+
+// BuildAgentBrief builds the full Agent context without writing an HTTP response.
+func (s *Service) BuildAgentBrief() *AgentBrief {
 	brief := &AgentBrief{Jobs: map[string]string{}, Warnings: []string{}}
 
 	// 数据新鲜度
 	lastDate, err := s.barRepo.GetMaxTradeDate()
 	if err != nil || lastDate == "" {
 		brief.Warnings = append(brief.Warnings, "数据库无行情数据, 请先执行数据更新")
-		writeJSON(w, http.StatusOK, brief)
-		return
+		return brief
 	}
 	brief.Date = lastDate
 	brief.DataLastDate = lastDate
@@ -286,7 +290,7 @@ func (s *Service) HandleAgentBrief(w http.ResponseWriter, r *http.Request) {
 	// 需要用户操作的提示
 	brief.ActionNeeded = s.buildActionNeededEnhanced(brief.OpenPlans, brief.DecisionChanges, brief.PlanStatusSummary)
 
-	writeJSON(w, http.StatusOK, brief)
+	return brief
 }
 
 // buildPlanStatusSummary 构建交易计划状态汇总
@@ -353,7 +357,11 @@ func (s *Service) buildActionNeededEnhanced(plans []store.TradePlan, changes []a
 // 查询交易计划列表, 不传 date 时返回全部待处理计划
 func (s *Service) HandlePlanList(w http.ResponseWriter, r *http.Request) {
 	date := r.URL.Query().Get("date")
+	writeJSON(w, http.StatusOK, s.BuildPlans(date))
+}
 
+// BuildPlans returns trade plans for a date, or all open plans if date is empty.
+func (s *Service) BuildPlans(date string) []store.TradePlan {
 	var plans []store.TradePlan
 	var err error
 	if date != "" {
@@ -362,10 +370,9 @@ func (s *Service) HandlePlanList(w http.ResponseWriter, r *http.Request) {
 		plans, err = s.planRepo.GetOpenPlans()
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
+		return []store.TradePlan{}
 	}
-	writeJSON(w, http.StatusOK, plans)
+	return plans
 }
 
 // PlanConfirmRequest 计划确认请求
@@ -385,15 +392,22 @@ func (s *Service) HandlePlanConfirm(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "JSON 解析失败: "+err.Error())
 		return
 	}
-
-	plan, err := s.planRepo.GetPlanByID(req.ID)
+	plan, err := s.ConfirmPlan(req.ID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	writeJSON(w, http.StatusOK, plan)
+}
+
+// ConfirmPlan confirms a trade plan by ID and returns the updated plan.
+func (s *Service) ConfirmPlan(id int64) (*store.TradePlan, error) {
+	plan, err := s.planRepo.GetPlanByID(id)
+	if err != nil {
+		return nil, err
+	}
 	if plan.Status != store.PlanStatusPending {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("计划状态为 %s, 无法确认", plan.Status))
-		return
+		return nil, fmt.Errorf("计划状态为 %s, 无法确认", plan.Status)
 	}
 
 	status := store.PlanStatusConfirmed
@@ -405,8 +419,7 @@ func (s *Service) HandlePlanConfirm(w http.ResponseWriter, r *http.Request) {
 				plan.TsCode, plan.Direction, plan.Qty, plan.RefPrice, err)); nerr != nil {
 				logger.L().Warnw("飞书通知发送失败", "err", nerr)
 			}
-			writeError(w, http.StatusInternalServerError, "QMT下单失败: "+err.Error())
-			return
+			return nil, fmt.Errorf("QMT下单失败: %w", err)
 		}
 		if nerr := notifier.SendText(fmt.Sprintf("✅ 惊蛰下单成功\n%s %s %d股 @%.2f (%s)",
 			plan.TsCode, plan.Direction, plan.Qty, plan.RefPrice, plan.Reason)); nerr != nil {
@@ -416,11 +429,10 @@ func (s *Service) HandlePlanConfirm(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.planRepo.UpdatePlanStatus(plan.ID, status); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
+		return nil, err
 	}
 	plan.Status = status
-	writeJSON(w, http.StatusOK, plan)
+	return plan, nil
 }
 
 // executePlanViaQMT 通过 QMT 桥执行交易计划, 成功后同步本地持仓

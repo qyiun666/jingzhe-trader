@@ -22,6 +22,11 @@ func (s *Service) HandleAgentAlerts(w http.ResponseWriter, r *http.Request) {
 	date := r.URL.Query().Get("date")
 	unreadOnly := r.URL.Query().Get("unread_only") == "true"
 
+	writeJSON(w, http.StatusOK, s.BuildAgentAlerts(unreadOnly, date))
+}
+
+// BuildAgentAlerts returns recent or unread agent alerts.
+func (s *Service) BuildAgentAlerts(unreadOnly bool, date string) map[string]interface{} {
 	var alerts []store.AgentAlert
 	var err error
 
@@ -34,8 +39,7 @@ func (s *Service) HandleAgentAlerts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "查询通知失败: "+err.Error())
-		return
+		return map[string]interface{}{"error": err.Error()}
 	}
 
 	// 附带汇总信息
@@ -46,11 +50,11 @@ func (s *Service) HandleAgentAlerts(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	return map[string]interface{}{
 		"alerts":       alerts,
 		"total":        len(alerts),
 		"unread_count": unreadCount,
-	})
+	}
 }
 
 // handleAlertsMarkRead 标记通知为已读
@@ -63,38 +67,49 @@ func (s *Service) handleAlertsMarkRead(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "JSON 解析失败: "+err.Error())
 		return
 	}
+	result, err := s.MarkAlertsRead(req.All, req.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
 
-	if req.All || req.ID == 0 {
+// MarkAlertsRead marks agent alerts as read. If all is true or id is zero,
+// all alerts are marked read; otherwise the single specified alert is marked.
+func (s *Service) MarkAlertsRead(all bool, id int64) (map[string]interface{}, error) {
+	if all || id == 0 {
 		n, err := s.alertRepo.MarkAllRead()
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
+			return nil, err
 		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{
+		return map[string]interface{}{
 			"marked_read": n,
 			"message":     fmt.Sprintf("已标记 %d 条通知为已读", n),
-		})
-		return
+		}, nil
 	}
 
-	if req.ID > 0 {
-		if err := s.alertRepo.MarkAsRead(req.ID); err != nil {
-			writeError(w, http.StatusNotFound, err.Error())
-			return
+	if id > 0 {
+		if err := s.alertRepo.MarkAsRead(id); err != nil {
+			return nil, err
 		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{
+		return map[string]interface{}{
 			"marked_read": 1,
-			"id":          req.ID,
-		})
-		return
+			"id":          id,
+		}, nil
 	}
 
-	writeError(w, http.StatusBadRequest, "需要指定 id 或 all=true")
+	return nil, fmt.Errorf("需要指定 id 或 all=true")
 }
 
 // HandleAgentDashboard GET /api/agent/dashboard
 // Agent 专用仪表盘: 一次返回 alerts + brief + changes 的汇总视图
 func (s *Service) HandleAgentDashboard(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.BuildAgentDashboard())
+}
+
+// BuildAgentDashboard builds the agent dashboard summary.
+func (s *Service) BuildAgentDashboard() map[string]interface{} {
 	today := time.Now().Format("20060102")
 
 	// 未读通知
@@ -140,7 +155,7 @@ func (s *Service) HandleAgentDashboard(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	return map[string]interface{}{
 		"date":             today,
 		"data_last_date":   lastDate,
 		"unread_alerts":    unreadAlerts,
@@ -155,5 +170,5 @@ func (s *Service) HandleAgentDashboard(w http.ResponseWriter, r *http.Request) {
 			"executed":  executed,
 			"total":     len(openPlans),
 		},
-	})
+	}
 }

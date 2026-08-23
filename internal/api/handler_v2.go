@@ -62,9 +62,18 @@ func (s *Service) HandleSyncPortfolio(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(req.Positions) == 0 {
-		writeError(w, http.StatusBadRequest, "持仓列表不能为空")
+	resp, err := s.SyncPortfolio(req)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// SyncPortfolio synchronizes the local portfolio with real broker positions.
+func (s *Service) SyncPortfolio(req SyncPortfolioRequest) (*SyncPortfolioResponse, error) {
+	if len(req.Positions) == 0 {
+		return nil, fmt.Errorf("持仓列表不能为空")
 	}
 
 	// 1. 转换为 store 持仓格式
@@ -93,8 +102,7 @@ func (s *Service) HandleSyncPortfolio(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(storeItems) == 0 {
-		writeError(w, http.StatusBadRequest, "有效持仓为空")
-		return
+		return nil, fmt.Errorf("有效持仓为空")
 	}
 
 	// 2. 持久化到数据库: Overwrite=true 全量覆盖, false 逐条 Upsert
@@ -102,14 +110,12 @@ func (s *Service) HandleSyncPortfolio(w http.ResponseWriter, r *http.Request) {
 	portRepo := store.NewPortfolioRepo(s.db)
 	if overwrite {
 		if err := portRepo.SyncPortfolio(storeItems); err != nil {
-			writeError(w, http.StatusInternalServerError, "持仓持久化失败: "+err.Error())
-			return
+			return nil, fmt.Errorf("持仓持久化失败: %w", err)
 		}
 	} else {
 		for _, item := range storeItems {
 			if err := portRepo.UpsertPosition(item); err != nil {
-				writeError(w, http.StatusInternalServerError, "持仓增量更新失败: "+err.Error())
-				return
+				return nil, fmt.Errorf("持仓增量更新失败: %w", err)
 			}
 		}
 	}
@@ -147,36 +153,41 @@ func (s *Service) HandleSyncPortfolio(w http.ResponseWriter, r *http.Request) {
 		portRepo.SetMeta("initial_capital", fmt.Sprintf("%.2f", cash))
 	}
 
-	writeJSON(w, http.StatusOK, SyncPortfolioResponse{
+	return &SyncPortfolioResponse{
 		SyncedCount: len(storeItems),
 		Positions:   names,
 		TotalAsset:  cash, // 初始时总资产约等于现金
 		Cash:        cash,
-	})
+	}, nil
 }
 
 // HandleGetPortfolio 处理 GET /api/portfolio
 // 获取当前持仓列表（从数据库读取）
 func (s *Service) HandleGetPortfolio(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.BuildPortfolio())
+}
+
+// PositionDetail is a single portfolio holding with market pricing.
+type PositionDetail struct {
+	TsCode         string  `json:"ts_code"`
+	Name           string  `json:"name"`
+	TotalQty       int     `json:"total_qty"`
+	AvailableQty   int     `json:"available_qty"`
+	CostPrice      float64 `json:"cost_price"`
+	AvgPrice       float64 `json:"avg_price"`
+	MarketPrice    float64 `json:"market_price"`
+	MarketValue    float64 `json:"market_value"`
+	FloatingPnL    float64 `json:"floating_pnl"`
+	FloatingPnLPct float64 `json:"floating_pnl_pct"`
+}
+
+// BuildPortfolio returns the current holdings from the database enriched with
+// the latest market prices.
+func (s *Service) BuildPortfolio() []PositionDetail {
 	portRepo := store.NewPortfolioRepo(s.db) // PortfolioRepo 含元数据操作, 暂不提升为共享字段
 	positions, err := portRepo.GetAllPositions()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	// 转换为带名称的响应
-	type PositionDetail struct {
-		TsCode         string  `json:"ts_code"`
-		Name           string  `json:"name"`
-		TotalQty       int     `json:"total_qty"`
-		AvailableQty   int     `json:"available_qty"`
-		CostPrice      float64 `json:"cost_price"`
-		AvgPrice       float64 `json:"avg_price"`
-		MarketPrice    float64 `json:"market_price"`
-		MarketValue    float64 `json:"market_value"`
-		FloatingPnL    float64 `json:"floating_pnl"`
-		FloatingPnLPct float64 `json:"floating_pnl_pct"`
+		return []PositionDetail{}
 	}
 
 	// 获取最新行情来计算市值
@@ -215,7 +226,7 @@ func (s *Service) HandleGetPortfolio(w http.ResponseWriter, r *http.Request) {
 		result = append(result, detail)
 	}
 
-	writeJSON(w, http.StatusOK, result)
+	return result
 }
 
 // ==================== 交易反馈 ====================
@@ -254,24 +265,31 @@ func (s *Service) HandleTradeConfirm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	resp, err := s.ConfirmTrade(req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// ConfirmTrade validates the request, applies the trade to the portfolio,
+// persists it, and returns the trade confirmation response.
+func (s *Service) ConfirmTrade(req TradeConfirmRequest) (*TradeConfirmResponse, error) {
 	// 参数校验
 	req.TsCode = strings.TrimSpace(req.TsCode)
 	if req.TsCode == "" {
-		writeError(w, http.StatusBadRequest, "ts_code 不能为空")
-		return
+		return nil, fmt.Errorf("ts_code 不能为空")
 	}
 	req.Side = strings.ToLower(strings.TrimSpace(req.Side))
 	if req.Side != "buy" && req.Side != "sell" {
-		writeError(w, http.StatusBadRequest, "side 必须为 buy 或 sell")
-		return
+		return nil, fmt.Errorf("side 必须为 buy 或 sell")
 	}
 	if req.Qty <= 0 || req.Qty%100 != 0 {
-		writeError(w, http.StatusBadRequest, "qty 必须是100的整数倍")
-		return
+		return nil, fmt.Errorf("qty 必须是100的整数倍")
 	}
 	if req.Price <= 0 {
-		writeError(w, http.StatusBadRequest, "price 必须大于0")
-		return
+		return nil, fmt.Errorf("price 必须大于0")
 	}
 
 	// 确定买卖方向
@@ -282,7 +300,7 @@ func (s *Service) HandleTradeConfirm(w http.ResponseWriter, r *http.Request) {
 
 	asset := s.applyTradeToPortfolio(req.TsCode, side, req.Qty, req.Price)
 
-	resp := TradeConfirmResponse{
+	return &TradeConfirmResponse{
 		TsCode:     req.TsCode,
 		Name:       s.stockName(req.TsCode),
 		Side:       req.Side,
@@ -291,8 +309,7 @@ func (s *Service) HandleTradeConfirm(w http.ResponseWriter, r *http.Request) {
 		Amount:     req.Price * float64(req.Qty),
 		Cash:       asset.Cash,
 		TotalAsset: asset.TotalAsset,
-	}
-	writeJSON(w, http.StatusOK, resp)
+	}, nil
 }
 
 // liveSnapshotRunID 实盘账户快照的 run_id (与回测 bt_* 区分)
@@ -586,11 +603,20 @@ func (a *advisorAdapter) recentIndexReturns(date string) []float64 {
 // HandleStrategyStatus 处理 GET /api/strategy/status
 // 获取当前动态策略选择器状态
 func (s *Service) HandleStrategyStatus(w http.ResponseWriter, r *http.Request) {
-	if s.dynamicSelector == nil {
-		writeError(w, http.StatusServiceUnavailable, "动态策略选择器未启用")
+	status, err := s.BuildStrategyStatus()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, s.dynamicSelector.GetStatus())
+	writeJSON(w, http.StatusOK, status)
+}
+
+// BuildStrategyStatus returns the dynamic strategy selector status.
+func (s *Service) BuildStrategyStatus() (interface{}, error) {
+	if s.dynamicSelector == nil {
+		return nil, fmt.Errorf("动态策略选择器未启用")
+	}
+	return s.dynamicSelector.GetStatus(), nil
 }
 
 // HandleStrategySwitch 处理 POST /api/strategy/switch
@@ -609,16 +635,24 @@ func (s *Service) HandleStrategySwitch(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&body)
 		name = body.Strategy
 	}
-	if name == "" {
-		writeError(w, http.StatusBadRequest, "请指定策略名称")
+	result, err := s.SwitchStrategy(name)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// SwitchStrategy switches the active strategy used for signal generation.
+func (s *Service) SwitchStrategy(name string) (map[string]string, error) {
+	if name == "" {
+		return nil, fmt.Errorf("请指定策略名称")
 	}
 
 	// 验证策略存在并确保缓存中有实例
 	strat, ok := s.getStrategy(name)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "未知策略: "+name)
-		return
+		return nil, fmt.Errorf("未知策略: %s", name)
 	}
 
 	// 通过动态选择器执行切换
@@ -626,10 +660,10 @@ func (s *Service) HandleStrategySwitch(w http.ResponseWriter, r *http.Request) {
 		s.dynamicSelector.SwitchTo(name, strat)
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{
+	return map[string]string{
 		"message":  "策略已切换为 " + name,
 		"strategy": name,
-	})
+	}, nil
 }
 
 // ==================== 系统维护 ====================
@@ -648,6 +682,11 @@ type SystemStatus struct {
 // HandleSystemStatus 处理 GET /api/system/status
 // 获取系统全面状态（数据新鲜度、持仓数量、运行时间等）
 func (s *Service) HandleSystemStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.BuildSystemStatus())
+}
+
+// BuildSystemStatus returns overall system status.
+func (s *Service) BuildSystemStatus() SystemStatus {
 	status := SystemStatus{
 		Healthy: true,
 		Today:   time.Now().Format("20060102"),
@@ -655,8 +694,7 @@ func (s *Service) HandleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.db.Ping(); err != nil {
 		status.Healthy = false
-		writeJSON(w, http.StatusOK, status)
-		return
+		return status
 	}
 	if maxDate, err := s.barRepo.GetMaxTradeDate(); err == nil {
 		status.LastDataDate = maxDate
@@ -670,7 +708,7 @@ func (s *Service) HandleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	if nextDate, err := s.calRepo.GetNextTradeDate(status.Today); err == nil {
 		status.NextMarketOpen = nextDate
 	}
-	writeJSON(w, http.StatusOK, status)
+	return status
 }
 
 // HandleUpdateData 处理 POST /api/system/update-data

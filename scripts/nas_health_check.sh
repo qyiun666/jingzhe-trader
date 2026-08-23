@@ -50,8 +50,8 @@ check_server_process() {
 
 # ===== 2. 检查 API 可访问性 =====
 check_api() {
-    if ! curl -s --max-time 5 "${API_URL}/api/health" > /dev/null 2>&1; then
-        alert "API unreachable (${API_URL}/api/health)"
+    if ! curl -s --max-time 5 "${API_URL}/health" > /dev/null 2>&1; then
+        alert "API unreachable (${API_URL}/health)"
         return 1
     fi
     log "OK: API accessible"
