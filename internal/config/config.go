@@ -22,6 +22,7 @@ type Config struct {
 	Universe   UniverseConfig   `mapstructure:"universe"`
 	Server     ServerConfig     `mapstructure:"server"`
 	Feishu     FeishuConfig     `mapstructure:"feishu"`
+	Mail       MailConfig       `mapstructure:"mail"`
 	LLM        LLMConfig        `mapstructure:"llm"`
 	Dataloader DataloaderConfig `mapstructure:"dataloader"`
 	Scheduler  SchedulerConfig  `mapstructure:"scheduler"`
@@ -129,6 +130,14 @@ type FeishuConfig struct {
 	WebhookURL string `mapstructure:"webhook_url"` // 飞书机器人 webhook URL
 	PushDaily  bool   `mapstructure:"push_daily"`  // 是否每天自动推送
 	PushTime   string `mapstructure:"push_time"`   // 推送时间 HH:MM
+}
+
+// MailConfig 邮件通知配置 (QQ 邮箱 SMTP)
+// Password 为 SMTP 授权码, 仅通过环境变量 JZ_MAIL_PASSWORD 注入, 不写入配置文件
+type MailConfig struct {
+	Enabled  bool   `mapstructure:"enabled"` // 是否启用邮件通知
+	From     string `mapstructure:"from"`    // 发件邮箱 (即收件人)
+	Password string // SMTP 授权码 (环境变量注入)
 }
 
 type TushareConfig struct {
@@ -298,6 +307,7 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("server.allowed_origins", []string{"http://localhost", "http://127.0.0.1"})
 	v.SetDefault("feishu.push_daily", false)
 	v.SetDefault("feishu.push_time", "15:30")
+	v.SetDefault("mail.enabled", false)
 	v.SetDefault("llm.enabled", false)
 	v.SetDefault("llm.base_url", "https://api.deepseek.com/v1")
 	v.SetDefault("llm.model", "deepseek-chat")
@@ -377,6 +387,9 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if w := os.Getenv("FEISHU_WEBHOOK"); w != "" {
 		cfg.Feishu.WebhookURL = w
+	}
+	if p := os.Getenv("JZ_MAIL_PASSWORD"); p != "" {
+		cfg.Mail.Password = p
 	}
 }
 

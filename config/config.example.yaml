@@ -182,6 +182,12 @@ feishu:
   push_daily: true
   push_time: "15:30"
 
+# 邮件通知 (QQ 邮箱, smtp.qq.com:465, 发件人即收件人)
+# 授权码通过环境变量 JZ_MAIL_PASSWORD 注入, 禁止写入配置文件
+mail:
+  enabled: false
+  from: ""            # 发件邮箱 (即收件人)
+
 # LLM 配置 (可选)
 llm:
   enabled: false

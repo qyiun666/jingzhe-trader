@@ -411,19 +411,26 @@ func (s *Service) ConfirmPlan(id int64) (*store.TradePlan, error) {
 	}
 
 	status := store.PlanStatusConfirmed
-	// 自动执行: 仅 QMT 实盘模式下真实下单; 下单结果飞书推送
+	// 自动执行: 仅 QMT 实盘模式下真实下单; 下单结果飞书/邮件推送
 	if s.cfg.Trading.AutoExecute && s.cfg.Broker.Type == "qmt" {
 		notifier := notify.NewFeishuNotifier(s.cfg.Feishu.WebhookURL)
+		mailer := notify.NewMailNotifier(s.cfg.Mail.Enabled, s.cfg.Mail.From, s.cfg.Mail.Password)
 		if err := s.executePlanViaQMT(plan); err != nil {
-			if nerr := notifier.SendText(fmt.Sprintf("❌ 惊蛰下单失败\n%s %s %d股 @%.2f: %v",
-				plan.TsCode, plan.Direction, plan.Qty, plan.RefPrice, err)); nerr != nil {
+			msg := fmt.Sprintf("%s %s %d股 @%.2f: %v", plan.TsCode, plan.Direction, plan.Qty, plan.RefPrice, err)
+			if nerr := notifier.SendText("❌ 惊蛰下单失败\n" + msg); nerr != nil {
 				logger.L().Warnw("飞书通知发送失败", "err", nerr)
+			}
+			if nerr := mailer.Send("❌ 惊蛰下单失败", msg); nerr != nil {
+				logger.L().Warnw("邮件通知发送失败", "err", nerr)
 			}
 			return nil, fmt.Errorf("QMT下单失败: %w", err)
 		}
-		if nerr := notifier.SendText(fmt.Sprintf("✅ 惊蛰下单成功\n%s %s %d股 @%.2f (%s)",
-			plan.TsCode, plan.Direction, plan.Qty, plan.RefPrice, plan.Reason)); nerr != nil {
+		msg := fmt.Sprintf("%s %s %d股 @%.2f (%s)", plan.TsCode, plan.Direction, plan.Qty, plan.RefPrice, plan.Reason)
+		if nerr := notifier.SendText("✅ 惊蛰下单成功\n" + msg); nerr != nil {
 			logger.L().Warnw("飞书通知发送失败", "err", nerr)
+		}
+		if nerr := mailer.Send("✅ 惊蛰下单成功", msg); nerr != nil {
+			logger.L().Warnw("邮件通知发送失败", "err", nerr)
 		}
 		status = store.PlanStatusExecuted
 	}

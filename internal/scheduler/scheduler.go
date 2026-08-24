@@ -53,6 +53,7 @@ type Scheduler struct {
 	db       *sqlx.DB
 	svc      *api.Service
 	notifier *notify.FeishuNotifier
+	mailer   *notify.MailNotifier
 	quoteSrc quote.Source
 
 	jobRepo  *store.JobRepo
@@ -75,6 +76,7 @@ func New(cfg *config.Config, db *sqlx.DB, svc *api.Service) *Scheduler {
 		db:       db,
 		svc:      svc,
 		notifier: notify.NewFeishuNotifier(cfg.Feishu.WebhookURL),
+		mailer:   notify.NewMailNotifier(cfg.Mail.Enabled, cfg.Mail.From, cfg.Mail.Password),
 		quoteSrc: src,
 		jobRepo:  store.NewJobRepo(db),
 		planRepo: store.NewPlanRepo(db),
@@ -284,8 +286,8 @@ func (s *Scheduler) finishJob(jobID int64, status, errMsg string) {
 	}
 }
 
-// alert 飞书告警 + 落库 (Agent 可通过 /api/agent/alerts 读取)
-// 降级: 飞书发送失败只打日志, 不影响落库
+// alert 飞书告警 + 邮件 + 落库 (Agent 可通过 /api/agent/alerts 读取)
+// 降级: 飞书/邮件发送失败只打日志, 不影响落库
 func (s *Scheduler) alert(title, text string) {
 	// 1. 落库 (无论飞书是否配置, 都存一份供 Agent 读取)
 	alertRepo := store.NewAlertRepo(s.db) // Scheduler 独立实例 (与 Service.alertRepo 不同生命周期)
@@ -338,6 +340,11 @@ func (s *Scheduler) alert(title, text string) {
 	// 2. 飞书发送 (失败不影响流程)
 	if err := s.notifier.SendText(title + "\n" + text); err != nil {
 		logger.L().Warnw("飞书告警发送失败", "err", err)
+	}
+
+	// 3. 邮件发送 (失败不影响流程)
+	if err := s.mailer.Send(title, text); err != nil {
+		logger.L().Warnw("邮件告警发送失败", "err", err)
 	}
 }
 
@@ -615,21 +622,27 @@ func (s *Scheduler) runReconcile(date string) error {
 	return nil
 }
 
-// runReport 15:45 日报生成 + 飞书推送
+// runReport 15:45 日报生成 + 飞书/邮件推送
 // 增强通知: 日报推送后追加操作提醒
 func (s *Scheduler) runReport(date string) error {
 	daily, err := s.svc.RunDaily(date, s.svc.SelectStrategy(date))
 	if err != nil {
 		return fmt.Errorf("生成日报失败: %w", err)
 	}
-	if !s.notifier.Enabled() {
-		logger.L().Info("飞书未配置, 日报仅落库不推送")
+	if !s.notifier.Enabled() && !s.mailer.Enabled() {
+		logger.L().Info("飞书与邮件均未配置, 日报仅落库不推送")
 		return nil
 	}
-	if err := s.notifier.SendCard(api.BuildFeishuDailyCard(daily)); err != nil {
-		return fmt.Errorf("推送日报失败: %w", err)
+	if s.notifier.Enabled() {
+		if err := s.notifier.SendCard(api.BuildFeishuDailyCard(daily)); err != nil {
+			return fmt.Errorf("推送日报失败: %w", err)
+		}
 	}
-
+	if s.mailer.Enabled() {
+		if err := s.mailer.Send("操盘报告 "+date, buildDailyMailText(daily)); err != nil {
+			logger.L().Warnw("日报邮件发送失败", "err", err)
+		}
+	}
 	// 追加操作提醒: 检查是否有待处理计划
 	if openPlans, err := s.planRepo.GetOpenPlans(); err == nil && len(openPlans) > 0 {
 		pending := 0
@@ -655,6 +668,22 @@ func (s *Scheduler) runReport(date string) error {
 		}
 	}
 	return nil
+}
+
+// buildDailyMailText 构造日报邮件摘要 (纯文本)
+func buildDailyMailText(daily *api.DailyReportJSON) string {
+	var lines []string
+	if daily.Portfolio != nil {
+		lines = append(lines, fmt.Sprintf("总资产: %.2f  当日盈亏: %.2f%%", daily.Portfolio.TotalAsset, daily.Portfolio.DailyPnLPct))
+	}
+	if daily.Rebalance != nil {
+		lines = append(lines, fmt.Sprintf("必卖: %d条  必买: %d条  持有提醒: %d条",
+			len(daily.Rebalance.SellList), len(daily.Rebalance.BuyList), len(daily.Rebalance.HoldList)))
+	}
+	if len(lines) == 0 {
+		return fmt.Sprintf("操盘报告 %s: 详见系统日报", daily.Date)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // runSettleT1 每日 09:25 T+1 持仓结转 (昨日买入转为可卖)
