@@ -27,6 +27,8 @@ func (b *Bar) Date() time.Time {
 // AdjustBarsForward 原地将日线序列调整为前复权 (以序列最后一天的有效复权因子为基准)
 // 价格: open/high/low/close/pre_close 乘以 adj_i/adj_last; 成交量反向调整
 // 复权因子缺失(0)的 bar 沿用前一有效因子, 保证序列口径一致
+// 复权完成后将 AdjFactor 归一化为 1: 价格已是前复权价, AdjClose()/AdjHigh() 等幂等返回复权价;
+// 原始因子比值由调用方在复权前自行缓存 (如 DataProvider.adjRatio 供涨跌停换算)
 func AdjustBarsForward(bars []Bar) {
 	// 找基准: 最后一个有效复权因子
 	lastAdj := 0.0
@@ -47,6 +49,7 @@ func AdjustBarsForward(bars []Bar) {
 		} else {
 			lastValid = adj
 		}
+		bars[i].AdjFactor = 1 // 归一化: 复权完成标记, Adj*() 幂等
 		if adj <= 0 {
 			continue
 		}

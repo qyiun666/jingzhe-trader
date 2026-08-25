@@ -53,8 +53,8 @@ func (f *MomentumFactor) Compute(ctx context.Context, date string, universe []st
 		startBar := bars[startIdx]
 
 		// 计算涨跌幅 (使用前复权价格)
-		startPrice := startBar.AdjClose()
-		endPrice := lastBar.AdjClose()
+		startPrice := startBar.Close
+		endPrice := lastBar.Close
 
 		if startPrice <= 0 {
 			continue

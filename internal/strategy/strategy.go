@@ -20,13 +20,13 @@ type Strategy interface {
 
 // BarContext 策略上下文, 聚合策略所需的全部信息
 type BarContext struct {
-	TradeDate  string                     // 当前交易日期 YYYYMMDD
-	Universe   []string                   // 当前股票池
-	Bars       map[string]*model.Bar      // 当日各标的行情 (前复权)
-	Positions  map[string]*model.Position // 当前持仓
-	Cash       float64                    // 可用现金
-	TotalAsset float64                    // 总资产
-	History    HistoryProvider            // 历史数据访问器
+	TradeDate string                       // 当前交易日期 YYYYMMDD
+	Universe  []string                     // 当前股票池
+	Bars      map[string]*model.Bar        // 当日各标的行情 (前复权)
+	Positions map[string]*model.Position   // 当前持仓
+	Cash      float64                      // 可用现金
+	TotalAsset float64                     // 总资产
+	History   HistoryProvider              // 历史数据访问器
 }
 
 // HistoryProvider 历史数据提供者
@@ -153,22 +153,22 @@ func tail2Valid(vals []float64) bool {
 	return n >= 2 && !math.IsNaN(vals[n-1]) && !math.IsNaN(vals[n-2])
 }
 
-// closesOf 提取收盘价序列 (前复权)
+// closesOf 提取收盘价序列 (前复权: 序列已由 DataProvider/dbHistoryAdapter 复权, 价格即复权价)
 func closesOf(bars []model.Bar) []float64 {
 	closes := make([]float64, len(bars))
 	for i, bar := range bars {
-		closes[i] = bar.AdjClose()
+		closes[i] = bar.Close
 	}
 	return closes
 }
 
-// highsLowsOf 提取最高/最低价序列 (前复权)
+// highsLowsOf 提取最高/最低价序列 (前复权: 同 closesOf)
 func highsLowsOf(bars []model.Bar) ([]float64, []float64) {
 	highs := make([]float64, len(bars))
 	lows := make([]float64, len(bars))
 	for i, bar := range bars {
-		highs[i] = bar.AdjHigh()
-		lows[i] = bar.AdjLow()
+		highs[i] = bar.High
+		lows[i] = bar.Low
 	}
 	return highs, lows
 }

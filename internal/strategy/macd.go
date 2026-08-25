@@ -60,11 +60,11 @@ func (s *MACDStrategy) OnBar(_ context.Context, barCtx *BarContext) ([]model.Sig
 
 		if isGoldenCross && !hasPosition {
 			bar, ok := barCtx.Bars[tsCode]
-			if !ok || bar.AdjClose() <= 0 {
+			if !ok || bar.Close <= 0 {
 				continue
 			}
 			targetAmount := barCtx.TotalAsset * s.PositionPct
-			qty := int(targetAmount/bar.AdjClose()/100) * 100
+			qty := int(targetAmount/bar.Close/100) * 100
 			if qty > 0 {
 				signals = append(signals, buySignal(tsCode, qty, fmt.Sprintf("MACD金叉: DIF=%.4f上穿DEA=%.4f", currDIF, currDEA), 0.7))
 			}

@@ -66,11 +66,11 @@ func (s *BollBreakoutStrategy) OnBar(_ context.Context, barCtx *BarContext) ([]m
 
 		if isBuySignal && !hasPosition {
 			bar, ok := barCtx.Bars[tsCode]
-			if !ok || bar.AdjClose() <= 0 {
+			if !ok || bar.Close <= 0 {
 				continue
 			}
 			targetAmount := barCtx.TotalAsset * s.PositionPct
-			qty := int(targetAmount/bar.AdjClose()/100) * 100
+			qty := int(targetAmount/bar.Close/100) * 100
 			if qty > 0 {
 				signals = append(signals, buySignal(tsCode, qty, fmt.Sprintf("布林带下轨回升: close=%.2f > lower=%.2f", currClose, currLower), 0.6))
 			}

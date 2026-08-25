@@ -155,12 +155,12 @@ func (s *MACrossStrategy) OnBar(_ context.Context, barCtx *BarContext) ([]model.
 				continue
 			}
 
-			// 计算买入数量 (按仓位占比, 向下取整到100股)
+			// 计算买入数量 (按仓位占比, 向下取整到100股; 当日bar价格即可成交口径: 回测=复权价/实盘=原始价)
 			bar, ok := barCtx.Bars[tsCode]
-			if !ok || bar.AdjClose() <= 0 {
+			if !ok || bar.Close <= 0 {
 				continue
 			}
-			qty := calcBuyQty(barCtx.TotalAsset, bar.AdjClose(), positionPct)
+			qty := calcBuyQty(barCtx.TotalAsset, bar.Close, positionPct)
 			if qty > 0 {
 				reason := fmt.Sprintf("均线金叉: MA%d=%.2f上穿MA%d=%.2f", shortPeriod, currShort, longPeriod, currLong)
 				if s.EnableAdaptive {

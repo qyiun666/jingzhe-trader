@@ -191,9 +191,9 @@ func (s *MultiFactorStrategy) updateVolatility(barCtx *BarContext) {
 	highs := make([]float64, len(bars))
 	lows := make([]float64, len(bars))
 	for i, bar := range bars {
-		closes[i] = bar.AdjClose()
-		highs[i] = bar.AdjHigh()
-		lows[i] = bar.AdjLow()
+		closes[i] = bar.Close
+		highs[i] = bar.High
+		lows[i] = bar.Low
 	}
 
 	s.adaptive.Update(closes, highs, lows)
@@ -315,7 +315,7 @@ func (s *MultiFactorStrategy) doRebalance(ctx context.Context, barCtx *BarContex
 		}
 
 		// 计算买入数量 (向下取整到100股)
-		price := bar.AdjClose()
+		price := bar.Close
 		if price <= 0 {
 			price = bar.Close
 		}
