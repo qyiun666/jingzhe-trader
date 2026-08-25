@@ -61,6 +61,32 @@ func TestBuildMailMessage(t *testing.T) {
 	}
 }
 
+func TestBuildHTMLMailMessage(t *testing.T) {
+	msg := buildHTMLMailMessage("test@qq.com", "盘前总结", "<html><body><h1>标题</h1></body></html>")
+
+	for _, want := range []string{
+		"From: test@qq.com",
+		"To: test@qq.com",
+		"Content-Type: text/html; charset=UTF-8",
+		"<html><body><h1>标题</h1></body></html>",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("HTML 邮件缺少 %q, 实际:\n%s", want, msg)
+		}
+	}
+	// Subject 换行压平 + Q 编码 (与纯文本一致, 防邮件头注入)
+	if !strings.Contains(msg, "Subject: =?utf-8?q?") {
+		t.Errorf("HTML 邮件 Subject 应为 Q 编码, 实际:\n%s", msg)
+	}
+}
+
+func TestSendHTMLDisabled(t *testing.T) {
+	n := NewMailNotifier(false, "a@qq.com", "pwd")
+	if err := n.SendHTML("标题", "<b>内容</b>"); err != nil {
+		t.Errorf("未启用时 SendHTML 应返回 nil, 实际 %v", err)
+	}
+}
+
 func TestSendSMTP(t *testing.T) {
 	srv := newFakeSMTPServer(t, "")
 	msg := buildMailMessage("test@qq.com", "测试邮件", "正文内容")

@@ -214,6 +214,8 @@ func NewService(cfg *config.Config) (*Service, error) {
 		MaxTokens:      cfg.LLM.MaxTokens,
 		TimeoutSeconds: cfg.LLM.TimeoutSeconds,
 		JSONMode:       &cfg.LLM.JSONMode,
+		MaxConcurrency: cfg.LLM.MaxConcurrency,
+		RPS:            cfg.LLM.RPS,
 	}
 	svc.llmClient = llm.NewClient(llmCfg)
 	svc.llmNews = llm.NewNewsAnalyzer(svc.llmClient)

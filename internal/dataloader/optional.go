@@ -3,6 +3,7 @@ package dataloader
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"jingzhe-trader/internal/model"
@@ -66,31 +67,46 @@ type maxDateRepo interface {
 	GetMaxTradeDate() (string, error)
 }
 
-// syncByTradeDay 按交易日增量同步: 拉取 → 入库, 跳过已同步日期 (syncMoneyFlow/syncTopList 共用)
+// syncByTradeDay 按交易日增量同步 (交易日间并行拉取): 拉取 → 入库, 跳过已同步日期 (syncMoneyFlow/syncTopList 共用)
 // fetch: 拉取某交易日数据; store: 批量入库; 返回同步的交易日数
 func syncByTradeDay[T any](repo maxDateRepo, tradeCals []model.TradeCal, name string,
 	fetch func(string) ([]T, error), store func([]T) error) int {
 	logger.L().Infof("=== 同步%s ===", name)
 	lastDate, _ := repo.GetMaxTradeDate()
+
+	var mu sync.Mutex
 	synced := 0
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, dataloaderConcurrency)
 	for _, cal := range tradeCals {
 		if lastDate != "" && cal.CalDate <= lastDate {
 			continue
 		}
-		items, err := fetch(cal.CalDate)
-		if err != nil {
-			logger.L().Errorf("获取 %s %s失败: %v", cal.CalDate, name, err)
-			continue
-		}
-		if len(items) == 0 {
-			continue
-		}
-		if err := store(items); err != nil {
-			logger.L().Errorf("存储 %s %s失败: %v", cal.CalDate, name, err)
-			continue
-		}
-		synced++
+		calDate := cal.CalDate
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			items, err := fetch(calDate)
+			if err != nil {
+				logger.L().Errorf("获取 %s %s失败: %v", calDate, name, err)
+				return
+			}
+			if len(items) == 0 {
+				return
+			}
+			if err := store(items); err != nil {
+				logger.L().Errorf("存储 %s %s失败: %v", calDate, name, err)
+				return
+			}
+			mu.Lock()
+			synced++
+			mu.Unlock()
+		}()
 	}
+	wg.Wait()
 	logger.L().Infof("%s同步完成, 共 %d 个交易日", name, synced)
 	return synced
 }
@@ -107,7 +123,7 @@ func (l *Loader) syncTopList(tradeCals []model.TradeCal) {
 	syncByTradeDay(repo, tradeCals, "龙虎榜", l.ts.TopList, repo.BatchInsert)
 }
 
-// syncFina 同步财务指标 (逐股票逐报告期获取)
+// syncFina 同步财务指标 (逐股票并行, 股票内各报告期串行)
 // Tushare 500元档 fina_indicator 必须传 ts_code, 不能按报告期批量获取
 func (l *Loader) syncFina(startDate, endDate string) {
 	logger.L().Info("=== 同步财务指标 ===")
@@ -122,28 +138,50 @@ func (l *Loader) syncFina(startDate, endDate string) {
 	periods := genReportPeriods(startDate, endDate)
 	logger.L().Infof("待同步报告期: %v, 股票数: %d", periods, len(allStocks))
 
+	var mu sync.Mutex
 	finaSynced := 0
 	failedCount := 0
-	for i, stock := range allStocks {
-		if i%100 == 0 {
-			logger.L().Infof("进度: %d/%d (已同步%d条)", i, len(allStocks), finaSynced)
-		}
-		for _, period := range periods {
-			indicators, err := l.ts.FinaIndicator(stock.TsCode, period)
-			if err != nil {
-				failedCount++
-				continue
+	processed := 0
+	total := len(allStocks)
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, dataloaderConcurrency)
+	for _, stock := range allStocks {
+		wg.Add(1)
+		go func(stock model.Stock) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			for _, period := range periods {
+				indicators, err := l.ts.FinaIndicator(stock.TsCode, period)
+				if err != nil {
+					mu.Lock()
+					failedCount++
+					mu.Unlock()
+					continue
+				}
+				if len(indicators) == 0 {
+					continue
+				}
+				if err := finaRepo.BatchInsert(indicators); err != nil {
+					logger.L().Errorf("存储 %s 财务指标失败: %v", stock.TsCode, err)
+					continue
+				}
+				mu.Lock()
+				finaSynced += len(indicators)
+				mu.Unlock()
 			}
-			if len(indicators) == 0 {
-				continue
+
+			mu.Lock()
+			processed++
+			if processed%100 == 0 {
+				logger.L().Infof("进度: %d/%d (已同步%d条)", processed, total, finaSynced)
 			}
-			if err := finaRepo.BatchInsert(indicators); err != nil {
-				logger.L().Errorf("存储 %s 财务指标失败: %v", stock.TsCode, err)
-				continue
-			}
-			finaSynced += len(indicators)
-		}
+			mu.Unlock()
+		}(stock)
 	}
+	wg.Wait()
 	logger.L().Infof("财务指标同步完成, 共 %d 条, 失败 %d 次", finaSynced, failedCount)
 }
 

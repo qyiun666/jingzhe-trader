@@ -2,6 +2,7 @@ package llm
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/time/rate"
 
 	"jingzhe-trader/pkg/retry"
 )
@@ -31,6 +34,7 @@ var retryBackoffBase = time.Second
 
 // Client LLM 客户端
 // 仅支持 DeepSeek API (OpenAI 兼容接口)
+// 全局并发/限流: 所有调用方 (辩论/新闻/日报) 共用同一实例, 在 Chat 入口统一受控
 type Client struct {
 	apiKey      string
 	baseURL     string
@@ -41,6 +45,8 @@ type Client struct {
 	maxTokens   int
 	jsonMode    bool
 	cache       sync.Map // 进程内缓存: key=date+symbol+role+输入hash, value=响应内容
+	sem         chan struct{}   // 并发在飞请求上限 (nil=不限制)
+	limiter     *rate.Limiter   // 每秒请求数限速 (nil=不限速)
 }
 
 // Config LLM 配置
@@ -53,6 +59,8 @@ type Config struct {
 	MaxTokens      int     `mapstructure:"max_tokens"`      // 默认 2048
 	TimeoutSeconds int     `mapstructure:"timeout_seconds"` // 默认 30
 	JSONMode       *bool   `mapstructure:"json_mode"`       // nil 表示默认 false, 强制 JSON 输出 (仅 DeepSeek 支持)
+	MaxConcurrency int     `mapstructure:"max_concurrency"` // 并发在飞请求上限, 0=不限制
+	RPS            float64 `mapstructure:"rps"`             // 每秒请求数上限, 0=不限速
 }
 
 // NewClient 创建 LLM 客户端
@@ -85,6 +93,22 @@ func NewClient(cfg Config) *Client {
 	if cfg.JSONMode != nil {
 		jsonMode = *cfg.JSONMode
 	}
+
+	// 并发/限流: 零值 (0) 表示不限制, 默认值由配置层 SetDefault 注入
+	// 测试直接构造 Config{} 时不受限速影响
+	var sem chan struct{}
+	if cfg.MaxConcurrency > 0 {
+		sem = make(chan struct{}, cfg.MaxConcurrency)
+	}
+	var limiter *rate.Limiter
+	if cfg.RPS > 0 {
+		burst := cfg.MaxConcurrency
+		if burst < 1 {
+			burst = 1
+		}
+		limiter = rate.NewLimiter(rate.Limit(cfg.RPS), burst)
+	}
+
 	return &Client{
 		apiKey:      cfg.APIKey,
 		baseURL:     baseURL,
@@ -92,6 +116,8 @@ func NewClient(cfg Config) *Client {
 		temperature: temperature,
 		maxTokens:   maxTokens,
 		jsonMode:    jsonMode,
+		sem:         sem,
+		limiter:     limiter,
 		httpClient: &http.Client{
 			Timeout: time.Duration(timeout) * time.Second,
 		},
@@ -141,6 +167,17 @@ type ChatCompletionResponse struct {
 func (c *Client) Chat(systemPrompt, userPrompt string) (string, error) {
 	if !c.enabled {
 		return "", fmt.Errorf("LLM 未启用")
+	}
+
+	// 全局并发/限流: 信号量限制在飞请求数, 令牌桶平滑限速 (429 由重试层兜底)
+	if c.sem != nil {
+		c.sem <- struct{}{}
+		defer func() { <-c.sem }()
+	}
+	if c.limiter != nil {
+		if err := c.limiter.Wait(context.Background()); err != nil {
+			return "", fmt.Errorf("LLM 限流等待失败: %w", err)
+		}
 	}
 
 	reqBody := ChatCompletionRequest{

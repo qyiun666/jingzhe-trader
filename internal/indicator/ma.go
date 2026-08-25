@@ -1,9 +1,23 @@
 package indicator
 
+import talib "github.com/markcheno/go-talib"
+
 // SMA 简单移动平均
+// 委托 go-talib 实现 (数值已验证一致); 输入含 NaN 或参数越界时回退自研
 // 返回长度与输入相同的切片, 前 period-1 个为 NaN
-// period 必须 >= 1, 否则返回全 NaN
 func SMA(values []float64, period int) []float64 {
+	n := len(values)
+	if period < 1 || n == 0 || period > n {
+		return nanSlice(n)
+	}
+	if hasNaN(values) {
+		return smaLocal(values, period)
+	}
+	return padTo(talib.Sma(values, period), n, period-1)
+}
+
+// smaLocal 自研实现 (输入含 NaN 时回退, 与旧行为完全一致)
+func smaLocal(values []float64, period int) []float64 {
 	n := len(values)
 	out := nanSlice(n)
 	if period < 1 || n == 0 || period > n {
@@ -56,10 +70,22 @@ func EMA(values []float64, period int) []float64 {
 }
 
 // WMA 加权移动平均
+// 委托 go-talib 实现 (数值已验证一致); 输入含 NaN 或参数越界时回退自研
 // 权重从 1 到 period 递增 (最新值权重最大为 period, 最旧值权重最小为 1)
-// WMA = sum(price[i] * weight) / sum(weights)
 // 返回长度与输入相同, 前 period-1 个为 NaN
 func WMA(values []float64, period int) []float64 {
+	n := len(values)
+	if period < 1 || n == 0 || period > n {
+		return nanSlice(n)
+	}
+	if hasNaN(values) {
+		return wmaLocal(values, period)
+	}
+	return padTo(talib.Wma(values, period), n, period-1)
+}
+
+// wmaLocal 自研实现 (输入含 NaN 时回退, 与旧行为完全一致)
+func wmaLocal(values []float64, period int) []float64 {
 	n := len(values)
 	out := nanSlice(n)
 	if period < 1 || n == 0 || period > n {

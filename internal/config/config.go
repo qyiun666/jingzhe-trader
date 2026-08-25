@@ -21,7 +21,6 @@ type Config struct {
 	Strategy   StrategyConfig   `mapstructure:"strategy"`
 	Universe   UniverseConfig   `mapstructure:"universe"`
 	Server     ServerConfig     `mapstructure:"server"`
-	Feishu     FeishuConfig     `mapstructure:"feishu"`
 	Mail       MailConfig       `mapstructure:"mail"`
 	LLM        LLMConfig        `mapstructure:"llm"`
 	Dataloader DataloaderConfig `mapstructure:"dataloader"`
@@ -44,6 +43,7 @@ type GoalConfig struct {
 // SchedulerConfig 内置调度器配置
 type SchedulerConfig struct {
 	Enabled        bool           `mapstructure:"enabled"`          // 是否启用调度器
+	PremarketTime  string         `mapstructure:"premarket_time"`   // 盘前总结时间 HH:MM
 	DataUpdateTime string         `mapstructure:"data_update_time"` // 数据更新时间 HH:MM
 	ScreenerTime   string         `mapstructure:"screener_time"`    // 自动选股时间 HH:MM
 	SignalTime     string         `mapstructure:"signal_time"`      // EOD信号生成时间 HH:MM
@@ -107,14 +107,16 @@ type DataloaderConfig struct {
 // 用于新闻深度分析和选股辅助，不直接做交易决策
 // 默认关闭，不影响系统核心功能
 type LLMConfig struct {
-	Enabled        bool    `mapstructure:"enabled"`         // 是否启用 LLM
-	APIKey         string  `mapstructure:"api_key"`         // API Key
-	BaseURL        string  `mapstructure:"base_url"`        // API 地址，默认 DeepSeek
-	Model          string  `mapstructure:"model"`           // 模型名称，默认 deepseek-chat
-	Temperature    float64 `mapstructure:"temperature"`     // 采样温度, 默认 0.3
-	MaxTokens      int     `mapstructure:"max_tokens"`      // 输出上限, 默认 2048
-	TimeoutSeconds int     `mapstructure:"timeout_seconds"` // HTTP 超时秒数, 默认 30
-	JSONMode       bool    `mapstructure:"json_mode"`       // 强制 JSON 输出 (response_format), 默认 true
+	Enabled        bool    `mapstructure:"enabled"`          // 是否启用 LLM
+	APIKey         string  `mapstructure:"api_key"`          // API Key
+	BaseURL        string  `mapstructure:"base_url"`         // API 地址，默认 DeepSeek
+	Model          string  `mapstructure:"model"`            // 模型名称，默认 deepseek-chat
+	Temperature    float64 `mapstructure:"temperature"`      // 采样温度, 默认 0.3
+	MaxTokens      int     `mapstructure:"max_tokens"`       // 输出上限, 默认 2048
+	TimeoutSeconds int     `mapstructure:"timeout_seconds"`  // HTTP 超时秒数, 默认 30
+	JSONMode       bool    `mapstructure:"json_mode"`        // 强制 JSON 输出 (response_format), 默认 true
+	MaxConcurrency int     `mapstructure:"max_concurrency"`  // 并发在飞请求上限, 默认 3
+	RPS            float64 `mapstructure:"rps"`              // 每秒请求数上限 (0=不限速), 默认 2
 }
 
 // ServerConfig HTTP 服务配置
@@ -123,13 +125,6 @@ type ServerConfig struct {
 	Port           int      `mapstructure:"port"`            // 监听端口
 	APIToken       string   `mapstructure:"api_token"`       // API鉴权token, 非空时启用Bearer校验
 	AllowedOrigins []string `mapstructure:"allowed_origins"` // CORS允许的来源列表
-}
-
-// FeishuConfig 飞书通知配置
-type FeishuConfig struct {
-	WebhookURL string `mapstructure:"webhook_url"` // 飞书机器人 webhook URL
-	PushDaily  bool   `mapstructure:"push_daily"`  // 是否每天自动推送
-	PushTime   string `mapstructure:"push_time"`   // 推送时间 HH:MM
 }
 
 // MailConfig 邮件通知配置 (QQ 邮箱 SMTP)
@@ -318,8 +313,6 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("server.port", 8080)
 	v.SetDefault("server.host", "127.0.0.1")
 	v.SetDefault("server.allowed_origins", []string{"http://localhost", "http://127.0.0.1"})
-	v.SetDefault("feishu.push_daily", false)
-	v.SetDefault("feishu.push_time", "15:30")
 	v.SetDefault("mail.enabled", false)
 	v.SetDefault("llm.enabled", false)
 	v.SetDefault("llm.base_url", "https://api.deepseek.com/v1")
@@ -328,16 +321,19 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("llm.max_tokens", 2048)
 	v.SetDefault("llm.timeout_seconds", 30)
 	v.SetDefault("llm.json_mode", false) // 仅 DeepSeek 支持, 默认关闭
+	v.SetDefault("llm.max_concurrency", 3)
+	v.SetDefault("llm.rps", 2) // DeepSeek 免费档保守值, 0 表示不限速
 	v.SetDefault("dataloader.filter_mode", false)
 	v.SetDefault("dataloader.enable_limit", true)
 	v.SetDefault("dataloader.enable_basic", true)
 	v.SetDefault("dataloader.enable_fund", true)
 	v.SetDefault("dataloader.enable_cleanup", false)
 	v.SetDefault("scheduler.enabled", true)
+	v.SetDefault("scheduler.premarket_time", "09:00")
 	v.SetDefault("scheduler.data_update_time", "15:10")
 	v.SetDefault("scheduler.screener_time", "15:15")
-	v.SetDefault("scheduler.signal_time", "15:30")
-	v.SetDefault("scheduler.report_time", "15:45")
+	v.SetDefault("scheduler.signal_time", "18:00")
+	v.SetDefault("scheduler.report_time", "18:00")
 	v.SetDefault("scheduler.intraday.enabled", true)
 	v.SetDefault("scheduler.intraday.interval_min", 5)
 	v.SetDefault("scheduler.intraday.start", "09:30")
@@ -397,9 +393,6 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if t := os.Getenv("JZ_API_TOKEN"); t != "" {
 		cfg.Server.APIToken = t
-	}
-	if w := os.Getenv("FEISHU_WEBHOOK"); w != "" {
-		cfg.Feishu.WebhookURL = w
 	}
 	if p := os.Getenv("JZ_MAIL_PASSWORD"); p != "" {
 		cfg.Mail.Password = p

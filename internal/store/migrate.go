@@ -282,7 +282,7 @@ func migrate(db *sqlx.DB) error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_job_run_name_date ON job_run(job_name, trade_date);`,
 
-		// 智能体通知记录 (飞书告警同时落库, Agent 读取后通知用户)
+		// 智能体通知记录 (告警同时落库, Agent 读取后通知用户)
 		`CREATE TABLE IF NOT EXISTS agent_alert (
 			id          INTEGER PRIMARY KEY AUTOINCREMENT,
 			trade_date  TEXT NOT NULL,

@@ -28,13 +28,12 @@ const tickInterval = 30 * time.Second
 const jobRetryCooldown = 30 * time.Minute
 
 // Scheduler 内置调度器
-// 交易日自动执行: 数据更新 → EOD信号生成 → 对账 → 日报推送 → 数据清理; 盘中定时止损监控
+// 交易日自动执行: 盘前总结 → 数据更新 → 选股 → EOD信号 → 当天总结/日报 → 数据清理; 盘中定时止损监控
 // 标准库 time.Ticker 实现, 所有任务经 runJob wrapper (recover + job_run 记录 + 启动补跑)
 type Scheduler struct {
 	cfg      *config.Config
 	db       *sqlx.DB
 	svc      *api.Service
-	notifier *notify.FeishuNotifier
 	mailer   *notify.MailNotifier
 	quoteSrc quote.Source
 
@@ -57,7 +56,6 @@ func New(cfg *config.Config, db *sqlx.DB, svc *api.Service) *Scheduler {
 		cfg:      cfg,
 		db:       db,
 		svc:      svc,
-		notifier: notify.NewFeishuNotifier(cfg.Feishu.WebhookURL),
 		mailer:   notify.NewMailNotifier(cfg.Mail.Enabled, cfg.Mail.From, cfg.Mail.Password),
 		quoteSrc: src,
 		jobRepo:  store.NewJobRepo(db),
@@ -128,6 +126,7 @@ func (s *Scheduler) tick() {
 	}
 
 	if isTradeDay {
+		s.maybeRunDaily(store.JobPremarket, s.cfg.Scheduler.PremarketTime, now, today, s.runPremarket)
 		s.maybeRunDaily(store.JobSettleT1, settleT1Time, now, today, s.runSettleT1)
 		s.maybeRunDataUpdateWithRetry(now, today)
 		s.maybeRunDaily(store.JobScreener, s.cfg.Scheduler.ScreenerTime, now, today, s.runScreener)
@@ -135,7 +134,15 @@ func (s *Scheduler) tick() {
 		if s.cfg.Broker.Type == "qmt" {
 			s.maybeRunDaily(store.JobReconcile, reconcileTime(s.cfg.Scheduler.SignalTime), now, today, s.runReconcile)
 		}
-		s.maybeRunDaily(store.JobReport, s.cfg.Scheduler.ReportTime, now, today, s.runReport)
+		s.maybeRunDaily(store.JobReport, s.cfg.Scheduler.ReportTime, now, today, func(date string) error {
+			// 日报依赖信号完成 (18:00 同时到点, 信号含 LLM 辩论可能耗时数分钟):
+			// 信号运行中则本轮跳过, 下一 tick 再检查; 信号已结束(成功或失败)则正常生成日报
+			if _, running := s.running.Load(store.JobSignal); running {
+				logger.L().Infow("调度器: 信号任务运行中, 日报等待下一轮", "date", date)
+				return nil
+			}
+			return s.runReport(date)
+		})
 		s.maybeRunIntraday(now, today)
 	} else {
 		logger.L().Infow("调度器: 今天是节假日(数据库确认), 跳过交易任务", "date", today)
@@ -220,7 +227,7 @@ func (s *Scheduler) maybeRunIntraday(now time.Time, today string) {
 	s.runJob(store.JobIntraday, today, s.runIntradayMonitor)
 }
 
-// runJob 统一任务执行 wrapper: 互斥防重叠 + recover隔离 + job_run 记录 + 失败飞书告警
+// runJob 统一任务执行 wrapper: 互斥防重叠 + recover隔离 + job_run 记录 + 失败告警
 func (s *Scheduler) runJob(name, date string, fn func(date string) error) {
 	if _, loaded := s.running.LoadOrStore(name, true); loaded {
 		logger.L().Warnw("调度器: 上一轮任务未结束, 跳过本轮", "job", name)
@@ -268,10 +275,11 @@ func (s *Scheduler) finishJob(jobID int64, status, errMsg string) {
 	}
 }
 
-// alert 飞书告警 + 邮件 + 落库 (Agent 可通过 /api/agent/alerts 读取)
-// 降级: 飞书/邮件发送失败只打日志, 不影响落库
+// alert 告警落库 (Agent 可通过 /api/agent/alerts 读取)
+// 设计: 任务失败/数据更新等过程告警不单独发邮件打扰, 统一汇总进 18:00 日报邮件;
+// 需用户操作的通知 (止损触发/盘前总结/日报/买卖指令) 由各场景显式调用 mailer 发送
 func (s *Scheduler) alert(title, text string) {
-	// 1. 落库 (无论飞书是否配置, 都存一份供 Agent 读取)
+	// 落库 (始终执行, 存一份供 Agent 读取)
 	alertRepo := store.NewAlertRepo(s.db) // Scheduler 独立实例 (与 Service.alertRepo 不同生命周期)
 	level := store.AlertLevelInfo
 	jobName := ""
@@ -317,16 +325,6 @@ func (s *Scheduler) alert(title, text string) {
 	}
 	if _, err := alertRepo.Insert(alert); err != nil {
 		logger.L().Warnw("通知落库失败", "title", title, "err", err)
-	}
-
-	// 2. 飞书发送 (失败不影响流程)
-	if err := s.notifier.SendText(title + "\n" + text); err != nil {
-		logger.L().Warnw("飞书告警发送失败", "err", err)
-	}
-
-	// 3. 邮件发送 (失败不影响流程)
-	if err := s.mailer.Send(title, text); err != nil {
-		logger.L().Warnw("邮件告警发送失败", "err", err)
 	}
 }
 

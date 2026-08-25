@@ -47,16 +47,7 @@ func (o *DebateOrchestrator) IsEnabled() bool {
 func (o *DebateOrchestrator) Debate(ctx *DebateContext) (*DebateResult, error) {
 	logger.L().Infof("[智能体辩论] 开始 %s (%s) %s", ctx.TsCode, ctx.Name, ctx.TradeDate)
 	reports := o.runAnalystsParallel(ctx)
-	bullArg, err := o.bull.Research(ctx, reports)
-	if err != nil {
-		logger.L().Warnw("看涨研究员失败", "ts_code", ctx.TsCode, "err", err)
-		bullArg = &ResearchArgument{Side: "bull", Sentiment: 0, Confidence: 0.1}
-	}
-	bearArg, err := o.bear.Research(ctx, reports)
-	if err != nil {
-		logger.L().Warnw("看跌研究员失败", "ts_code", ctx.TsCode, "err", err)
-		bearArg = &ResearchArgument{Side: "bear", Sentiment: 0, Confidence: 0.1}
-	}
+	bullArg, bearArg := o.runResearchersParallel(ctx, reports)
 	result, err := o.riskMgr.Judge(ctx, reports, bullArg, bearArg)
 	if err != nil || result == nil {
 		logger.L().Warnw("风险管理员裁决失败, 使用降级逻辑", "ts_code", ctx.TsCode, "err", err)
@@ -94,6 +85,41 @@ func (o *DebateOrchestrator) runAnalystsParallel(ctx *DebateContext) []*Analysis
 	return reports
 }
 
+// runResearchersParallel 并行执行看涨/看跌研究员 (失败时降级为空论点, 与串行行为一致)
+func (o *DebateOrchestrator) runResearchersParallel(ctx *DebateContext, reports []*AnalysisReport) (*ResearchArgument, *ResearchArgument) {
+	type researchResult struct {
+		arg *ResearchArgument
+		err error
+	}
+	bullCh := make(chan researchResult, 1)
+	bearCh := make(chan researchResult, 1)
+	go func() {
+		arg, err := o.bull.Research(ctx, reports)
+		bullCh <- researchResult{arg: arg, err: err}
+	}()
+	go func() {
+		arg, err := o.bear.Research(ctx, reports)
+		bearCh <- researchResult{arg: arg, err: err}
+	}()
+	bullRes := <-bullCh
+	bearRes := <-bearCh
+
+	bullArg := bullRes.arg
+	if bullRes.err != nil {
+		logger.L().Warnw("看涨研究员失败", "ts_code", ctx.TsCode, "err", bullRes.err)
+		bullArg = &ResearchArgument{Side: "bull", Sentiment: 0, Confidence: 0.1}
+	}
+	bearArg := bearRes.arg
+	if bearRes.err != nil {
+		logger.L().Warnw("看跌研究员失败", "ts_code", ctx.TsCode, "err", bearRes.err)
+		bearArg = &ResearchArgument{Side: "bear", Sentiment: 0, Confidence: 0.1}
+	}
+	return bullArg, bearArg
+}
+
+// debateConcurrency 同时辩论的股票数上限 (LLM 全局限流在 client 层统一控制, 此上限防资源峰值)
+const debateConcurrency = 4
+
 func (o *DebateOrchestrator) EnhanceSignals(date string, signals []model.Signal, bars map[string]*model.Bar, positions map[string]*model.Position, totalAsset float64, stockNames map[string]string) []model.Signal {
 	if !o.IsEnabled() {
 		return signals
@@ -104,43 +130,73 @@ func (o *DebateOrchestrator) EnhanceSignals(date string, signals []model.Signal,
 			marketBars[code] = bar
 		}
 	}
-	enhanced := make([]model.Signal, 0, len(signals))
-	for _, sig := range signals {
+
+	// 股票间并行辩论: 每只股票独立 (LLM 调用已在 client 层限流), 按下标收集保证信号顺序稳定
+	enhanced := make([]model.Signal, len(signals))
+	kept := make([]bool, len(signals))
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, debateConcurrency)
+	for i, sig := range signals {
 		if sig.Direction == model.DirSell {
-			enhanced = append(enhanced, sig)
+			enhanced[i] = sig
+			kept[i] = true
 			continue
 		}
-		ctx := o.buildContext(date, sig.TsCode, stockNames, bars, positions, totalAsset, marketBars)
-		if ctx == nil {
-			enhanced = append(enhanced, sig)
-			continue
-		}
-		result, err := o.Debate(ctx)
-		if err != nil || result == nil {
-			enhanced = append(enhanced, sig)
-			continue
-		}
-		switch result.Decision {
-		case "reject", "hold", "sell":
-			// reject=否决买入, hold=建议观望, sell=建议卖出(对买入信号而言都意味着不买入)
-			logger.L().Infof("[智能体辩论] %s 信号被过滤 %s: decision=%s summary=%s",
-				result.Decision, sig.TsCode, result.Decision, result.Summary)
-			continue
-		case "buy":
-			// 按辩论建议的仓位比例调整数量 (PositionPct 0~0.6, 不超过原始目标)
-			if result.PositionPct > 0 && result.PositionPct < 1 {
-				adjustedQty := int(float64(sig.TargetQty) * result.PositionPct)
-				if adjustedQty > 0 && adjustedQty <= sig.TargetQty {
-					sig.TargetQty = adjustedQty
-				}
+		wg.Add(1)
+		go func(idx int, sig model.Signal) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			ctx := o.buildContext(date, sig.TsCode, stockNames, bars, positions, totalAsset, marketBars)
+			if ctx == nil {
+				enhanced[idx] = sig
+				kept[idx] = true
+				return
 			}
-			sig.Reason = fmt.Sprintf("%s | LLM辩论: %s", sig.Reason, result.Summary)
-			sig.Reason = appendStopPriceReason(sig.Reason, result.StopPrice)
-			sig.Strength = result.Confidence
-		}
-		enhanced = append(enhanced, sig)
+			result, err := o.Debate(ctx)
+			if err != nil || result == nil {
+				enhanced[idx] = sig
+				kept[idx] = true
+				return
+			}
+			switch result.Decision {
+			case "reject", "hold", "sell":
+				// reject=否决买入, hold=建议观望, sell=建议卖出(对买入信号而言都意味着不买入)
+				logger.L().Infof("[智能体辩论] %s 信号被过滤 %s: decision=%s summary=%s",
+					result.Decision, sig.TsCode, result.Decision, result.Summary)
+				return // 过滤, kept 保持 false
+			case "buy":
+				// 按辩论建议的仓位比例调整数量 (PositionPct 0~0.6, 不超过原始目标)
+				if result.PositionPct > 0 && result.PositionPct < 1 {
+					adjustedQty := int(float64(sig.TargetQty) * result.PositionPct)
+					if adjustedQty > 0 && adjustedQty <= sig.TargetQty {
+						sig.TargetQty = adjustedQty
+					}
+				}
+				sig.Reason = fmt.Sprintf("%s | LLM辩论: %s", sig.Reason, result.Summary)
+				sig.Reason = appendStopPriceReason(sig.Reason, result.StopPrice)
+				sig.Strength = result.Confidence
+				enhanced[idx] = sig
+				kept[idx] = true
+			default:
+				// LLM 输出不可控, 未知决策与旧行为一致保留原信号 (不静默丢单)
+				logger.L().Warnw("[智能体辩论] 未知决策, 保留原信号", "decision", result.Decision, "ts_code", sig.TsCode)
+				enhanced[idx] = sig
+				kept[idx] = true
+			}
+		}(i, sig)
 	}
-	return enhanced
+	wg.Wait()
+
+	out := make([]model.Signal, 0, len(signals))
+	for i := range signals {
+		if kept[i] {
+			out = append(out, enhanced[i])
+		}
+	}
+	return out
 }
 
 func (o *DebateOrchestrator) buildContext(date, tsCode string, stockNames map[string]string, bars map[string]*model.Bar, positions map[string]*model.Position, totalAsset float64, marketBars map[string]*model.Bar) *DebateContext {

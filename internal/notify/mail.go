@@ -21,7 +21,7 @@ const mailSMTPAddr = "smtp.qq.com:465"
 const mailSMTPHost = "smtp.qq.com"
 
 // MailNotifier QQ 邮箱邮件通知器
-// 未启用时所有发送调用降级为 no-op, 调用方无需判空 (与 FeishuNotifier 一致)
+// 未启用时所有发送调用降级为 no-op, 调用方无需判空
 type MailNotifier struct {
 	enabled  bool   // 是否启用邮件通知
 	from     string // 发件邮箱 (即收件人)
@@ -44,10 +44,24 @@ func (n *MailNotifier) Enabled() bool {
 
 // Send 发送纯文本邮件 (主题=title, 收件人=发件人)
 func (n *MailNotifier) Send(title, text string) error {
+	return n.send(title, text, false)
+}
+
+// SendHTML 发送 HTML 邮件 (主题=title, 收件人=发件人)
+// 用于盘前总结/日报等需要排版的通知, 内容必须为完整或片段 HTML
+func (n *MailNotifier) SendHTML(title, htmlBody string) error {
+	return n.send(title, htmlBody, true)
+}
+
+// send 统一发送入口
+func (n *MailNotifier) send(title, body string, html bool) error {
 	if !n.Enabled() {
 		return nil
 	}
-	msg := buildMailMessage(n.from, title, text)
+	msg := buildMailMessage(n.from, title, body)
+	if html {
+		msg = buildHTMLMailMessage(n.from, title, body)
+	}
 	if err := sendSMTP(mailSMTPAddr, mailSMTPHost, true, n.from, n.password, n.from, msg); err != nil {
 		return fmt.Errorf("发送邮件失败: %w", err)
 	}
@@ -55,8 +69,18 @@ func (n *MailNotifier) Send(title, text string) error {
 	return nil
 }
 
-// buildMailMessage 构建纯文本邮件 (RFC 5322 最小集)
+// buildMailMessage 构建纯文本邮件 (RFC 5322 最小集, 正文含标题行)
 func buildMailMessage(from, title, text string) string {
+	return buildMailMessageWithContentType(from, title, title+"\n\n"+text, "text/plain; charset=UTF-8")
+}
+
+// buildHTMLMailMessage 构建 HTML 邮件 (RFC 5322 最小集)
+func buildHTMLMailMessage(from, title, htmlBody string) string {
+	return buildMailMessageWithContentType(from, title, htmlBody, "text/html; charset=UTF-8")
+}
+
+// buildMailMessageWithContentType 构建邮件 (RFC 5322 最小集)
+func buildMailMessageWithContentType(from, title, body, contentType string) string {
 	// Subject 含换行会破坏邮件头结构, 统一压平
 	flatTitle := strings.NewReplacer("\r", " ", "\n", " ").Replace(title)
 	var b strings.Builder
@@ -65,9 +89,9 @@ func buildMailMessage(from, title, text string) string {
 	fmt.Fprintf(&b, "Subject: %s\r\n", mime.QEncoding.Encode("utf-8", flatTitle))
 	fmt.Fprintf(&b, "Date: %s\r\n", time.Now().Format(time.RFC1123Z))
 	fmt.Fprintf(&b, "MIME-Version: 1.0\r\n")
-	fmt.Fprintf(&b, "Content-Type: text/plain; charset=UTF-8\r\n")
+	fmt.Fprintf(&b, "Content-Type: %s\r\n", contentType)
 	b.WriteString("\r\n")
-	b.WriteString(title + "\n\n" + text)
+	b.WriteString(body)
 	return b.String()
 }
 

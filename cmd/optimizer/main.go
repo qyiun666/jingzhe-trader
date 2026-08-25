@@ -22,6 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime"
 	"sort"
 	"time"
 
@@ -53,6 +54,7 @@ func main() {
 	topN := flag.Int("top", 10, "输出前N个最优结果")
 	walkForward := flag.Bool("walkforward", false, "启用 walk-forward 样本外验证模式")
 	folds := flag.Int("folds", 3, "walk-forward 分段数 (仅 -walkforward 时生效)")
+	parallel := flag.Int("parallel", defaultParallelWorkers(), "并行回测 worker 数 (0=串行)")
 	flag.Parse()
 
 	// 1. 加载配置
@@ -80,7 +82,7 @@ func main() {
 
 	// Walk-Forward 样本外验证模式: 切窗后在每段训练窗网格搜索、测试窗样本外评估
 	if *walkForward {
-		runWalkForward(cfg, *strategyName, *startDate, *endDate, *capital, universe, grid, *folds)
+		runWalkForward(cfg, *strategyName, *startDate, *endDate, *capital, universe, grid, *folds, *parallel)
 		return
 	}
 
@@ -96,20 +98,12 @@ func main() {
 	fmt.Printf("有效组合: %d (已剔除 short>=long)\n", total)
 	fmt.Printf("==================================\n\n")
 
-	// 5. 遍历所有参数组合运行回测
-	var results []OptResult
-	idx := 0
+	// 5. 并行遍历所有参数组合运行回测 (结果按组合顺序收集, 与串行输出一致)
 	start := time.Now()
-
-	for _, c := range grid.combos() {
-		sp, lp, pp := c[0].(int), c[1].(int), c[2].(float64)
-		idx++
-		fmt.Printf("\r[%d/%d] 测试: short=%-2d long=%-2d pos=%.0f%% ...", idx, total, sp, lp, pp*100)
-		results = append(results, runSingleBacktest(cfg, *strategyName, *startDate, *endDate, *capital, universe, sp, lp, pp))
-	}
+	results := runParallelBacktests(cfg, *strategyName, *startDate, *endDate, *capital, universe, grid.combos(), *parallel)
 
 	elapsed := time.Since(start)
-	fmt.Printf("\r完成: %d 组合, 耗时 %s                      \n\n", idx, elapsed.Truncate(time.Second))
+	fmt.Printf("\r完成: %d 组合, 耗时 %s                      \n\n", len(results), elapsed.Truncate(time.Second))
 
 	// 6. 过滤掉出错的组合
 	valid := make([]OptResult, 0, len(results))
@@ -141,6 +135,15 @@ func main() {
 		func(a, b OptResult) bool { return a.AnnualReturn > b.AnnualReturn })
 	printTopN("按最大回撤排序 (越小越好)", valid, *topN,
 		func(a, b OptResult) bool { return a.MaxDrawdown < b.MaxDrawdown })
+}
+
+// defaultParallelWorkers 默认并行 worker 数: min(CPU核数, 8)
+func defaultParallelWorkers() int {
+	n := runtime.NumCPU()
+	if n > 8 {
+		return 8
+	}
+	return n
 }
 
 // printTopN 按指定维度排序后输出 TOP N

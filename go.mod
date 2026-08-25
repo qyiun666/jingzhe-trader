@@ -5,8 +5,10 @@ go 1.25.5
 require (
 	github.com/jmoiron/sqlx v1.4.0
 	github.com/mark3labs/mcp-go v0.58.0
+	github.com/markcheno/go-talib v0.0.0-20260617004048-4ff5e103edd9
 	github.com/spf13/viper v1.21.0
 	go.uber.org/zap v1.28.0
+	golang.org/x/time v0.15.0
 	modernc.org/sqlite v1.53.0
 )
 

@@ -3,6 +3,7 @@ package dataloader
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -54,6 +55,11 @@ func New(cfg *config.Config, db *sqlx.DB) *Loader {
 		portfolioRepo: store.NewPortfolioRepo(db),
 	}
 }
+
+// dataloaderConcurrency 数据同步并发 worker 数
+// 收益来自 tushare HTTP 请求往返并行 (限流由 tushare.Client 令牌桶统一控制)
+// 写入受 SQLite 单连接 (SetMaxOpenConns(1)) 串行化, 不产生额外锁竞争
+const dataloaderConcurrency = 4
 
 // Run 执行数据同步 (核心 + 可选项)
 func (l *Loader) Run(opts Options) error {
@@ -113,7 +119,7 @@ func (l *Loader) syncStockList() {
 	logger.L().Infof("股票列表同步完成: %d 只", len(stocks))
 }
 
-// syncDailyData 按交易日同步日线/涨跌停/基本面/ETF
+// syncDailyData 按交易日同步日线/涨跌停/基本面/ETF (交易日间并行拉取)
 // 除增量同步外, 每个交易日重拉最近 reSyncTradeDays 个交易日 (UPSERT覆盖),
 // 以吸收 tushare 对近期数据的更正 (分红/停复牌/行情修订)
 func (l *Loader) syncDailyData(tradeCals []model.TradeCal) {
@@ -125,32 +131,56 @@ func (l *Loader) syncDailyData(tradeCals []model.TradeCal) {
 			reSyncFrom = t.AddDate(0, 0, -14).Format("20060102") // 自然日回退14天 ≈ 10个交易日
 		}
 	}
+
+	// 预热 watchCodes 缓存: 并发期间各 goroutine 只读共享 map, 避免写入竞争
+	l.watchCodes()
+
+	var mu sync.Mutex
 	syncedCount := 0
 	reSyncedCount := 0
 
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, dataloaderConcurrency)
 	for _, cal := range tradeCals {
-		if lastDate != "" && cal.CalDate <= lastDate {
-			if reSyncFrom != "" && cal.CalDate >= reSyncFrom {
+		calDate := cal.CalDate
+		isResync := false
+		if lastDate != "" && calDate <= lastDate {
+			if reSyncFrom != "" && calDate >= reSyncFrom {
 				// 重拉窗口内: 覆盖式刷新近期数据 (吸收数据源更正)
-				reSyncedCount++
-				logger.L().Debugf("重拉 %s 日线(覆盖更正)...", cal.CalDate)
+				isResync = true
 			} else {
 				continue // 跳过历史日期
 			}
-		} else {
-			logger.L().Infof("同步 %s 日线...", cal.CalDate)
 		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
-		if !l.syncOneDayBars(cal.CalDate) {
-			continue
-		}
-		l.syncOneDayExtras(cal.CalDate)
+			if isResync {
+				mu.Lock()
+				reSyncedCount++
+				mu.Unlock()
+				logger.L().Debugf("重拉 %s 日线(覆盖更正)...", calDate)
+			} else {
+				logger.L().Infof("同步 %s 日线...", calDate)
+			}
 
-		syncedCount++
-		if syncedCount%10 == 0 {
-			logger.L().Infof("已同步 %d 个交易日", syncedCount)
-		}
+			if !l.syncOneDayBars(calDate) {
+				return
+			}
+			l.syncOneDayExtras(calDate)
+
+			mu.Lock()
+			syncedCount++
+			if (syncedCount+reSyncedCount)%10 == 0 {
+				logger.L().Infof("已同步 %d 个交易日", syncedCount+reSyncedCount)
+			}
+			mu.Unlock()
+		}()
 	}
+	wg.Wait()
 	logger.L().Infof("日线行情同步完成, 新增 %d 个交易日, 重拉覆盖 %d 个交易日", syncedCount, reSyncedCount)
 }
 
@@ -294,34 +324,45 @@ func (l *Loader) SyncCalendarOnly(start, end string) error {
 	return nil
 }
 
-// syncIndexHistory 同步 watchlist 中指数的历史日线 (按代码拉取, 不依赖交易日遍历)
+// syncIndexHistory 同步 watchlist 中指数的历史日线 (按代码并行拉取, 不依赖交易日遍历)
 func (l *Loader) syncIndexHistory(start, end string) {
 	indexCodes := l.indexCodes()
 	if len(indexCodes) == 0 {
 		return
 	}
 	logger.L().Infof("=== 同步指数历史日线 (%d个) ===", len(indexCodes))
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, dataloaderConcurrency)
 	for code := range indexCodes {
-		bars, err := l.ts.DailyByCode(code, start, end)
-		if err != nil {
-			logger.L().Errorf("获取 %s 指数日线失败: %v", code, err)
-			continue
-		}
-		// DailyByCode 用的是 daily 接口, 指数需要 index_daily
-		// 这里直接用 IndexDailyByCode
-		if len(bars) == 0 {
-			bars, err = l.ts.IndexDailyByCode(code, start, end)
+		wg.Add(1)
+		go func(code string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			bars, err := l.ts.DailyByCode(code, start, end)
 			if err != nil {
-				logger.L().Errorf("获取 %s 指数日线(index)失败: %v", code, err)
-				continue
+				logger.L().Errorf("获取 %s 指数日线失败: %v", code, err)
+				return
 			}
-		}
-		if err := l.barRepo.BatchInsert(bars); err != nil {
-			logger.L().Errorf("存储 %s 指数日线失败: %v", code, err)
-			continue
-		}
-		logger.L().Infof("  %s: %d 条", code, len(bars))
+			// DailyByCode 用的是 daily 接口, 指数需要 index_daily
+			// 这里直接用 IndexDailyByCode
+			if len(bars) == 0 {
+				bars, err = l.ts.IndexDailyByCode(code, start, end)
+				if err != nil {
+					logger.L().Errorf("获取 %s 指数日线(index)失败: %v", code, err)
+					return
+				}
+			}
+			if err := l.barRepo.BatchInsert(bars); err != nil {
+				logger.L().Errorf("存储 %s 指数日线失败: %v", code, err)
+				return
+			}
+			logger.L().Infof("  %s: %d 条", code, len(bars))
+		}(code)
 	}
+	wg.Wait()
 }
 
 // watchCodes 获取关注股票代码集合(实例级缓存)

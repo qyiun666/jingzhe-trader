@@ -74,7 +74,7 @@ func (s *Server) registerTools() {
 		mcp.WithString("date", mcp.Description("Date in YYYYMMDD format; defaults to latest trade date")))
 
 	s.addTool("get_agent_alerts",
-		"Get recent or unread agent alerts (notifications persisted from Feishu).",
+		"Get recent or unread agent alerts (notifications persisted to the alert store).",
 		s.handleGetAgentAlerts,
 		mcp.WithBoolean("unread_only", mcp.Description("Only return unread alerts"), mcp.DefaultBool(false)),
 		mcp.WithString("date", mcp.Description("Optional date filter in YYYYMMDD format")))

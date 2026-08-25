@@ -34,7 +34,7 @@ type AgentBrief struct {
 	DecisionChanges   []agent.DecisionChange `json:"decision_changes"`    // 决策变更记录
 	PlanStatusSummary PlanStatusSummary      `json:"plan_status_summary"` // 交易计划状态汇总
 	TaskCompleted     map[string]bool        `json:"task_completed"`      // 当日各任务是否已完成
-	Goal              *goal.Status           `json:"goal,omitempty"`      // 季度目标状态 (目标跟踪启用时)
+	Goal              *goal.Status           `json:"goal,omitempty"`           // 季度目标状态 (目标跟踪启用时)
 }
 
 // PlanStatusSummary 交易计划状态汇总
@@ -104,7 +104,7 @@ func (s *Service) BuildAgentBrief() *AgentBrief {
 	}
 
 	// 任务健康度
-	for _, name := range []string{"data_update", "signal", "report", "intraday_monitor", "retention"} {
+	for _, name := range []string{"data_update", "signal", "report", "intraday_monitor", "retention", "premarket"} {
 		if run, jerr := s.jobRepo.LastSuccess(name); jerr == nil && run != nil {
 			brief.Jobs[name] = run.FinishedAt
 		}
@@ -148,7 +148,7 @@ func (s *Service) buildPlanStatusSummary(plans []store.TradePlan) PlanStatusSumm
 // buildTaskCompletedStatus 构建当日任务完成状态
 func (s *Service) buildTaskCompletedStatus(today string) map[string]bool {
 	status := map[string]bool{}
-	for _, name := range []string{"data_update", "signal", "report", "intraday_monitor", "retention"} {
+	for _, name := range []string{"data_update", "signal", "report", "intraday_monitor", "retention", "premarket"} {
 		done, err := s.jobRepo.HasSucceeded(name, today)
 		if err == nil {
 			status[name] = done
@@ -218,24 +218,17 @@ func (s *Service) ConfirmPlan(id int64) (*store.TradePlan, error) {
 	}
 
 	status := store.PlanStatusConfirmed
-	// 自动执行: 仅 QMT 实盘模式下真实下单; 下单结果飞书/邮件推送
+	// 自动执行: 仅 QMT 实盘模式下真实下单; 下单结果邮件推送
 	if s.cfg.Trading.AutoExecute && s.cfg.Broker.Type == "qmt" {
-		notifier := notify.NewFeishuNotifier(s.cfg.Feishu.WebhookURL)
 		mailer := notify.NewMailNotifier(s.cfg.Mail.Enabled, s.cfg.Mail.From, s.cfg.Mail.Password)
 		if err := s.executePlanViaQMT(plan); err != nil {
 			msg := fmt.Sprintf("%s %s %d股 @%.2f: %v", plan.TsCode, plan.Direction, plan.Qty, plan.RefPrice, err)
-			if nerr := notifier.SendText("❌ 惊蛰下单失败\n" + msg); nerr != nil {
-				logger.L().Warnw("飞书通知发送失败", "err", nerr)
-			}
 			if nerr := mailer.Send("❌ 惊蛰下单失败", msg); nerr != nil {
 				logger.L().Warnw("邮件通知发送失败", "err", nerr)
 			}
 			return nil, fmt.Errorf("QMT下单失败: %w", err)
 		}
 		msg := fmt.Sprintf("%s %s %d股 @%.2f (%s)", plan.TsCode, plan.Direction, plan.Qty, plan.RefPrice, plan.Reason)
-		if nerr := notifier.SendText("✅ 惊蛰下单成功\n" + msg); nerr != nil {
-			logger.L().Warnw("飞书通知发送失败", "err", nerr)
-		}
 		if nerr := mailer.Send("✅ 惊蛰下单成功", msg); nerr != nil {
 			logger.L().Warnw("邮件通知发送失败", "err", nerr)
 		}
@@ -307,7 +300,7 @@ func (s *Service) BuildHealthStatus() *HealthStatus {
 		}
 	}
 	jobRepo := store.NewJobRepo(s.db)
-	for _, name := range []string{"data_update", "signal", "report", "intraday_monitor", "retention"} {
+	for _, name := range []string{"data_update", "signal", "report", "intraday_monitor", "retention", "premarket"} {
 		if run, err := jobRepo.LastSuccess(name); err == nil && run != nil {
 			hs.Jobs[name] = run.FinishedAt
 		}

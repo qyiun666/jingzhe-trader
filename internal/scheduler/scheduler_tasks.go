@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"jingzhe-trader/internal/api"
 	"jingzhe-trader/internal/broker"
 	"jingzhe-trader/internal/goal"
 	"jingzhe-trader/internal/model"
@@ -31,7 +30,7 @@ func (s *Scheduler) runDataUpdate(date string) error {
 	return nil
 }
 
-// checkGoalMode 评估季度目标状态, 风险模式变化时飞书告警并记录
+// checkGoalMode 评估季度目标状态, 风险模式变化时告警并记录
 func (s *Scheduler) checkGoalMode(date string) {
 	st, err := s.svc.GoalStatus(date)
 	if err != nil || st == nil {
@@ -103,28 +102,36 @@ func (s *Scheduler) runReconcile(date string) error {
 	return nil
 }
 
-// runReport 15:45 日报生成 + 飞书/邮件推送
-// 增强通知: 日报推送后追加操作提醒
+// runPremarket 09:00 盘前总结邮件 (昨日复盘 + 当前持仓 + 今日计划 + 目标状态)
+// 数据来自上一交易日收盘: 盘前当日行情尚未产生
+func (s *Scheduler) runPremarket(date string) error {
+	sum := s.svc.BuildPremarketSummary()
+	if !s.mailer.Enabled() {
+		logger.L().Info("邮件未配置, 盘前总结仅记录")
+		return nil
+	}
+	title := fmt.Sprintf("📊 惊蛰盘前总结 %s", sum.DataDate)
+	if err := s.mailer.SendHTML(title, buildPremarketHTML(sum)); err != nil {
+		logger.L().Warnw("盘前总结邮件发送失败", "err", err)
+		return err
+	}
+	logger.L().Infow("盘前总结邮件已发送", "data_date", sum.DataDate, "plans", len(sum.OpenPlans))
+	return nil
+}
+
+// runReport 18:00 当天总结 + 日报邮件 (含当日告警汇总)
+// 增强通知: 日报推送后追加操作提醒 (落库, Agent 可读)
 func (s *Scheduler) runReport(date string) error {
 	daily, err := s.svc.RunDaily(date, s.svc.SelectStrategy(date))
 	if err != nil {
 		return fmt.Errorf("生成日报失败: %w", err)
 	}
-	if !s.notifier.Enabled() && !s.mailer.Enabled() {
-		logger.L().Info("飞书与邮件均未配置, 日报仅落库不推送")
-		return nil
+	// 当日告警汇总 (任务失败/数据更新/对账等过程通知统一进日报, 不单独打扰)
+	var alerts []store.AgentAlert
+	if list, aerr := store.NewAlertRepo(s.db).GetByDate(date); aerr == nil {
+		alerts = list
 	}
-	if s.notifier.Enabled() {
-		if err := s.notifier.SendCard(api.BuildFeishuDailyCard(daily)); err != nil {
-			return fmt.Errorf("推送日报失败: %w", err)
-		}
-	}
-	if s.mailer.Enabled() {
-		if err := s.mailer.Send("操盘报告 "+date, buildDailyMailText(daily)); err != nil {
-			logger.L().Warnw("日报邮件发送失败", "err", err)
-		}
-	}
-	// 追加操作提醒: 检查是否有待处理计划
+	// 追加操作提醒: 检查是否有待处理计划 (先落库, 与邮件推送解耦; Agent 可离线读取)
 	if openPlans, err := s.planRepo.GetOpenPlans(); err == nil && len(openPlans) > 0 {
 		pending := 0
 		confirmed := 0
@@ -137,7 +144,7 @@ func (s *Scheduler) runReport(date string) error {
 			}
 		}
 		if pending > 0 || confirmed > 0 {
-			reminder := fmt.Sprintf("📊 日报已推送, 请查看:\n")
+			reminder := fmt.Sprintf("📊 日报已生成, 请查看:\n")
 			if pending > 0 {
 				reminder += fmt.Sprintf("⏸️ %d条计划待确认 (POST /api/plan/confirm)\n", pending)
 			}
@@ -148,23 +155,14 @@ func (s *Scheduler) runReport(date string) error {
 			s.alert("📌 惊蛰操作提醒", reminder)
 		}
 	}
+	if !s.mailer.Enabled() {
+		logger.L().Info("邮件未配置, 日报仅落库不推送")
+		return nil
+	}
+	if err := s.mailer.SendHTML("📊 惊蛰日报 "+date, buildDailyMailHTML(daily, alerts)); err != nil {
+		logger.L().Warnw("日报邮件发送失败", "err", err)
+	}
 	return nil
-}
-
-// buildDailyMailText 构造日报邮件摘要 (纯文本)
-func buildDailyMailText(daily *api.DailyReportJSON) string {
-	var lines []string
-	if daily.Portfolio != nil {
-		lines = append(lines, fmt.Sprintf("总资产: %.2f  当日盈亏: %.2f%%", daily.Portfolio.TotalAsset, daily.Portfolio.DailyPnLPct))
-	}
-	if daily.Rebalance != nil {
-		lines = append(lines, fmt.Sprintf("必卖: %d条  必买: %d条  持有提醒: %d条",
-			len(daily.Rebalance.SellList), len(daily.Rebalance.BuyList), len(daily.Rebalance.HoldList)))
-	}
-	if len(lines) == 0 {
-		return fmt.Sprintf("操盘报告 %s: 详见系统日报", daily.Date)
-	}
-	return strings.Join(lines, "\n")
 }
 
 // runSettleT1 每日 09:25 T+1 持仓结转 (昨日买入转为可卖)
@@ -176,7 +174,7 @@ func (s *Scheduler) runSettleT1(date string) error {
 	return nil
 }
 
-// runIntradayMonitor 盘中止损监控: 实时价 → 止损检查 → 紧急卖出计划 + 飞书告警
+// runIntradayMonitor 盘中止损监控: 实时价 → 止损检查 → 紧急卖出计划 + 告警
 func (s *Scheduler) runIntradayMonitor(date string) error {
 	portRepo := store.NewPortfolioRepo(s.db)
 	positions, err := portRepo.GetAllPositions()
@@ -261,6 +259,10 @@ func (s *Scheduler) runIntradayMonitor(date string) error {
 			msg += fmt.Sprintf("\n⚠️ 现价已触及跌停价 %.2f, 卖出单可能无法成交, 请立即人工处理!", limit.DownLimit)
 		}
 		s.alert("🚨 惊蛰盘中止损告警", msg)
+		// 止损需要立即操作, 即时邮件 (需操作的通知单独发; 其余告警汇总进日报)
+		if serr := s.mailer.Send("🚨 惊蛰盘中止损告警", msg); serr != nil {
+			logger.L().Warnw("止损告警邮件发送失败", "err", serr)
+		}
 	}
 	return nil
 }

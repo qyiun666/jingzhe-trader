@@ -2,7 +2,7 @@
 # 默认配置: 小资金模式 (1万本金)
 # 复制此文件为 config.yaml
 # 密钥类配置建议通过环境变量注入, 不要写入配置文件:
-#   TUSHARE_TOKEN / LLM_API_KEY / JZ_API_TOKEN / FEISHU_WEBHOOK / QMT_SIDECAR_TOKEN
+#   TUSHARE_TOKEN / LLM_API_KEY / JZ_API_TOKEN / QMT_SIDECAR_TOKEN
 # ============================================
 
 # 季度目标跟踪 (核心决策约束)
@@ -134,10 +134,11 @@ server:
 # 内置调度器 (server 常驻进程自动执行, Agent 只需读 API)
 scheduler:
   enabled: true
+  premarket_time: "09:00"    # 盘前总结邮件 (持仓/今日计划/目标状态)
   data_update_time: "15:10"  # 收盘后更新行情数据
   screener_time: "15:15"     # 全市场自动选股 (数据更新后, 信号生成前)
-  signal_time: "15:30"       # 生成次日交易计划
-  report_time: "15:45"       # 日报生成+飞书推送
+  signal_time: "18:00"       # 生成次日交易计划
+  report_time: "18:00"       # 当天总结+日报邮件 (含当日告警汇总)
   intraday:
     enabled: true            # 盘中止损监控
     interval_min: 5
@@ -176,11 +177,6 @@ screener:
   min_circ_mv: 50000.0       # 最小流通市值(万元) ≈ 50亿
   max_circ_mv: 0.0           # 最大流通市值(万元) 0=不限
 
-# 飞书通知
-feishu:
-  webhook_url: ""            # 建议用环境变量 FEISHU_WEBHOOK 注入
-  push_daily: true
-  push_time: "15:30"
 
 # 邮件通知 (QQ 邮箱, smtp.qq.com:465, 发件人即收件人)
 # 授权码通过环境变量 JZ_MAIL_PASSWORD 注入, 禁止写入配置文件
@@ -198,3 +194,5 @@ llm:
   max_tokens: 2048            # 输出上限, 过小会导致 JSON 被截断
   timeout_seconds: 30         # HTTP 请求超时
   json_mode: true             # 强制 JSON 输出 (response_format), 不支持的兼容端点可关闭
+  max_concurrency: 3          # 并发在飞请求上限 (多智能体辩论并行时生效)
+  rps: 2                      # 每秒请求数上限 (0=不限速, DeepSeek 免费档建议 2)

@@ -19,7 +19,7 @@
 
 **部署**: `git clone` → 环境变量(`.env`) → `go build` → `systemd` 自启 → cron 健康检查
 
-**密钥**: 全部走环境变量（`TUSHARE_TOKEN` / `LLM_API_KEY` / `JZ_API_TOKEN` / `FEISHU_WEBHOOK`），config.yaml 已 gitignore 不提交
+**密钥**: 全部走环境变量（`TUSHARE_TOKEN` / `LLM_API_KEY` / `JZ_API_TOKEN`），config.yaml 已 gitignore 不提交
 
 **核心 MCP 工具**（`get_*` 为读工具，其余为写工具）：
 
@@ -49,14 +49,15 @@ AI Agent（如 Hermes / Claude / Cursor）通过 **MCP over Streamable HTTP** �
                       ┌──────────────────────────────────────────────────┐
                       │                cmd/server (24h常驻)               │
                       │                                                  │
-  Tushare ──────────▶ │  调度器 (交易日自动执行, 每次任务后飞书通知)         │
-  腾讯免费行情 ──────▶ │   09:25 T+1持仓结转 (昨日买入转可卖)                │
+  Tushare ──────────▶ │  调度器 (交易日自动执行, 每次任务后邮件通知)         │
+  腾讯免费行情 ──────▶ │   09:00 盘前总结邮件 (持仓/今日计划/目标)           │
+                      │   09:25 T+1持仓结转 (昨日买入转可卖)                │
                       │   15:10 数据更新 (进程内 dataloader) + 实盘账户快照  │
-                      │         + 季度目标评估 (模式切换飞书告警)            │
+                      │         + 季度目标评估 (模式切换告警)            │
                       │   15:15 全市场选股 → 候选股票自动入池 + 历史K线同步  │
-  QMT sidecar ◀─────▶ │   15:30 EOD信号 → 多智能体辩论 → trade_plan 表    │
+  QMT sidecar ◀─────▶ │   18:00 EOD信号 → 多智能体辩论 → trade_plan 表    │
                       │   15:35 对账 (QMT模式) + 成交回报轮询落库           │
-                      │   15:45 日报生成 + 飞书推送 + 操作提醒              │
+                      │   18:00 当天总结 + 日报邮件 (含当日告警汇总)        │
                       │   盘中每5分钟 实时价止损监控 → 紧急计划+告警         │
                       │   16:30 数据保留清理 + WAL checkpoint              │
                       │                                                  │
@@ -96,17 +97,17 @@ AI Agent（如 Hermes / Claude / Cursor）通过 **MCP over Streamable HTTP** �
 
 **自动调节规则**：回撤预算消耗 ≥70% → 总仓位 ×0.6 收紧；预算耗尽 → 仓位压至 20% + 止损 5%（防守）；目标提前达成 → 仓位 ×0.5 锁利。
 
-每日数据更新后自动评估，**风险模式切换时飞书告警**；状态可查 `get_goal_status`，`get_agent_brief` 返回的 `goal` 字段是 Agent 决策核心约束。数据源为每日实盘账户快照（account_snapshot，run_id=live)，季初基准取季度开始前最后一个快照，无快照时退回初始资金。
+每日数据更新后自动评估，**风险模式切换时告警**；状态可查 `get_goal_status`，`get_agent_brief` 返回的 `goal` 字段是 Agent 决策核心约束。数据源为每日实盘账户快照（account_snapshot，run_id=live)，季初基准取季度开始前最后一个快照，无快照时退回初始资金。
 
 ## 核心特点
 
 - **小资金友好** — 1 万本金即可运行；按资金量级自适应持仓数与最小交易额（5 元最低佣金下默认单笔 ≥5000 元保证费率 ≤0.1%）
 - **回测即实盘** — 回测/模拟/实盘共用同一条 `信号 → 风控 → 下单 → 落库` 管道，回测结果不虚高
 - **风控内建** — 止损/止盈信号优先执行、单票/总仓位/板块敞口限制、含手续费的买入资金检查
-- **全自动闭环** — 内置调度器：数据更新 → EOD 信号 → 对账 → 日报飞书推送 → 盘中止损监控 → 数据自动清理
+- **全自动闭环** — 内置调度器：数据更新 → EOD 信号 → 对账 → 日报邮件推送 → 盘中止损监控 → 数据自动清理
 - **自动选股** — 每日全市场扫描（4000+股票），多维度筛选 TopN 候选自动入池，无需手动维护股票池
 - **常驻稳定** — 任务 panic 隔离、job_run 防重复/启动补跑、优雅关机、WAL checkpoint、共享仓储实例
-- **季度目标跟踪** — 日历季度收益目标 + 回撤预算，超预算自动收紧风险敞口（只收紧不放松），模式切换飞书告警
+- **季度目标跟踪** — 日历季度收益目标 + 回撤预算，超预算自动收紧风险敞口（只收紧不放松），模式切换告警
 - **数据可信** — 全链路前复权、真实 T+1 交收、涨跌停/滑点/最低佣金建模、近期数据自动重拉吸收更正
 - **多策略支持** — 均线交叉 / MACD / 布林带突破 / 多因子选股 / 日内做T，按市况动态切换，成交归因到策略
 - **DeepSeek 多智能体辩论** — 仅支持 DeepSeek：4位分析师并行 → 多空辩论 → 风险经理裁决，二次验证买入信号 + 决策变更追踪（LLM 失败时明确告警不降级）
@@ -131,14 +132,13 @@ go build -o bin/optimizer ./cmd/optimizer
 cp config/config.example.yaml config/config.yaml
 ```
 
-> **安全模型**: `config/config.yaml` 已在 `.gitignore` 中，**永远不会提交到 Git**。所有密钥（Tushare Token、DeepSeek Key、API Token、飞书 Webhook）一律通过环境变量注入，源码和配置文件均不含任何密钥。部署时创建 `.env` 文件（同样 gitignore），systemd/cron 自动读取。
+> **安全模型**: `config/config.yaml` 已在 `.gitignore` 中，**永远不会提交到 Git**。所有密钥（Tushare Token、DeepSeek Key、API Token、SMTP 授权码）一律通过环境变量注入，源码和配置文件均不含任何密钥。部署时创建 `.env` 文件（同样 gitignore），systemd/cron 自动读取。
 
 **密钥一律走环境变量，不要写进配置文件**（配置文件中的同名项会被环境变量覆盖）：
 
 ```bash
 export TUSHARE_TOKEN=你的tushare token       # 必需, 行情数据源
 export JZ_API_TOKEN=随机长字符串              # 推荐, API鉴权token
-export FEISHU_WEBHOOK=飞书机器人webhook       # 可选, 日报/告警推送
 export LLM_API_KEY=deepseek密钥              # 可选, 新闻分析+多智能体辩论
 export QMT_SIDECAR_TOKEN=随机长字符串         # QMT实盘时, sidecar鉴权
 ```
@@ -208,7 +208,7 @@ curl http://127.0.0.1:11270/health              # 健康检查 (无需鉴权)
 | `get_agent_brief` | **Agent 首选**：计划+持仓+市场+健康度+辩论结果+决策变更+任务状态 一次拿全 |
 | `get_agent_dashboard` | **Agent 仪表盘**：未读通知+今日通知+计划+辩论+变更+任务状态 汇总视图 |
 | `get_agent_changes` | 决策变更检测：辩论结果对比 + 计划状态变更 + 任务完成状态 |
-| `get_agent_alerts` | 通知存储：飞书告警同时落库，Agent 可离线读取/标记已读 |
+| `get_agent_alerts` | 通知存储：告警同时落库，Agent 可离线读取/标记已读 |
 | `get_plans` | 交易计划列表（不传 date 返回全部待处理） |
 | `get_daily_report` | 每日操盘报告（汇总） |
 | `get_positions` | 持仓诊断 |
@@ -269,12 +269,12 @@ export LLM_API_KEY=sk-your-deepseek-key
 
 ### 通知存储机制
 
-调度器每次执行任务后的飞书通知**同时落库 SQLite**（`agent_alert` 表），即使飞书未配置或发送失败，Agent 也能通过 MCP 读取：
+调度器每次执行任务后的通知**同时落库 SQLite**（`agent_alert` 表），即使邮件未配置或发送失败，Agent 也能通过 MCP 读取：
 
 ```
 调度器任务完成 → alert() 方法
-  ├─ 1. 落库 agent_alert 表 (始终执行, 不受飞书配置影响)
-  └─ 2. 飞书推送 (可选, 失败不影响流程)
+  ├─ 1. 落库 agent_alert 表 (始终执行, 不受邮件配置影响)
+  └─ 2. 邮件推送 (可选, 失败不影响流程)
          ↓
 Agent 调用 get_agent_alerts {"unread_only": true}
   → 读取未读通知 → 通知用户 → mark_alerts_read {"all": true} 标记已读
@@ -294,17 +294,18 @@ export JZ_API_TOKEN="your-random-token"    # 服务端: config 留空则从环�
 
 | 时间 | 任务 |
 |---|---|
-| 00:00-09:25 | 常驻运行（systemd 保活），调度器每 30 秒检查到点任务 |
+| 00:00-09:00 | 常驻运行（systemd 保活），调度器每 30 秒检查到点任务 |
+| 09:00 | 盘前总结邮件（昨日市场概况 + 当前持仓 + 今日计划 + 季度目标） |
 | 09:25 | T+1 持仓结转 + 盘中止损监控就绪 |
 | 09:30-15:00 | 盘中监控（每 5 分钟，触发止损 → 紧急计划 + 告警） |
 | 15:10 | 数据更新（Tushare 行情入库）+ 实盘账户快照 + 季度目标评估 |
 | 15:15 | 全市场自动选股 → 候选入池 + 历史K线同步 |
-| 15:30 | EOD 信号生成 → 多智能体辩论 → 交易计划落库 |
+| 18:00 | EOD 信号生成 → 多智能体辩论 → 交易计划落库 |
 | 15:35 | 对账（仅 QMT 实盘） |
-| 15:45 | 日报生成 + 飞书推送 |
+| 18:00 | 当天总结 + 日报邮件（含当日告警汇总）+ 操作提醒落库 |
 | 16:30 | 数据保留清理 + WAL checkpoint |
 
-所有任务完成后通知**同时落库 + 飞书推送**（无论有无交易计划）；Agent 下次执行时检查 `task_completed` + `plan_status_summary` 确认状态已更新。
+所有任务完成后通知**同时落库 + 邮件推送**（无论有无交易计划）；Agent 下次执行时检查 `task_completed` + `plan_status_summary` 确认状态已更新。
 
 ### 推荐轮询节奏（交易日）
 
@@ -373,7 +374,7 @@ get_agent_brief
 confirm_plan {"id": 12}
 ```
 
-- `broker.type=paper`（默认）：模拟盘立即成交并更新持仓，飞书推送成交回执
+- `broker.type=paper`（默认）：模拟盘立即成交并更新持仓，邮件推送成交回执
 - `broker.type=qmt` + `trading.auto_execute=true`：直接真实下单
 - 否则仅标记 `confirmed`，等人工在券商 App 成交后走第 3 步反馈
 
@@ -419,7 +420,7 @@ get_agent_alerts {"unread_only": true} → 按 level 排序（urgent > warning >
 get_agent_dashboard → 未读通知 + 今日通知 + 待处理计划 + 辩论结果 + 决策变更 + 任务状态
 ```
 
-### 6. 读取飞书通知存档（Agent 核心）
+### 6. 读取通知存档（Agent 核心）
 
 调度器所有通知（信号/日报/止损/告警）都会落库，Agent 读取后通知用户：
 
@@ -478,11 +479,11 @@ get_agent_dashboard
 - 置信度显著变化（>20%）
 - 风险等级变化
 
-变更结果通过 `get_agent_changes` 查询，同时在飞书通知中提示。
+变更结果通过 `get_agent_changes` 查询，同时通过通知落库提示。
 
 ## 自动选股与新闻过滤
 
-系统**完全自动选股**，无需手动维护股票池：启用 `screener.enabled: true` 后，每日 15:15 自动从全市场（4000+股票）筛选 TopN 候选，同步 6 个月历史K线并自动加入策略股票池（15:30 信号生成时与配置池、持仓一并扫描）。当前持仓自动加入扫描范围；`universe.bluechip` / `universe.tech` 可手动补充关注股票（可选，留空则完全依赖自动选股）；`dataloader.filter_mode: true` 时只拉选股结果+持仓+watchlist 的数据，大幅减少数据量。
+系统**完全自动选股**，无需手动维护股票池：启用 `screener.enabled: true` 后，每日 15:15 自动从全市场（4000+股票）筛选 TopN 候选，同步 6 个月历史K线并自动加入策略股票池（18:00 信号生成时与配置池、持仓一并扫描）。当前持仓自动加入扫描范围；`universe.bluechip` / `universe.tech` 可手动补充关注股票（可选，留空则完全依赖自动选股）；`dataloader.filter_mode: true` 时只拉选股结果+持仓+watchlist 的数据，大幅减少数据量。
 
 ### 选股流程
 
@@ -494,8 +495,8 @@ get_agent_dashboard
   3. 多维度筛选 (价格/换手率/PE/PB/市值/ST/新股)
   4. 评分排序 (活跃度+资金关注度+估值吸引力)
   5. Top N 候选 → 同步6个月历史K线 → 结果落库
-  6. 通知落库 + 飞书推送
-15:30 信号生成 (策略扫描: 配置池 + 持仓 + 选股候选)
+  6. 通知落库 + 邮件推送
+18:00 信号生成 (策略扫描: 配置池 + 持仓 + 选股候选)
 ```
 
 ### 筛选条件
@@ -611,7 +612,6 @@ cp config/config.example.yaml config/config.yaml
 cat > /opt/jingzhe-trader/.env <<'EOF'
 TUSHARE_TOKEN=你的tushare_token
 JZ_API_TOKEN=随机长字符串_用于API鉴权
-FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/xxx
 LLM_API_KEY=你的deepseek密钥
 EOF
 chmod 600 /opt/jingzhe-trader/.env      # 仅 owner 可读
@@ -753,7 +753,7 @@ internal/
   strategy/     策略与动态选择器 (实例缓存/SwitchTo手动切换)
   store/        SQLite 仓储 (共享Repo/retention清理/辩论结果/通知存储)
   quote/        盘中实时行情 (腾讯免费源 / QMT)
-  notify/       飞书通知
+  notify/       通知（邮件）
   api/          业务服务层 (被 MCP 层复用)
   mcp/          MCP over Streamable HTTP 对外接口
   dataloader/   Tushare 数据同步 (库化, CLI与调度器共用)

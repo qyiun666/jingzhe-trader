@@ -24,10 +24,11 @@ const (
 	JobIntraday   = "intraday_monitor"
 	JobRetention  = "retention"
 	JobSettleT1   = "settle_t1"
+	JobPremarket  = "premarket"
 )
 
 // JobNames 全部任务名列表 (健康度/变更报告展示用, 新增任务时同步追加)
-var JobNames = []string{JobDataUpdate, JobScreener, JobSignal, JobReconcile, JobReport, JobIntraday, JobRetention, JobSettleT1}
+var JobNames = []string{JobDataUpdate, JobScreener, JobSignal, JobReconcile, JobReport, JobIntraday, JobRetention, JobSettleT1, JobPremarket}
 
 // JobRun 调度任务执行记录
 type JobRun struct {

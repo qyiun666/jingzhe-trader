@@ -320,7 +320,7 @@ func stitchOOS(folds []foldResult) stitchedOOS {
 
 // runWalkForward walk-forward 模式主流程
 func runWalkForward(cfg *config.Config, strategyName, startDate, endDate string,
-	capital float64, universe []string, grid paramGrid, folds int) {
+	capital float64, universe []string, grid paramGrid, folds int, parallelWorkers int) {
 
 	windows, err := splitWalkForwardFolds(startDate, endDate, folds)
 	if err != nil {
@@ -345,25 +345,23 @@ func runWalkForward(cfg *config.Config, strategyName, startDate, endDate string,
 		fmt.Printf("----- 段 %d/%d: 训练 %s~%s  测试 %s~%s -----\n",
 			w.Index, len(windows), w.TrainStart, w.TrainEnd, w.TestStart, w.TestEnd)
 
-		// 1. 训练窗网格搜索
-		var trainResults []OptResult
-		for i, c := range combos {
-			sp, lp, pp := c[0].(int), c[1].(int), c[2].(float64)
-			fmt.Printf("\r  训练窗网格搜索 [%d/%d] short=%-2d long=%-2d pos=%.0f%% ...",
-				i+1, len(combos), sp, lp, pp*100)
-			r := runSingleBacktest(cfg, strategyName, w.TrainStart, w.TrainEnd, capital, universe, sp, lp, pp)
+		// 1. 训练窗网格搜索 (并行, 结果按组合顺序收集)
+		trainResults := runParallelBacktests(cfg, strategyName, w.TrainStart, w.TrainEnd,
+			capital, universe, combos, parallelWorkers)
+		var valid []OptResult
+		for _, r := range trainResults {
 			if r.Err == nil {
-				trainResults = append(trainResults, r)
+				valid = append(valid, r)
 			}
 		}
 		fmt.Println()
-		if len(trainResults) == 0 {
+		if len(valid) == 0 {
 			fmt.Printf("  段 %d 训练窗无有效结果, 跳过\n\n", w.Index)
 			continue
 		}
 
 		// 2. 选样本内最优, 跑测试窗样本外回测
-		best, _ := bestByComposite(trainResults)
+		best, _ := bestByComposite(valid)
 		oos := runSingleBacktest(cfg, strategyName, w.TestStart, w.TestEnd, capital, universe,
 			best.ShortPeriod, best.LongPeriod, best.PositionPct)
 		if oos.Err != nil {
