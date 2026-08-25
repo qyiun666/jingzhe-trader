@@ -18,10 +18,10 @@ type TargetPosition struct {
 
 // RebalanceOrder 调仓指令
 type RebalanceOrder struct {
-	TsCode    string
-	Side      model.Side
-	Qty       int
-	Reason    string
+	TsCode string
+	Side   model.Side
+	Qty    int
+	Reason string
 }
 
 // Manager 组合管理器

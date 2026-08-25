@@ -10,6 +10,7 @@ import (
 
 	"jingzhe-trader/internal/config"
 	"jingzhe-trader/pkg/logger"
+	"jingzhe-trader/pkg/retry"
 )
 
 // Client Tushare API 客户端
@@ -83,7 +84,7 @@ func (c *Client) call(apiName string, params map[string]interface{}, fields stri
 	for attempt := 0; attempt <= retries; attempt++ {
 		// 重试时进行指数退避等待
 		if attempt > 0 {
-			backoff := c.retryInterval * time.Duration(1<<(attempt-1))
+			backoff := retry.Backoff(c.retryInterval, attempt)
 			logger.L().Warnf("tushare %s 第 %d 次重试, 等待 %s", apiName, attempt, backoff)
 			time.Sleep(backoff)
 		}

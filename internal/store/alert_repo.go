@@ -9,10 +9,10 @@ import (
 
 // AlertLevel 通知级别
 const (
-	AlertLevelInfo     = "info"     // 常规信息
-	AlertLevelWarning  = "warning"  // 警告
-	AlertLevelUrgent   = "urgent"   // 紧急
-	AlertLevelSuccess  = "success"  // 成功
+	AlertLevelInfo    = "info"    // 常规信息
+	AlertLevelWarning = "warning" // 警告
+	AlertLevelUrgent  = "urgent"  // 紧急
+	AlertLevelSuccess = "success" // 成功
 )
 
 // AlertStatus 通知状态 (是否已被 Agent 读取)
@@ -46,7 +46,7 @@ func NewAlertRepo(db *sqlx.DB) *AlertRepo {
 
 // Insert 插入通知记录
 func (r *AlertRepo) Insert(alert *AgentAlert) (int64, error) {
-	now := time.Now().Format("2006-01-02 15:04:05")
+	now := time.Now().Format(TimeLayout)
 	if alert.Status == "" {
 		alert.Status = AlertStatusUnread
 	}
@@ -103,7 +103,7 @@ func (r *AlertRepo) GetRecent(limit int) ([]AgentAlert, error) {
 
 // MarkAsRead 将指定 ID 的通知标记为已读
 func (r *AlertRepo) MarkAsRead(id int64) error {
-	now := time.Now().Format("2006-01-02 15:04:05")
+	now := time.Now().Format(TimeLayout)
 	res, err := r.db.Exec(`UPDATE agent_alert SET status = ?, read_at = ? WHERE id = ?`,
 		AlertStatusRead, now, id)
 	if err != nil {
@@ -117,7 +117,7 @@ func (r *AlertRepo) MarkAsRead(id int64) error {
 
 // MarkAllRead 将所有未读通知标记为已读
 func (r *AlertRepo) MarkAllRead() (int64, error) {
-	now := time.Now().Format("2006-01-02 15:04:05")
+	now := time.Now().Format(TimeLayout)
 	res, err := r.db.Exec(`UPDATE agent_alert SET status = ?, read_at = ? WHERE status = ?`,
 		AlertStatusRead, now, AlertStatusUnread)
 	if err != nil {
@@ -129,10 +129,5 @@ func (r *AlertRepo) MarkAllRead() (int64, error) {
 
 // HasAlertsOnDate 判断指定日期是否有通知记录
 func (r *AlertRepo) HasAlertsOnDate(tradeDate string) (bool, error) {
-	var count int
-	if err := r.db.Get(&count,
-		`SELECT COUNT(1) FROM agent_alert WHERE trade_date = ?`, tradeDate); err != nil {
-		return false, fmt.Errorf("查询通知记录失败: %w", err)
-	}
-	return count > 0, nil
+	return existsRow(r.db, `SELECT COUNT(1) FROM agent_alert WHERE trade_date = ?`, tradeDate)
 }

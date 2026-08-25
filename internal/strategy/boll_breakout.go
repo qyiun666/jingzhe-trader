@@ -21,26 +21,9 @@ type BollBreakoutStrategy struct {
 func (s *BollBreakoutStrategy) Name() string { return "boll_breakout" }
 
 func (s *BollBreakoutStrategy) Init(_ context.Context, params map[string]interface{}) error {
-	s.Period = 20
-	s.Multiplier = 2.0
-	s.PositionPct = 0.1
-	s.HistoryLen = 80
-
-	if v, ok := params["period"]; ok {
-		if n, ok := v.(float64); ok {
-			s.Period = int(n)
-		}
-	}
-	if v, ok := params["multiplier"]; ok {
-		if n, ok := v.(float64); ok {
-			s.Multiplier = n
-		}
-	}
-	if v, ok := params["position_pct"]; ok {
-		if n, ok := v.(float64); ok {
-			s.PositionPct = n
-		}
-	}
+	s.Period = paramInt(params, "period", 20)
+	s.Multiplier = paramFloat(params, "multiplier", 2.0)
+	s.PositionPct = paramFloat(params, "position_pct", 0.1)
 	s.HistoryLen = s.Period * 4
 	return nil
 }
@@ -89,13 +72,7 @@ func (s *BollBreakoutStrategy) OnBar(_ context.Context, barCtx *BarContext) ([]m
 			targetAmount := barCtx.TotalAsset * s.PositionPct
 			qty := int(targetAmount/bar.AdjClose()/100) * 100
 			if qty > 0 {
-				signals = append(signals, model.Signal{
-					TsCode:    tsCode,
-					Direction: model.DirBuy,
-					TargetQty: qty,
-					Reason:    fmt.Sprintf("布林带下轨回升: close=%.2f > lower=%.2f", currClose, currLower),
-					Strength:  0.6,
-				})
+				signals = append(signals, buySignal(tsCode, qty, fmt.Sprintf("布林带下轨回升: close=%.2f > lower=%.2f", currClose, currLower), 0.6))
 			}
 		} else if (isSellSignal1 || isSellSignal2) && hasPosition && pos.TotalQty > 0 {
 			reason := fmt.Sprintf("布林带卖出: close=%.2f", currClose)
@@ -104,13 +81,7 @@ func (s *BollBreakoutStrategy) OnBar(_ context.Context, barCtx *BarContext) ([]m
 			} else {
 				reason = fmt.Sprintf("布林带回到中轨下方: close=%.2f < middle=%.2f", currClose, currMiddle)
 			}
-			signals = append(signals, model.Signal{
-				TsCode:    tsCode,
-				Direction: model.DirSell,
-				TargetQty: pos.TotalQty,
-				Reason:    reason,
-				Strength:  0.6,
-			})
+			signals = append(signals, sellSignal(tsCode, pos.TotalQty, reason, 0.6))
 		}
 	}
 

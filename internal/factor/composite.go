@@ -4,7 +4,6 @@ import (
 	"context"
 	"math"
 	"sort"
-	"strconv"
 )
 
 // FactorWeight 因子权重配置
@@ -72,13 +71,12 @@ func (cf *CompositeFactor) Compute(ctx context.Context, date string, universe []
 		// 标准化
 		standardized := Standardize(winsorized)
 
-		// 排名打分 (0-100), 越高越好
+		// 排名打分 (0-100), 越高越好; 结果按索引与 commonStocks 对齐, 直接下标取分
 		rankScores := Rank(standardized, true)
 
-		// 转回 map[tsCode]score
 		scoreMap := make(map[string]float64, len(commonStocks))
 		for j, code := range commonStocks {
-			scoreMap[code] = rankScores[strconv.Itoa(j)]
+			scoreMap[code] = rankScores[j]
 		}
 		factorScores[i] = scoreMap
 	}

@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
+
+	"jingzhe-trader/pkg/retry"
 )
 
 const (
@@ -164,7 +167,7 @@ func (c *Client) Chat(systemPrompt, userPrompt string) (string, error) {
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
 			// 指数退避: 第1次重试等 base, 第2次等 2*base
-			time.Sleep(retryBackoffBase << (attempt - 1))
+			time.Sleep(retry.Backoff(retryBackoffBase, attempt))
 		}
 		content, retryable, err := c.doChatRequest(bodyBytes)
 		if err == nil {
@@ -243,4 +246,14 @@ func (c *Client) doChatRequest(bodyBytes []byte) (string, bool, error) {
 	}
 
 	return result.Choices[0].Message.Content, false, nil
+}
+
+// StripCodeFence 剥离 LLM 响应中的 markdown 代码块包裹 (```json ... ```)
+// 多个调用方(agent 分析师/研究员/新闻分析)共用同一解析预处理
+func StripCodeFence(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "```json")
+	s = strings.TrimPrefix(s, "```")
+	s = strings.TrimSuffix(s, "```")
+	return strings.TrimSpace(s)
 }

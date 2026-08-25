@@ -27,35 +27,22 @@ const newsSelectCols = `id, datetime, content, title, channels`
 
 // BatchInsert 批量插入新闻快讯(已存在则忽略, 避免重复)
 func (r *NewsRepo) BatchInsert(newsList []model.News) error {
-	if len(newsList) == 0 {
-		return nil
-	}
-	tx, err := r.db.Beginx()
-	if err != nil {
-		return fmt.Errorf("开启事务失败: %w", err)
-	}
-	defer tx.Rollback()
-
-	stmt, err := tx.Preparex(newsInsertSQL)
-	if err != nil {
-		return fmt.Errorf("预编译插入语句失败: %w", err)
-	}
-	defer stmt.Close()
-
-	for _, n := range newsList {
-		if _, err := stmt.Exec(n.Datetime, n.Content, n.Title, n.Channels); err != nil {
-			return fmt.Errorf("插入新闻失败(datetime=%s): %w", n.Datetime, err)
+	return batchInsert(r.db, newsInsertSQL, "插入新闻失败", len(newsList), func(stmt *sqlx.Stmt, i int) error {
+		n := newsList[i]
+		_, err := stmt.Exec(n.Datetime, n.Content, n.Title, n.Channels)
+		if err != nil {
+			return fmt.Errorf("datetime=%s: %w", n.Datetime, err)
 		}
-	}
-	return tx.Commit()
+		return nil
+	})
 }
 
 // GetRecent 获取最近 n 条新闻(按时间倒序)
 func (r *NewsRepo) GetRecent(n int) ([]model.News, error) {
 	query := fmt.Sprintf(`SELECT %s FROM news ORDER BY datetime DESC LIMIT ?`, newsSelectCols)
 	var newsList []model.News
-	if err := r.db.Select(&newsList, query, n); err != nil {
-		return nil, fmt.Errorf("查询新闻失败: %w", err)
+	if err := selectList(r.db, query, &newsList, "查询新闻失败", n); err != nil {
+		return nil, err
 	}
 	return newsList, nil
 }
@@ -67,8 +54,8 @@ func (r *NewsRepo) GetByKeyword(keyword string) ([]model.News, error) {
 		ORDER BY datetime DESC`, newsSelectCols)
 	var newsList []model.News
 	like := "%" + strings.TrimSpace(keyword) + "%"
-	if err := r.db.Select(&newsList, query, like, like); err != nil {
-		return nil, fmt.Errorf("搜索新闻失败: %w", err)
+	if err := selectList(r.db, query, &newsList, "搜索新闻失败", like, like); err != nil {
+		return nil, err
 	}
 	return newsList, nil
 }

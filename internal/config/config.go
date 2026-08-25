@@ -239,6 +239,19 @@ type UniverseConfig struct {
 	Tech     string `mapstructure:"tech"`
 }
 
+// ParseUniverseCSV 解析命令行传入的股票池 CSV (逗号分隔, 去空白), 空串返回 nil
+// cmd/backtest 与 cmd/optimizer 共用, 避免各写一份
+func ParseUniverseCSV(csv string) []string {
+	if csv == "" {
+		return nil
+	}
+	parts := strings.Split(csv, ",")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return parts
+}
+
 // UniverseCodes 返回配置股票池代码列表 (bluechip + tech 去重, 保持顺序)
 func (c *Config) UniverseCodes() []string {
 	seen := make(map[string]bool)

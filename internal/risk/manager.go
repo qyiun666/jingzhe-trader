@@ -16,14 +16,18 @@ type RejectReason struct {
 	Rule   string       // 触发的规则名
 }
 
+// reject 构造拒绝原因 (统一 13 处构造样板)
+func reject(sig model.Signal, rule, reason string) *RejectReason {
+	return &RejectReason{TsCode: sig.TsCode, Signal: sig, Reason: reason, Rule: rule}
+}
+
 // RiskManager 风控管理器
 // 所有信号进入执行前都必须经过风控检查
-// 检查顺序: 黑名单 -> 仓位限制 -> 止损止盈 -> 敞口控制 -> T+1
+// 检查顺序: 黑名单 -> 仓位限制(含板块敞口) -> 止损止盈 -> 小资金 -> T+1
 type RiskManager struct {
 	cfg             config.RiskConfig
 	positionLimiter *PositionLimiter
 	stopLossManager *StopLossManager
-	exposureManager *ExposureManager
 	blacklist       *Blacklist
 	sizeLimits      SizeLimits // 小资金资金管理 (最小单笔金额/最大持仓数)
 }
@@ -38,7 +42,6 @@ func NewRiskManager(cfg config.RiskConfig) *RiskManager {
 		cfg:             cfg,
 		positionLimiter: NewPositionLimiter(cfg.MaxPositionPct, cfg.MaxTotalPositionPct, cfg.MaxSectorPct),
 		stopLossManager: sl,
-		exposureManager: NewExposureManager(cfg.MaxSectorPct),
 		blacklist:       NewBlacklist(cfg.ExcludeST, cfg.MinListDays),
 	}
 }
@@ -51,11 +54,6 @@ func (rm *RiskManager) PositionLimiter() *PositionLimiter {
 // StopLossManager 获取止损止盈管理器
 func (rm *RiskManager) StopLossManager() *StopLossManager {
 	return rm.stopLossManager
-}
-
-// ExposureManager 获取敞口管理器
-func (rm *RiskManager) ExposureManager() *ExposureManager {
-	return rm.exposureManager
 }
 
 // Blacklist 获取黑名单
@@ -86,12 +84,7 @@ func (rm *RiskManager) checkSizeLimits(sig model.Signal, currentPrice, totalAsse
 				qty += 100
 			}
 			if currentPrice*float64(qty) < minAmount {
-				return sig, &RejectReason{
-					TsCode: sig.TsCode,
-					Signal: sig,
-					Reason: fmt.Sprintf("单笔金额 %.0f 低于最小交易额 %.0f (最低佣金侵蚀)", amount, minAmount),
-					Rule:   "min_trade_amount",
-				}
+				return sig, reject(sig, "min_trade_amount", fmt.Sprintf("单笔金额 %.0f 低于最小交易额 %.0f (最低佣金侵蚀)", amount, minAmount))
 			}
 			sig.TargetQty = qty
 		}
@@ -108,12 +101,7 @@ func (rm *RiskManager) checkSizeLimits(sig model.Signal, currentPrice, totalAsse
 				}
 			}
 			if held >= maxPos {
-				return sig, &RejectReason{
-					TsCode: sig.TsCode,
-					Signal: sig,
-					Reason: fmt.Sprintf("持仓数已达上限 %d (小资金集中持仓)", maxPos),
-					Rule:   "max_positions",
-				}
+				return sig, reject(sig, "max_positions", fmt.Sprintf("持仓数已达上限 %d (小资金集中持仓)", maxPos))
 			}
 		}
 	}
@@ -188,12 +176,7 @@ func (rm *RiskManager) Check(signals []model.Signal, positions map[string]*model
 			// 1. 涨跌停检查：涨停不能买入
 			if currentPrice > 0 && upLimit > 0 {
 				if err := market.CheckLimit(model.SideBuy, currentPrice, upLimit, downLimit); err != nil {
-					rejected = append(rejected, RejectReason{
-						TsCode: sig.TsCode,
-						Signal: sig,
-						Reason: err.Error(),
-						Rule:   "limit_up_buy",
-					})
+					rejected = append(rejected, *reject(sig, "limit_up_buy", err.Error()))
 					continue
 				}
 			}
@@ -203,12 +186,7 @@ func (rm *RiskManager) Check(signals []model.Signal, positions map[string]*model
 			if err != nil {
 				// 如果调整后数量为 0，完全拒绝
 				if adjusted.TargetQty <= 0 {
-					rejected = append(rejected, RejectReason{
-						TsCode: sig.TsCode,
-						Signal: sig,
-						Reason: err.Error(),
-						Rule:   "position_limit",
-					})
+					rejected = append(rejected, *reject(sig, "position_limit", err.Error()))
 					continue
 				}
 				// 部分调整，继续后续检查
@@ -223,14 +201,9 @@ func (rm *RiskManager) Check(signals []model.Signal, positions map[string]*model
 			}
 			sig = sized
 
-			// 4. 敞口控制检查（板块限制）
-			if err := rm.exposureManager.CheckSectorLimit(sig, positions, stocks, totalAsset, currentPrice, sig.TargetQty); err != nil {
-				rejected = append(rejected, RejectReason{
-					TsCode: sig.TsCode,
-					Signal: sig,
-					Reason: err.Error(),
-					Rule:   "sector_exposure",
-				})
+			// 4. 板块敞口控制检查（板块限制）
+			if err := rm.positionLimiter.CheckSectorLimit(sig, positions, stocks, totalAsset, currentPrice, sig.TargetQty); err != nil {
+				rejected = append(rejected, *reject(sig, "sector_exposure", err.Error()))
 				continue
 			}
 
@@ -246,12 +219,7 @@ func (rm *RiskManager) Check(signals []model.Signal, positions map[string]*model
 
 			// 1. 检查是否有持仓
 			if pos == nil || pos.TotalQty <= 0 {
-				rejected = append(rejected, RejectReason{
-					TsCode: sig.TsCode,
-					Signal: sig,
-					Reason: "无持仓可卖",
-					Rule:   "no_position",
-				})
+				rejected = append(rejected, *reject(sig, "no_position", "无持仓可卖"))
 				continue
 			}
 
@@ -264,12 +232,7 @@ func (rm *RiskManager) Check(signals []model.Signal, positions map[string]*model
 					adjusted.Reason = sig.Reason + fmt.Sprintf(" (T+1调整: 可卖%d股)", pos.AvailableQty)
 					sig = adjusted
 				} else {
-					rejected = append(rejected, RejectReason{
-						TsCode: sig.TsCode,
-						Signal: sig,
-						Reason: fmt.Sprintf("T+1限制: 可卖量不足(可卖%d, 需卖%d)", pos.AvailableQty, sig.TargetQty),
-						Rule:   "t1_restriction",
-					})
+					rejected = append(rejected, *reject(sig, "t1_restriction", fmt.Sprintf("T+1限制: 可卖量不足(可卖%d, 需卖%d)", pos.AvailableQty, sig.TargetQty)))
 					continue
 				}
 			}
@@ -277,12 +240,7 @@ func (rm *RiskManager) Check(signals []model.Signal, positions map[string]*model
 			// 3. 涨跌停检查：跌停不能卖出
 			if currentPrice > 0 && downLimit > 0 {
 				if err := market.CheckLimit(model.SideSell, currentPrice, upLimit, downLimit); err != nil {
-					rejected = append(rejected, RejectReason{
-						TsCode: sig.TsCode,
-						Signal: sig,
-						Reason: err.Error(),
-						Rule:   "limit_down_sell",
-					})
+					rejected = append(rejected, *reject(sig, "limit_down_sell", err.Error()))
 					continue
 				}
 			}
@@ -310,5 +268,5 @@ func (rm *RiskManager) CheckStopLoss(positions map[string]*model.Position,
 // SectorExposure 获取各板块敞口
 func (rm *RiskManager) SectorExposure(positions map[string]*model.Position,
 	stocks map[string]*model.Stock, totalAsset float64) map[string]float64 {
-	return rm.exposureManager.SectorExposure(positions, stocks, totalAsset)
+	return rm.positionLimiter.SectorExposure(positions, stocks, totalAsset)
 }

@@ -17,11 +17,11 @@ type FactorDataProvider struct {
 	barRepo   *store.BarRepo
 
 	// 缓存
-	dailyBasicCache    map[string][]model.DailyBasic   // date -> basics
-	dailyBasicCodeCache map[string][]model.DailyBasic  // tsCode:start:end -> basics
-	finaCache          map[string][]model.FinaIndicator // tsCode -> indicators
-	stockCache         map[string]*model.Stock          // tsCode -> stock
-	barCache           map[string][]model.Bar           // tsCode:start:end -> bars
+	dailyBasicCache     map[string][]model.DailyBasic    // date -> basics
+	dailyBasicCodeCache map[string][]model.DailyBasic    // tsCode:start:end -> basics
+	finaCache           map[string][]model.FinaIndicator // tsCode -> indicators
+	stockCache          map[string]*model.Stock          // tsCode -> stock
+	barCache            map[string][]model.Bar           // tsCode:start:end -> bars
 
 	mu sync.RWMutex
 }
@@ -34,140 +34,74 @@ func NewFactorDataProvider(
 	barRepo *store.BarRepo,
 ) *FactorDataProvider {
 	return &FactorDataProvider{
-		basicRepo:          basicRepo,
-		finaRepo:           finaRepo,
-		stockRepo:          stockRepo,
-		barRepo:            barRepo,
-		dailyBasicCache:    make(map[string][]model.DailyBasic),
+		basicRepo:           basicRepo,
+		finaRepo:            finaRepo,
+		stockRepo:           stockRepo,
+		barRepo:             barRepo,
+		dailyBasicCache:     make(map[string][]model.DailyBasic),
 		dailyBasicCodeCache: make(map[string][]model.DailyBasic),
-		finaCache:          make(map[string][]model.FinaIndicator),
-		stockCache:         make(map[string]*model.Stock),
-		barCache:           make(map[string][]model.Bar),
+		finaCache:           make(map[string][]model.FinaIndicator),
+		stockCache:          make(map[string]*model.Stock),
+		barCache:            make(map[string][]model.Bar),
 	}
+}
+
+// cached 通用缓存访问: RLock 查缓存 → 未命中调 load → Lock 写缓存
+// 5 个数据访问方法共用同一模板
+func cached[T any](p *FactorDataProvider, cache map[string]T, key string, load func() (T, error)) (T, error) {
+	p.mu.RLock()
+	if v, ok := cache[key]; ok {
+		p.mu.RUnlock()
+		return v, nil
+	}
+	p.mu.RUnlock()
+
+	v, err := load()
+	if err != nil {
+		return v, err
+	}
+
+	p.mu.Lock()
+	cache[key] = v
+	p.mu.Unlock()
+	return v, nil
 }
 
 // GetDailyBasic 获取指定交易日的全市场基本面数据 (实现 factor.DataProvider 接口)
 func (p *FactorDataProvider) GetDailyBasic(date string) ([]model.DailyBasic, error) {
-	// 先查缓存
-	p.mu.RLock()
-	if basics, ok := p.dailyBasicCache[date]; ok {
-		p.mu.RUnlock()
-		return basics, nil
-	}
-	p.mu.RUnlock()
-
-	// 缓存未命中，查询数据库
-	basics, err := p.basicRepo.GetByDate(date)
-	if err != nil {
-		return nil, err
-	}
-
-	// 写入缓存
-	p.mu.Lock()
-	p.dailyBasicCache[date] = basics
-	p.mu.Unlock()
-
-	return basics, nil
+	return cached(p, p.dailyBasicCache, date, func() ([]model.DailyBasic, error) {
+		return p.basicRepo.GetByDate(date)
+	})
 }
 
 // GetDailyBasicByCode 获取指定股票在 [startDate, endDate] 区间内的基本面数据 (实现 factor.DataProvider 接口)
 func (p *FactorDataProvider) GetDailyBasicByCode(tsCode, startDate, endDate string) ([]model.DailyBasic, error) {
-	cacheKey := tsCode + ":" + startDate + ":" + endDate
-
-	// 先查缓存
-	p.mu.RLock()
-	if basics, ok := p.dailyBasicCodeCache[cacheKey]; ok {
-		p.mu.RUnlock()
-		return basics, nil
-	}
-	p.mu.RUnlock()
-
-	// 缓存未命中，查询数据库
-	basics, err := p.basicRepo.GetByCode(tsCode, startDate, endDate)
-	if err != nil {
-		return nil, err
-	}
-
-	// 写入缓存
-	p.mu.Lock()
-	p.dailyBasicCodeCache[cacheKey] = basics
-	p.mu.Unlock()
-
-	return basics, nil
+	key := tsCode + ":" + startDate + ":" + endDate
+	return cached(p, p.dailyBasicCodeCache, key, func() ([]model.DailyBasic, error) {
+		return p.basicRepo.GetByCode(tsCode, startDate, endDate)
+	})
 }
 
 // GetFinaIndicator 获取指定股票的全部财务指标 (实现 factor.DataProvider 接口)
 func (p *FactorDataProvider) GetFinaIndicator(tsCode string) ([]model.FinaIndicator, error) {
-	// 先查缓存
-	p.mu.RLock()
-	if fis, ok := p.finaCache[tsCode]; ok {
-		p.mu.RUnlock()
-		return fis, nil
-	}
-	p.mu.RUnlock()
-
-	// 缓存未命中，查询数据库
-	fis, err := p.finaRepo.GetByCode(tsCode)
-	if err != nil {
-		return nil, err
-	}
-
-	// 写入缓存
-	p.mu.Lock()
-	p.finaCache[tsCode] = fis
-	p.mu.Unlock()
-
-	return fis, nil
+	return cached(p, p.finaCache, tsCode, func() ([]model.FinaIndicator, error) {
+		return p.finaRepo.GetByCode(tsCode)
+	})
 }
 
 // GetStockByCode 按代码查询股票基本信息 (实现 factor.DataProvider 接口)
 func (p *FactorDataProvider) GetStockByCode(tsCode string) (*model.Stock, error) {
-	// 先查缓存
-	p.mu.RLock()
-	if stock, ok := p.stockCache[tsCode]; ok {
-		p.mu.RUnlock()
-		return stock, nil
-	}
-	p.mu.RUnlock()
-
-	// 缓存未命中，查询数据库
-	stock, err := p.stockRepo.GetByCode(tsCode)
-	if err != nil {
-		return nil, err
-	}
-
-	// 写入缓存
-	p.mu.Lock()
-	p.stockCache[tsCode] = stock
-	p.mu.Unlock()
-
-	return stock, nil
+	return cached(p, p.stockCache, tsCode, func() (*model.Stock, error) {
+		return p.stockRepo.GetByCode(tsCode)
+	})
 }
 
 // GetBars 获取指定股票在 [startDate, endDate] 区间内的日线数据 (实现 factor.DataProvider 接口)
 func (p *FactorDataProvider) GetBars(tsCode, startDate, endDate string) ([]model.Bar, error) {
-	cacheKey := tsCode + ":" + startDate + ":" + endDate
-
-	// 先查缓存
-	p.mu.RLock()
-	if bars, ok := p.barCache[cacheKey]; ok {
-		p.mu.RUnlock()
-		return bars, nil
-	}
-	p.mu.RUnlock()
-
-	// 缓存未命中，查询数据库
-	bars, err := p.barRepo.GetBars(tsCode, startDate, endDate)
-	if err != nil {
-		return nil, err
-	}
-
-	// 写入缓存
-	p.mu.Lock()
-	p.barCache[cacheKey] = bars
-	p.mu.Unlock()
-
-	return bars, nil
+	key := tsCode + ":" + startDate + ":" + endDate
+	return cached(p, p.barCache, key, func() ([]model.Bar, error) {
+		return p.barRepo.GetBars(tsCode, startDate, endDate)
+	})
 }
 
 // ClearCache 清空所有缓存

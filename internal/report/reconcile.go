@@ -14,9 +14,9 @@ import (
 type ReconcileResult struct {
 	TradeDate string
 	// 资金对账
-	LocalCash       float64
-	BrokerCash      float64
-	CashDiff        float64
+	LocalCash  float64
+	BrokerCash float64
+	CashDiff   float64
 	// 持仓对账
 	LocalPositions  map[string]*model.Position
 	BrokerPositions map[string]*model.Position
@@ -33,7 +33,7 @@ type ReconcileResult struct {
 // PositionDiff 持仓差异项
 type PositionDiff struct {
 	TsCode      string
-	Field       string  // qty/price/market_value
+	Field       string // qty/price/market_value
 	LocalValue  float64
 	BrokerValue float64
 	Diff        float64
@@ -53,10 +53,10 @@ const reconcileThreshold = 0.01
 // 对比本地记录与券商实际数据，返回对账结果
 func Reconcile(brk broker.Broker, tradeRepo *store.TradeRepo, tradeDate string) (*ReconcileResult, error) {
 	result := &ReconcileResult{
-		TradeDate:      tradeDate,
-		LocalPositions: make(map[string]*model.Position),
+		TradeDate:       tradeDate,
+		LocalPositions:  make(map[string]*model.Position),
 		BrokerPositions: make(map[string]*model.Position),
-		Issues:         []string{},
+		Issues:          []string{},
 	}
 
 	// 1. 获取券商端账户资产

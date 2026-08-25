@@ -18,7 +18,7 @@ func RSI(values []float64, period int) []float64 {
 	}
 
 	// 计算每日变动并分离涨跌
-	gains := make([]float64, n) // gain[i] 对应 close[i]-close[i-1] 的正部分
+	gains := make([]float64, n)  // gain[i] 对应 close[i]-close[i-1] 的正部分
 	losses := make([]float64, n) // loss[i] 对应 close[i]-close[i-1] 的负部分的绝对值
 	for i := 1; i < n; i++ {
 		diff := values[i] - values[i-1]
@@ -29,15 +29,9 @@ func RSI(values []float64, period int) []float64 {
 		}
 	}
 
-	// 第一个平均增益/损失: 使用 index 1..period 的 SMA
-	sumGain := 0.0
-	sumLoss := 0.0
-	for i := 1; i <= period; i++ {
-		sumGain += gains[i]
-		sumLoss += losses[i]
-	}
-	avgGain := sumGain / float64(period)
-	avgLoss := sumLoss / float64(period)
+	// 第一个平均增益/损失: 使用 index 1..period 的 SMA (复用 Mean)
+	avgGain := Mean(gains[1 : period+1])
+	avgLoss := Mean(losses[1 : period+1])
 
 	// 首个 RSI 在 index = period
 	out[period] = rsiFromAvg(avgGain, avgLoss)

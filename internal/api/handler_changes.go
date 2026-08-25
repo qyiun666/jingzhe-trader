@@ -2,7 +2,7 @@ package api
 
 import (
 	"fmt"
-	"net/http"
+	"strings"
 	"time"
 
 	"jingzhe-trader/internal/store"
@@ -48,13 +48,6 @@ type TaskStatusJSON struct {
 	LastStatus string `json:"last_status"`
 }
 
-// HandleAgentChanges GET /api/agent/changes?date=YYYYMMDD
-// 返回当日决策变更、计划状态变更和任务完成状态
-func (s *Service) HandleAgentChanges(w http.ResponseWriter, r *http.Request) {
-	date := r.URL.Query().Get("date")
-	writeJSON(w, http.StatusOK, s.BuildAgentChanges(date))
-}
-
 // BuildAgentChanges builds the change report for the given date.
 func (s *Service) BuildAgentChanges(date string) *ChangeReport {
 	if date == "" {
@@ -65,7 +58,7 @@ func (s *Service) BuildAgentChanges(date string) *ChangeReport {
 		}
 		date = lastDate
 	} else {
-		date = parseDateParam(date)
+		date = strings.ReplaceAll(strings.TrimSpace(date), "-", "")
 	}
 
 	report := &ChangeReport{
@@ -118,7 +111,7 @@ func (s *Service) BuildAgentChanges(date string) *ChangeReport {
 
 	// 3. 任务完成状态
 	today := time.Now().Format("20060102")
-	for _, name := range []string{"data_update", "signal", "report", "intraday_monitor", "retention"} {
+	for _, name := range store.JobNames {
 		ts := TaskStatusJSON{Completed: false}
 		if done, err := s.jobRepo.HasSucceeded(name, today); err == nil {
 			ts.Completed = done

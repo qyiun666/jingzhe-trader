@@ -1,6 +1,7 @@
 package goal
 
 import (
+	"math"
 	"path/filepath"
 	"testing"
 
@@ -59,7 +60,7 @@ func TestStatus_Normal(t *testing.T) {
 		t.Errorf("季初基准应为11000, 实际 %.0f", st.BaselineAsset)
 	}
 	wantRet := 300.0 / 11000.0
-	if abs(st.ReturnPct-wantRet) > 1e-9 {
+	if math.Abs(st.ReturnPct-wantRet) > 1e-9 {
 		t.Errorf("收益率错误: %.4f want %.4f", st.ReturnPct, wantRet)
 	}
 	if st.Mode != ModeNormal {
@@ -82,7 +83,7 @@ func TestStatus_DefensiveOnBudgetExhausted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if abs(st.DrawdownPct-0.10) > 1e-9 {
+	if math.Abs(st.DrawdownPct-0.10) > 1e-9 {
 		t.Errorf("回撤应为10%%, 实际 %.4f", st.DrawdownPct)
 	}
 	if st.Mode != ModeDefensive {
@@ -113,7 +114,7 @@ func TestStatus_Tightened(t *testing.T) {
 	}
 	base := config.RiskConfig{MaxTotalPositionPct: 0.9}
 	adj, _ := tr.AdjustRisk(base, st)
-	if abs(adj.MaxTotalPositionPct-0.54) > 1e-9 {
+	if math.Abs(adj.MaxTotalPositionPct-0.54) > 1e-9 {
 		t.Errorf("收紧后总仓位应为0.54, 实际 %.2f", adj.MaxTotalPositionPct)
 	}
 }
@@ -165,11 +166,4 @@ func TestAdjustRisk_NeverLoosens(t *testing.T) {
 	if adj2 != base || len(notes) != 0 {
 		t.Error("auto_adjust=false 时不应调整")
 	}
-}
-
-func abs(x float64) float64 {
-	if x < 0 {
-		return -x
-	}
-	return x
 }

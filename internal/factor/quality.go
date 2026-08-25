@@ -19,23 +19,9 @@ func (f *ROEFactor) Name() string {
 // Compute 计算ROE因子值
 // ROE越高越好, 直接返回最近一期财报的ROE
 func (f *ROEFactor) Compute(ctx context.Context, date string, universe []string, provider DataProvider) (map[string]float64, error) {
-	result := make(map[string]float64, len(universe))
-
-	for _, tsCode := range universe {
-		indicators, err := provider.GetFinaIndicator(tsCode)
-		if err != nil {
-			return nil, err
-		}
-
-		// 找到指定日期前最近一期已公告的财报
-		latest := findLatestFinaBeforeDate(indicators, date)
-		if latest != nil {
-			result[tsCode] = latest.ROE
-		}
-		// 如果没有找到财报数据, 该股票不纳入结果
-	}
-
-	return result, nil
+	return finaFactorValues(ctx, date, universe, provider, func(latest *model.FinaIndicator) float64 {
+		return latest.ROE
+	})
 }
 
 // GrossMarginFactor 毛利率因子 (越高越好)
@@ -49,22 +35,9 @@ func (f *GrossMarginFactor) Name() string {
 // Compute 计算毛利率因子值
 // 毛利率越高越好, 直接返回最近一期财报的毛利率
 func (f *GrossMarginFactor) Compute(ctx context.Context, date string, universe []string, provider DataProvider) (map[string]float64, error) {
-	result := make(map[string]float64, len(universe))
-
-	for _, tsCode := range universe {
-		indicators, err := provider.GetFinaIndicator(tsCode)
-		if err != nil {
-			return nil, err
-		}
-
-		// 找到指定日期前最近一期已公告的财报
-		latest := findLatestFinaBeforeDate(indicators, date)
-		if latest != nil {
-			result[tsCode] = latest.GrossProfitMargin
-		}
-	}
-
-	return result, nil
+	return finaFactorValues(ctx, date, universe, provider, func(latest *model.FinaIndicator) float64 {
+		return latest.GrossProfitMargin
+	})
 }
 
 // DebtToAssetsFactor 资产负债率因子 (越低越好, 取负值)
@@ -78,6 +51,16 @@ func (f *DebtToAssetsFactor) Name() string {
 // Compute 计算资产负债率因子值
 // 资产负债率越低越好, 所以返回 -debt_to_assets
 func (f *DebtToAssetsFactor) Compute(ctx context.Context, date string, universe []string, provider DataProvider) (map[string]float64, error) {
+	return finaFactorValues(ctx, date, universe, provider, func(latest *model.FinaIndicator) float64 {
+		// 资产负债率越低越好, 取负值
+		return -latest.DebtToAssets
+	})
+}
+
+// finaFactorValues 财报类因子公共取值循环: 逐股票取指定日期前最近一期财报并提取字段
+// quality/growth 两个包的 5 个因子共用
+func finaFactorValues(ctx context.Context, date string, universe []string, provider DataProvider,
+	pick func(latest *model.FinaIndicator) float64) (map[string]float64, error) {
 	result := make(map[string]float64, len(universe))
 
 	for _, tsCode := range universe {
@@ -89,9 +72,9 @@ func (f *DebtToAssetsFactor) Compute(ctx context.Context, date string, universe 
 		// 找到指定日期前最近一期已公告的财报
 		latest := findLatestFinaBeforeDate(indicators, date)
 		if latest != nil {
-			// 资产负债率越低越好, 取负值
-			result[tsCode] = -latest.DebtToAssets
+			result[tsCode] = pick(latest)
 		}
+		// 如果没有找到财报数据, 该股票不纳入结果
 	}
 
 	return result, nil

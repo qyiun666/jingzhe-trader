@@ -8,42 +8,12 @@ import (
 	"jingzhe-trader/internal/model"
 )
 
-// OrderState 订单状态机
-type OrderState int
-
-const (
-	StatePending    OrderState = iota // 待处理
-	StateSubmitted                     // 已提交
-	StatePartial                       // 部分成交
-	StateFilled                        // 全部成交
-	StateCanceled                      // 已撤单
-	StateRejected                      // 已拒绝
-)
-
-func (s OrderState) String() string {
-	switch s {
-	case StatePending:
-		return "pending"
-	case StateSubmitted:
-		return "submitted"
-	case StatePartial:
-		return "partial"
-	case StateFilled:
-		return "filled"
-	case StateCanceled:
-		return "canceled"
-	case StateRejected:
-		return "rejected"
-	default:
-		return "unknown"
-	}
-}
-
 // OrderRecord OMS内部订单记录
+// 状态统一使用 model.OrderStatus (与落库订单共用同一状态机, 避免双份定义漂移)
 type OrderRecord struct {
 	OrderID   string
 	Req       OrderRequest
-	State     OrderState
+	State     model.OrderStatus
 	FilledQty int
 	AvgPrice  float64
 	Trades    []model.Trade
@@ -54,17 +24,15 @@ type OrderRecord struct {
 
 // OMS 订单管理系统
 type OMS struct {
-	mu        sync.RWMutex
-	orders    map[string]*OrderRecord
-	orderSeq  int64
-	callbacks []func(model.Trade)
+	mu       sync.RWMutex
+	orders   map[string]*OrderRecord
+	orderSeq int64
 }
 
 // NewOMS 创建订单管理系统
 func NewOMS() *OMS {
 	return &OMS{
-		orders:    make(map[string]*OrderRecord),
-		callbacks: make([]func(model.Trade), 0),
+		orders: make(map[string]*OrderRecord),
 	}
 }
 
@@ -77,7 +45,7 @@ func (o *OMS) CreateOrder(req OrderRequest) string {
 	rec := &OrderRecord{
 		OrderID:  orderID,
 		Req:      req,
-		State:    StatePending,
+		State:    model.StatusCreated,
 		CreateAt: time.Now(),
 		UpdateAt: time.Now(),
 	}
@@ -90,7 +58,7 @@ func (o *OMS) SubmitOrder(orderID string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if rec, ok := o.orders[orderID]; ok {
-		rec.State = StateSubmitted
+		rec.State = model.StatusSubmitted
 		rec.UpdateAt = time.Now()
 	}
 }
@@ -120,14 +88,11 @@ func (o *OMS) FillOrder(orderID string, trade model.Trade) {
 		}
 	}
 	if rec.FilledQty >= rec.Req.Qty {
-		rec.State = StateFilled
+		rec.State = model.StatusFilled
 	} else {
-		rec.State = StatePartial
+		rec.State = model.StatusPartial
 	}
 	rec.UpdateAt = time.Now()
-
-	// 触发回调
-	o.emitTrade(trade)
 }
 
 // RejectOrder 订单被拒绝
@@ -135,7 +100,7 @@ func (o *OMS) RejectOrder(orderID string, reason string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if rec, ok := o.orders[orderID]; ok {
-		rec.State = StateRejected
+		rec.State = model.StatusRejected
 		rec.RejectMsg = reason
 		rec.UpdateAt = time.Now()
 	}
@@ -146,8 +111,8 @@ func (o *OMS) CancelOrder(orderID string) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if rec, ok := o.orders[orderID]; ok {
-		if rec.State == StatePending || rec.State == StateSubmitted {
-			rec.State = StateCanceled
+		if rec.State == model.StatusCreated || rec.State == model.StatusSubmitted {
+			rec.State = model.StatusCanceled
 			rec.UpdateAt = time.Now()
 			return true
 		}
@@ -173,24 +138,6 @@ func (o *OMS) GetAllOrders() []*OrderRecord {
 	return result
 }
 
-// RegisterCallback 注册成交回调
-func (o *OMS) RegisterCallback(callback func(model.Trade)) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	o.callbacks = append(o.callbacks, callback)
-}
-
-// emitTrade 触发成交回调
-// 调用方必须持有 o.mu 写锁 (与 RegisterCallback 互斥, 遍历安全);
-// 回调异步执行避免在锁内阻塞, 每个 goroutine 执行完回调后自然退出
-func (o *OMS) emitTrade(trade model.Trade) {
-	callbacks := make([]func(model.Trade), len(o.callbacks))
-	copy(callbacks, o.callbacks)
-	for _, cb := range callbacks {
-		go cb(trade)
-	}
-}
-
 // Stats 统计
 func (o *OMS) Stats() (total, filled, canceled, rejected int) {
 	o.mu.RLock()
@@ -198,11 +145,11 @@ func (o *OMS) Stats() (total, filled, canceled, rejected int) {
 	for _, rec := range o.orders {
 		total++
 		switch rec.State {
-		case StateFilled:
+		case model.StatusFilled:
 			filled++
-		case StateCanceled:
+		case model.StatusCanceled:
 			canceled++
-		case StateRejected:
+		case model.StatusRejected:
 			rejected++
 		}
 	}

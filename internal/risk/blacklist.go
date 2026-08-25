@@ -9,8 +9,8 @@ import (
 // Blacklist 黑名单过滤器
 // 用于过滤不符合条件的股票，如 ST 股、上市时间不足的新股、自定义黑名单等
 type Blacklist struct {
-	excludeST   bool          // 是否排除 ST 股
-	minListDays int           // 最小上市天数
+	excludeST   bool            // 是否排除 ST 股
+	minListDays int             // 最小上市天数
 	customCodes map[string]bool // 自定义黑名单
 }
 
@@ -85,42 +85,22 @@ func (bl *Blacklist) FilterSignals(signals []model.Signal, stocks map[string]*mo
 	for _, sig := range signals {
 		stock := stocks[sig.TsCode]
 		if stock == nil {
-			rejected = append(rejected, RejectReason{
-				TsCode: sig.TsCode,
-				Signal: sig,
-				Reason: "股票信息不存在",
-				Rule:   "blacklist_no_stock_info",
-			})
+			rejected = append(rejected, *reject(sig, "blacklist_no_stock_info", "股票信息不存在"))
 			continue
 		}
 
 		if bl.customCodes[sig.TsCode] {
-			rejected = append(rejected, RejectReason{
-				TsCode: sig.TsCode,
-				Signal: sig,
-				Reason: "股票在自定义黑名单中",
-				Rule:   "blacklist_custom",
-			})
+			rejected = append(rejected, *reject(sig, "blacklist_custom", "股票在自定义黑名单中"))
 			continue
 		}
 
 		if bl.excludeST && stock.IsST {
-			rejected = append(rejected, RejectReason{
-				TsCode: sig.TsCode,
-				Signal: sig,
-				Reason: "ST 股被排除",
-				Rule:   "blacklist_st",
-			})
+			rejected = append(rejected, *reject(sig, "blacklist_st", "ST 股被排除"))
 			continue
 		}
 
 		if stock.ListStatus != "L" {
-			rejected = append(rejected, RejectReason{
-				TsCode: sig.TsCode,
-				Signal: sig,
-				Reason: "股票未上市或已退市",
-				Rule:   "blacklist_list_status",
-			})
+			rejected = append(rejected, *reject(sig, "blacklist_list_status", "股票未上市或已退市"))
 			continue
 		}
 
@@ -130,12 +110,7 @@ func (bl *Blacklist) FilterSignals(signals []model.Signal, stocks map[string]*mo
 			if err1 == nil && err2 == nil {
 				days := int(curDate.Sub(listDate).Hours() / 24)
 				if days < bl.minListDays {
-					rejected = append(rejected, RejectReason{
-						TsCode: sig.TsCode,
-						Signal: sig,
-						Reason: "上市天数不足",
-						Rule:   "blacklist_min_list_days",
-					})
+					rejected = append(rejected, *reject(sig, "blacklist_min_list_days", "上市天数不足"))
 					continue
 				}
 			}

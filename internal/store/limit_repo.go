@@ -26,35 +26,22 @@ const limitSelectCols = `ts_code, trade_date, up_limit, down_limit`
 
 // BatchInsert 批量插入涨跌停价(已存在则覆盖)
 func (r *LimitRepo) BatchInsert(limits []model.StkLimit) error {
-	if len(limits) == 0 {
-		return nil
-	}
-	tx, err := r.db.Beginx()
-	if err != nil {
-		return fmt.Errorf("开启事务失败: %w", err)
-	}
-	defer tx.Rollback()
-
-	stmt, err := tx.Preparex(limitInsertSQL)
-	if err != nil {
-		return fmt.Errorf("预编译插入语句失败: %w", err)
-	}
-	defer stmt.Close()
-
-	for _, l := range limits {
-		if _, err := stmt.Exec(l.TsCode, l.TradeDate, l.UpLimit, l.DownLimit); err != nil {
-			return fmt.Errorf("插入涨跌停价失败(ts_code=%s date=%s): %w", l.TsCode, l.TradeDate, err)
+	return batchInsert(r.db, limitInsertSQL, "插入涨跌停价失败", len(limits), func(stmt *sqlx.Stmt, i int) error {
+		l := limits[i]
+		_, err := stmt.Exec(l.TsCode, l.TradeDate, l.UpLimit, l.DownLimit)
+		if err != nil {
+			return fmt.Errorf("ts_code=%s date=%s: %w", l.TsCode, l.TradeDate, err)
 		}
-	}
-	return tx.Commit()
+		return nil
+	})
 }
 
 // GetByDate 查询某交易日全市场涨跌停价
 func (r *LimitRepo) GetByDate(tradeDate string) ([]model.StkLimit, error) {
 	query := fmt.Sprintf(`SELECT %s FROM stk_limit WHERE trade_date = ? ORDER BY ts_code ASC`, limitSelectCols)
 	var limits []model.StkLimit
-	if err := r.db.Select(&limits, query, tradeDate); err != nil {
-		return nil, fmt.Errorf("查询涨跌停价失败: %w", err)
+	if err := selectList(r.db, query, &limits, "查询涨跌停价失败", tradeDate); err != nil {
+		return nil, err
 	}
 	return limits, nil
 }
@@ -65,8 +52,8 @@ func (r *LimitRepo) GetByCode(tsCode, startDate, endDate string) ([]model.StkLim
 		WHERE ts_code = ? AND trade_date >= ? AND trade_date <= ?
 		ORDER BY trade_date ASC`, limitSelectCols)
 	var limits []model.StkLimit
-	if err := r.db.Select(&limits, query, tsCode, startDate, endDate); err != nil {
-		return nil, fmt.Errorf("查询涨跌停价失败: %w", err)
+	if err := selectList(r.db, query, &limits, "查询涨跌停价失败", tsCode, startDate, endDate); err != nil {
+		return nil, err
 	}
 	return limits, nil
 }
@@ -75,11 +62,9 @@ func (r *LimitRepo) GetByCode(tsCode, startDate, endDate string) ([]model.StkLim
 func (r *LimitRepo) GetByCodeAndDate(tsCode, tradeDate string) (*model.StkLimit, error) {
 	query := fmt.Sprintf(`SELECT %s FROM stk_limit WHERE ts_code = ? AND trade_date = ?`, limitSelectCols)
 	var l model.StkLimit
-	if err := r.db.Get(&l, query, tsCode, tradeDate); err != nil {
-		if isNoRowsErr(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("查询涨跌停价失败: %w", err)
+	found, err := getOne(r.db, query, &l, "查询涨跌停价失败", tsCode, tradeDate)
+	if err != nil || !found {
+		return nil, err
 	}
 	return &l, nil
 }

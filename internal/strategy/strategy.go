@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"context"
+	"math"
 
 	"jingzhe-trader/internal/model"
 )
@@ -19,13 +20,13 @@ type Strategy interface {
 
 // BarContext 策略上下文, 聚合策略所需的全部信息
 type BarContext struct {
-	TradeDate string                       // 当前交易日期 YYYYMMDD
-	Universe  []string                     // 当前股票池
-	Bars      map[string]*model.Bar        // 当日各标的行情 (前复权)
-	Positions map[string]*model.Position   // 当前持仓
-	Cash      float64                      // 可用现金
-	TotalAsset float64                     // 总资产
-	History   HistoryProvider              // 历史数据访问器
+	TradeDate  string                     // 当前交易日期 YYYYMMDD
+	Universe   []string                   // 当前股票池
+	Bars       map[string]*model.Bar      // 当日各标的行情 (前复权)
+	Positions  map[string]*model.Position // 当前持仓
+	Cash       float64                    // 可用现金
+	TotalAsset float64                    // 总资产
+	History    HistoryProvider            // 历史数据访问器
 }
 
 // HistoryProvider 历史数据提供者
@@ -79,4 +80,95 @@ func DefaultRegistry() *Registry {
 	r.Register("multi_factor", func() Strategy { return NewMultiFactorStrategy() })
 	r.Register("intraday_t", func() Strategy { return NewIntradayTStrategy() })
 	return r
+}
+
+// ==================== 策略公共 helper ====================
+
+// paramFloat 读取浮点参数, 不存在或类型不符时返回默认值
+func paramFloat(params map[string]interface{}, key string, def float64) float64 {
+	if v, ok := params[key]; ok {
+		if n, ok := v.(float64); ok {
+			return n
+		}
+	}
+	return def
+}
+
+// paramInt 读取整数参数 (YAML 数字解析为 float64)
+func paramInt(params map[string]interface{}, key string, def int) int {
+	return int(paramFloat(params, key, float64(def)))
+}
+
+// paramBool 读取布尔参数
+func paramBool(params map[string]interface{}, key string, def bool) bool {
+	if v, ok := params[key]; ok {
+		if b, ok := v.(bool); ok {
+			return b
+		}
+	}
+	return def
+}
+
+// paramStr 读取字符串参数
+func paramStr(params map[string]interface{}, key string, def string) string {
+	if v, ok := params[key]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return def
+}
+
+// calcBuyQty 按仓位占比计算买入数量 (向下取整到100股)
+func calcBuyQty(totalAsset, price, pct float64) int {
+	if totalAsset <= 0 || price <= 0 || pct <= 0 {
+		return 0
+	}
+	return int(totalAsset*pct/price/100) * 100
+}
+
+// buySignal 构造买入信号
+func buySignal(tsCode string, qty int, reason string, strength float64) model.Signal {
+	return model.Signal{TsCode: tsCode, Direction: model.DirBuy, TargetQty: qty, Reason: reason, Strength: strength}
+}
+
+// sellSignal 构造卖出信号
+func sellSignal(tsCode string, qty int, reason string, strength float64) model.Signal {
+	return model.Signal{TsCode: tsCode, Direction: model.DirSell, TargetQty: qty, Reason: reason, Strength: strength}
+}
+
+// crossUp 快速线上穿慢速线 (金叉)
+func crossUp(prevFast, prevSlow, currFast, currSlow float64) bool {
+	return prevFast <= prevSlow && currFast > currSlow
+}
+
+// crossDown 快速线下穿慢速线 (死叉)
+func crossDown(prevFast, prevSlow, currFast, currSlow float64) bool {
+	return prevFast >= prevSlow && currFast < currSlow
+}
+
+// tail2Valid 判断序列末尾两个值是否有效 (非 NaN)
+func tail2Valid(vals []float64) bool {
+	n := len(vals)
+	return n >= 2 && !math.IsNaN(vals[n-1]) && !math.IsNaN(vals[n-2])
+}
+
+// closesOf 提取收盘价序列 (前复权)
+func closesOf(bars []model.Bar) []float64 {
+	closes := make([]float64, len(bars))
+	for i, bar := range bars {
+		closes[i] = bar.AdjClose()
+	}
+	return closes
+}
+
+// highsLowsOf 提取最高/最低价序列 (前复权)
+func highsLowsOf(bars []model.Bar) ([]float64, []float64) {
+	highs := make([]float64, len(bars))
+	lows := make([]float64, len(bars))
+	for i, bar := range bars {
+		highs[i] = bar.AdjHigh()
+		lows[i] = bar.AdjLow()
+	}
+	return highs, lows
 }

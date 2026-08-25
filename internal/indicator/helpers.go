@@ -118,6 +118,11 @@ func nanSlice(n int) []float64 {
 	return out
 }
 
+// IsNaN 判断是否为 NaN (跨包复用: strategy/adaptive_params 原有一份私有实现)
+func IsNaN(v float64) bool {
+	return v != v
+}
+
 // isNaN 判断是否为 NaN
 func isNaN(v float64) bool {
 	return v != v

@@ -37,7 +37,7 @@ func (a *TechnicalAnalyst) Analyze(ctx *DebateContext) (*AnalysisReport, error) 
 		volRatio = last.Vol / avgVol(bars[len(bars)-6:len(bars)-1], 5)
 	}
 	rsi := lastValid(indicator.RSI(closes, 14))
-	
+
 	// 处理数据不足的情况
 	ma5Str := "N/A"
 	ma20Str := "N/A"
@@ -51,7 +51,7 @@ func (a *TechnicalAnalyst) Analyze(ctx *DebateContext) (*AnalysisReport, error) 
 	if !math.IsNaN(rsi) {
 		rsiStr = fmt.Sprintf("%.1f", rsi)
 	}
-	
+
 	userPrompt := fmt.Sprintf(`股票: %s (%s)  日期: %s
 近5日K线:
 %s
@@ -171,29 +171,30 @@ func (a *MarketAnalyst) Analyze(ctx *DebateContext) (*AnalysisReport, error) {
 }
 
 func callLLMCommon(client *llm.Client, tsCode, tradeDate, agentType, sysPrompt, userPrompt string) (*AnalysisReport, error) {
+	report, err := callLLMJSON[AnalysisReport](client, tsCode, tradeDate, agentType, sysPrompt, userPrompt)
+	if err != nil {
+		return nil, err
+	}
+	report.Agent = agentType
+	report.TsCode = tsCode
+	return report, nil
+}
+
+// callLLMJSON 通用 LLM 调用样板: 校验启用 → ChatWithCache → 剥离代码块 → 解析 JSON
+// 分析师/研究员/风控经理共用, 消除三处重复实现
+func callLLMJSON[T any](client *llm.Client, tsCode, tradeDate, role, sysPrompt, userPrompt string) (*T, error) {
 	if client == nil || !client.IsEnabled() {
 		return nil, fmt.Errorf("LLM 未启用")
 	}
-	resp, err := client.ChatWithCache(tradeDate, tsCode, agentType, sysPrompt, userPrompt)
+	resp, err := client.ChatWithCache(tradeDate, tsCode, role, sysPrompt, userPrompt)
 	if err != nil {
 		return nil, fmt.Errorf("LLM 调用失败: %w", err)
 	}
-	resp = stripJSON(resp)
-	var report AnalysisReport
-	report.Agent = agentType
-	report.TsCode = tsCode
-	if err := json.Unmarshal([]byte(resp), &report); err != nil {
-		return nil, fmt.Errorf("响应解析失败: %w, raw: %s", err, resp[:min(200, len(resp))])
+	var out T
+	if err := json.Unmarshal([]byte(llm.StripCodeFence(resp)), &out); err != nil {
+		return nil, fmt.Errorf("响应解析失败: %w, raw: %.200s", err, resp)
 	}
-	return &report, nil
-}
-
-func stripJSON(s string) string {
-	s = strings.TrimSpace(s)
-	s = strings.TrimPrefix(s, "```json")
-	s = strings.TrimPrefix(s, "```")
-	s = strings.TrimSuffix(s, "```")
-	return strings.TrimSpace(s)
+	return &out, nil
 }
 
 func extractCloses(bars []model.Bar) []float64 {
@@ -325,13 +326,6 @@ func formatNews(news []model.News) string {
 		sb.WriteString(fmt.Sprintf("  [%s] %s\n", n.Datetime, n.Title))
 	}
 	return sb.String()
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 const technicalSysPrompt = `你是专业的A股技术分析师，擅长通过K线形态、均线系统和量价关系判断短期走势。

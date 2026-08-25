@@ -17,6 +17,26 @@ func (c *Client) callAPI(apiName string, params map[string]interface{}, fields [
 	return rowsToMaps(resp), nil
 }
 
+// fetchRows 调用接口并将每行映射为 T (统一 15 个数据接口的样板)
+func fetchRows[T any](c *Client, apiName string, params map[string]interface{}, fields []string, mapper func(map[string]interface{}) T) ([]T, error) {
+	rows, err := c.callAPI(apiName, params, fields)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]T, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, mapper(row))
+	}
+	return result, nil
+}
+
+// setOpt 可选参数: 非空才放入 params
+func setOpt(params map[string]interface{}, key, val string) {
+	if val != "" {
+		params[key] = val
+	}
+}
+
 // rowsToMaps 将 Tushare 的列存结果(fields + items)转为行 map
 func rowsToMaps(resp *Response) []map[string]interface{} {
 	fields := resp.Data.Fields
@@ -72,20 +92,24 @@ var dailyFields = []string{
 	"pre_close", "change", "pct_chg", "vol", "amount",
 }
 
+// barParams 按交易日/按代码查询日线的公共参数
+func barParams(tradeDate, tsCode, startDate, endDate string) map[string]interface{} {
+	params := map[string]interface{}{}
+	setOpt(params, "trade_date", tradeDate)
+	setOpt(params, "ts_code", tsCode)
+	setOpt(params, "start_date", startDate)
+	setOpt(params, "end_date", endDate)
+	return params
+}
+
 // StockBasic 获取 A 股股票列表(基础信息)
 func (c *Client) StockBasic() ([]model.Stock, error) {
 	fields := []string{
 		"ts_code", "symbol", "name", "market", "exchange",
 		"is_st", "list_status", "list_date", "delist_date", "industry",
 	}
-	rows, err := c.callAPI("stock_basic", map[string]interface{}{}, fields)
-	if err != nil {
-		return nil, err
-	}
-
-	result := make([]model.Stock, 0, len(rows))
-	for _, row := range rows {
-		s := model.Stock{
+	return fetchRows(c, "stock_basic", map[string]interface{}{}, fields, func(row map[string]interface{}) model.Stock {
+		return model.Stock{
 			TsCode:     fieldStr(row, "ts_code"),
 			Symbol:     fieldStr(row, "symbol"),
 			Name:       fieldStr(row, "name"),
@@ -97,9 +121,7 @@ func (c *Client) StockBasic() ([]model.Stock, error) {
 			DelistDate: fieldStr(row, "delist_date"),
 			Industry:   fieldStr(row, "industry"),
 		}
-		result = append(result, s)
-	}
-	return result, nil
+	})
 }
 
 // TradeCal 获取指定交易所在 [startDate, endDate] 区间内的交易日历
@@ -111,132 +133,56 @@ func (c *Client) TradeCal(exchange, startDate, endDate string) ([]model.TradeCal
 		"start_date": startDate,
 		"end_date":   endDate,
 	}
-	rows, err := c.callAPI("trade_cal", params, fields)
-	if err != nil {
-		return nil, err
-	}
-
-	result := make([]model.TradeCal, 0, len(rows))
-	for _, row := range rows {
-		tc := model.TradeCal{
+	return fetchRows(c, "trade_cal", params, fields, func(row map[string]interface{}) model.TradeCal {
+		return model.TradeCal{
 			CalDate:      fieldStr(row, "cal_date"),
 			IsOpen:       fieldInt(row, "is_open"),
 			PreTradeDate: fieldStr(row, "pretrade_date"),
 			PExchange:    fieldStr(row, "exchange"),
 		}
-		result = append(result, tc)
-	}
-	return result, nil
+	})
 }
 
 // FundDaily 按交易日获取全市场基金(含ETF)日线(未复权)
 // 返回数据结构与 Daily 相同, 可直接写入 daily_bar 表
 func (c *Client) FundDaily(tradeDate string) ([]model.Bar, error) {
-	params := map[string]interface{}{"trade_date": tradeDate}
-	rows, err := c.callAPI("fund_daily", params, dailyFields)
-	if err != nil {
-		return nil, err
-	}
-
-	result := make([]model.Bar, 0, len(rows))
-	for _, row := range rows {
-		result = append(result, parseBar(row))
-	}
-	return result, nil
+	return fetchRows(c, "fund_daily", barParams(tradeDate, "", "", ""), dailyFields, parseBar)
 }
 
 // Daily 按交易日获取全市场日线(未复权)
 func (c *Client) Daily(tradeDate string) ([]model.Bar, error) {
-	params := map[string]interface{}{"trade_date": tradeDate}
-	rows, err := c.callAPI("daily", params, dailyFields)
-	if err != nil {
-		return nil, err
-	}
-
-	result := make([]model.Bar, 0, len(rows))
-	for _, row := range rows {
-		result = append(result, parseBar(row))
-	}
-	return result, nil
+	return fetchRows(c, "daily", barParams(tradeDate, "", "", ""), dailyFields, parseBar)
 }
 
 // DailyByCode 按股票代码获取指定区间的日线(未复权)
 func (c *Client) DailyByCode(tsCode, startDate, endDate string) ([]model.Bar, error) {
-	params := map[string]interface{}{
-		"ts_code":    tsCode,
-		"start_date": startDate,
-		"end_date":   endDate,
-	}
-	rows, err := c.callAPI("daily", params, dailyFields)
-	if err != nil {
-		return nil, err
-	}
-
-	result := make([]model.Bar, 0, len(rows))
-	for _, row := range rows {
-		result = append(result, parseBar(row))
-	}
-	return result, nil
+	return fetchRows(c, "daily", barParams("", tsCode, startDate, endDate), dailyFields, parseBar)
 }
 
 // IndexDaily 按交易日获取指数日线 (如 000300.SH 沪深300, 000001.SH 上证综指)
 func (c *Client) IndexDaily(tradeDate string) ([]model.Bar, error) {
-	params := map[string]interface{}{"trade_date": tradeDate}
-	rows, err := c.callAPI("index_daily", params, dailyFields)
-	if err != nil {
-		return nil, err
-	}
-	result := make([]model.Bar, 0, len(rows))
-	for _, row := range rows {
-		result = append(result, parseBar(row))
-	}
-	return result, nil
+	return fetchRows(c, "index_daily", barParams(tradeDate, "", "", ""), dailyFields, parseBar)
 }
 
 // IndexDailyByCode 按代码获取指数日线
 func (c *Client) IndexDailyByCode(tsCode, startDate, endDate string) ([]model.Bar, error) {
-	params := map[string]interface{}{
-		"ts_code":    tsCode,
-		"start_date": startDate,
-		"end_date":   endDate,
-	}
-	rows, err := c.callAPI("index_daily", params, dailyFields)
-	if err != nil {
-		return nil, err
-	}
-	result := make([]model.Bar, 0, len(rows))
-	for _, row := range rows {
-		result = append(result, parseBar(row))
-	}
-	return result, nil
+	return fetchRows(c, "index_daily", barParams("", tsCode, startDate, endDate), dailyFields, parseBar)
 }
 
 // AdjFactor 获取复权因子
 // 当 tsCode 或 tradeDate 为空时对应参数不传, 由 Tushare 按默认处理
 func (c *Client) AdjFactor(tsCode, tradeDate string) ([]AdjFactor, error) {
 	fields := []string{"ts_code", "trade_date", "adj_factor"}
-	params := make(map[string]interface{})
-	if tsCode != "" {
-		params["ts_code"] = tsCode
-	}
-	if tradeDate != "" {
-		params["trade_date"] = tradeDate
-	}
-	rows, err := c.callAPI("adj_factor", params, fields)
-	if err != nil {
-		return nil, err
-	}
-
-	result := make([]AdjFactor, 0, len(rows))
-	for _, row := range rows {
-		af := AdjFactor{
+	params := map[string]interface{}{}
+	setOpt(params, "ts_code", tsCode)
+	setOpt(params, "trade_date", tradeDate)
+	return fetchRows(c, "adj_factor", params, fields, func(row map[string]interface{}) AdjFactor {
+		return AdjFactor{
 			TsCode:    fieldStr(row, "ts_code"),
 			TradeDate: fieldStr(row, "trade_date"),
 			AdjFactor: fieldFloat(row, "adj_factor"),
 		}
-		result = append(result, af)
-	}
-	return result, nil
+	})
 }
 
 // DailyBasic 按交易日获取全市场每日基本面数据
@@ -246,15 +192,8 @@ func (c *Client) DailyBasic(tradeDate string) ([]model.DailyBasic, error) {
 		"pe", "pe_ttm", "pb", "ps", "ps_ttm", "dv_ratio",
 		"total_mv", "circ_mv", "limit_status",
 	}
-	params := map[string]interface{}{"trade_date": tradeDate}
-	rows, err := c.callAPI("daily_basic", params, fields)
-	if err != nil {
-		return nil, err
-	}
-
-	result := make([]model.DailyBasic, 0, len(rows))
-	for _, row := range rows {
-		db := model.DailyBasic{
+	return fetchRows(c, "daily_basic", barParams(tradeDate, "", "", ""), fields, func(row map[string]interface{}) model.DailyBasic {
+		return model.DailyBasic{
 			TsCode:       fieldStr(row, "ts_code"),
 			TradeDate:    fieldStr(row, "trade_date"),
 			Close:        fieldFloat(row, "close"),
@@ -270,31 +209,20 @@ func (c *Client) DailyBasic(tradeDate string) ([]model.DailyBasic, error) {
 			CircMV:       fieldFloat(row, "circ_mv"),
 			LimitStatus:  fieldInt(row, "limit_status"),
 		}
-		result = append(result, db)
-	}
-	return result, nil
+	})
 }
 
 // StkLimit 按交易日获取全市场涨跌停价
 func (c *Client) StkLimit(tradeDate string) ([]model.StkLimit, error) {
 	fields := []string{"ts_code", "trade_date", "up_limit", "down_limit"}
-	params := map[string]interface{}{"trade_date": tradeDate}
-	rows, err := c.callAPI("stk_limit", params, fields)
-	if err != nil {
-		return nil, err
-	}
-
-	result := make([]model.StkLimit, 0, len(rows))
-	for _, row := range rows {
-		sl := model.StkLimit{
+	return fetchRows(c, "stk_limit", barParams(tradeDate, "", "", ""), fields, func(row map[string]interface{}) model.StkLimit {
+		return model.StkLimit{
 			TsCode:    fieldStr(row, "ts_code"),
 			TradeDate: fieldStr(row, "trade_date"),
 			UpLimit:   fieldFloat(row, "up_limit"),
 			DownLimit: fieldFloat(row, "down_limit"),
 		}
-		result = append(result, sl)
-	}
-	return result, nil
+	})
 }
 
 // FinaIndicator 获取财务指标
@@ -309,21 +237,11 @@ func (c *Client) FinaIndicator(tsCode string, period string) ([]model.FinaIndica
 		"netprofit_yoy", "or_yoy", "bps",
 	}
 	// ts_code 和 period 均为可选参数, 为空时不传, 由 Tushare 按默认处理
-	params := make(map[string]interface{})
-	if tsCode != "" {
-		params["ts_code"] = tsCode
-	}
-	if period != "" {
-		params["period"] = period
-	}
-	rows, err := c.callAPI("fina_indicator", params, fields)
-	if err != nil {
-		return nil, err
-	}
-
-	result := make([]model.FinaIndicator, 0, len(rows))
-	for _, row := range rows {
-		fi := model.FinaIndicator{
+	params := map[string]interface{}{}
+	setOpt(params, "ts_code", tsCode)
+	setOpt(params, "period", period)
+	return fetchRows(c, "fina_indicator", params, fields, func(row map[string]interface{}) model.FinaIndicator {
+		return model.FinaIndicator{
 			TsCode:            fieldStr(row, "ts_code"),
 			AnnDate:           fieldStr(row, "ann_date"),
 			EndDate:           fieldStr(row, "end_date"),
@@ -336,9 +254,7 @@ func (c *Client) FinaIndicator(tsCode string, period string) ([]model.FinaIndica
 			ORYoy:             fieldFloat(row, "or_yoy"),
 			BPS:               fieldFloat(row, "bps"),
 		}
-		result = append(result, fi)
-	}
-	return result, nil
+	})
 }
 
 // NewShare 获取新股申购数据
@@ -349,20 +265,10 @@ func (c *Client) NewShare(startDate, endDate string) ([]model.NewShare, error) {
 		"amount", "market_amount", "price", "pe", "limit_amount", "funds", "ballot",
 	}
 	params := map[string]interface{}{}
-	if startDate != "" {
-		params["start_date"] = startDate
-	}
-	if endDate != "" {
-		params["end_date"] = endDate
-	}
-	rows, err := c.callAPI("new_share", params, fields)
-	if err != nil {
-		return nil, err
-	}
-
-	result := make([]model.NewShare, 0, len(rows))
-	for _, row := range rows {
-		ns := model.NewShare{
+	setOpt(params, "start_date", startDate)
+	setOpt(params, "end_date", endDate)
+	return fetchRows(c, "new_share", params, fields, func(row map[string]interface{}) model.NewShare {
+		return model.NewShare{
 			TsCode:       fieldStr(row, "ts_code"),
 			SubCode:      fieldStr(row, "sub_code"),
 			Name:         fieldStr(row, "name"),
@@ -376,9 +282,7 @@ func (c *Client) NewShare(startDate, endDate string) ([]model.NewShare, error) {
 			Funds:        fieldFloat(row, "funds"),
 			Ballot:       fieldFloat(row, "ballot"),
 		}
-		result = append(result, ns)
-	}
-	return result, nil
+	})
 }
 
 // MajorNews 获取新闻快讯
@@ -386,31 +290,17 @@ func (c *Client) NewShare(startDate, endDate string) ([]model.NewShare, error) {
 func (c *Client) MajorNews(startDate, endDate string, src string) ([]model.News, error) {
 	fields := []string{"datetime", "content", "title", "channels"}
 	params := map[string]interface{}{}
-	if startDate != "" {
-		params["start_date"] = startDate
-	}
-	if endDate != "" {
-		params["end_date"] = endDate
-	}
-	if src != "" {
-		params["src"] = src
-	}
-	rows, err := c.callAPI("major_news", params, fields)
-	if err != nil {
-		return nil, err
-	}
-
-	result := make([]model.News, 0, len(rows))
-	for _, row := range rows {
-		n := model.News{
+	setOpt(params, "start_date", startDate)
+	setOpt(params, "end_date", endDate)
+	setOpt(params, "src", src)
+	return fetchRows(c, "major_news", params, fields, func(row map[string]interface{}) model.News {
+		return model.News{
 			Datetime: fieldStr(row, "datetime"),
 			Content:  fieldStr(row, "content"),
 			Title:    fieldStr(row, "title"),
 			Channels: fieldStr(row, "channels"),
 		}
-		result = append(result, n)
-	}
-	return result, nil
+	})
 }
 
 // MoneyFlow 获取个股资金流向(按交易日)
@@ -419,24 +309,15 @@ func (c *Client) MoneyFlow(tradeDate string) ([]model.MoneyFlow, error) {
 	fields := []string{
 		"ts_code", "trade_date", "buy_elg_amount", "sell_elg_amount", "net_mf_amount",
 	}
-	params := map[string]interface{}{"trade_date": tradeDate}
-	rows, err := c.callAPI("moneyflow", params, fields)
-	if err != nil {
-		return nil, err
-	}
-
-	result := make([]model.MoneyFlow, 0, len(rows))
-	for _, row := range rows {
-		mf := model.MoneyFlow{
+	return fetchRows(c, "moneyflow", barParams(tradeDate, "", "", ""), fields, func(row map[string]interface{}) model.MoneyFlow {
+		return model.MoneyFlow{
 			TsCode:        fieldStr(row, "ts_code"),
 			TradeDate:     fieldStr(row, "trade_date"),
 			BuyElgAmount:  fieldFloat(row, "buy_elg_amount"),
 			SellElgAmount: fieldFloat(row, "sell_elg_amount"),
 			NetMFAmount:   fieldFloat(row, "net_mf_amount"),
 		}
-		result = append(result, mf)
-	}
-	return result, nil
+	})
 }
 
 // TopList 获取龙虎榜数据(按交易日)
@@ -446,15 +327,8 @@ func (c *Client) TopList(tradeDate string) ([]model.TopList, error) {
 		"ts_code", "trade_date", "name", "close", "pct_change",
 		"turnover_rate", "amount", "net_amount", "buy_amount", "sell_amount",
 	}
-	params := map[string]interface{}{"trade_date": tradeDate}
-	rows, err := c.callAPI("top_list", params, fields)
-	if err != nil {
-		return nil, err
-	}
-
-	result := make([]model.TopList, 0, len(rows))
-	for _, row := range rows {
-		tl := model.TopList{
+	return fetchRows(c, "top_list", barParams(tradeDate, "", "", ""), fields, func(row map[string]interface{}) model.TopList {
+		return model.TopList{
 			TsCode:       fieldStr(row, "ts_code"),
 			TradeDate:    fieldStr(row, "trade_date"),
 			Name:         fieldStr(row, "name"),
@@ -466,7 +340,5 @@ func (c *Client) TopList(tradeDate string) ([]model.TopList, error) {
 			BuyAmount:    fieldFloat(row, "buy_amount"),
 			SellAmount:   fieldFloat(row, "sell_amount"),
 		}
-		result = append(result, tl)
-	}
-	return result, nil
+	})
 }

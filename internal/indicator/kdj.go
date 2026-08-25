@@ -26,14 +26,18 @@ func KDJ(highs, lows, closes []float64, period int) KDJResult {
 		return KDJResult{K: k, D: d, J: j}
 	}
 
+	// 预计算窗口最高/最低 (复用 Highest/Lowest 滚动封装, 避免循环内重复切片)
+	hh := Highest(highs, period)
+	ll := Lowest(lows, period)
+
 	// 初始 K, D 均为 50
 	prevK := 50.0
 	prevD := 50.0
 
 	// RSV 从 index = period-1 开始有效
 	for i := period - 1; i < n; i++ {
-		highestHigh := Max(highs[i-period+1 : i+1])
-		lowestLow := Min(lows[i-period+1 : i+1])
+		highestHigh := hh[i]
+		lowestLow := ll[i]
 
 		// 计算 RSV, 除零保护: 当最高=最低时 RSV 取 50 (中性)
 		rsv := 50.0

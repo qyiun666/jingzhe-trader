@@ -34,7 +34,7 @@ func NewDebateRepo(db *sqlx.DB) *DebateRepo {
 }
 
 func (r *DebateRepo) Insert(result *DebateResult) (int64, error) {
-	now := time.Now().Format("2006-01-02 15:04:05")
+	now := time.Now().Format(TimeLayout)
 	res, err := r.db.Exec(`INSERT INTO agent_debate
 		(trade_date, ts_code, name, decision, confidence, position_pct, stop_price,
 		 risk_level, bull_args, bear_args, risk_note, summary, created_at)
@@ -108,10 +108,5 @@ func (r *DebateRepo) GetPreviousDebates(beforeDate string) (map[string]DebateRes
 
 // HasDebatesOnDate 判断指定日期是否已有辩论记录 (用于检测是否已执行)
 func (r *DebateRepo) HasDebatesOnDate(tradeDate string) (bool, error) {
-	var count int
-	if err := r.db.Get(&count,
-		`SELECT COUNT(1) FROM agent_debate WHERE trade_date = ?`, tradeDate); err != nil {
-		return false, fmt.Errorf("查询辩论记录失败: %w", err)
-	}
-	return count > 0, nil
+	return existsRow(r.db, `SELECT COUNT(1) FROM agent_debate WHERE trade_date = ?`, tradeDate)
 }

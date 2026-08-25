@@ -1,7 +1,6 @@
 package store
 
 import (
-	"database/sql"
 	"fmt"
 	"time"
 
@@ -92,28 +91,16 @@ func (r *ScreenRepo) GetByDate(date string) ([]ScreenResult, error) {
 
 // GetLatest 获取最新一次选股结果
 func (r *ScreenRepo) GetLatest() ([]ScreenResult, error) {
-	var date string
-	err := r.db.Get(&date, "SELECT MAX(trade_date) FROM screen_result")
-	if err == sql.ErrNoRows || date == "" {
+	date, err := maxTableDate(r.db, "screen_result")
+	if err != nil || date == "" {
 		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("查询最新选股日期失败: %w", err)
 	}
 	return r.GetByDate(date)
 }
 
 // GetLatestDate 获取最新一次选股结果的日期 (无数据返回空字符串)
 func (r *ScreenRepo) GetLatestDate() (string, error) {
-	var date sql.NullString
-	err := r.db.Get(&date, "SELECT MAX(trade_date) FROM screen_result")
-	if err != nil {
-		return "", fmt.Errorf("查询最新选股日期失败: %w", err)
-	}
-	if !date.Valid {
-		return "", nil
-	}
-	return date.String, nil
+	return maxTableDate(r.db, "screen_result")
 }
 
 // GetScreenedCodes 获取最新选股代码列表 (供策略合并股票池用)

@@ -61,58 +61,50 @@ func (l *Loader) syncNews(startDate, endDate string) {
 	logger.L().Infof("新闻快讯同步完成: %d 条", len(newsList))
 }
 
+// maxDateRepo 支持查询最大交易日的 repo (增量同步判断用)
+type maxDateRepo interface {
+	GetMaxTradeDate() (string, error)
+}
+
+// syncByTradeDay 按交易日增量同步: 拉取 → 入库, 跳过已同步日期 (syncMoneyFlow/syncTopList 共用)
+// fetch: 拉取某交易日数据; store: 批量入库; 返回同步的交易日数
+func syncByTradeDay[T any](repo maxDateRepo, tradeCals []model.TradeCal, name string,
+	fetch func(string) ([]T, error), store func([]T) error) int {
+	logger.L().Infof("=== 同步%s ===", name)
+	lastDate, _ := repo.GetMaxTradeDate()
+	synced := 0
+	for _, cal := range tradeCals {
+		if lastDate != "" && cal.CalDate <= lastDate {
+			continue
+		}
+		items, err := fetch(cal.CalDate)
+		if err != nil {
+			logger.L().Errorf("获取 %s %s失败: %v", cal.CalDate, name, err)
+			continue
+		}
+		if len(items) == 0 {
+			continue
+		}
+		if err := store(items); err != nil {
+			logger.L().Errorf("存储 %s %s失败: %v", cal.CalDate, name, err)
+			continue
+		}
+		synced++
+	}
+	logger.L().Infof("%s同步完成, 共 %d 个交易日", name, synced)
+	return synced
+}
+
 // syncMoneyFlow 同步个股资金流向 (按交易日增量)
 func (l *Loader) syncMoneyFlow(tradeCals []model.TradeCal) {
-	logger.L().Info("=== 同步个股资金流向 ===")
-	mfRepo := store.NewMoneyFlowRepo(l.db)
-	lastMFDate, _ := mfRepo.GetMaxTradeDate()
-	mfSynced := 0
-	for _, cal := range tradeCals {
-		if lastMFDate != "" && cal.CalDate <= lastMFDate {
-			continue
-		}
-		flows, err := l.ts.MoneyFlow(cal.CalDate)
-		if err != nil {
-			logger.L().Errorf("获取 %s 资金流向失败: %v", cal.CalDate, err)
-			continue
-		}
-		if len(flows) == 0 {
-			continue
-		}
-		if err := mfRepo.BatchInsert(flows); err != nil {
-			logger.L().Errorf("存储 %s 资金流向失败: %v", cal.CalDate, err)
-			continue
-		}
-		mfSynced++
-	}
-	logger.L().Infof("个股资金流向同步完成, 共 %d 个交易日", mfSynced)
+	repo := store.NewMoneyFlowRepo(l.db)
+	syncByTradeDay(repo, tradeCals, "个股资金流向", l.ts.MoneyFlow, repo.BatchInsert)
 }
 
 // syncTopList 同步龙虎榜 (按交易日增量)
 func (l *Loader) syncTopList(tradeCals []model.TradeCal) {
-	logger.L().Info("=== 同步龙虎榜 ===")
-	tlRepo := store.NewTopListRepo(l.db)
-	lastTLDate, _ := tlRepo.GetMaxTradeDate()
-	tlSynced := 0
-	for _, cal := range tradeCals {
-		if lastTLDate != "" && cal.CalDate <= lastTLDate {
-			continue
-		}
-		list, err := l.ts.TopList(cal.CalDate)
-		if err != nil {
-			logger.L().Errorf("获取 %s 龙虎榜失败: %v", cal.CalDate, err)
-			continue
-		}
-		if len(list) == 0 {
-			continue
-		}
-		if err := tlRepo.BatchInsert(list); err != nil {
-			logger.L().Errorf("存储 %s 龙虎榜失败: %v", cal.CalDate, err)
-			continue
-		}
-		tlSynced++
-	}
-	logger.L().Infof("龙虎榜同步完成, 共 %d 个交易日", tlSynced)
+	repo := store.NewTopListRepo(l.db)
+	syncByTradeDay(repo, tradeCals, "龙虎榜", l.ts.TopList, repo.BatchInsert)
 }
 
 // syncFina 同步财务指标 (逐股票逐报告期获取)

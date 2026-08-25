@@ -40,38 +40,25 @@ func (r *PositionRepo) InsertPositionSnapshot(runID, tradeDate string, pos model
 
 // BatchInsertPositionSnapshot 批量插入某交易日的持仓快照(使用事务)
 func (r *PositionRepo) BatchInsertPositionSnapshot(runID, tradeDate string, positions []model.Position) error {
-	if len(positions) == 0 {
-		return nil
-	}
-	tx, err := r.db.Beginx()
-	if err != nil {
-		return fmt.Errorf("开启事务失败: %w", err)
-	}
-	defer tx.Rollback()
-
-	stmt, err := tx.Preparex(positionSnapshotInsertSQL)
-	if err != nil {
-		return fmt.Errorf("预编译插入语句失败: %w", err)
-	}
-	defer stmt.Close()
-
-	for _, p := range positions {
-		if _, err := stmt.Exec(
+	return batchInsert(r.db, positionSnapshotInsertSQL, "插入持仓快照失败", len(positions), func(stmt *sqlx.Stmt, i int) error {
+		p := positions[i]
+		_, err := stmt.Exec(
 			runID, tradeDate, p.TsCode, p.TotalQty, p.AvailableQty,
 			p.CostPrice, p.MarketPrice, p.MarketValue, p.FloatingPnL,
-		); err != nil {
-			return fmt.Errorf("插入持仓快照失败(ts_code=%s): %w", p.TsCode, err)
+		)
+		if err != nil {
+			return fmt.Errorf("ts_code=%s: %w", p.TsCode, err)
 		}
-	}
-	return tx.Commit()
+		return nil
+	})
 }
 
 // GetPositionsByRunID 查询某次运行的全部持仓快照
 func (r *PositionRepo) GetPositionsByRunID(runID string) ([]model.Position, error) {
 	query := fmt.Sprintf(`SELECT %s FROM position_snapshot WHERE run_id = ? ORDER BY ts_code ASC`, positionSelectCols)
 	var positions []model.Position
-	if err := r.db.Select(&positions, query, runID); err != nil {
-		return nil, fmt.Errorf("查询持仓快照失败: %w", err)
+	if err := selectList(r.db, query, &positions, "查询持仓快照失败", runID); err != nil {
+		return nil, err
 	}
 	return positions, nil
 }
@@ -81,8 +68,8 @@ func (r *PositionRepo) GetPositionsByDate(runID, tradeDate string) ([]model.Posi
 	query := fmt.Sprintf(`SELECT %s FROM position_snapshot
 		WHERE run_id = ? AND trade_date = ? ORDER BY ts_code ASC`, positionSelectCols)
 	var positions []model.Position
-	if err := r.db.Select(&positions, query, runID, tradeDate); err != nil {
-		return nil, fmt.Errorf("查询持仓快照失败: %w", err)
+	if err := selectList(r.db, query, &positions, "查询持仓快照失败", runID, tradeDate); err != nil {
+		return nil, err
 	}
 	return positions, nil
 }

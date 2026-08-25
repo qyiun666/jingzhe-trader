@@ -50,7 +50,7 @@ func NewPlanRepo(db *sqlx.DB) *PlanRepo {
 
 // InsertPlan 插入交易计划
 func (r *PlanRepo) InsertPlan(p *TradePlan) (int64, error) {
-	now := time.Now().Format("2006-01-02 15:04:05")
+	now := time.Now().Format(TimeLayout)
 	p.CreatedAt = now
 	p.UpdatedAt = now
 	if p.Status == "" {
@@ -83,7 +83,7 @@ func (r *PlanRepo) ReplaceDayPlans(tradeDate string, plans []*TradePlan) error {
 		return fmt.Errorf("清理旧计划失败: %w", err)
 	}
 
-	now := time.Now().Format("2006-01-02 15:04:05")
+	now := time.Now().Format(TimeLayout)
 	for _, p := range plans {
 		if p.Status == "" {
 			p.Status = PlanStatusPending
@@ -135,7 +135,7 @@ func (r *PlanRepo) GetPlanByID(id int64) (*TradePlan, error) {
 
 // UpdatePlanStatus 更新交易计划状态
 func (r *PlanRepo) UpdatePlanStatus(id int64, status string) error {
-	now := time.Now().Format("2006-01-02 15:04:05")
+	now := time.Now().Format(TimeLayout)
 	res, err := r.db.Exec(`UPDATE trade_plan SET status = ?, updated_at = ? WHERE id = ?`, status, now, id)
 	if err != nil {
 		return fmt.Errorf("更新交易计划状态失败(id=%d): %w", id, err)
@@ -148,7 +148,7 @@ func (r *PlanRepo) UpdatePlanStatus(id int64, status string) error {
 
 // ExpireOldPlans 将指定日期之前仍pending的计划标记为过期
 func (r *PlanRepo) ExpireOldPlans(beforeDate string) (int64, error) {
-	now := time.Now().Format("2006-01-02 15:04:05")
+	now := time.Now().Format(TimeLayout)
 	res, err := r.db.Exec(`UPDATE trade_plan SET status = ?, updated_at = ? WHERE trade_date < ? AND status = ?`,
 		PlanStatusExpired, now, beforeDate, PlanStatusPending)
 	if err != nil {

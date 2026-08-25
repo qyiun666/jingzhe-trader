@@ -22,19 +22,19 @@ type OrderType int
 
 const (
 	OrderMarket OrderType = iota // 市价单
-	OrderLimit                    // 限价单
+	OrderLimit                   // 限价单
 )
 
 // OrderStatus 订单状态
 type OrderStatus int
 
 const (
-	StatusCreated  OrderStatus = iota // 已创建
-	StatusSubmitted                   // 已提交
-	StatusPartial                     // 部分成交
-	StatusFilled                      // 全部成交
-	StatusCanceled                    // 已撤单
-	StatusRejected                    // 已拒绝
+	StatusCreated   OrderStatus = iota // 已创建
+	StatusSubmitted                    // 已提交
+	StatusPartial                      // 部分成交
+	StatusFilled                       // 全部成交
+	StatusCanceled                     // 已撤单
+	StatusRejected                     // 已拒绝
 )
 
 func (s OrderStatus) String() string {
@@ -58,19 +58,19 @@ func (s OrderStatus) String() string {
 
 // Order 订单
 type Order struct {
-	ID         int64      `json:"id"`
-	RunID      string     `json:"run_id"`      // 回测/实盘运行批次
-	TsCode     string     `json:"ts_code"`
-	Side       Side       `json:"side"`
-	OrderType  OrderType  `json:"order_type"`
-	Price      float64    `json:"price"`       // 限价单价格
-	Qty        int        `json:"qty"`         // 委托数量
-	FilledQty  int        `json:"filled_qty"`  // 已成交数量
-	AvgPrice   float64    `json:"avg_price"`   // 成交均价
+	ID         int64       `json:"id"`
+	RunID      string      `json:"run_id"` // 回测/实盘运行批次
+	TsCode     string      `json:"ts_code"`
+	Side       Side        `json:"side"`
+	OrderType  OrderType   `json:"order_type"`
+	Price      float64     `json:"price"`      // 限价单价格
+	Qty        int         `json:"qty"`        // 委托数量
+	FilledQty  int         `json:"filled_qty"` // 已成交数量
+	AvgPrice   float64     `json:"avg_price"`  // 成交均价
 	Status     OrderStatus `json:"status"`
-	Reason     string     `json:"reason"`     // 下单原因
-	CreateTime time.Time  `json:"create_time"`
-	UpdateTime time.Time  `json:"update_time"`
+	Reason     string      `json:"reason"` // 下单原因
+	CreateTime time.Time   `json:"create_time"`
+	UpdateTime time.Time   `json:"update_time"`
 }
 
 // Trade 成交记录
@@ -82,12 +82,12 @@ type Trade struct {
 	Side        Side    `json:"side" db:"side"`
 	Price       float64 `json:"price" db:"price"`
 	Qty         int     `json:"qty" db:"qty"`
-	Amount      float64 `json:"amount" db:"amount"`           // 成交金额
-	Commission  float64 `json:"commission" db:"commission"`   // 佣金
-	StampTax    float64 `json:"stamp_tax" db:"stamp_tax"`     // 印花税
+	Amount      float64 `json:"amount" db:"amount"`             // 成交金额
+	Commission  float64 `json:"commission" db:"commission"`     // 佣金
+	StampTax    float64 `json:"stamp_tax" db:"stamp_tax"`       // 印花税
 	TransferFee float64 `json:"transfer_fee" db:"transfer_fee"` // 过户费
-	TotalCost   float64 `json:"total_cost" db:"total_cost"`   // 总费用
+	TotalCost   float64 `json:"total_cost" db:"total_cost"`     // 总费用
 	TradeDate   string  `json:"trade_date" db:"trade_date"`
 	TradeTime   string  `json:"trade_time" db:"trade_time"`
-	Strategy    string  `json:"strategy" db:"strategy"`      // 来源策略 (绩效归因用)
+	Strategy    string  `json:"strategy" db:"strategy"` // 来源策略 (绩效归因用)
 }

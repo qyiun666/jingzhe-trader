@@ -117,7 +117,7 @@ func TestRunRetention(t *testing.T) {
 	}
 	defer db.Close()
 
-	oldDate := time.Now().AddDate(-4, 0, 0).Format("20060102")   // 4年前, 超出3年保留期
+	oldDate := time.Now().AddDate(-4, 0, 0).Format("20060102")    // 4年前, 超出3年保留期
 	recentDate := time.Now().AddDate(0, 0, -1).Format("20060102") // 昨天
 
 	// 行情: 一条过期 + 一条新鲜

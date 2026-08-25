@@ -3,7 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"strings"
 
 	"jingzhe-trader/internal/backtest"
 	"jingzhe-trader/internal/config"
@@ -44,13 +43,8 @@ func main() {
 	}
 
 	// 解析股票池 (缺省用配置 universe)
-	var universe []string
-	if *universeStr != "" {
-		universe = strings.Split(*universeStr, ",")
-		for i := range universe {
-			universe[i] = strings.TrimSpace(universe[i])
-		}
-	} else {
+	universe := config.ParseUniverseCSV(*universeStr)
+	if universe == nil {
 		universe = cfg.UniverseCodes()
 	}
 

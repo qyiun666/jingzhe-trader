@@ -40,90 +40,23 @@ type MACrossStrategy struct {
 func (s *MACrossStrategy) Name() string { return "ma_cross" }
 
 func (s *MACrossStrategy) Init(_ context.Context, params map[string]interface{}) error {
-	s.ShortPeriod = 5
-	s.LongPeriod = 20
-	s.PositionPct = 0.1
+	s.ShortPeriod = paramInt(params, "short_period", 5)
+	s.LongPeriod = paramInt(params, "long_period", 20)
+	s.PositionPct = paramFloat(params, "position_pct", 0.1)
 	s.HistoryLen = 60
-	s.EnableAdaptive = false
-
-	if v, ok := params["short_period"]; ok {
-		if n, ok := v.(float64); ok {
-			s.ShortPeriod = int(n)
-		}
-	}
-	if v, ok := params["long_period"]; ok {
-		if n, ok := v.(float64); ok {
-			s.LongPeriod = int(n)
-		}
-	}
-	if v, ok := params["position_pct"]; ok {
-		if n, ok := v.(float64); ok {
-			s.PositionPct = n
-		}
-	}
-	if v, ok := params["enable_adaptive"]; ok {
-		if b, ok := v.(bool); ok {
-			s.EnableAdaptive = b
-		}
-	}
+	s.EnableAdaptive = paramBool(params, "enable_adaptive", false)
 
 	// ===== 信号过滤参数 (默认全部开启, 可通过 params 关闭) =====
-	s.volConfirm = true
-	s.trendConfirm = true
-	s.marketFilter = true
-	s.buyCooldownDays = 5
-	s.sellCooldownDays = 3
-	s.volConfirmRatio = 1.2
-	s.trendThreshold = 0.005
-	s.marketDropThreshold = -0.02
-	s.marketIndexCode = "000300.SH"
+	s.volConfirm = paramBool(params, "vol_confirm", true)
+	s.trendConfirm = paramBool(params, "trend_confirm", true)
+	s.marketFilter = paramBool(params, "market_filter", true)
+	s.buyCooldownDays = paramInt(params, "buy_cooldown_days", 5)
+	s.sellCooldownDays = paramInt(params, "sell_cooldown_days", 3)
+	s.volConfirmRatio = paramFloat(params, "vol_confirm_ratio", 1.2)
+	s.trendThreshold = paramFloat(params, "trend_threshold", 0.005)
+	s.marketDropThreshold = paramFloat(params, "market_drop_threshold", -0.02)
+	s.marketIndexCode = paramStr(params, "market_index_code", "000300.SH")
 	s.lastSignalDate = make(map[string]string)
-
-	if v, ok := params["vol_confirm"]; ok {
-		if b, ok := v.(bool); ok {
-			s.volConfirm = b
-		}
-	}
-	if v, ok := params["trend_confirm"]; ok {
-		if b, ok := v.(bool); ok {
-			s.trendConfirm = b
-		}
-	}
-	if v, ok := params["market_filter"]; ok {
-		if b, ok := v.(bool); ok {
-			s.marketFilter = b
-		}
-	}
-	if v, ok := params["buy_cooldown_days"]; ok {
-		if n, ok := v.(float64); ok {
-			s.buyCooldownDays = int(n)
-		}
-	}
-	if v, ok := params["sell_cooldown_days"]; ok {
-		if n, ok := v.(float64); ok {
-			s.sellCooldownDays = int(n)
-		}
-	}
-	if v, ok := params["vol_confirm_ratio"]; ok {
-		if n, ok := v.(float64); ok {
-			s.volConfirmRatio = n
-		}
-	}
-	if v, ok := params["trend_threshold"]; ok {
-		if n, ok := v.(float64); ok {
-			s.trendThreshold = n
-		}
-	}
-	if v, ok := params["market_drop_threshold"]; ok {
-		if n, ok := v.(float64); ok {
-			s.marketDropThreshold = n
-		}
-	}
-	if v, ok := params["market_index_code"]; ok {
-		if str, ok := v.(string); ok {
-			s.marketIndexCode = str
-		}
-	}
 
 	// 如果启用自适应, 创建自适应参数调整器
 	if s.EnableAdaptive {
@@ -156,10 +89,7 @@ func (s *MACrossStrategy) OnBar(_ context.Context, barCtx *BarContext) ([]model.
 		}
 
 		// 提取收盘价序列
-		closes := make([]float64, len(bars))
-		for i, bar := range bars {
-			closes[i] = bar.AdjClose()
-		}
+		closes := closesOf(bars)
 
 		// 当前使用的均线周期和仓位
 		shortPeriod := s.ShortPeriod
@@ -169,12 +99,7 @@ func (s *MACrossStrategy) OnBar(_ context.Context, barCtx *BarContext) ([]model.
 		// 如果启用自适应, 先更新波动率并获取动态参数
 		if s.EnableAdaptive && s.adaptive != nil {
 			// 提取最高价和最低价序列 (用于ATR计算)
-			highs := make([]float64, len(bars))
-			lows := make([]float64, len(bars))
-			for i, bar := range bars {
-				highs[i] = bar.AdjHigh()
-				lows[i] = bar.AdjLow()
-			}
+			highs, lows := highsLowsOf(bars)
 			s.adaptive.Update(closes, highs, lows)
 			shortPeriod, longPeriod = s.adaptive.GetMA()
 			positionPct = s.adaptive.GetPositionSize()
@@ -190,8 +115,7 @@ func (s *MACrossStrategy) OnBar(_ context.Context, barCtx *BarContext) ([]model.
 
 		n := len(closes)
 		// 需要今日和昨日的MA值来判断交叉
-		if math.IsNaN(shortMA[n-1]) || math.IsNaN(longMA[n-1]) ||
-			math.IsNaN(shortMA[n-2]) || math.IsNaN(longMA[n-2]) {
+		if !tail2Valid(shortMA) || !tail2Valid(longMA) {
 			continue
 		}
 
@@ -204,9 +128,9 @@ func (s *MACrossStrategy) OnBar(_ context.Context, barCtx *BarContext) ([]model.
 		pos, hasPosition := barCtx.Positions[tsCode]
 
 		// 金叉: 昨日短均线在长均线下方, 今日短均线在长均线上方
-		isGoldenCross := prevShort <= prevLong && currShort > currLong
+		isGoldenCross := crossUp(prevShort, prevLong, currShort, currLong)
 		// 死叉: 昨日短均线在长均线上方, 今日短均线在长均线下方
-		isDeathCross := prevShort >= prevLong && currShort < currLong
+		isDeathCross := crossDown(prevShort, prevLong, currShort, currLong)
 
 		if isGoldenCross && !hasPosition {
 			// ===== 买入信号过滤层 (金叉) =====
@@ -236,21 +160,14 @@ func (s *MACrossStrategy) OnBar(_ context.Context, barCtx *BarContext) ([]model.
 			if !ok || bar.AdjClose() <= 0 {
 				continue
 			}
-			targetAmount := barCtx.TotalAsset * positionPct
-			qty := int(targetAmount/bar.AdjClose()/100) * 100
+			qty := calcBuyQty(barCtx.TotalAsset, bar.AdjClose(), positionPct)
 			if qty > 0 {
 				reason := fmt.Sprintf("均线金叉: MA%d=%.2f上穿MA%d=%.2f", shortPeriod, currShort, longPeriod, currLong)
 				if s.EnableAdaptive {
 					status := s.adaptive.GetStatus()
 					reason = fmt.Sprintf("%s [%s]", reason, status.VolatilityDesc)
 				}
-				signals = append(signals, model.Signal{
-					TsCode:    tsCode,
-					Direction: model.DirBuy,
-					TargetQty: qty,
-					Reason:    reason,
-					Strength:  0.8,
-				})
+				signals = append(signals, buySignal(tsCode, qty, reason, 0.8))
 				// 记录金叉信号日期, 用于冷却期判断
 				s.lastSignalDate[s.signalKey(tsCode, model.DirBuy)] = barCtx.TradeDate
 			}
@@ -267,13 +184,7 @@ func (s *MACrossStrategy) OnBar(_ context.Context, barCtx *BarContext) ([]model.
 				status := s.adaptive.GetStatus()
 				reason = fmt.Sprintf("%s [%s]", reason, status.VolatilityDesc)
 			}
-			signals = append(signals, model.Signal{
-				TsCode:    tsCode,
-				Direction: model.DirSell,
-				TargetQty: pos.TotalQty,
-				Reason:    reason,
-				Strength:  0.8,
-			})
+			signals = append(signals, sellSignal(tsCode, pos.TotalQty, reason, 0.8))
 			// 记录死叉信号日期, 用于冷却期判断
 			s.lastSignalDate[s.signalKey(tsCode, model.DirSell)] = barCtx.TradeDate
 		}

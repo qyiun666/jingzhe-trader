@@ -67,44 +67,14 @@ func (s *MultiFactorStrategy) SetCalendar(cal *market.Calendar) {
 
 // Init 初始化策略参数
 func (s *MultiFactorStrategy) Init(_ context.Context, params map[string]interface{}) error {
-	// 解析参数
-	if v, ok := params["top_n"]; ok {
-		if n, ok := v.(float64); ok && n > 0 {
-			s.TopN = int(n)
-		}
-	}
-	if v, ok := params["rebalance_freq"]; ok {
-		if freq, ok := v.(string); ok {
-			freq = strings.ToLower(freq)
-			if freq == "weekly" || freq == "monthly" {
-				s.RebalanceFreq = freq
-			}
-		}
-	}
-	if v, ok := params["position_pct"]; ok {
-		if pct, ok := v.(float64); ok {
-			s.PositionPct = pct
-		}
-	}
-	if v, ok := params["stop_loss_pct"]; ok {
-		if pct, ok := v.(float64); ok {
-			s.StopLossPct = pct
-		}
-	}
-	if v, ok := params["take_profit_pct"]; ok {
-		if pct, ok := v.(float64); ok {
-			s.TakeProfitPct = pct
-		}
-	}
-	if v, ok := params["momentum_period"]; ok {
-		if n, ok := v.(float64); ok && n > 0 {
-			s.MomentumPeriod = int(n)
-		}
-	}
-	if v, ok := params["enable_adaptive"]; ok {
-		if b, ok := v.(bool); ok {
-			s.EnableAdaptive = b
-		}
+	s.TopN = paramInt(params, "top_n", s.TopN)
+	s.PositionPct = paramFloat(params, "position_pct", s.PositionPct)
+	s.StopLossPct = paramFloat(params, "stop_loss_pct", s.StopLossPct)
+	s.TakeProfitPct = paramFloat(params, "take_profit_pct", s.TakeProfitPct)
+	s.MomentumPeriod = paramInt(params, "momentum_period", s.MomentumPeriod)
+	s.EnableAdaptive = paramBool(params, "enable_adaptive", s.EnableAdaptive)
+	if freq := strings.ToLower(paramStr(params, "rebalance_freq", "")); freq == "weekly" || freq == "monthly" {
+		s.RebalanceFreq = freq
 	}
 
 	// 如果未指定单票仓位, 按 topN 均仓
@@ -321,13 +291,7 @@ func (s *MultiFactorStrategy) doRebalance(ctx context.Context, barCtx *BarContex
 				status := s.adaptive.GetStatus()
 				reason = fmt.Sprintf("%s [%s]", reason, status.VolatilityDesc)
 			}
-			signals = append(signals, model.Signal{
-				TsCode:    tsCode,
-				Direction: model.DirSell,
-				TargetQty: pos.TotalQty,
-				Reason:    reason,
-				Strength:  0.7,
-			})
+			signals = append(signals, sellSignal(tsCode, pos.TotalQty, reason, 0.7))
 		}
 	}
 
@@ -374,13 +338,7 @@ func (s *MultiFactorStrategy) doRebalance(ctx context.Context, barCtx *BarContex
 			status := s.adaptive.GetStatus()
 			reason = fmt.Sprintf("%s [%s, 仓位%.1f%%]", reason, status.VolatilityDesc, positionPct*100)
 		}
-		signals = append(signals, model.Signal{
-			TsCode:    tsCode,
-			Direction: model.DirBuy,
-			TargetQty: qty,
-			Reason:    reason,
-			Strength:  0.8,
-		})
+		signals = append(signals, buySignal(tsCode, qty, reason, 0.8))
 	}
 
 	return signals, nil
@@ -421,13 +379,7 @@ func (s *MultiFactorStrategy) checkStopLossProfit(barCtx *BarContext) []model.Si
 				status := s.adaptive.GetStatus()
 				reason = fmt.Sprintf("%s [%s, 止损线%.1f%%]", reason, status.VolatilityDesc, stopLossPct*100)
 			}
-			signals = append(signals, model.Signal{
-				TsCode:    tsCode,
-				Direction: model.DirSell,
-				TargetQty: pos.TotalQty,
-				Reason:    reason,
-				Strength:  0.9,
-			})
+			signals = append(signals, sellSignal(tsCode, pos.TotalQty, reason, 0.9))
 			continue
 		}
 
@@ -438,13 +390,7 @@ func (s *MultiFactorStrategy) checkStopLossProfit(barCtx *BarContext) []model.Si
 				status := s.adaptive.GetStatus()
 				reason = fmt.Sprintf("%s [%s, 止盈线%.1f%%]", reason, status.VolatilityDesc, takeProfitPct*100)
 			}
-			signals = append(signals, model.Signal{
-				TsCode:    tsCode,
-				Direction: model.DirSell,
-				TargetQty: pos.TotalQty,
-				Reason:    reason,
-				Strength:  0.9,
-			})
+			signals = append(signals, sellSignal(tsCode, pos.TotalQty, reason, 0.9))
 		}
 	}
 

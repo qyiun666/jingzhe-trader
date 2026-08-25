@@ -3,7 +3,6 @@ package llm
 import (
 	"encoding/json"
 	"fmt"
-	"strings"
 
 	"jingzhe-trader/internal/model"
 )
@@ -67,11 +66,7 @@ func (na *NewsAnalyzer) AnalyzeNews(news *model.News) (*NewsAnalysis, error) {
 	}
 
 	// 解析 JSON (处理可能的markdown代码块包裹)
-	result = strings.TrimSpace(result)
-	result = strings.TrimPrefix(result, "```json")
-	result = strings.TrimPrefix(result, "```")
-	result = strings.TrimSuffix(result, "```")
-	result = strings.TrimSpace(result)
+	result = StripCodeFence(result)
 
 	var analysis NewsAnalysis
 	if err := json.Unmarshal([]byte(result), &analysis); err != nil {

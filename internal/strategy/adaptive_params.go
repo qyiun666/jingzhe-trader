@@ -57,7 +57,7 @@ func (ap *AdaptiveParams) Update(closes, highs, lows []float64) {
 	// 计算ATR
 	atr := indicator.ATR(highs, lows, closes, ap.atrPeriod)
 	n := len(atr)
-	if n > 0 && !isNaNFloat(atr[n-1]) {
+	if n > 0 && !indicator.IsNaN(atr[n-1]) {
 		currentAtr := atr[n-1]
 		// 用ATR/收盘价归一化 (波动率百分比)
 		lastClose := closes[len(closes)-1]
@@ -173,11 +173,6 @@ func (ap *AdaptiveParams) GetStatus() ParamStatus {
 		TakeProfit:      ap.GetTakeProfit(),
 		PositionPct:     ap.GetPositionSize(),
 	}
-}
-
-// isNaNFloat 判断是否为 NaN
-func isNaNFloat(v float64) bool {
-	return v != v
 }
 
 // maxInt 返回两个整数中的较大值

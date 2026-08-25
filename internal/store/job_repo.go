@@ -14,6 +14,21 @@ const (
 	JobStatusFailed  = "failed"
 )
 
+// 任务名常量 (job_run 表 / 健康度展示 / API 共用, 避免各包硬编码字面量)
+const (
+	JobDataUpdate = "data_update"
+	JobScreener   = "screener"
+	JobSignal     = "signal"
+	JobReconcile  = "reconcile"
+	JobReport     = "report"
+	JobIntraday   = "intraday_monitor"
+	JobRetention  = "retention"
+	JobSettleT1   = "settle_t1"
+)
+
+// JobNames 全部任务名列表 (健康度/变更报告展示用, 新增任务时同步追加)
+var JobNames = []string{JobDataUpdate, JobScreener, JobSignal, JobReconcile, JobReport, JobIntraday, JobRetention, JobSettleT1}
+
 // JobRun 调度任务执行记录
 type JobRun struct {
 	ID         int64  `json:"id" db:"id"`
@@ -37,7 +52,7 @@ func NewJobRepo(db *sqlx.DB) *JobRepo {
 
 // StartJob 记录任务开始, 返回记录ID
 func (r *JobRepo) StartJob(jobName, tradeDate string) (int64, error) {
-	now := time.Now().Format("2006-01-02 15:04:05")
+	now := time.Now().Format(TimeLayout)
 	res, err := r.db.Exec(`INSERT INTO job_run (job_name, trade_date, status, error, started_at, finished_at)
 		VALUES (?, ?, ?, '', ?, '')`, jobName, tradeDate, JobStatusRunning, now)
 	if err != nil {
@@ -48,7 +63,7 @@ func (r *JobRepo) StartJob(jobName, tradeDate string) (int64, error) {
 
 // FinishJob 记录任务结束
 func (r *JobRepo) FinishJob(id int64, status, errMsg string) error {
-	now := time.Now().Format("2006-01-02 15:04:05")
+	now := time.Now().Format(TimeLayout)
 	if _, err := r.db.Exec(`UPDATE job_run SET status = ?, error = ?, finished_at = ? WHERE id = ?`,
 		status, errMsg, now, id); err != nil {
 		return fmt.Errorf("记录任务结束失败(id=%d): %w", id, err)
@@ -58,13 +73,8 @@ func (r *JobRepo) FinishJob(id int64, status, errMsg string) error {
 
 // HasSucceeded 判断指定任务当日是否已成功执行 (防重复执行/启动补跑判断)
 func (r *JobRepo) HasSucceeded(jobName, tradeDate string) (bool, error) {
-	var count int
-	err := r.db.Get(&count, `SELECT COUNT(1) FROM job_run WHERE job_name = ? AND trade_date = ? AND status = ?`,
+	return existsRow(r.db, `SELECT COUNT(1) FROM job_run WHERE job_name = ? AND trade_date = ? AND status = ?`,
 		jobName, tradeDate, JobStatusSuccess)
-	if err != nil {
-		return false, fmt.Errorf("查询任务记录失败(%s): %w", jobName, err)
-	}
-	return count > 0, nil
 }
 
 // LastAttemptStartedAt 返回指定任务当日最后一次尝试的开始时间 (用于重试间隔判断)
@@ -75,9 +85,12 @@ func (r *JobRepo) LastAttemptStartedAt(jobName, tradeDate string) (time.Time, er
 		WHERE job_name = ? AND trade_date = ?
 		ORDER BY id DESC LIMIT 1`, jobName, tradeDate)
 	if err != nil {
-		return time.Time{}, nil // 无记录不算错误
+		if isNoRowsErr(err) {
+			return time.Time{}, nil // 无记录不算错误
+		}
+		return time.Time{}, fmt.Errorf("查询任务尝试时间失败(%s): %w", jobName, err)
 	}
-	t, err := time.ParseInLocation("2006-01-02 15:04:05", startedAt, time.Local)
+	t, err := time.ParseInLocation(TimeLayout, startedAt, time.Local)
 	if err != nil {
 		return time.Time{}, nil
 	}

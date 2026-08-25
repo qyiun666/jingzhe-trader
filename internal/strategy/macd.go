@@ -3,7 +3,6 @@ package strategy
 import (
 	"context"
 	"fmt"
-	"math"
 
 	"jingzhe-trader/internal/indicator"
 	"jingzhe-trader/internal/model"
@@ -22,32 +21,10 @@ type MACDStrategy struct {
 func (s *MACDStrategy) Name() string { return "macd" }
 
 func (s *MACDStrategy) Init(_ context.Context, params map[string]interface{}) error {
-	s.Fast = 12
-	s.Slow = 26
-	s.Signal = 9
-	s.PositionPct = 0.1
-	s.HistoryLen = 100
-
-	if v, ok := params["fast"]; ok {
-		if n, ok := v.(float64); ok {
-			s.Fast = int(n)
-		}
-	}
-	if v, ok := params["slow"]; ok {
-		if n, ok := v.(float64); ok {
-			s.Slow = int(n)
-		}
-	}
-	if v, ok := params["signal"]; ok {
-		if n, ok := v.(float64); ok {
-			s.Signal = int(n)
-		}
-	}
-	if v, ok := params["position_pct"]; ok {
-		if n, ok := v.(float64); ok {
-			s.PositionPct = n
-		}
-	}
+	s.Fast = paramInt(params, "fast", 12)
+	s.Slow = paramInt(params, "slow", 26)
+	s.Signal = paramInt(params, "signal", 9)
+	s.PositionPct = paramFloat(params, "position_pct", 0.1)
 	s.HistoryLen = s.Slow + s.Signal + 50
 	return nil
 }
@@ -64,8 +41,7 @@ func (s *MACDStrategy) OnBar(_ context.Context, barCtx *BarContext) ([]model.Sig
 		macdResult := indicator.MACD(closes, s.Fast, s.Slow, s.Signal)
 		n := len(closes)
 
-		if math.IsNaN(macdResult.DIF[n-1]) || math.IsNaN(macdResult.DEA[n-1]) ||
-			math.IsNaN(macdResult.DIF[n-2]) || math.IsNaN(macdResult.DEA[n-2]) {
+		if !tail2Valid(macdResult.DIF) || !tail2Valid(macdResult.DEA) {
 			continue
 		}
 
@@ -78,9 +54,9 @@ func (s *MACDStrategy) OnBar(_ context.Context, barCtx *BarContext) ([]model.Sig
 		pos, hasPosition := barCtx.Positions[tsCode]
 
 		// 金叉: DIF从下方上穿DEA, 且柱状图为正
-		isGoldenCross := prevDIF <= prevDEA && currDIF > currDEA && currHist > 0
+		isGoldenCross := crossUp(prevDIF, prevDEA, currDIF, currDEA) && currHist > 0
 		// 死叉: DIF从上方下穿DEA
-		isDeathCross := prevDIF >= prevDEA && currDIF < currDEA
+		isDeathCross := crossDown(prevDIF, prevDEA, currDIF, currDEA)
 
 		if isGoldenCross && !hasPosition {
 			bar, ok := barCtx.Bars[tsCode]
@@ -90,22 +66,10 @@ func (s *MACDStrategy) OnBar(_ context.Context, barCtx *BarContext) ([]model.Sig
 			targetAmount := barCtx.TotalAsset * s.PositionPct
 			qty := int(targetAmount/bar.AdjClose()/100) * 100
 			if qty > 0 {
-				signals = append(signals, model.Signal{
-					TsCode:    tsCode,
-					Direction: model.DirBuy,
-					TargetQty: qty,
-					Reason:    fmt.Sprintf("MACD金叉: DIF=%.4f上穿DEA=%.4f", currDIF, currDEA),
-					Strength:  0.7,
-				})
+				signals = append(signals, buySignal(tsCode, qty, fmt.Sprintf("MACD金叉: DIF=%.4f上穿DEA=%.4f", currDIF, currDEA), 0.7))
 			}
 		} else if isDeathCross && hasPosition && pos.TotalQty > 0 {
-			signals = append(signals, model.Signal{
-				TsCode:    tsCode,
-				Direction: model.DirSell,
-				TargetQty: pos.TotalQty,
-				Reason:    fmt.Sprintf("MACD死叉: DIF=%.4f下穿DEA=%.4f", currDIF, currDEA),
-				Strength:  0.7,
-			})
+			signals = append(signals, sellSignal(tsCode, pos.TotalQty, fmt.Sprintf("MACD死叉: DIF=%.4f下穿DEA=%.4f", currDIF, currDEA), 0.7))
 		}
 	}
 

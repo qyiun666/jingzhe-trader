@@ -17,6 +17,7 @@ import (
 	"jingzhe-trader/internal/config"
 	"jingzhe-trader/internal/mcp"
 	"jingzhe-trader/internal/scheduler"
+	"jingzhe-trader/pkg/logger"
 )
 
 func main() {
@@ -29,6 +30,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("加载配置失败: %v", err)
 	}
+
+	// 初始化结构化日志 (与 backtest/dataloader 同一套配置驱动, 避免 zap 默认分支无 caller/无文件输出)
+	logger.Init(cfg.Log.Level, cfg.Log.Format, cfg.Log.Output, cfg.Log.FilePath)
+	defer logger.Sync()
 
 	// 优先使用配置文件中的端口
 	serverPort := *port

@@ -6,8 +6,8 @@ import "sort"
 // 内部维护一份去重并按日期升序排序的交易日列表 (格式 YYYYMMDD),
 // 并构建日期到索引的映射以加速查询。
 type Calendar struct {
-	tradeDates []string        // 排序后的交易日列表 (YYYYMMDD)
-	index      map[string]int  // 日期 -> 在 tradeDates 中的索引
+	tradeDates []string       // 排序后的交易日列表 (YYYYMMDD)
+	index      map[string]int // 日期 -> 在 tradeDates 中的索引
 }
 
 // NewCalendar 创建交易日历, tradeDates 格式为 YYYYMMDD
@@ -48,22 +48,12 @@ func (c *Calendar) IsTradeDate(date string) bool {
 // 若 date 本身是交易日, 返回其后的下一个交易日 (不包含 date)
 // 若不存在下一个交易日, 返回空字符串
 func (c *Calendar) NextTradeDate(date string) string {
-	n := len(c.tradeDates)
-	if n == 0 {
-		return ""
-	}
-	// 二分查找第一个大于 date 的交易日
-	lo, hi := 0, n
-	for lo < hi {
-		mid := (lo + hi) / 2
-		if c.tradeDates[mid] <= date {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	if lo < n {
-		return c.tradeDates[lo]
+	// 第一个 > date 的位置 (sort.Search 语义: 最小的使 f(i) 为真的下标)
+	i := sort.Search(len(c.tradeDates), func(i int) bool {
+		return c.tradeDates[i] > date
+	})
+	if i < len(c.tradeDates) {
+		return c.tradeDates[i]
 	}
 	return ""
 }
@@ -72,22 +62,12 @@ func (c *Calendar) NextTradeDate(date string) string {
 // 若 date 本身是交易日, 返回其前的上一个交易日 (不包含 date)
 // 若不存在上一个交易日, 返回空字符串
 func (c *Calendar) PrevTradeDate(date string) string {
-	n := len(c.tradeDates)
-	if n == 0 {
-		return ""
-	}
-	// 二分查找第一个 >= date 的位置, 其前一个即为最后一个 < date 的交易日
-	lo, hi := 0, n
-	for lo < hi {
-		mid := (lo + hi) / 2
-		if c.tradeDates[mid] < date {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	if lo > 0 {
-		return c.tradeDates[lo-1]
+	// 第一个 >= date 的位置, 其前一个即为最后一个 < date 的交易日
+	i := sort.Search(len(c.tradeDates), func(i int) bool {
+		return c.tradeDates[i] >= date
+	})
+	if i > 0 {
+		return c.tradeDates[i-1]
 	}
 	return ""
 }
@@ -99,32 +79,17 @@ func (c *Calendar) TradeDatesBetween(start, end string) []string {
 	if n == 0 || start > end {
 		return nil
 	}
-	// 二分查找第一个 >= start 的位置
-	lo, hi := 0, n
-	for lo < hi {
-		mid := (lo + hi) / 2
-		if c.tradeDates[mid] < start {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	startIdx := lo
+	// 第一个 >= start 的位置
+	startIdx := sort.Search(n, func(i int) bool {
+		return c.tradeDates[i] >= start
+	})
 	if startIdx >= n {
 		return nil
 	}
-
-	// 二分查找最后一个 <= end 的位置
-	lo2, hi2 := 0, n
-	for lo2 < hi2 {
-		mid := (lo2 + hi2) / 2
-		if c.tradeDates[mid] <= end {
-			lo2 = mid + 1
-		} else {
-			hi2 = mid
-		}
-	}
-	endIdx := lo2 - 1 // 最后一个 <= end 的索引
+	// 最后一个 <= end 的位置
+	endIdx := sort.Search(n, func(i int) bool {
+		return c.tradeDates[i] > end
+	}) - 1
 
 	if startIdx > endIdx {
 		return nil

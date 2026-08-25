@@ -39,20 +39,6 @@ type MarketAlarm struct {
 	Message string
 }
 
-// MoneyFlow 资金流向 (占位结构, 与 model 包保持一致)
-type MoneyFlow struct {
-	TsCode    string
-	TradeDate string
-	Inflow    float64 // 净流入
-}
-
-// TopList 龙虎榜 (占位结构)
-type TopList struct {
-	TsCode    string
-	TradeDate string
-	Reason    string
-}
-
 // 主要大盘指数代码
 var indexCodes = map[string]bool{
 	"000001.SH": true, // 上证指数
@@ -68,8 +54,6 @@ func MonitorMarket(
 	tradeDate string,
 	allBars []model.Bar,
 	prevBars map[string]*model.Bar,
-	moneyflows []MoneyFlow,
-	toplists []TopList,
 ) *MarketSnapshot {
 	snapshot := &MarketSnapshot{
 		TradeDate: tradeDate,

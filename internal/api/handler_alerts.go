@@ -1,29 +1,12 @@
 package api
 
 import (
-	"encoding/json"
 	"fmt"
-	"net/http"
+	"strings"
 	"time"
 
 	"jingzhe-trader/internal/store"
 )
-
-// HandleAgentAlerts GET /api/agent/alerts?date=&unread_only=true
-// POST /api/agent/alerts  - 标记已读 {"id": N} 或 {"all": true}
-// Agent 获取飞书通知的持久化副本, 用于离线读取和状态追踪
-func (s *Service) HandleAgentAlerts(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodPost {
-		s.handleAlertsMarkRead(w, r)
-		return
-	}
-
-	// GET: 查询通知
-	date := r.URL.Query().Get("date")
-	unreadOnly := r.URL.Query().Get("unread_only") == "true"
-
-	writeJSON(w, http.StatusOK, s.BuildAgentAlerts(unreadOnly, date))
-}
 
 // BuildAgentAlerts returns recent or unread agent alerts.
 func (s *Service) BuildAgentAlerts(unreadOnly bool, date string) map[string]interface{} {
@@ -33,7 +16,7 @@ func (s *Service) BuildAgentAlerts(unreadOnly bool, date string) map[string]inte
 	if unreadOnly {
 		alerts, err = s.alertRepo.GetUnread()
 	} else if date != "" {
-		alerts, err = s.alertRepo.GetByDate(parseDateParam(date))
+		alerts, err = s.alertRepo.GetByDate(strings.ReplaceAll(strings.TrimSpace(date), "-", ""))
 	} else {
 		alerts, err = s.alertRepo.GetRecent(50)
 	}
@@ -55,24 +38,6 @@ func (s *Service) BuildAgentAlerts(unreadOnly bool, date string) map[string]inte
 		"total":        len(alerts),
 		"unread_count": unreadCount,
 	}
-}
-
-// handleAlertsMarkRead 标记通知为已读
-func (s *Service) handleAlertsMarkRead(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		ID     int64 `json:"id"`      // 指定ID标记已读, 0=全部标记已读
-		All    bool  `json:"all"`     // true=全部标记已读
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "JSON 解析失败: "+err.Error())
-		return
-	}
-	result, err := s.MarkAlertsRead(req.All, req.ID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, result)
 }
 
 // MarkAlertsRead marks agent alerts as read. If all is true or id is zero,
@@ -102,12 +67,6 @@ func (s *Service) MarkAlertsRead(all bool, id int64) (map[string]interface{}, er
 	return nil, fmt.Errorf("需要指定 id 或 all=true")
 }
 
-// HandleAgentDashboard GET /api/agent/dashboard
-// Agent 专用仪表盘: 一次返回 alerts + brief + changes 的汇总视图
-func (s *Service) HandleAgentDashboard(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.BuildAgentDashboard())
-}
-
 // BuildAgentDashboard builds the agent dashboard summary.
 func (s *Service) BuildAgentDashboard() map[string]interface{} {
 	today := time.Now().Format("20060102")
@@ -123,7 +82,7 @@ func (s *Service) BuildAgentDashboard() map[string]interface{} {
 
 	// 任务完成状态
 	taskStatus := map[string]bool{}
-	for _, name := range []string{"data_update", "signal", "report", "intraday_monitor", "retention"} {
+	for _, name := range store.JobNames {
 		done, _ := s.jobRepo.HasSucceeded(name, today)
 		taskStatus[name] = done
 	}

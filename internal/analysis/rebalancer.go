@@ -26,7 +26,7 @@ type TradeSuggestion struct {
 	Name       string
 	CurrentQty int
 	TargetQty  int
-	DeltaQty   int    // 正=买入, 负=卖出
+	DeltaQty   int // 正=买入, 负=卖出
 	Price      float64
 	Amount     float64
 	Priority   int    // 1=最高优先级

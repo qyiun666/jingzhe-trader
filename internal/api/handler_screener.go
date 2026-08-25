@@ -2,17 +2,9 @@ package api
 
 import (
 	"fmt"
-	"net/http"
 
 	"jingzhe-trader/internal/store"
 )
-
-// HandleScreenResults GET /api/screener/results?date=
-// 获取选股结果 (不传 date 返回最新一次)
-func (s *Service) HandleScreenResults(w http.ResponseWriter, r *http.Request) {
-	date := r.URL.Query().Get("date")
-	writeJSON(w, http.StatusOK, s.BuildScreenerResults(date))
-}
 
 // BuildScreenerResults returns the latest or historical stock screening results.
 func (s *Service) BuildScreenerResults(date string) map[string]interface{} {
@@ -39,21 +31,6 @@ func (s *Service) BuildScreenerResults(date string) map[string]interface{} {
 		"count":   len(results),
 		"results": results,
 	}
-}
-
-// HandleScreenRun POST /api/screener/run
-// 手动触发选股 (测试用, 正常由调度器自动执行)
-func (s *Service) HandleScreenRun(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "仅支持 POST")
-		return
-	}
-	result, err := s.RunScreener()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, result)
 }
 
 // RunScreener manually triggers the full-market stock screener.

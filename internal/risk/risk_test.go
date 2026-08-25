@@ -666,7 +666,7 @@ func TestRiskManagerManager_SellT1(t *testing.T) {
 
 // TestSectorExposure 测试板块敞口计算
 func TestSectorExposure(t *testing.T) {
-	em := NewExposureManager(0.3)
+	pl := NewPositionLimiter(0, 0, 0.3) // 板块敞口上限 30% (单票/总仓不用)
 	totalAsset := 1000000.0
 
 	positions := map[string]*model.Position{
@@ -691,7 +691,7 @@ func TestSectorExposure(t *testing.T) {
 	}
 
 	stocks := make(map[string]*model.Stock)
-	exposure := em.SectorExposure(positions, stocks, totalAsset)
+	exposure := pl.SectorExposure(positions, stocks, totalAsset)
 
 	// 深市主板: (10000 + 20000) / 1000000 = 3%
 	szPct := exposure["深市主板"]
@@ -708,7 +708,7 @@ func TestSectorExposure(t *testing.T) {
 
 // TestCheckSectorLimit 测试板块限制检查
 func TestCheckSectorLimit(t *testing.T) {
-	em := NewExposureManager(0.05) // 板块上限 5%
+	pl := NewPositionLimiter(0, 0, 0.05) // 板块上限 5% (单票/总仓不用)
 	totalAsset := 1000000.0
 	price := 10.0
 
@@ -731,13 +731,13 @@ func TestCheckSectorLimit(t *testing.T) {
 		Direction: model.DirBuy,
 	}
 
-	err := em.CheckSectorLimit(signal, positions, stocks, totalAsset, price, 2000)
+	err := pl.CheckSectorLimit(signal, positions, stocks, totalAsset, price, 2000)
 	if err == nil {
 		t.Error("突破板块限制应报错")
 	}
 
 	// 买入 500 股 (5000 元)，深市主板总市值变为 45000，占比 4.5% < 5%，应通过
-	err = em.CheckSectorLimit(signal, positions, stocks, totalAsset, price, 500)
+	err = pl.CheckSectorLimit(signal, positions, stocks, totalAsset, price, 500)
 	if err != nil {
 		t.Errorf("未突破板块限制不应报错: %v", err)
 	}

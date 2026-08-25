@@ -49,27 +49,9 @@ func (rm *RiskManagerAgent) Judge(ctx *DebateContext, reports []*AnalysisReport,
 		ctx.TsCode, ctx.Name, ctx.TradeDate,
 		posStr(ctx.Position), ctx.TotalAsset,
 		reportsText, bullText, bearText)
-	if rm.llm == nil || !rm.llm.IsEnabled() {
-		return nil, fmt.Errorf("LLM 未启用")
-	}
-	resp, err := rm.llm.ChatWithCache(ctx.TradeDate, ctx.TsCode, "risk_manager", riskMgrSysPrompt, userPrompt)
+	raw, err := callLLMJSON[judgeRaw](rm.llm, ctx.TsCode, ctx.TradeDate, "risk_manager", riskMgrSysPrompt, userPrompt)
 	if err != nil {
-		return nil, fmt.Errorf("LLM 调用失败: %w", err)
-	}
-	resp = stripJSON(resp)
-	var raw struct {
-		Decision    string   `json:"decision"`
-		Confidence  float64  `json:"confidence"`
-		PositionPct float64  `json:"position_pct"`
-		StopPrice   float64  `json:"stop_price"`
-		RiskLevel   string   `json:"risk_level"`
-		BullArgs    []string `json:"bull_args"`
-		BearArgs    []string `json:"bear_args"`
-		RiskNote    string   `json:"risk_note"`
-		Summary     string   `json:"summary"`
-	}
-	if err := json.Unmarshal([]byte(resp), &raw); err != nil {
-		return nil, fmt.Errorf("响应解析失败: %w, raw: %s", err, resp[:min(200, len(resp))])
+		return nil, err
 	}
 	result := &DebateResult{
 		TradeDate:   ctx.TradeDate,
@@ -93,6 +75,19 @@ func (rm *RiskManagerAgent) Judge(ctx *DebateContext, reports []*AnalysisReport,
 		result.BearArgs = string(b)
 	}
 	return result, nil
+}
+
+// judgeRaw LLM 风控裁决的原始 JSON 结构 (字段与 DebateResult 对应)
+type judgeRaw struct {
+	Decision    string   `json:"decision"`
+	Confidence  float64  `json:"confidence"`
+	PositionPct float64  `json:"position_pct"`
+	StopPrice   float64  `json:"stop_price"`
+	RiskLevel   string   `json:"risk_level"`
+	BullArgs    []string `json:"bull_args"`
+	BearArgs    []string `json:"bear_args"`
+	RiskNote    string   `json:"risk_note"`
+	Summary     string   `json:"summary"`
 }
 
 func (rm *RiskManagerAgent) fallbackJudge(ctx *DebateContext, reports []*AnalysisReport, bull, bear *ResearchArgument) *DebateResult {

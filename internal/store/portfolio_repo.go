@@ -67,7 +67,7 @@ func (r *PortfolioRepo) SyncPortfolio(positions []PortfolioSyncItem) error {
 		}
 		defer stmt.Close()
 
-		now := time.Now().Format("2006-01-02 15:04:05")
+		now := time.Now().Format(TimeLayout)
 		for _, p := range positions {
 			// 如果条目未设置更新时间，使用当前时间
 			updatedAt := p.UpdatedAt
@@ -90,7 +90,7 @@ func (r *PortfolioRepo) SyncPortfolio(positions []PortfolioSyncItem) error {
 func (r *PortfolioRepo) UpsertPosition(pos PortfolioSyncItem) error {
 	updatedAt := pos.UpdatedAt
 	if updatedAt == "" {
-		updatedAt = time.Now().Format("2006-01-02 15:04:05")
+		updatedAt = time.Now().Format(TimeLayout)
 	}
 	_, err := r.db.Exec(portfolioUpsertSQL,
 		pos.TsCode, pos.TotalQty, pos.AvailableQty, pos.TodayBought, pos.HighPrice,
@@ -126,14 +126,11 @@ func (r *PortfolioRepo) GetAllPositions() ([]PortfolioSyncItem, error) {
 // GetPosition 查询单只股票的持仓
 func (r *PortfolioRepo) GetPosition(tsCode string) (*PortfolioSyncItem, error) {
 	var pos PortfolioSyncItem
-	err := r.db.Get(&pos,
+	found, err := getOne(r.db,
 		`SELECT ts_code, total_qty, available_qty, today_bought, high_price, cost_price, avg_price, updated_at
-		 FROM portfolio WHERE ts_code = ?`, tsCode)
-	if err != nil {
-		if isNoRowsErr(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("查询持仓失败(ts_code=%s): %w", tsCode, err)
+		 FROM portfolio WHERE ts_code = ?`, &pos, "查询持仓失败", tsCode)
+	if err != nil || !found {
+		return nil, err
 	}
 	return &pos, nil
 }

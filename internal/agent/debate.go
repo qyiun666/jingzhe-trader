@@ -23,8 +23,8 @@ type DebateOrchestrator struct {
 	fund       *FundamentalAnalyst
 	news       *NewsAnalyst
 	market     *MarketAnalyst
-	bull       *BullResearcher
-	bear       *BearResearcher
+	bull       *researcher
+	bear       *researcher
 	riskMgr    *RiskManagerAgent
 }
 
@@ -34,8 +34,8 @@ func NewDebateOrchestrator(llmClient *llm.Client, barRepo *store.BarRepo, basicR
 	o.fund = NewFundamentalAnalyst(llmClient, basicRepo, finaRepo)
 	o.news = NewNewsAnalyst(llmClient, newsRepo)
 	o.market = NewMarketAnalyst(llmClient, barRepo)
-	o.bull = NewBullResearcher(llmClient)
-	o.bear = NewBearResearcher(llmClient)
+	o.bull = NewResearcher(llmClient, "bull")
+	o.bear = NewResearcher(llmClient, "bear")
 	o.riskMgr = NewRiskManagerAgent(llmClient)
 	return o
 }

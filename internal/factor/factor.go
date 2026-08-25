@@ -33,13 +33,6 @@ type DataProvider interface {
 	GetBars(tsCode, startDate, endDate string) ([]model.Bar, error)
 }
 
-// FactorScore 因子得分
-type FactorScore struct {
-	TsCode string  // 股票代码
-	Score  float64 // 标准化后的得分 0-100, 越高越好
-	Raw    float64 // 原始因子值
-}
-
 // CompositeResult 多因子合成结果
 type CompositeResult struct {
 	TsCode  string             // 股票代码
@@ -181,13 +174,12 @@ func Standardize(values []float64) []float64 {
 
 // Rank 排名打分 (0-100分, 排名越前分数越高)
 // higherBetter 为 true 时, 值越大排名越高; 为 false 时, 值越小排名越高
-// 返回 map[索引]score, 调用方需根据索引对应到 tsCode
-// 注意: 这里返回的 key 是 values 切片的索引字符串形式, 方便调用方维护对应关系
-// 为了与描述一致, 我们使用 float64 索引映射
-func Rank(values []float64, higherBetter bool) map[string]float64 {
+// 返回与输入等长的切片, 按输入索引对齐 (无效值确定性地给 0 分)
+func Rank(values []float64, higherBetter bool) []float64 {
 	n := len(values)
+	result := make([]float64, n)
 	if n == 0 {
-		return map[string]float64{}
+		return result
 	}
 
 	// 分离有限值与无效值 (NaN/Inf): 无效值确定性地给 0 分
@@ -196,17 +188,17 @@ func Rank(values []float64, higherBetter bool) map[string]float64 {
 		value float64
 	}
 	items := make([]indexed, 0, n)
-	invalid := make([]int, 0)
+	invalid := 0
 	for i, v := range values {
 		if math.IsNaN(v) || math.IsInf(v, 0) {
-			invalid = append(invalid, i)
+			invalid++
 		} else {
 			items = append(items, indexed{idx: i, value: v})
 		}
 	}
 	// 无效值占比过高时告警 (数据质量问题的早期信号)
-	if n > 0 && len(invalid)*5 > n {
-		logger.L().Warnf("[factor] Rank 输入无效值占比 %d/%d, 排名质量下降", len(invalid), n)
+	if n > 0 && invalid*5 > n {
+		logger.L().Warnf("[factor] Rank 输入无效值占比 %d/%d, 排名质量下降", invalid, n)
 	}
 
 	// 排序: higherBetter=true 时降序, false 时升序
@@ -217,48 +209,18 @@ func Rank(values []float64, higherBetter bool) map[string]float64 {
 		return items[i].value < items[j].value
 	})
 
-	// 计算排名分数 (0-100)
-	// 第1名得100分, 最后1名得0分, 线性分布
-	result := make(map[string]float64, n)
-	for _, i := range invalid {
-		result[itoa(i)] = 0
-	}
+	// 计算排名分数 (0-100): 第1名得100分, 最后1名得0分, 线性分布
 	m := len(items)
 	if m == 0 {
-		return result
+		return result // 全为无效值, 全部 0 分
 	}
 	if m == 1 {
-		result[itoa(items[0].idx)] = 50.0
+		result[items[0].idx] = 50.0
 		return result
 	}
 	for rank, item := range items {
 		// 排名从0开始, 分数从100线性降到0
-		score := 100.0 * (1.0 - float64(rank)/float64(m-1))
-		result[itoa(item.idx)] = score
+		result[item.idx] = 100.0 * (1.0 - float64(rank)/float64(m-1))
 	}
 	return result
-}
-
-// itoa 简单的整数转字符串, 避免导入 strconv
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	neg := false
-	if i < 0 {
-		neg = true
-		i = -i
-	}
-	var buf [20]byte
-	pos := len(buf)
-	for i > 0 {
-		pos--
-		buf[pos] = byte('0' + i%10)
-		i /= 10
-	}
-	if neg {
-		pos--
-		buf[pos] = '-'
-	}
-	return string(buf[pos:])
 }

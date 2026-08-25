@@ -23,14 +23,12 @@ const orderInsertSQL = `INSERT INTO orders
 	(run_id, ts_code, side, price, qty, filled_qty, avg_price, status, reason, create_time, update_time)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
-const timeLayout = "2006-01-02 15:04:05"
-
 // InsertOrder 插入订单记录, 返回自增主键 ID 并回填到 o.ID
 func (r *TradeRepo) InsertOrder(o *model.Order) (int64, error) {
 	res, err := r.db.Exec(orderInsertSQL,
 		o.RunID, o.TsCode, int(o.Side), o.Price, o.Qty, o.FilledQty, o.AvgPrice,
 		int(o.Status), o.Reason,
-		o.CreateTime.Format(timeLayout), o.UpdateTime.Format(timeLayout),
+		o.CreateTime.Format(TimeLayout), o.UpdateTime.Format(TimeLayout),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("插入订单失败: %w", err)
@@ -47,7 +45,7 @@ func (r *TradeRepo) InsertOrder(o *model.Order) (int64, error) {
 func (r *TradeRepo) UpdateOrderStatus(id int64, status model.OrderStatus, filledQty int, avgPrice float64) error {
 	_, err := r.db.Exec(
 		`UPDATE orders SET status = ?, filled_qty = ?, avg_price = ?, update_time = ? WHERE id = ?`,
-		int(status), filledQty, avgPrice, time.Now().Format(timeLayout), id,
+		int(status), filledQty, avgPrice, time.Now().Format(TimeLayout), id,
 	)
 	if err != nil {
 		return fmt.Errorf("更新订单失败: %w", err)

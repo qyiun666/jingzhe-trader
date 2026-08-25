@@ -3,6 +3,7 @@ package factor
 import (
 	"context"
 	"math"
+	"strconv"
 	"testing"
 
 	"jingzhe-trader/internal/model"
@@ -134,18 +135,18 @@ func TestRank_HigherBetter(t *testing.T) {
 	result := Rank(values, true)
 
 	// 最大值50 (索引3) 应该得100分
-	if result["3"] != 100.0 {
-		t.Errorf("最大值应该得100分, got %v", result["3"])
+	if result[3] != 100.0 {
+		t.Errorf("最大值应该得100分, got %v", result[3])
 	}
 
 	// 最小值10 (索引0) 应该得0分
-	if result["0"] != 0.0 {
-		t.Errorf("最小值应该得0分, got %v", result["0"])
+	if result[0] != 0.0 {
+		t.Errorf("最小值应该得0分, got %v", result[0])
 	}
 
 	// 第二大值40 (索引4) 应该得75分 (100 * (1 - 1/4) = 75)
-	if math.Abs(result["4"]-75.0) > 1e-10 {
-		t.Errorf("第二大值应该得75分, got %v", result["4"])
+	if math.Abs(result[4]-75.0) > 1e-10 {
+		t.Errorf("第二大值应该得75分, got %v", result[4])
 	}
 }
 
@@ -154,20 +155,20 @@ func TestRank_LowerBetter(t *testing.T) {
 	result := Rank(values, false)
 
 	// 最小值10 (索引0) 应该得100分
-	if result["0"] != 100.0 {
-		t.Errorf("最小值应该得100分, got %v", result["0"])
+	if result[0] != 100.0 {
+		t.Errorf("最小值应该得100分, got %v", result[0])
 	}
 
 	// 最大值50 (索引3) 应该得0分
-	if result["3"] != 0.0 {
-		t.Errorf("最大值应该得0分, got %v", result["3"])
+	if result[3] != 0.0 {
+		t.Errorf("最大值应该得0分, got %v", result[3])
 	}
 }
 
 func TestRank_Empty(t *testing.T) {
 	result := Rank([]float64{}, true)
 	if len(result) != 0 {
-		t.Errorf("空切片应该返回空map, got %v", result)
+		t.Errorf("空切片应该返回空切片, got %v", result)
 	}
 }
 
@@ -177,8 +178,8 @@ func TestRank_SingleValue(t *testing.T) {
 		t.Errorf("单元素应该返回1个元素, got %v", result)
 	}
 	// 单元素应该得50分 (中间值)
-	if result["0"] != 50.0 {
-		t.Errorf("单元素应该得50分, got %v", result["0"])
+	if result[0] != 50.0 {
+		t.Errorf("单元素应该得50分, got %v", result[0])
 	}
 }
 
@@ -282,11 +283,11 @@ func TestRank_WithNaN(t *testing.T) {
 	values := []float64{3.0, 1.0, math.NaN(), 2.0, math.Inf(-1)}
 	scores := Rank(values, true)
 	// NaN 和 -Inf 必须确定性得 0 分
-	if scores["2"] != 0 || scores["4"] != 0 {
-		t.Errorf("无效值应得0分: NaN=%v -Inf=%v", scores["2"], scores["4"])
+	if scores[2] != 0 || scores[4] != 0 {
+		t.Errorf("无效值应得0分: NaN=%v -Inf=%v", scores[2], scores[4])
 	}
 	// 有限值排名不受影响: 3.0 > 2.0 > 1.0
-	if !(scores["0"] > scores["3"] && scores["3"] > scores["1"]) {
+	if !(scores[0] > scores[3] && scores[3] > scores[1]) {
 		t.Errorf("有限值排名被无效值污染: %v", scores)
 	}
 }
@@ -299,7 +300,7 @@ func TestCompositePipeline_WithNaN(t *testing.T) {
 	scores := Rank(s, true)
 	// 有限值必须拿到有限分
 	for i, v := range values {
-		score := scores[itoa(i)]
+		score := scores[i]
 		if math.IsNaN(score) || math.IsInf(score, 0) {
 			t.Fatalf("排名分数出现非有限值: idx=%d raw=%v score=%v", i, v, score)
 		}
@@ -474,7 +475,7 @@ func TestMomentumFactor(t *testing.T) {
 		price := 100.0 + float64(i) // 每天涨1元
 		bars[i] = model.Bar{
 			TsCode:    "000001.SZ",
-			TradeDate: itoa(date),
+			TradeDate: strconv.Itoa(date),
 			Close:     price,
 			AdjFactor: 1.0,
 		}

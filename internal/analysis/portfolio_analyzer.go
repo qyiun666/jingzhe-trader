@@ -51,7 +51,7 @@ type PnLAttribution struct {
 	TotalRealizedPnL float64 // 总实现盈亏 (如果有记录)
 	BestStock        string  // 最赚的股票
 	BestStockPnL     float64
-	WorstStock       string  // 最亏的股票
+	WorstStock       string // 最亏的股票
 	WorstStockPnL    float64
 	WinCount         int     // 盈利股票数
 	LossCount        int     // 亏损股票数

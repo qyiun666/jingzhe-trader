@@ -26,27 +26,14 @@ const calSelectCols = `cal_date, is_open, pretrade_date, exchange`
 
 // BatchInsert 批量插入交易日历(已存在则覆盖)
 func (r *CalendarRepo) BatchInsert(cals []model.TradeCal) error {
-	if len(cals) == 0 {
-		return nil
-	}
-	tx, err := r.db.Beginx()
-	if err != nil {
-		return fmt.Errorf("开启事务失败: %w", err)
-	}
-	defer tx.Rollback()
-
-	stmt, err := tx.Preparex(calInsertSQL)
-	if err != nil {
-		return fmt.Errorf("预编译插入语句失败: %w", err)
-	}
-	defer stmt.Close()
-
-	for _, c := range cals {
-		if _, err := stmt.Exec(c.CalDate, c.IsOpen, c.PreTradeDate, c.PExchange); err != nil {
-			return fmt.Errorf("插入交易日历失败(cal_date=%s): %w", c.CalDate, err)
+	return batchInsert(r.db, calInsertSQL, "插入交易日历失败", len(cals), func(stmt *sqlx.Stmt, i int) error {
+		c := cals[i]
+		_, err := stmt.Exec(c.CalDate, c.IsOpen, c.PreTradeDate, c.PExchange)
+		if err != nil {
+			return fmt.Errorf("cal_date=%s: %w", c.CalDate, err)
 		}
-	}
-	return tx.Commit()
+		return nil
+	})
 }
 
 // GetTradeDays 查询 [startDate, endDate] 区间内的交易日(is_open=1), 按日期升序
@@ -55,8 +42,8 @@ func (r *CalendarRepo) GetTradeDays(startDate, endDate string) ([]model.TradeCal
 		WHERE is_open = 1 AND cal_date >= ? AND cal_date <= ?
 		ORDER BY cal_date ASC`, calSelectCols)
 	var cals []model.TradeCal
-	if err := r.db.Select(&cals, query, startDate, endDate); err != nil {
-		return nil, fmt.Errorf("查询交易日失败: %w", err)
+	if err := selectList(r.db, query, &cals, "查询交易日失败", startDate, endDate); err != nil {
+		return nil, err
 	}
 	return cals, nil
 }
@@ -65,11 +52,9 @@ func (r *CalendarRepo) GetTradeDays(startDate, endDate string) ([]model.TradeCal
 func (r *CalendarRepo) GetByDate(date string) (*model.TradeCal, error) {
 	query := fmt.Sprintf(`SELECT %s FROM trade_cal WHERE cal_date = ?`, calSelectCols)
 	var c model.TradeCal
-	if err := r.db.Get(&c, query, date); err != nil {
-		if isNoRowsErr(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("查询交易日历失败: %w", err)
+	found, err := getOne(r.db, query, &c, "查询交易日历失败", date)
+	if err != nil || !found {
+		return nil, err
 	}
 	return &c, nil
 }
@@ -89,12 +74,7 @@ func (r *CalendarRepo) IsTradeDay(date string) (bool, error) {
 // HasDate 检查日历中是否存在指定日期的记录
 // 区分"不在日历中"(日历数据可能过期)和"在日历中但非交易日"(周末/节假日)
 func (r *CalendarRepo) HasDate(date string) (bool, error) {
-	var count int
-	err := r.db.Get(&count, `SELECT COUNT(1) FROM trade_cal WHERE cal_date = ?`, date)
-	if err != nil {
-		return false, fmt.Errorf("查询日历记录失败(%s): %w", date, err)
-	}
-	return count > 0, nil
+	return existsRow(r.db, `SELECT COUNT(1) FROM trade_cal WHERE cal_date = ?`, date)
 }
 
 // GetPreTradeDate 获取指定日期的上一交易日

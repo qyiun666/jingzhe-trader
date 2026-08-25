@@ -29,11 +29,7 @@ func ATR(highs, lows, closes []float64, period int) []float64 {
 	}
 
 	// 第一个 ATR = 前 period 个 TR 的 SMA (位于 index = period-1)
-	sum := 0.0
-	for i := 0; i < period; i++ {
-		sum += tr[i]
-	}
-	prev := sum / float64(period)
+	prev := Mean(tr[:period])
 	out[period-1] = prev
 
 	// 后续使用 Wilder 平滑: ATR = (prevATR*(period-1) + currentTR) / period
