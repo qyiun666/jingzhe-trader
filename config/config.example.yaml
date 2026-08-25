@@ -2,7 +2,7 @@
 # 默认配置: 小资金模式 (1万本金)
 # 复制此文件为 config.yaml
 # 密钥类配置建议通过环境变量注入, 不要写入配置文件:
-#   TUSHARE_TOKEN / LLM_API_KEY / JZ_API_TOKEN / QMT_SIDECAR_TOKEN
+#   TUSHARE_TOKEN / LLM_API_KEY / JZ_API_TOKEN / FEISHU_WEBHOOK / QMT_SIDECAR_TOKEN
 # ============================================
 
 # 季度目标跟踪 (核心决策约束)
@@ -80,6 +80,9 @@ strategy:
     position_pct: 0.55
     # 自适应会动态降低仓位, 小资金易跌破最小交易额门槛, 资金 ≥ 5万再开启
     enable_adaptive: false
+    # 信号过滤器阈值 (0=用策略内置默认: 量能1.2倍/趋势0.5%%, 过严会导致金叉全被拦截长期无交易)
+    vol_confirm_ratio: 1.05      # 量能确认倍数: 当日量 > 过去5日均量 × 倍数
+    trend_threshold: 0.001       # 趋势强度阈值: 金叉日短均线须高于长均线 0.1%%
 
   # MACD策略
   macd:
@@ -134,11 +137,10 @@ server:
 # 内置调度器 (server 常驻进程自动执行, Agent 只需读 API)
 scheduler:
   enabled: true
-  premarket_time: "09:00"    # 盘前总结邮件 (持仓/今日计划/目标状态)
   data_update_time: "15:10"  # 收盘后更新行情数据
   screener_time: "15:15"     # 全市场自动选股 (数据更新后, 信号生成前)
-  signal_time: "18:00"       # 生成次日交易计划
-  report_time: "18:00"       # 当天总结+日报邮件 (含当日告警汇总)
+  signal_time: "15:30"       # 生成次日交易计划
+  report_time: "15:45"       # 日报生成+飞书推送
   intraday:
     enabled: true            # 盘中止损监控
     interval_min: 5
@@ -177,6 +179,11 @@ screener:
   min_circ_mv: 50000.0       # 最小流通市值(万元) ≈ 50亿
   max_circ_mv: 0.0           # 最大流通市值(万元) 0=不限
 
+# 飞书通知
+feishu:
+  webhook_url: ""            # 建议用环境变量 FEISHU_WEBHOOK 注入
+  push_daily: true
+  push_time: "15:30"
 
 # 邮件通知 (QQ 邮箱, smtp.qq.com:465, 发件人即收件人)
 # 授权码通过环境变量 JZ_MAIL_PASSWORD 注入, 禁止写入配置文件

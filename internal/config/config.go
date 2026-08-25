@@ -208,6 +208,9 @@ type MACrossConfig struct {
 	LongPeriod     int     `mapstructure:"long_period"`
 	PositionPct    float64 `mapstructure:"position_pct"`
 	EnableAdaptive bool    `mapstructure:"enable_adaptive"`
+	// 信号过滤器阈值 (0=用策略内置默认值; 金叉信号需通过趋势强度+量能确认, 过严会导致长期无交易)
+	VolConfirmRatio float64 `mapstructure:"vol_confirm_ratio"` // 量能确认倍数, 默认1.2 (当日量>过去5日均量×倍数)
+	TrendThreshold  float64 `mapstructure:"trend_threshold"`  // 趋势强度阈值(小数), 默认0.005 (金叉日短均线须高于长均线0.5%%)
 }
 
 // MACDConfig MACD策略配置
@@ -273,6 +276,13 @@ func (c *Config) StrategyParams(name string) map[string]interface{} {
 		params["long_period"] = float64(c.Strategy.MACross.LongPeriod)
 		params["position_pct"] = c.Strategy.MACross.PositionPct
 		params["enable_adaptive"] = c.Strategy.MACross.EnableAdaptive
+		// 过滤器阈值: 仅显式配置(>0)时覆盖内置默认, 避免零值误覆盖
+		if c.Strategy.MACross.VolConfirmRatio > 0 {
+			params["vol_confirm_ratio"] = c.Strategy.MACross.VolConfirmRatio
+		}
+		if c.Strategy.MACross.TrendThreshold > 0 {
+			params["trend_threshold"] = c.Strategy.MACross.TrendThreshold
+		}
 	case "macd":
 		params["fast"] = float64(c.Strategy.MACD.Fast)
 		params["slow"] = float64(c.Strategy.MACD.Slow)
