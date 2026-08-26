@@ -20,6 +20,9 @@ const mailSMTPAddr = "smtp.qq.com:465"
 // mailSMTPHost QQ 邮箱 SMTP 主机名 (用于 TLS ServerName 与 EHLO)
 const mailSMTPHost = "smtp.qq.com"
 
+// mailMaxLineLen 正文单行最大长度 (RFC 5322 限制 998, QQ 邮箱超限拒收; 留余量)
+const mailMaxLineLen = 990
+
 // MailNotifier QQ 邮箱邮件通知器
 // 未启用时所有发送调用降级为 no-op, 调用方无需判空
 type MailNotifier struct {
@@ -91,7 +94,51 @@ func buildMailMessageWithContentType(from, title, body, contentType string) stri
 	fmt.Fprintf(&b, "MIME-Version: 1.0\r\n")
 	fmt.Fprintf(&b, "Content-Type: %s\r\n", contentType)
 	b.WriteString("\r\n")
-	b.WriteString(body)
+	b.WriteString(foldLongLines(body, mailMaxLineLen))
+	return b.String()
+}
+
+// foldLongLines 折叠超过 maxLine 个字符的行 (RFC 5322 单行 ≤998, 避免 QQ 邮箱拒收)
+// HTML/JS 中插入换行会被解析为空白, 不影响渲染; 按 rune 折叠避免切断多字节字符
+func foldLongLines(body string, maxLine int) string {
+	lines := strings.Split(body, "\n")
+	for i, line := range lines {
+		if len([]rune(line)) <= maxLine {
+			continue
+		}
+		lines[i] = foldLine(line, maxLine)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// foldLine 单行折叠: 优先在空格处断行, 其次在标签闭合符 > 之后 (避免切断 HTML 标签), 最后硬折; 折行后跳过行首空格
+func foldLine(line string, maxLine int) string {
+	rs := []rune(line)
+	var b strings.Builder
+	for len(rs) > maxLine {
+		cut := maxLine
+		for i := maxLine - 1; i > 0; i-- {
+			if rs[i] == ' ' {
+				cut = i
+				break
+			}
+		}
+		if cut == maxLine { // 无空格: 找标签闭合符, 在其后断行
+			for i := maxLine - 1; i > 0; i-- {
+				if rs[i] == '>' {
+					cut = i + 1
+					break
+				}
+			}
+		}
+		b.WriteString(string(rs[:cut]))
+		b.WriteByte('\n')
+		rs = rs[cut:]
+		for len(rs) > 0 && rs[0] == ' ' {
+			rs = rs[1:]
+		}
+	}
+	b.WriteString(string(rs))
 	return b.String()
 }
 

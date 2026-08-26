@@ -3,6 +3,7 @@ package notify
 import (
 	"bufio"
 	"net"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -84,6 +85,63 @@ func TestSendHTMLDisabled(t *testing.T) {
 	n := NewMailNotifier(false, "a@qq.com", "pwd")
 	if err := n.SendHTML("标题", "<b>内容</b>"); err != nil {
 		t.Errorf("未启用时 SendHTML 应返回 nil, 实际 %v", err)
+	}
+}
+
+func TestFoldLongLines(t *testing.T) {
+	// 超长单行折叠后每行 ≤ 上限, 且拼接可还原原文
+	long := strings.Repeat("a", 2000)
+	folded := foldLongLines(long, 990)
+	if strings.Count(folded, "\n") == 0 {
+		t.Fatalf("超长行应被折叠, 实际无换行")
+	}
+	for _, l := range strings.Split(folded, "\n") {
+		if len(l) > 990 {
+			t.Errorf("折叠后行仍超长: %d", len(l))
+		}
+	}
+	if strings.ReplaceAll(folded, "\n", "") != long {
+		t.Errorf("折叠后拼接内容与原文本不一致")
+	}
+
+	// 短行/已有换行原样保留
+	short := "你好 world\n第二行"
+	if got := foldLongLines(short, 990); got != short {
+		t.Errorf("短行不应被修改: %q", got)
+	}
+
+	// 中文按 rune 折叠, 不切断多字节字符
+	zh := strings.Repeat("惊蛰", 600) // 1200 rune
+	for _, l := range strings.Split(foldLongLines(zh, 990), "\n") {
+		if len([]rune(l)) > 990 {
+			t.Errorf("中文行折叠后仍超长: %d rune", len([]rune(l)))
+		}
+	}
+
+	// 无空格的连续 HTML 标签行, 折叠不得切断标签 (如 </tr>)
+	tags := strings.Repeat("<tr><td>2024-02-07</td><td>000725.SZ</td></tr>", 100)
+	lines := strings.Split(foldLongLines(tags, 990), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("标签行应被折叠")
+	}
+	re := regexp.MustCompile(`<([a-zA-Z/][a-zA-Z0-9]*)$`)
+	for i, l := range lines {
+		if m := re.FindStringSubmatch(l); m != nil {
+			// 行尾是未闭合标签名: 仅当下一行继续属性或直接闭合才合法
+			if i+1 >= len(lines) || (!strings.HasPrefix(lines[i+1], ">") && !strings.Contains(lines[i+1], "=")) {
+				t.Errorf("第%d行折叠切断了标签 %q, 下一行 %q", i+1, m[1], lines[i+1])
+			}
+		}
+	}
+}
+
+func TestBuildMailMessageFoldLongBody(t *testing.T) {
+	// 超长正文发送前必须被折叠 (QQ 邮箱拒收 >998 字符的行)
+	msg := buildMailMessage("test@qq.com", "标题", strings.Repeat("x", 2000))
+	for _, l := range strings.Split(msg, "\n") {
+		if len(l) > 998 {
+			t.Errorf("邮件正文存在超长行: %d 字符", len(l))
+		}
 	}
 }
 

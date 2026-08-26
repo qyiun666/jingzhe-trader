@@ -50,6 +50,7 @@ Thumbs.db
 
 # Temporary files
 tmp/
+tmp_verify/
 temp/
 *.tmp
 
