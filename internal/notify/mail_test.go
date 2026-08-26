@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestMailNotifierEnabled(t *testing.T) {
@@ -110,11 +111,26 @@ func TestFoldLongLines(t *testing.T) {
 		t.Errorf("短行不应被修改: %q", got)
 	}
 
-	// 中文按 rune 折叠, 不切断多字节字符
-	zh := strings.Repeat("惊蛰", 600) // 1200 rune
-	for _, l := range strings.Split(foldLongLines(zh, 990), "\n") {
-		if len([]rune(l)) > 990 {
-			t.Errorf("中文行折叠后仍超长: %d rune", len([]rune(l)))
+	// 中文按字节折叠 (RFC 5321 限制 998 octets, 1 中文=3 字节), 且不切断多字节字符
+	zh := strings.Repeat("惊蛰", 600) // 1200 rune = 3600 字节
+	zhFolded := foldLongLines(zh, 990)
+	for _, l := range strings.Split(zhFolded, "\n") {
+		if len(l) > 990 {
+			t.Errorf("中文行折叠后仍超字节上限: %d bytes", len(l))
+		}
+		if !utf8.ValidString(l) {
+			t.Errorf("中文行折叠切断了多字节字符")
+		}
+	}
+	if strings.ReplaceAll(zhFolded, "\n", "") != zh {
+		t.Errorf("中文行折叠后拼接内容与原文本不一致")
+	}
+
+	// 中英混排超长行 (无空格无标签), 逐行不得超字节上限 (回归: 曾按 rune 计数导致中文行超 998 octet)
+	mix := strings.Repeat("惊蛰A股B", 300) // 1500 rune ≈ 3900+ 字节
+	for _, l := range strings.Split(foldLongLines(mix, 990), "\n") {
+		if len(l) > 990 {
+			t.Errorf("中英混排行折叠后仍超字节上限: %d bytes", len(l))
 		}
 	}
 
@@ -136,11 +152,19 @@ func TestFoldLongLines(t *testing.T) {
 }
 
 func TestBuildMailMessageFoldLongBody(t *testing.T) {
-	// 超长正文发送前必须被折叠 (QQ 邮箱拒收 >998 字符的行)
+	// 超长正文发送前必须被折叠 (QQ 邮箱拒收 >998 字节的行)
 	msg := buildMailMessage("test@qq.com", "标题", strings.Repeat("x", 2000))
 	for _, l := range strings.Split(msg, "\n") {
 		if len(l) > 998 {
-			t.Errorf("邮件正文存在超长行: %d 字符", len(l))
+			t.Errorf("邮件正文存在超长行: %d 字节", len(l))
+		}
+	}
+
+	// 中文超长正文同样按字节折叠 (回归: 曾按 rune 折叠, 中文行超 998 字节被 QQ 拒收)
+	zhMsg := buildMailMessage("test@qq.com", "标题", strings.Repeat("惊蛰量化", 500))
+	for _, l := range strings.Split(zhMsg, "\n") {
+		if len(l) > 998 {
+			t.Errorf("中文邮件正文存在超长行: %d 字节", len(l))
 		}
 	}
 }

@@ -20,7 +20,8 @@ const mailSMTPAddr = "smtp.qq.com:465"
 // mailSMTPHost QQ 邮箱 SMTP 主机名 (用于 TLS ServerName 与 EHLO)
 const mailSMTPHost = "smtp.qq.com"
 
-// mailMaxLineLen 正文单行最大长度 (RFC 5322 限制 998, QQ 邮箱超限拒收; 留余量)
+// mailMaxLineLen 正文单行最大字节数 (RFC 5321 限制 998 octets, QQ 邮箱超限拒收; 留余量)
+// 按字节而非字符计数: UTF-8 中文 1 字符=3 字节, 按字符折叠会突破 998 字节上限
 const mailMaxLineLen = 990
 
 // MailNotifier QQ 邮箱邮件通知器
@@ -98,48 +99,62 @@ func buildMailMessageWithContentType(from, title, body, contentType string) stri
 	return b.String()
 }
 
-// foldLongLines 折叠超过 maxLine 个字符的行 (RFC 5322 单行 ≤998, 避免 QQ 邮箱拒收)
-// HTML/JS 中插入换行会被解析为空白, 不影响渲染; 按 rune 折叠避免切断多字节字符
-func foldLongLines(body string, maxLine int) string {
+// foldLongLines 折叠超过 maxBytes 个字节的行 (RFC 5321 单行 ≤998 octets, 避免 QQ 邮箱拒收)
+// HTML/JS 中插入换行会被解析为空白, 不影响渲染; 按字节折叠并修正 UTF-8 边界避免切断多字节字符
+func foldLongLines(body string, maxBytes int) string {
 	lines := strings.Split(body, "\n")
 	for i, line := range lines {
-		if len([]rune(line)) <= maxLine {
+		if len(line) <= maxBytes {
 			continue
 		}
-		lines[i] = foldLine(line, maxLine)
+		lines[i] = foldLine(line, maxBytes)
 	}
 	return strings.Join(lines, "\n")
 }
 
 // foldLine 单行折叠: 优先在空格处断行, 其次在标签闭合符 > 之后 (避免切断 HTML 标签), 最后硬折; 折行后跳过行首空格
-func foldLine(line string, maxLine int) string {
-	rs := []rune(line)
+// 切割位置按字节计算, 并用 prevRuneBoundary 修正到 UTF-8 字符边界
+func foldLine(line string, maxBytes int) string {
+	if len(line) <= maxBytes {
+		return line
+	}
 	var b strings.Builder
-	for len(rs) > maxLine {
-		cut := maxLine
-		for i := maxLine - 1; i > 0; i-- {
-			if rs[i] == ' ' {
+	rest := line
+	for len(rest) > maxBytes {
+		cut := maxBytes
+		for i := maxBytes - 1; i > 0; i-- {
+			if rest[i] == ' ' {
 				cut = i
 				break
 			}
 		}
-		if cut == maxLine { // 无空格: 找标签闭合符, 在其后断行
-			for i := maxLine - 1; i > 0; i-- {
-				if rs[i] == '>' {
+		if cut == maxBytes { // 无空格: 找标签闭合符, 在其后断行
+			for i := maxBytes - 1; i > 0; i-- {
+				if rest[i] == '>' {
 					cut = i + 1
 					break
 				}
 			}
 		}
-		b.WriteString(string(rs[:cut]))
+		cut = prevRuneBoundary(rest, cut) // 切割点回退到字符边界, 不切断多字节 UTF-8
+		b.WriteString(rest[:cut])
 		b.WriteByte('\n')
-		rs = rs[cut:]
-		for len(rs) > 0 && rs[0] == ' ' {
-			rs = rs[1:]
+		rest = rest[cut:]
+		for len(rest) > 0 && rest[0] == ' ' {
+			rest = rest[1:]
 		}
 	}
-	b.WriteString(string(rs))
+	b.WriteString(rest)
 	return b.String()
+}
+
+// prevRuneBoundary 将 pos 向前回退到 UTF-8 字符边界 (pos 落在多字节字符中间时)
+// UTF-8 连续字节形如 10xxxxxx, 向前跳过即可到达字符起始字节
+func prevRuneBoundary(s string, pos int) int {
+	for pos > 0 && pos < len(s) && s[pos]&0xC0 == 0x80 {
+		pos--
+	}
+	return pos
 }
 
 // sendSMTP 通过 SMTP 发送邮件
