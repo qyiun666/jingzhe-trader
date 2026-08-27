@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"jingzhe-trader/internal/model"
+	"jingzhe-trader/internal/store"
 	"jingzhe-trader/pkg/logger"
 )
 
@@ -290,7 +291,7 @@ func (q *QMTBridge) PollTrades() error {
 		q.seenTrades[key] = true
 		orderID, _ := strconv.ParseInt(t.OrderID, 10, 64)
 		fired = append(fired, model.Trade{
-			RunID:     "live",
+			RunID:     store.RunIDLive,
 			OrderID:   orderID,
 			TsCode:    t.StockCode,
 			Side:      side,

@@ -172,7 +172,9 @@ func (s *Service) applyTradeToPortfolio(tsCode string, side model.Side, qty int,
 	// 4. 查询更新后的资产并持久化 cash
 	asset, _ := s.brk.QueryAsset()
 	if asset != nil {
-		portRepo.SetMeta("cash", fmt.Sprintf("%.2f", asset.Cash))
+		if err := portRepo.SetMeta("cash", fmt.Sprintf("%.2f", asset.Cash)); err != nil {
+			logger.L().Warnw("成交后持久化 cash 失败, 重启后现金将回退到旧值", "ts_code", tsCode, "err", err)
+		}
 	} else {
 		asset = &broker.AssetInfo{}
 	}

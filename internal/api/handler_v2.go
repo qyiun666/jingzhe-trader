@@ -108,13 +108,23 @@ func (s *Service) SyncPortfolio(req SyncPortfolioRequest) (*SyncPortfolioRespons
 	// 4. 记录现金到元数据; initial_capital 仅首次设置 (避免覆盖已有值导致总盈亏计算错误)
 	// 首次同步本金 = 现金 + 持仓成本市值: 只记现金会把带入持仓的市值全部算成虚假盈利
 	costValue := 0.0
+	missingCost := false
 	for _, p := range positionMap {
+		if p.CostPrice <= 0 {
+			missingCost = true
+			continue
+		}
 		costValue += float64(p.TotalQty) * p.CostPrice
 	}
-	portRepo.SetMeta("cash", fmt.Sprintf("%.2f", cash))
+	if err := portRepo.SetMeta("cash", fmt.Sprintf("%.2f", cash)); err != nil {
+		logger.L().Warnf("[持仓同步] 写入 cash 失败, 重启后现金将回退到旧值: %v", err)
+	}
 	if existing, err := portRepo.GetMeta("initial_capital"); err != nil {
 		// 真实查询错误时跳过写入: 盲写会覆盖/错设资金基准且仅首次写入不可自愈
 		logger.L().Warnf("[持仓同步] 查询 initial_capital 失败, 跳过本金初始化: %v", err)
+	} else if existing == "" && missingCost {
+		// 成本价缺失时不写本金: write-once 基准宁缺勿错, 留空回退 config 并提醒补传 cost_price
+		logger.L().Warnf("[持仓同步] 存在 cost_price 缺失的持仓, 跳过本金初始化, 请带完整成本价重新同步")
 	} else if existing == "" {
 		if err := portRepo.SetMeta("initial_capital", fmt.Sprintf("%.2f", cash+costValue)); err != nil {
 			logger.L().Warnf("[持仓同步] 写入 initial_capital 失败: %v", err)

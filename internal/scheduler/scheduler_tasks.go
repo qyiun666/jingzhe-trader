@@ -22,11 +22,12 @@ func (s *Scheduler) runDataUpdate(date string) error {
 		return err
 	}
 	// 数据新鲜后记录实盘账户快照 (收益曲线; 失败不阻断主任务)
+	// 与信号任务同策略: 快照成功才重评风险模式, 避免用未收盘的旧市值误切模式 (18:00 信号补记会再评)
 	if err := s.svc.RecordLiveSnapshot(date); err != nil {
 		logger.L().Warnw("实盘账户快照记录失败", "date", date, "err", err)
+	} else {
+		s.checkGoalMode(date)
 	}
-	// 季度目标评估: 风险模式变化时告警 (失败不阻断)
-	s.checkGoalMode(date)
 	return nil
 }
 

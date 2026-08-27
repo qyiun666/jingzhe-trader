@@ -70,14 +70,23 @@ func (s *Service) RecordLiveSnapshot(date string) error {
 	}
 	tradeRepo := store.NewTradeRepo(s.db)
 	// 当日盈亏: 对比上一交易日快照 (不能用当日已有记录作基准, 否则同日补记时盈亏被归零)
-	if prev, err := tradeRepo.GetAccountSnapshotBefore(liveSnapshotRunID, date); err == nil && prev != nil && prev.TotalAsset > 0 {
+	// 查询错误必须中止: 同日补记走 INSERT OR REPLACE, 吞错会用 pnl=0 覆盖已写对的正确记录
+	prev, err := tradeRepo.GetAccountSnapshotBefore(liveSnapshotRunID, date)
+	if err != nil {
+		return fmt.Errorf("查询上一交易日快照失败: %w", err)
+	}
+	if prev != nil && prev.TotalAsset > 0 {
 		snap.PnL = snap.TotalAsset - prev.TotalAsset
 		snap.PnLPct = snap.PnL / prev.TotalAsset
 	}
-	// 累计盈亏: 对比初始资金
+	// 累计盈亏: 对比初始资金 (查询错误同样中止, 避免用 config 回退值覆盖已写对的累计值)
 	portRepo := store.NewPortfolioRepo(s.db)
 	initial := s.cfg.Backtest.InitialCapital
-	if v, _ := portRepo.GetMeta("initial_capital"); v != "" {
+	v, err := portRepo.GetMeta("initial_capital")
+	if err != nil {
+		return fmt.Errorf("查询 initial_capital 失败: %w", err)
+	}
+	if v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
 			initial = f
 		}
