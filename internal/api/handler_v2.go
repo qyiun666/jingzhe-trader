@@ -112,15 +112,20 @@ func (s *Service) SyncPortfolio(req SyncPortfolioRequest) (*SyncPortfolioRespons
 	}
 
 	// 4. 记录现金到元数据; initial_capital 仅首次设置 (避免覆盖已有值导致总盈亏计算错误)
+	// 首次同步本金 = 现金 + 持仓成本市值: 只记现金会把带入持仓的市值全部算成虚假盈利
+	costValue := 0.0
+	for _, p := range positionMap {
+		costValue += float64(p.TotalQty) * p.CostPrice
+	}
 	portRepo.SetMeta("cash", fmt.Sprintf("%.2f", cash))
 	if existing, err := portRepo.GetMeta("initial_capital"); err != nil || existing == "" {
-		portRepo.SetMeta("initial_capital", fmt.Sprintf("%.2f", cash))
+		portRepo.SetMeta("initial_capital", fmt.Sprintf("%.2f", cash+costValue))
 	}
 
 	return &SyncPortfolioResponse{
 		SyncedCount: len(storeItems),
 		Positions:   names,
-		TotalAsset:  cash, // 初始时总资产约等于现金
+		TotalAsset:  cash + costValue,
 		Cash:        cash,
 	}, nil
 }

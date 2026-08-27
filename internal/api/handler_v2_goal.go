@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 
@@ -45,8 +46,11 @@ func (s *Service) GoalStatus(date string) (*goal.Status, error) {
 // 数据更新成功后调用: 用当日收盘价更新市值 → 计算当日/累计盈亏 → 落 account_snapshot
 func (s *Service) RecordLiveSnapshot(date string) error {
 	bars, err := s.barRepo.GetBarsByDate(date)
-	if err != nil || len(bars) == 0 {
-		return fmt.Errorf("无当日行情, 跳过快照: %w", err)
+	if err != nil {
+		return fmt.Errorf("查询当日行情失败: %w", err)
+	}
+	if len(bars) == 0 {
+		return errors.New("无当日行情, 跳过快照")
 	}
 	barMap := make(map[string]*model.Bar, len(bars))
 	for i := range bars {
@@ -65,8 +69,8 @@ func (s *Service) RecordLiveSnapshot(date string) error {
 		MarketValue: asset.MarketValue,
 	}
 	tradeRepo := store.NewTradeRepo(s.db)
-	// 当日盈亏: 对比上一个实盘快照
-	if prev, err := tradeRepo.GetLatestAccountSnapshot(liveSnapshotRunID); err == nil && prev != nil && prev.TotalAsset > 0 {
+	// 当日盈亏: 对比上一交易日快照 (不能用当日已有记录作基准, 否则同日补记时盈亏被归零)
+	if prev, err := tradeRepo.GetAccountSnapshotBefore(liveSnapshotRunID, date); err == nil && prev != nil && prev.TotalAsset > 0 {
 		snap.PnL = snap.TotalAsset - prev.TotalAsset
 		snap.PnLPct = snap.PnL / prev.TotalAsset
 	}

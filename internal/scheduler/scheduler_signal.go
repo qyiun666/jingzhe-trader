@@ -38,6 +38,14 @@ func (s *Scheduler) runSignalWithFreshnessCheck(date string) error {
 		logger.L().Infow("信号任务: 数据新鲜度检查通过", "latest_data", maxDate)
 	}
 
+	// 数据已新鲜: 幂等补记实盘快照 (15:10 数据更新时行情常未出, 快照会被跳过; INSERT OR REPLACE 重记无害)
+	// 补记成功则重评季度目标风险模式, 让当日风控反映真实资产 (否则季初基准会一直错用 initial_capital)
+	if err := s.svc.RecordLiveSnapshot(date); err != nil {
+		logger.L().Warnw("信号任务: 实盘快照补记失败", "date", date, "err", err)
+	} else {
+		s.checkGoalMode(date)
+	}
+
 	// 选股结果新鲜度检查: 选股器启用时, 检查当日选股任务是否已成功
 	// 失败时不中止整个信号 (卖出/风控计划照常生成), 仅跳过选股池合并 (买入侧)
 	if s.cfg.Screener.Enabled {

@@ -148,3 +148,17 @@ func (r *TradeRepo) GetLatestAccountSnapshot(runID string) (*model.AccountSnapsh
 	}
 	return &snap, nil
 }
+
+// GetAccountSnapshotBefore 查询某次运行在 date 之前最近一个交易日的账户快照
+// 当日盈亏对比用: 同日重复记录快照时不能拿当日自己作基准
+func (r *TradeRepo) GetAccountSnapshotBefore(runID, date string) (*model.AccountSnapshot, error) {
+	query := fmt.Sprintf(`SELECT %s FROM account_snapshot WHERE run_id = ? AND trade_date < ? ORDER BY trade_date DESC LIMIT 1`, accountSnapshotSelectCols)
+	var snap model.AccountSnapshot
+	if err := r.db.Get(&snap, query, runID, date); err != nil {
+		if isNoRowsErr(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("查询账户快照失败: %w", err)
+	}
+	return &snap, nil
+}
