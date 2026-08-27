@@ -42,6 +42,7 @@ type Scheduler struct {
 	calRepo  *store.CalendarRepo
 
 	running      sync.Map       // job_name -> bool, 防止同名任务重叠执行
+	goalMu       sync.Mutex     // 串行化 checkGoalMode: data_update 重试与 signal 补记可能同日并发评估 (读-改-写非原子, 防重复告警)
 	lastIntraday time.Time      // 上一轮盘中监控时间
 	jobWg        sync.WaitGroup // 等待所有 job goroutine 完成 (优雅关闭用)
 }

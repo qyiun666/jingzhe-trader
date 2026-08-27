@@ -31,7 +31,10 @@ func (s *Scheduler) runDataUpdate(date string) error {
 }
 
 // checkGoalMode 评估季度目标状态, 风险模式变化时告警并记录
+// 可能同日多次被调用 (15:10 数据更新 / 18:00 信号补记快照), goalMu 保证读-改-写原子, 不会重复告警
 func (s *Scheduler) checkGoalMode(date string) {
+	s.goalMu.Lock()
+	defer s.goalMu.Unlock()
 	st, err := s.svc.GoalStatus(date)
 	if err != nil || st == nil {
 		return // 未启用目标跟踪

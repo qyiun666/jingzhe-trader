@@ -12,7 +12,7 @@ import (
 )
 
 // liveSnapshotRunID 实盘账户快照的 run_id (与回测 bt_* 区分)
-const liveSnapshotRunID = "live"
+const liveSnapshotRunID = store.RunIDLive
 
 // ==================== 交易反馈 ====================
 

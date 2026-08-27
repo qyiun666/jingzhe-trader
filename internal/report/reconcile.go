@@ -66,8 +66,8 @@ func Reconcile(brk broker.Broker, tradeRepo *store.TradeRepo, tradeDate string) 
 	}
 	result.BrokerCash = asset.Cash
 
-	// 2. 获取本地最新的账户快照
-	snap, err := tradeRepo.GetLatestAccountSnapshot("")
+	// 2. 获取本地最新的账户快照 (实盘 run_id: 传空串永远查不到, 对账基准会退化为 0)
+	snap, err := tradeRepo.GetLatestAccountSnapshot(store.RunIDLive)
 	if err != nil {
 		return nil, fmt.Errorf("查询本地账户快照失败: %w", err)
 	}
@@ -91,8 +91,8 @@ func Reconcile(brk broker.Broker, tradeRepo *store.TradeRepo, tradeDate string) 
 	// 5. 对比持仓
 	result.PositionDiffs = reconcilePositions(result.LocalPositions, result.BrokerPositions)
 
-	// 6. 获取本地成交记录 (按日期查询)
-	localTrades, err := tradeRepo.GetTradesByRunID("")
+	// 6. 获取本地成交记录 (按日期查询, 限实盘)
+	localTrades, err := tradeRepo.GetTradesByRunID(store.RunIDLive)
 	if err != nil {
 		return nil, fmt.Errorf("查询本地成交记录失败: %w", err)
 	}

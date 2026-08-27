@@ -8,7 +8,6 @@ import (
 
 	"jingzhe-trader/internal/broker"
 	"jingzhe-trader/internal/dataloader"
-	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/store"
 	"jingzhe-trader/internal/strategy"
 )
@@ -121,17 +120,7 @@ func (s *Service) restorePortfolioFromDB() {
 		return // 无持仓数据，使用默认空仓
 	}
 
-	positionMap := make(map[string]*model.Position)
-	for _, p := range positions {
-		positionMap[p.TsCode] = &model.Position{
-			TsCode:       p.TsCode,
-			TotalQty:     p.TotalQty,
-			AvailableQty: p.AvailableQty,
-			TodayBought:  p.TodayBought,
-			HighPrice:    p.HighPrice,
-			CostPrice:    p.CostPrice,
-		}
-	}
+	positionMap := positionsToMap(positions)
 
 	// 优先读取实际 cash，其次 initial_capital，最后 fallback 到 config
 	cash := s.cfg.Backtest.InitialCapital

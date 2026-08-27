@@ -39,7 +39,7 @@ func (s *Scheduler) runSignalWithFreshnessCheck(date string) error {
 	}
 
 	// 数据已新鲜: 幂等补记实盘快照 (15:10 数据更新时行情常未出, 快照会被跳过; INSERT OR REPLACE 重记无害)
-	// 补记成功则重评季度目标风险模式, 让当日风控反映真实资产 (否则季初基准会一直错用 initial_capital)
+	// 补记成功才重评风险模式 (用当日收盘市值); 失败时不重评, 避免用陈旧资产误切模式
 	if err := s.svc.RecordLiveSnapshot(date); err != nil {
 		logger.L().Warnw("信号任务: 实盘快照补记失败", "date", date, "err", err)
 	} else {

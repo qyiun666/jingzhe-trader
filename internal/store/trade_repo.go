@@ -107,6 +107,10 @@ func (r *TradeRepo) GetLatestRunPerStrategy() (map[string]string, error) {
 	return result, nil
 }
 
+// RunIDLive 实盘账户快照/成交记录的 run_id (与回测 bt_* 区分)
+// 写入方: api 持仓同步/成交确认/快照; 读取方: goal tracker / report reconcile
+const RunIDLive = "live"
+
 // 同一 run 重跑当日幂等覆盖 (配合 (run_id, trade_date) 唯一索引)
 const accountSnapshotInsertSQL = `INSERT OR REPLACE INTO account_snapshot
 	(run_id, trade_date, total_asset, cash, market_value, pnl, pnl_pct, total_pnl, total_pnl_pct)

@@ -7,6 +7,7 @@ import (
 	"jingzhe-trader/internal/broker"
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/store"
+	"jingzhe-trader/pkg/logger"
 )
 
 // ==================== 持仓同步 ====================
@@ -93,19 +94,12 @@ func (s *Service) SyncPortfolio(req SyncPortfolioRequest) (*SyncPortfolioRespons
 	}
 	if !overwrite {
 		// 增量模式: 内存重建为数据库全量持仓 (含本次未触及的旧持仓)
-		positionMap = make(map[string]*model.Position)
-		if all, err := portRepo.GetAllPositions(); err == nil {
-			for _, p := range all {
-				positionMap[p.TsCode] = &model.Position{
-					TsCode:       p.TsCode,
-					TotalQty:     p.TotalQty,
-					AvailableQty: p.AvailableQty,
-					TodayBought:  p.TodayBought,
-					HighPrice:    p.HighPrice,
-					CostPrice:    p.CostPrice,
-				}
-			}
+		// 失败必须中止: 留着空 map 会让下方本金核算把基准写成只记现金, 造成不可逆污染
+		all, err := portRepo.GetAllPositions()
+		if err != nil {
+			return nil, fmt.Errorf("持仓增量更新后重建全量持仓失败: %w", err)
 		}
+		positionMap = positionsToMap(all)
 	}
 	if pb, ok := s.brk.(*broker.PaperBroker); ok {
 		pb.ImportPositions(positionMap, cash)
@@ -118,8 +112,13 @@ func (s *Service) SyncPortfolio(req SyncPortfolioRequest) (*SyncPortfolioRespons
 		costValue += float64(p.TotalQty) * p.CostPrice
 	}
 	portRepo.SetMeta("cash", fmt.Sprintf("%.2f", cash))
-	if existing, err := portRepo.GetMeta("initial_capital"); err != nil || existing == "" {
-		portRepo.SetMeta("initial_capital", fmt.Sprintf("%.2f", cash+costValue))
+	if existing, err := portRepo.GetMeta("initial_capital"); err != nil {
+		// 真实查询错误时跳过写入: 盲写会覆盖/错设资金基准且仅首次写入不可自愈
+		logger.L().Warnf("[持仓同步] 查询 initial_capital 失败, 跳过本金初始化: %v", err)
+	} else if existing == "" {
+		if err := portRepo.SetMeta("initial_capital", fmt.Sprintf("%.2f", cash+costValue)); err != nil {
+			logger.L().Warnf("[持仓同步] 写入 initial_capital 失败: %v", err)
+		}
 	}
 
 	return &SyncPortfolioResponse{
@@ -128,6 +127,22 @@ func (s *Service) SyncPortfolio(req SyncPortfolioRequest) (*SyncPortfolioRespons
 		TotalAsset:  cash + costValue,
 		Cash:        cash,
 	}, nil
+}
+
+// positionsToMap 将数据库持仓列表转为 PaperBroker 导入用的 map (同步增量重建与启动恢复共用)
+func positionsToMap(items []store.PortfolioSyncItem) map[string]*model.Position {
+	m := make(map[string]*model.Position, len(items))
+	for _, p := range items {
+		m[p.TsCode] = &model.Position{
+			TsCode:       p.TsCode,
+			TotalQty:     p.TotalQty,
+			AvailableQty: p.AvailableQty,
+			TodayBought:  p.TodayBought,
+			HighPrice:    p.HighPrice,
+			CostPrice:    p.CostPrice,
+		}
+	}
+	return m
 }
 
 // PositionDetail is a single portfolio holding with market pricing.
