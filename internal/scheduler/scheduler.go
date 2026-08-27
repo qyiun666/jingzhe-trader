@@ -45,6 +45,8 @@ type Scheduler struct {
 	goalMu       sync.Mutex     // 串行化 checkGoalMode: data_update 重试与 signal 补记可能同日并发评估 (读-改-写非原子, 防重复告警)
 	lastIntraday time.Time      // 上一轮盘中监控时间
 	jobWg        sync.WaitGroup // 等待所有 job goroutine 完成 (优雅关闭用)
+	mailWarnMu   sync.Mutex     // 串行化"邮件未配置"每日告警去重
+	mailWarnDate string         // 最近一次该告警的日期 (当日只提醒一次)
 }
 
 // New 创建调度器
@@ -327,6 +329,19 @@ func (s *Scheduler) alert(title, text string) {
 	if _, err := alertRepo.Insert(alert); err != nil {
 		logger.L().Warnw("通知落库失败", "title", title, "err", err)
 	}
+}
+
+// warnMailDisabled 邮件通知未完整配置时, 当日仅落一条告警留痕 (此后当日静默跳过)
+// 背景: MailNotifier 对未配置状态是静默 no-op, 曾出现任务全绿但一封邮件都没发的无声故障
+func (s *Scheduler) warnMailDisabled(scene string) {
+	s.mailWarnMu.Lock()
+	defer s.mailWarnMu.Unlock()
+	today := time.Now().Format("20060102")
+	if s.mailWarnDate == today {
+		return
+	}
+	s.mailWarnDate = today
+	s.alert("⚠️ 邮件通知未配置", fmt.Sprintf("今日推送已跳过(%s): 需同时满足 enabled=true、from 非空、JZ_MAIL_PASSWORD 已注入", scene))
 }
 
 // ==================== 时间工具 ====================

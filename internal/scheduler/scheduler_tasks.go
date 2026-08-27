@@ -111,6 +111,7 @@ func (s *Scheduler) runReconcile(date string) error {
 func (s *Scheduler) runPremarket(date string) error {
 	sum := s.svc.BuildPremarketSummary()
 	if !s.mailer.Enabled() {
+		s.warnMailDisabled("盘前总结")
 		logger.L().Info("邮件未配置, 盘前总结仅记录")
 		return nil
 	}
@@ -160,6 +161,7 @@ func (s *Scheduler) runReport(date string) error {
 		}
 	}
 	if !s.mailer.Enabled() {
+		s.warnMailDisabled("日报推送")
 		logger.L().Info("邮件未配置, 日报仅落库不推送")
 		return nil
 	}
@@ -264,7 +266,9 @@ func (s *Scheduler) runIntradayMonitor(date string) error {
 		}
 		s.alert("🚨 惊蛰盘中止损告警", msg)
 		// 止损需要立即操作, 即时邮件 (需操作的通知单独发; 其余告警汇总进日报)
-		if serr := s.mailer.Send("🚨 惊蛰盘中止损告警", msg); serr != nil {
+		if !s.mailer.Enabled() {
+			s.warnMailDisabled("止损即时告警")
+		} else if serr := s.mailer.Send("🚨 惊蛰盘中止损告警", msg); serr != nil {
 			logger.L().Warnw("止损告警邮件发送失败", "err", serr)
 		}
 	}

@@ -25,7 +25,7 @@ const mailSMTPHost = "smtp.qq.com"
 const mailMaxLineLen = 990
 
 // MailNotifier QQ 邮箱邮件通知器
-// 未启用时所有发送调用降级为 no-op, 调用方无需判空
+// 未启用时所有发送调用降级为告警日志+no-op, 调用方无需判空
 type MailNotifier struct {
 	enabled  bool   // 是否启用邮件通知
 	from     string // 发件邮箱 (即收件人)
@@ -60,6 +60,7 @@ func (n *MailNotifier) SendHTML(title, htmlBody string) error {
 // send 统一发送入口
 func (n *MailNotifier) send(title, body string, html bool) error {
 	if !n.Enabled() {
+		logger.L().Warnw("邮件通知未启用, 跳过发送", "title", title)
 		return nil
 	}
 	msg := buildMailMessage(n.from, title, body)
