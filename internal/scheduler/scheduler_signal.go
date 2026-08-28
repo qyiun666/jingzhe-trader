@@ -96,7 +96,7 @@ func (s *Scheduler) runSignal(date string) error {
 	return nil
 }
 
-// notifySignalResult 发送信号生成结果通知 (每次都通知, 包含决策变更检测)
+// notifySignalResult 发送信号生成结果通知 (结果始终落库; 有交易计划时额外即时发邮件, 无计划不打扰)
 func (s *Scheduler) notifySignalResult(date string, plans []*store.TradePlan) {
 	var lines []string
 
@@ -199,4 +199,13 @@ func (s *Scheduler) notifySignalResult(date string, plans []*store.TradePlan) {
 		msg += l
 	}
 	s.alert("📋 惊蛰交易信号", msg)
+
+	// 即时推送: 有交易计划才发邮件 (计划需用户确认, 早于 18:00 日报留出决策窗口; 无计划不打扰)
+	if len(plans) > 0 {
+		if !s.mailer.Enabled() {
+			s.warnMailDisabled("信号即时推送")
+		} else if serr := s.mailer.Send("📋 惊蛰交易信号 "+date, msg); serr != nil {
+			logger.L().Warnw("信号即时邮件发送失败", "err", serr)
+		}
+	}
 }
