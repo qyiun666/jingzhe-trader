@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"time"
 
-	"jingzhe-trader/internal/broker"
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/store"
 	"jingzhe-trader/pkg/logger"
@@ -43,7 +42,6 @@ func (s *Service) SyncPortfolio(req SyncPortfolioRequest) (*SyncPortfolioRespons
 
 	// 1. 转换为 store 持仓格式
 	storeItems := make([]store.PortfolioSyncItem, 0, len(req.Positions))
-	positionMap := make(map[string]*model.Position)
 	var names []string
 
 	for _, item := range req.Positions {
@@ -55,16 +53,10 @@ func (s *Service) SyncPortfolio(req SyncPortfolioRequest) (*SyncPortfolioRespons
 			TotalQty:     item.TotalQty,
 			AvailableQty: item.AvailableQty,
 			CostPrice:    item.CostPrice,
-			AvgPrice:     item.CostPrice, // 默认用成本价
 		})
-		positionMap[item.TsCode] = &model.Position{
-			TsCode:       item.TsCode,
-			TotalQty:     item.TotalQty,
-			AvailableQty: item.AvailableQty,
-			CostPrice:    item.CostPrice,
-		}
 		names = append(names, s.stockName(item.TsCode))
 	}
+	positionMap := positionsToMap(storeItems)
 
 	if len(storeItems) == 0 {
 		return nil, fmt.Errorf("有效持仓为空")
@@ -101,10 +93,7 @@ func (s *Service) SyncPortfolio(req SyncPortfolioRequest) (*SyncPortfolioRespons
 		}
 		positionMap = positionsToMap(all)
 	}
-	if pb, ok := s.brk.(*broker.PaperBroker); ok {
-		pb.ImportPositions(positionMap, cash)
-	}
-
+	s.importPositions(positionMap, cash)
 	// 4. 记录现金到元数据; initial_capital 仅首次设置 (避免覆盖已有值导致总盈亏计算错误)
 	// 首次同步本金 = 现金 + 持仓成本市值: 只记现金会把带入持仓的市值全部算成虚假盈利
 	costValue := 0.0
@@ -194,7 +183,7 @@ func (s *Service) BuildPortfolio() []PositionDetail {
 			TotalQty:     p.TotalQty,
 			AvailableQty: p.AvailableQty,
 			CostPrice:    p.CostPrice,
-			AvgPrice:     p.AvgPrice,
+			AvgPrice:     p.CostPrice, // 与 cost_price 恒等, 保留键仅为响应兼容
 		}
 		price := 0.0
 		if close, ok := barMap[p.TsCode]; ok && close > 0 {

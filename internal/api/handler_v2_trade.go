@@ -131,7 +131,6 @@ func (s *Service) applyTradeToPortfolio(tsCode string, side model.Side, qty int,
 			TodayBought:  pos.TodayBought + qty,
 			HighPrice:    highPrice,
 			CostPrice:    newCost,
-			AvgPrice:     newCost,
 		})
 	} else {
 		// 卖出: 减少持仓与可卖量, 清仓则删除记录
@@ -150,7 +149,6 @@ func (s *Service) applyTradeToPortfolio(tsCode string, side model.Side, qty int,
 				TodayBought:  pos.TodayBought,
 				HighPrice:    pos.HighPrice,
 				CostPrice:    pos.CostPrice,
-				AvgPrice:     pos.AvgPrice,
 			})
 		}
 	}

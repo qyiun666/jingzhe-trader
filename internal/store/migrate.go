@@ -214,14 +214,13 @@ func migrate(db *sqlx.DB) error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_toplist_date ON top_list(trade_date);`,
 
-		// 持仓（持久化，API 重启后不丢失）
+		// 持仓（持久化，API 重启后不丢失）; 旧库残留的 avg_price 列已废弃, 应用层不再读写
 		`CREATE TABLE IF NOT EXISTS portfolio (
 			ts_code        TEXT PRIMARY KEY,
 			total_qty      INTEGER NOT NULL DEFAULT 0,
 			available_qty  INTEGER NOT NULL DEFAULT 0,
 			today_bought   INTEGER NOT NULL DEFAULT 0,
 			cost_price     REAL NOT NULL DEFAULT 0,
-			avg_price      REAL NOT NULL DEFAULT 0,
 			updated_at     TEXT NOT NULL
 		);`,
 

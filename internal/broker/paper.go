@@ -132,13 +132,6 @@ func (pb *PaperBroker) GetOMS() *OMS {
 	return pb.oms
 }
 
-// GetCash 获取现金
-func (pb *PaperBroker) GetCash() float64 {
-	pb.mu.RLock()
-	defer pb.mu.RUnlock()
-	return pb.account.cash
-}
-
 // GetPositions 获取持仓 (直接引用, 注意并发安全)
 func (pb *PaperBroker) GetPositions() map[string]*model.Position {
 	pb.mu.RLock()
