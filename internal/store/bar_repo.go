@@ -2,6 +2,7 @@ package store
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/jmoiron/sqlx"
 
@@ -114,4 +115,25 @@ func (r *BarRepo) GetZeroAdjFactorCodes() ([]string, error) {
 // GetMaxTradeDate 获取 daily_bar 中最大的交易日(无数据返回空字符串)
 func (r *BarRepo) GetMaxTradeDate() (string, error) {
 	return maxTableDate(r.db, "daily_bar")
+}
+
+// GetLatestBars 查询每只股票各自最新一根日线 (停牌股取停牌前收盘)
+func (r *BarRepo) GetLatestBars(tsCodes []string) ([]model.Bar, error) {
+	if len(tsCodes) == 0 {
+		return nil, nil
+	}
+	ph := strings.TrimSuffix(strings.Repeat("?,", len(tsCodes)), ",")
+	query := fmt.Sprintf(`SELECT %s FROM daily_bar
+		JOIN (SELECT ts_code AS m_code, MAX(trade_date) AS max_date FROM daily_bar
+			WHERE ts_code IN (%s) GROUP BY ts_code) m
+		ON ts_code = m.m_code AND trade_date = m.max_date`, barSelectCols, ph)
+	args := make([]any, len(tsCodes))
+	for i, c := range tsCodes {
+		args[i] = c
+	}
+	var bars []model.Bar
+	if err := selectList(r.db, query, &bars, "查询持仓最新日线失败", args...); err != nil {
+		return nil, err
+	}
+	return bars, nil
 }

@@ -8,8 +8,10 @@ import (
 
 	"jingzhe-trader/internal/broker"
 	"jingzhe-trader/internal/dataloader"
+	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/store"
 	"jingzhe-trader/internal/strategy"
+	"jingzhe-trader/pkg/logger"
 )
 
 // ==================== 系统维护 ====================
@@ -135,7 +137,39 @@ func (s *Service) restorePortfolioFromDB() {
 	}
 
 	// 导入到 PaperBroker
-	if pb, ok := s.brk.(*broker.PaperBroker); ok {
-		pb.ImportPositions(positionMap, cash)
+	s.importPositions(positionMap, cash)
+}
+
+// importPositions 导入持仓到 PaperBroker 并用库内最新收盘价现算市值
+// 市值是派生值, 不随恢复/同步携带, 导入后一律现算
+func (s *Service) importPositions(positions map[string]*model.Position, cash float64) {
+	pb, ok := s.brk.(*broker.PaperBroker)
+	if !ok {
+		return
 	}
+	pb.ImportPositions(positions, cash)
+	s.refreshMarketValueFromDB(pb)
+}
+
+// refreshMarketValueFromDB 用库内每只持仓最新一根日线收盘价现算市值 (停牌股取停牌前收盘)
+func (s *Service) refreshMarketValueFromDB(pb *broker.PaperBroker) {
+	pos := pb.GetPositions()
+	codes := make([]string, 0, len(pos))
+	for code := range pos {
+		codes = append(codes, code)
+	}
+	bars, err := s.barRepo.GetLatestBars(codes)
+	if err != nil {
+		logger.L().Warnf("[持仓导入] 读取最新收盘价失败, 市值暂为0, 由 15:10 快照补正: %v", err)
+		return
+	}
+	if len(bars) == 0 {
+		logger.L().Warnw("[持仓导入] 库内无持仓股票行情, 市值暂为0, 由 15:10 快照补正")
+		return
+	}
+	barMap := make(map[string]*model.Bar, len(bars))
+	for i := range bars {
+		barMap[bars[i].TsCode] = &bars[i]
+	}
+	pb.UpdateMarketValue(barMap)
 }
