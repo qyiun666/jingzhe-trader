@@ -66,8 +66,8 @@ func cleanMarketData(db *sqlx.DB, p RetentionPolicy) error {
 	if p.BarYears > 0 {
 		cutoff := time.Now().AddDate(-p.BarYears, 0, 0).Format("20060102")
 		for _, table := range []string{"daily_bar", "daily_basic", "stk_limit", "moneyflow"} {
-			if err := deleteRows(db, table,
-				fmt.Sprintf(`DELETE FROM %s WHERE trade_date < ?`, table), cutoff); err != nil {
+			if err := deleteRowsBatched(db, table,
+				`trade_date < ?`, 0, cutoff); err != nil {
 				return err
 			}
 		}
@@ -75,7 +75,7 @@ func cleanMarketData(db *sqlx.DB, p RetentionPolicy) error {
 	if p.NewsDays > 0 {
 		// news.datetime 格式 "2006-01-02 15:04:05"
 		cutoff := time.Now().AddDate(0, 0, -p.NewsDays).Format("2006-01-02")
-		if err := deleteRows(db, "news", `DELETE FROM news WHERE datetime < ?`, cutoff); err != nil {
+		if err := deleteRowsBatched(db, "news", `datetime < ?`, 0, cutoff); err != nil {
 			return err
 		}
 	}
@@ -238,21 +238,39 @@ func cleanPlansAndJobs(db *sqlx.DB, planDays int) error {
 		return nil
 	}
 	cutoff := time.Now().AddDate(0, 0, -planDays).Format("20060102")
-	if err := deleteRows(db, "trade_plan", `DELETE FROM trade_plan WHERE trade_date < ?`, cutoff); err != nil {
+	if err := deleteRowsBatched(db, "trade_plan", `trade_date < ?`, 0, cutoff); err != nil {
 		return err
 	}
 	jobCutoff := time.Now().AddDate(0, 0, -planDays).Format("2006-01-02")
-	return deleteRows(db, "job_run", `DELETE FROM job_run WHERE started_at < ?`, jobCutoff)
+	return deleteRowsBatched(db, "job_run", `started_at < ?`, 0, jobCutoff)
 }
 
-// deleteRows 参数化删除并记录行数
-func deleteRows(db *sqlx.DB, table, query string, args ...interface{}) error {
-	res, err := db.Exec(query, args...)
-	if err != nil {
-		return fmt.Errorf("清理 %s 失败: %w", table, err)
+// retentionBatchSize 分批删除的每批行数 (批间释放连接, 其他任务可插入)
+const retentionBatchSize = 5000
+
+// deleteRowsBatched 分批参数化删除 (每批独立提交, 批间释放 SQLite 连接)
+// 背景: 进程内 SetMaxOpenConns(1), 大表 DELETE 的隐式长事务会阻塞后续所有任务落库
+// (2026-08-26/27 曾因此出现 16:30 清理后调度整体卡死), 分批后其他任务可在批间隙获得连接
+func deleteRowsBatched(db *sqlx.DB, table, where string, batchSize int, args ...interface{}) error {
+	if batchSize <= 0 {
+		batchSize = retentionBatchSize
 	}
-	if n, _ := res.RowsAffected(); n > 0 {
-		logger.L().Infow("数据清理", "table", table, "deleted_rows", n)
+	var total int64
+	for {
+		query := fmt.Sprintf(`DELETE FROM %s WHERE rowid IN (SELECT rowid FROM %s WHERE %s LIMIT ?)`,
+			table, table, where)
+		res, err := db.Exec(query, append(append([]interface{}{}, args...), batchSize)...)
+		if err != nil {
+			return fmt.Errorf("清理 %s 失败: %w", table, err)
+		}
+		n, _ := res.RowsAffected()
+		total += n
+		if n < int64(batchSize) {
+			break // 本批未满, 已删完
+		}
+	}
+	if total > 0 {
+		logger.L().Infow("数据清理(分批)", "table", table, "deleted_rows", total)
 	}
 	return nil
 }
