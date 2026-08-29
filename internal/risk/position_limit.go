@@ -28,11 +28,36 @@ func NewPositionLimiter(maxSingle, maxTotal, maxSector float64) *PositionLimiter
 	}
 }
 
+// batchPending 同批次在途买入市值累计 (按票/按板块/总量)
+// 同一 Check 批次内多笔买入会逐笔通过, 若不累计, 总仓位/板块敞口约束
+// 会被"每笔单独看都未超限、叠加后超限"绕过 (月末调仓一次产出多笔买入的场景)
+type batchPending struct {
+	byCode   map[string]float64
+	bySector map[string]float64
+	total    float64
+}
+
+func newBatchPending() *batchPending {
+	return &batchPending{byCode: make(map[string]float64), bySector: make(map[string]float64)}
+}
+
+// add 累计一笔已通过买入的市值
+func (b *batchPending) add(tsCode, sector string, value float64) {
+	b.byCode[tsCode] += value
+	b.bySector[sector] += value
+	b.total += value
+}
+
 // CheckPosition 检查买入信号是否突破仓位限制
 // 返回调整后的信号（可能减少买入数量）和错误信息
 // 对于卖出信号，直接返回原信号
 func (pl *PositionLimiter) CheckPosition(signal model.Signal, positions map[string]*model.Position,
 	totalAsset float64, stocks map[string]*model.Stock, price float64) (model.Signal, error) {
+	return pl.checkPosition(signal, positions, totalAsset, stocks, price, nil)
+}
+
+func (pl *PositionLimiter) checkPosition(signal model.Signal, positions map[string]*model.Position,
+	totalAsset float64, stocks map[string]*model.Stock, price float64, bp *batchPending) (model.Signal, error) {
 
 	// 卖出信号不做仓位限制检查
 	if signal.Direction != model.DirBuy {
@@ -43,7 +68,7 @@ func (pl *PositionLimiter) CheckPosition(signal model.Signal, positions map[stri
 		return signal, fmt.Errorf("价格或总资产无效")
 	}
 
-	maxBuyQty := pl.CalcMaxBuyQty(signal.TsCode, positions, totalAsset, stocks, price)
+	maxBuyQty := pl.calcMaxBuyQty(signal.TsCode, positions, totalAsset, stocks, price, bp)
 
 	// 如果最大可买数量为 0，直接拒绝
 	if maxBuyQty <= 0 {
@@ -62,19 +87,27 @@ func (pl *PositionLimiter) CheckPosition(signal model.Signal, positions map[stri
 }
 
 // CalcMaxBuyQty 计算某股票最大可买数量
-// 综合考虑单票仓位限制、总仓位限制和板块敞口限制
+// 综合考虑单票仓位限制、总仓位限制和板块敞口限制 (不含批次在途买入)
 func (pl *PositionLimiter) CalcMaxBuyQty(tsCode string, positions map[string]*model.Position,
 	totalAsset float64, stocks map[string]*model.Stock, price float64) int {
+	return pl.calcMaxBuyQty(tsCode, positions, totalAsset, stocks, price, nil)
+}
+
+func (pl *PositionLimiter) calcMaxBuyQty(tsCode string, positions map[string]*model.Position,
+	totalAsset float64, stocks map[string]*model.Stock, price float64, bp *batchPending) int {
 
 	if price <= 0 || totalAsset <= 0 {
 		return 0
 	}
 
-	// 当前持仓
+	// 当前持仓 + 本批次在途买入
 	currentPos := positions[tsCode]
 	currentValue := 0.0
 	if currentPos != nil {
 		currentValue = float64(currentPos.TotalQty) * price
+	}
+	if bp != nil {
+		currentValue += bp.byCode[tsCode]
 	}
 
 	// 1. 单票仓位限制: 单票市值 <= 总资产 * maxPositionPct
@@ -89,6 +122,9 @@ func (pl *PositionLimiter) CalcMaxBuyQty(tsCode string, positions map[string]*mo
 	totalMarketValue := 0.0
 	for _, pos := range positions {
 		totalMarketValue += holdingValue(pos)
+	}
+	if bp != nil {
+		totalMarketValue += bp.total
 	}
 	maxTotalValue := totalAsset * pl.maxTotalPositionPct
 	remainingTotalValue := maxTotalValue - totalMarketValue
@@ -109,6 +145,9 @@ func (pl *PositionLimiter) CalcMaxBuyQty(tsCode string, positions map[string]*mo
 			if sectorOf(stocks[code], code) == sectorName {
 				sectorValue += holdingValue(pos)
 			}
+		}
+		if bp != nil {
+			sectorValue += bp.bySector[sectorName]
 		}
 		maxSectorValue := totalAsset * pl.maxSectorPct
 		remainingSectorValue := maxSectorValue - sectorValue
@@ -167,6 +206,11 @@ func (pl *PositionLimiter) SectorExposure(positions map[string]*model.Position,
 // buyQty: 拟买入数量
 func (pl *PositionLimiter) CheckSectorLimit(signal model.Signal, positions map[string]*model.Position,
 	stocks map[string]*model.Stock, totalAsset float64, price float64, buyQty int) error {
+	return pl.checkSectorLimit(signal, positions, stocks, totalAsset, price, buyQty, nil)
+}
+
+func (pl *PositionLimiter) checkSectorLimit(signal model.Signal, positions map[string]*model.Position,
+	stocks map[string]*model.Stock, totalAsset float64, price float64, buyQty int, bp *batchPending) error {
 
 	if pl.maxSectorPct <= 0 {
 		// 未设置板块限制，直接通过
@@ -185,7 +229,7 @@ func (pl *PositionLimiter) CheckSectorLimit(signal model.Signal, positions map[s
 	// 获取信号股票的行业 (缺失时回退交易所板块)
 	sectorName := sectorOf(stocks[signal.TsCode], signal.TsCode)
 
-	// 计算当前行业敞口
+	// 计算当前行业敞口 (+ 本批次在途买入)
 	currentSectorValue := 0.0
 	for tsCode, pos := range positions {
 		if pos == nil || pos.TotalQty <= 0 {
@@ -194,6 +238,9 @@ func (pl *PositionLimiter) CheckSectorLimit(signal model.Signal, positions map[s
 		if sectorOf(stocks[tsCode], tsCode) == sectorName {
 			currentSectorValue += holdingValue(pos)
 		}
+	}
+	if bp != nil {
+		currentSectorValue += bp.bySector[sectorName]
 	}
 
 	// 拟买入金额

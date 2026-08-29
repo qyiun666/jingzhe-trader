@@ -130,6 +130,8 @@ func (rm *RiskManager) Check(signals []model.Signal, positions map[string]*model
 	var rejected []RejectReason
 	// 本批次已通过的新开仓代码 (用于最大持仓数检查)
 	newCodes := make(map[string]bool)
+	// 本批次在途买入市值累计 (防同批次多笔买入叠加绕过总仓位/板块敞口约束)
+	batch := newBatchPending()
 
 	// 第一步：黑名单过滤
 	survived, blRejected := rm.blacklist.FilterSignals(signals, stocks, tradeDate)
@@ -181,8 +183,8 @@ func (rm *RiskManager) Check(signals []model.Signal, positions map[string]*model
 				}
 			}
 
-			// 2. 仓位限制检查（可能调整买入数量）
-			adjusted, err := rm.positionLimiter.CheckPosition(sig, positions, totalAsset, stocks, currentPrice)
+			// 2. 仓位限制检查（可能调整买入数量, 含本批次在途买入）
+			adjusted, err := rm.positionLimiter.checkPosition(sig, positions, totalAsset, stocks, currentPrice, batch)
 			if err != nil {
 				// 如果调整后数量为 0，完全拒绝
 				if adjusted.TargetQty <= 0 {
@@ -201,8 +203,8 @@ func (rm *RiskManager) Check(signals []model.Signal, positions map[string]*model
 			}
 			sig = sized
 
-			// 4. 板块敞口控制检查（板块限制）
-			if err := rm.positionLimiter.CheckSectorLimit(sig, positions, stocks, totalAsset, currentPrice, sig.TargetQty); err != nil {
+			// 4. 板块敞口控制检查（板块限制, 含本批次在途买入）
+			if err := rm.positionLimiter.checkSectorLimit(sig, positions, stocks, totalAsset, currentPrice, sig.TargetQty, batch); err != nil {
 				rejected = append(rejected, *reject(sig, "sector_exposure", err.Error()))
 				continue
 			}
@@ -210,6 +212,8 @@ func (rm *RiskManager) Check(signals []model.Signal, positions map[string]*model
 			if pos := positions[sig.TsCode]; pos == nil || pos.TotalQty <= 0 {
 				newCodes[sig.TsCode] = true
 			}
+			// 记录本批次在途买入市值, 供后续信号的同批次累计约束
+			batch.add(sig.TsCode, sectorOf(stocks[sig.TsCode], sig.TsCode), float64(sig.TargetQty)*currentPrice)
 			passed = append(passed, sig)
 
 		} else if sig.Direction == model.DirSell {

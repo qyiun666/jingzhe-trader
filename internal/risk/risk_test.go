@@ -555,6 +555,62 @@ func TestRiskManager_BuyFlow(t *testing.T) {
 	}
 }
 
+// TestRiskManager_BatchSectorBypass 同批次多笔买入不得叠加绕过板块敞口约束
+// 场景: 板块上限 60%, 3 笔同板块买入各 25%, 修复前逐笔检查均通过 (叠加后 75% 超限)
+func TestRiskManager_BatchSectorBypass(t *testing.T) {
+	cfg := config.RiskConfig{
+		MaxPositionPct:      0.3,
+		MaxTotalPositionPct: 1.0,
+		MaxSectorPct:        0.6,
+		StopLossPct:         0.05,
+		TakeProfitPct:       0.15,
+		ExcludeST:           true,
+		MinListDays:         0,
+	}
+	rm := NewRiskManager(cfg)
+
+	codes := []string{"000001.SZ", "000002.SZ", "000003.SZ"}
+	signals := make([]model.Signal, 0, 3)
+	stocks := make(map[string]*model.Stock)
+	bars := make(map[string]*model.Bar)
+	for _, code := range codes {
+		signals = append(signals, model.Signal{TsCode: code, Direction: model.DirBuy, TargetQty: 25000})
+		stocks[code] = &model.Stock{TsCode: code, Name: code, Industry: "银行", ListStatus: "L", ListDate: "20200101"}
+		bars[code] = &model.Bar{TsCode: code, Close: 10.0, PreClose: 10.0, TradeDate: "20250101"}
+	}
+
+	passed, rejected := rm.Check(signals, nil, 1000000.0, stocks, "20250101", bars)
+
+	// 总资产 100万, 板块上限 60% = 60万; 每笔 25万: 第 1/2 笔可通过, 第 3 笔买入后 75万 超限应被拒/降档
+	totalBuy := 0.0
+	for _, sig := range passed {
+		totalBuy += float64(sig.TargetQty) * 10.0
+	}
+	if totalBuy > 600000.0 {
+		t.Errorf("批次累计买入市值 %.0f 超过板块敞口上限 600000", totalBuy)
+	}
+	if totalBuy < 500000.0 {
+		t.Errorf("前两笔应正常通过, 实际累计仅 %.0f", totalBuy)
+	}
+	if len(passed)+countRules(rejected, "sector_exposure", "position_limit") != 3 {
+		t.Errorf("第三笔应被敞口约束拒绝或降档: passed=%d rejected=%+v", len(passed), rejected)
+	}
+}
+
+func countRules(rejected []RejectReason, rules ...string) int {
+	set := make(map[string]bool, len(rules))
+	for _, r := range rules {
+		set[r] = true
+	}
+	n := 0
+	for _, r := range rejected {
+		if set[r.Rule] {
+			n++
+		}
+	}
+	return n
+}
+
 // TestRiskManager_STBuyRejected 测试 ST 股买入被拒绝
 func TestRiskManager_STBuyRejected(t *testing.T) {
 	cfg := config.RiskConfig{
