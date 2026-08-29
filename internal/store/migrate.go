@@ -269,6 +269,23 @@ func migrate(db *sqlx.DB) error {
 		CREATE INDEX IF NOT EXISTS idx_agent_debate_date ON agent_debate(trade_date);
 		CREATE INDEX IF NOT EXISTS idx_agent_debate_code ON agent_debate(ts_code);`,
 
+		// 辩论决策复盘 (T+5 收益回填, 反思闭环数据源; debate_id 唯一防重复回填)
+		`CREATE TABLE IF NOT EXISTS agent_debate_review (
+					id          INTEGER PRIMARY KEY AUTOINCREMENT,
+					debate_id   INTEGER NOT NULL,
+					trade_date  TEXT NOT NULL,
+					ts_code     TEXT NOT NULL,
+					decision    TEXT NOT NULL,
+					confidence  REAL NOT NULL DEFAULT 0,
+					base_close  REAL NOT NULL DEFAULT 0,
+					review_date TEXT NOT NULL,
+					last_close  REAL NOT NULL DEFAULT 0,
+					ret_pct     REAL NOT NULL DEFAULT 0,
+					correct     INTEGER NOT NULL DEFAULT 0
+				);
+				CREATE INDEX IF NOT EXISTS idx_debate_review_code ON agent_debate_review(ts_code);
+				CREATE UNIQUE INDEX IF NOT EXISTS idx_debate_review_debate ON agent_debate_review(debate_id);`,
+
 		// 调度任务执行记录 (防重复执行/启动补跑/健康度展示)
 		`CREATE TABLE IF NOT EXISTS job_run (
 			id          INTEGER PRIMARY KEY AUTOINCREMENT,
