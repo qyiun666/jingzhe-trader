@@ -52,6 +52,8 @@ func (a *TechnicalAnalyst) Analyze(ctx *DebateContext) (*AnalysisReport, error) 
 		rsiStr = fmt.Sprintf("%.1f", rsi)
 	}
 
+	flowText := formatMoneyFlows(ctx.MoneyFlows, 5)
+	topText := formatTopLists(ctx.TopLists, 3)
 	userPrompt := fmt.Sprintf(`股票: %s (%s)  日期: %s
 近5日K线:
 %s
@@ -59,6 +61,10 @@ func (a *TechnicalAnalyst) Analyze(ctx *DebateContext) (*AnalysisReport, error) 
 MA5: %s  MA20: %s  (MA5%sMA20)
 RSI(14): %s  (RSI>70超买, <30超卖)
 成交量比(5日均量): %.2f
+资金面(近5个交易日):
+%s
+龙虎榜(近2周):
+%s
 总资产: %.0f  持仓: %s
 
 请从技术面分析该股票，输出JSON:
@@ -69,6 +75,7 @@ RSI(14): %s  (RSI>70超买, <30超卖)
 		ma5Str, ma20Str, crossIndicator,
 		rsiStr,
 		volRatio,
+		flowText, topText,
 		ctx.TotalAsset, posStr(ctx.Position))
 	return callLLMCommon(a.llm, ctx.TsCode, ctx.TradeDate, "technical", technicalSysPrompt, userPrompt)
 }
@@ -335,6 +342,7 @@ const technicalSysPrompt = `你是专业的A股技术分析师，擅长通过K�
 2. 量价配合：放量上涨=资金入场，缩量下跌=抛压减轻，放量下跌=主力出逃
 3. K线形态：近5日K线的实体长短、上下影线、连续阳/阴线
 4. 支撑阻力：近期高低点形成的关键位
+5. 资金面：主力净流入连续为正=资金入场，连续净流出=主力撤退；上龙虎榜的股票短期波动放大，需警惕游资一日游
 
 A股特性：
 - T+1交易，当日买入次日才能卖出
