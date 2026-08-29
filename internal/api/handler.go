@@ -364,7 +364,7 @@ func (h *dbHistoryAdapter) GetBars(tsCode, endDate string, n int) ([]model.Bar, 
 	}
 	bars, err := h.barRepo.GetBars(tsCode, start, endDate)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("查询历史行情失败 %s: %w", tsCode, err)
 	}
 	if len(bars) > n {
 		bars = bars[len(bars)-n:]
@@ -377,7 +377,7 @@ func (h *dbHistoryAdapter) GetBars(tsCode, endDate string, n int) ([]model.Bar, 
 func (h *dbHistoryAdapter) GetCloses(tsCode, endDate string, n int) ([]float64, error) {
 	bars, err := h.GetBars(tsCode, endDate, n)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("查询历史收盘失败 %s: %w", tsCode, err)
 	}
 	closes := make([]float64, len(bars))
 	for i, b := range bars {

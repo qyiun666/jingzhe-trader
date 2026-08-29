@@ -1,6 +1,7 @@
 package tushare
 
 import (
+	"fmt"
 	"strings"
 
 	"jingzhe-trader/internal/model"
@@ -12,7 +13,7 @@ func (c *Client) callAPI(apiName string, params map[string]interface{}, fields [
 	fieldsStr := strings.Join(fields, ",")
 	resp, err := c.call(apiName, params, fieldsStr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("调用 %s 失败: %w", apiName, err)
 	}
 	return rowsToMaps(resp), nil
 }
@@ -21,7 +22,7 @@ func (c *Client) callAPI(apiName string, params map[string]interface{}, fields [
 func fetchRows[T any](c *Client, apiName string, params map[string]interface{}, fields []string, mapper func(map[string]interface{}) T) ([]T, error) {
 	rows, err := c.callAPI(apiName, params, fields)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("拉取 %s 行数据失败: %w", apiName, err)
 	}
 	result := make([]T, 0, len(rows))
 	for _, row := range rows {

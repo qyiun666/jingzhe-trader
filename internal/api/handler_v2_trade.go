@@ -92,7 +92,7 @@ func (s *Service) SettleT1(date string) error {
 		pb.SettleT1(date)
 	}
 	if err := store.NewPortfolioRepo(s.db).SettleT1(); err != nil {
-		return err
+		return fmt.Errorf("T+1持仓结转失败: %w", err)
 	}
 	logger.L().Infof("[T+1结算] %s 持仓结转完成", date)
 	return nil

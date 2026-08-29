@@ -19,7 +19,7 @@ import (
 // runDataUpdate 15:10 数据更新 (进程内调用 dataloader)
 func (s *Scheduler) runDataUpdate(date string) error {
 	if err := s.svc.UpdateData(); err != nil {
-		return err
+		return fmt.Errorf("数据更新失败: %w", err)
 	}
 	// 数据新鲜后记录实盘账户快照 (收益曲线; 失败不阻断主任务)
 	// 与信号任务同策略: 快照成功才重评风险模式, 避免用未收盘的旧市值误切模式 (18:00 信号补记会再评)
@@ -148,7 +148,7 @@ func (s *Scheduler) runPremarket(date string) error {
 	title := fmt.Sprintf("📊 惊蛰盘前总结 %s", sum.DataDate)
 	if err := s.mailer.SendHTML(title, buildPremarketHTML(sum)); err != nil {
 		logger.L().Warnw("盘前总结邮件发送失败", "err", err)
-		return err
+		return fmt.Errorf("盘前总结邮件发送失败: %w", err)
 	}
 	logger.L().Infow("盘前总结邮件已发送", "data_date", sum.DataDate, "plans", len(sum.OpenPlans))
 	return nil
@@ -205,7 +205,7 @@ func (s *Scheduler) runReport(date string) error {
 func (s *Scheduler) runSettleT1(date string) error {
 	if err := s.svc.SettleT1(date); err != nil {
 		s.alert("⚠️ 惊蛰T+1结转失败", fmt.Sprintf("%v, 今日可卖量可能不准确", err))
-		return err
+		return fmt.Errorf("T+1持仓结转失败: %w", err)
 	}
 	return nil
 }

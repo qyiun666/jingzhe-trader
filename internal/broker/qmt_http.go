@@ -33,7 +33,7 @@ func (q *QMTBridge) do(req *http.Request) ([]byte, error) {
 	}
 	resp, err := q.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("请求 QMT sidecar 失败 %s: %w", req.URL, err)
 	}
 	defer resp.Body.Close()
 
@@ -42,5 +42,9 @@ func (q *QMTBridge) do(req *http.Request) ([]byte, error) {
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
-	return io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取 QMT sidecar 响应失败: %w", err)
+	}
+	return body, nil
 }

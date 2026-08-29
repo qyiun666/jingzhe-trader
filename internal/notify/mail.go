@@ -63,9 +63,12 @@ func (n *MailNotifier) send(title, body string, html bool) error {
 		logger.L().Warnw("邮件通知未启用, 跳过发送", "title", title)
 		return nil
 	}
-	msg := buildMailMessage(n.from, title, body)
+	// 分支构建, 避免纯文本消息体在 html 模式下被整个丢弃重建
+	var msg string
 	if html {
 		msg = buildHTMLMailMessage(n.from, title, body)
+	} else {
+		msg = buildMailMessage(n.from, title, body)
 	}
 	if err := sendSMTP(mailSMTPAddr, mailSMTPHost, true, n.from, n.password, n.from, msg); err != nil {
 		return fmt.Errorf("发送邮件失败: %w", err)

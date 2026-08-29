@@ -2,6 +2,7 @@ package factor
 
 import (
 	"context"
+	"fmt"
 	"sort"
 
 	"jingzhe-trader/internal/model"
@@ -66,7 +67,7 @@ func finaFactorValues(ctx context.Context, date string, universe []string, provi
 	for _, tsCode := range universe {
 		indicators, err := provider.GetFinaIndicator(tsCode)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("获取财务指标失败 %s: %w", tsCode, err)
 		}
 
 		// 找到指定日期前最近一期已公告的财报

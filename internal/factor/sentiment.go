@@ -33,7 +33,7 @@ func (f *TurnoverFactor) Compute(ctx context.Context, date string, universe []st
 	for _, tsCode := range universe {
 		basics, err := provider.GetDailyBasicByCode(tsCode, startDate, date)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("获取个股基本面失败 %s: %w", tsCode, err)
 		}
 
 		if len(basics) == 0 {
@@ -114,7 +114,7 @@ func (f *VolumeRatioFactor) Compute(ctx context.Context, date string, universe [
 	for _, tsCode := range universe {
 		bars, err := provider.GetBars(tsCode, startDate, date)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("获取行情失败 %s: %w", tsCode, err)
 		}
 
 		if len(bars) < shortPeriod {
@@ -188,7 +188,7 @@ func (f *LimitMotionFactor) Compute(ctx context.Context, date string, universe [
 	for _, tsCode := range universe {
 		basics, err := provider.GetDailyBasicByCode(tsCode, startDate, date)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("获取个股基本面失败 %s: %w", tsCode, err)
 		}
 
 		if len(basics) == 0 {

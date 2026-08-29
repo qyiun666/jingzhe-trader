@@ -2,6 +2,7 @@ package factor
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"sort"
 )
@@ -44,7 +45,7 @@ func (cf *CompositeFactor) Compute(ctx context.Context, date string, universe []
 	for i, fw := range cf.factors {
 		vals, err := fw.Factor.Compute(ctx, date, universe, provider)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("子因子 %s 计算失败: %w", fw.Factor.Name(), err)
 		}
 		factorValues[i] = vals
 	}

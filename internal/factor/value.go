@@ -2,6 +2,7 @@ package factor
 
 import (
 	"context"
+	"fmt"
 	"math"
 )
 
@@ -20,7 +21,7 @@ func (f *PEFactor) Name() string {
 func (f *PEFactor) Compute(ctx context.Context, date string, universe []string, provider DataProvider) (map[string]float64, error) {
 	basics, err := provider.GetDailyBasic(date)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("获取全市场基本面失败: %w", err)
 	}
 
 	// 构建 universe 的 map 用于快速查找
@@ -62,7 +63,7 @@ func (f *PBFactor) Name() string {
 func (f *PBFactor) Compute(ctx context.Context, date string, universe []string, provider DataProvider) (map[string]float64, error) {
 	basics, err := provider.GetDailyBasic(date)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("获取全市场基本面失败: %w", err)
 	}
 
 	// 构建 universe 的 map 用于快速查找
@@ -102,7 +103,7 @@ func (f *DividendYieldFactor) Name() string {
 func (f *DividendYieldFactor) Compute(ctx context.Context, date string, universe []string, provider DataProvider) (map[string]float64, error) {
 	basics, err := provider.GetDailyBasic(date)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("获取全市场基本面失败: %w", err)
 	}
 
 	// 构建 universe 的 map 用于快速查找

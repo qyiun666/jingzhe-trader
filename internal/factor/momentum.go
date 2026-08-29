@@ -33,7 +33,7 @@ func (f *MomentumFactor) Compute(ctx context.Context, date string, universe []st
 	for _, tsCode := range universe {
 		bars, err := provider.GetBars(tsCode, startDate, date)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("获取行情失败 %s: %w", tsCode, err)
 		}
 
 		if len(bars) < 2 {

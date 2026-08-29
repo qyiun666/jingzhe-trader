@@ -127,11 +127,16 @@ func (pb *PaperBroker) notifyTrade(trade model.Trade) {
 	}
 }
 
-// GetPositions 获取持仓 (直接引用, 注意并发安全)
+// GetPositions 获取持仓快照 (深拷贝; 直接返回内部 map 会与调度器并发路径产生 data race)
 func (pb *PaperBroker) GetPositions() map[string]*model.Position {
 	pb.mu.RLock()
 	defer pb.mu.RUnlock()
-	return pb.account.positions
+	result := make(map[string]*model.Position, len(pb.account.positions))
+	for k, v := range pb.account.positions {
+		pos := *v
+		result[k] = &pos
+	}
+	return result
 }
 
 // UpdateMarketValue 更新持仓市值 (回测引擎调用)
