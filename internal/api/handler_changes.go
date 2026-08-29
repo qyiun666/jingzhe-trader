@@ -123,22 +123,10 @@ func (s *Service) BuildAgentChanges(date string) *ChangeReport {
 		report.TaskStatus[name] = ts
 	}
 
-	// 4. 汇总
-	pendingCount := 0
-	confirmedCount := 0
-	executedCount := 0
-	for _, p := range plans {
-		switch p.Status {
-		case store.PlanStatusPending:
-			pendingCount++
-		case store.PlanStatusConfirmed:
-			confirmedCount++
-		case store.PlanStatusExecuted:
-			executedCount++
-		}
-	}
+	// 4. 汇总 (复用统一的计划状态汇总)
+	summary := s.buildPlanStatusSummary(plans)
 	report.Summary = fmt.Sprintf("日期:%s | 辩论变更:%d | 计划:待确认%d/已确认%d/已执行%d | 任务完成:%v",
-		date, len(report.DecisionChanges), pendingCount, confirmedCount, executedCount,
+		date, len(report.DecisionChanges), summary.Pending, summary.Confirmed, summary.Executed,
 		report.TaskStatus["signal"].Completed)
 
 	return report

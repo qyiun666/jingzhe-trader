@@ -15,11 +15,7 @@ func (s *Service) RunPositions(date string) (*PortfolioJSON, error) {
 		return nil, fmt.Errorf("获取行情失败: %w", err)
 	}
 
-	todayBars := make(map[string]*model.Bar, len(allBars))
-	for i := range allBars {
-		b := &allBars[i]
-		todayBars[b.TsCode] = b
-	}
+	todayBars := barsToMap(allBars)
 
 	s.brk.UpdateMarketValue(todayBars)
 	positions, _ := s.brk.QueryPositions()

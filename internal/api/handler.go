@@ -319,20 +319,15 @@ func (s *Service) Close() error {
 
 // getPrevBars 获取上一交易日行情
 func (s *Service) getPrevBars(date string) map[string]*model.Bar {
-	prevBars := make(map[string]*model.Bar)
 	preTradeDate, err := s.calRepo.GetPreTradeDate(date)
 	if err != nil || preTradeDate == "" {
-		return prevBars
+		return map[string]*model.Bar{}
 	}
 	prevBarsList, err := s.barRepo.GetBarsByDate(preTradeDate)
 	if err != nil {
-		return prevBars
+		return map[string]*model.Bar{}
 	}
-	for i := range prevBarsList {
-		b := &prevBarsList[i]
-		prevBars[b.TsCode] = b
-	}
-	return prevBars
+	return barsToMap(prevBarsList)
 }
 
 // getPositions 获取持仓 (出错返回空 map)

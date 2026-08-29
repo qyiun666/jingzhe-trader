@@ -17,10 +17,7 @@ func (s *Service) SelectStrategy(date string) string {
 	if s.dynamicSelector != nil {
 		allBars, err := s.barRepo.GetBarsByDate(date)
 		if err == nil && len(allBars) > 0 {
-			barMap := make(map[string]*model.Bar, len(allBars))
-			for i := range allBars {
-				barMap[allBars[i].TsCode] = &allBars[i]
-			}
+			barMap := barsToMap(allBars)
 			if name, switched := s.dynamicSelector.Select(date, barMap); name != "" {
 				if switched {
 					logger.L().Infof("[动态策略] %s 策略切换为 %s", date, name)
@@ -42,10 +39,7 @@ func (s *Service) GenerateTradePlans(date string) ([]*store.TradePlan, error) {
 	if len(allBars) == 0 {
 		return nil, fmt.Errorf("当日 %s 无行情数据", date)
 	}
-	todayBars := make(map[string]*model.Bar, len(allBars))
-	for i := range allBars {
-		todayBars[allBars[i].TsCode] = &allBars[i]
-	}
+	todayBars := barsToMap(allBars)
 
 	s.brk.UpdateMarketValue(todayBars)
 	positions := s.getPositions()

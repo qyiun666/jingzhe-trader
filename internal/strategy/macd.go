@@ -63,8 +63,7 @@ func (s *MACDStrategy) OnBar(_ context.Context, barCtx *BarContext) ([]model.Sig
 			if !ok || bar.Close <= 0 {
 				continue
 			}
-			targetAmount := barCtx.TotalAsset * s.PositionPct
-			qty := int(targetAmount/bar.Close/100) * 100
+			qty := calcBuyQty(barCtx.TotalAsset, bar.Close, s.PositionPct)
 			if qty > 0 {
 				signals = append(signals, buySignal(tsCode, qty, fmt.Sprintf("MACD金叉: DIF=%.4f上穿DEA=%.4f", currDIF, currDEA), 0.7))
 			}

@@ -19,11 +19,7 @@ func (s *Service) RunDaily(date string, strategyName string) (*DailyReportJSON, 
 	}
 
 	// 2. 构建当日行情 map
-	todayBars := make(map[string]*model.Bar, len(allBars))
-	for i := range allBars {
-		b := &allBars[i]
-		todayBars[b.TsCode] = b
-	}
+	todayBars := barsToMap(allBars)
 
 	// 3. 获取上一交易日行情
 	prevBars := s.getPrevBars(date)

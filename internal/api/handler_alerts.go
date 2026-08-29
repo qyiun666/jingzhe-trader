@@ -102,17 +102,7 @@ func (s *Service) BuildAgentDashboard() map[string]interface{} {
 	}
 
 	// 计划状态汇总
-	pending, confirmed, executed := 0, 0, 0
-	for _, p := range openPlans {
-		switch p.Status {
-		case store.PlanStatusPending:
-			pending++
-		case store.PlanStatusConfirmed:
-			confirmed++
-		case store.PlanStatusExecuted:
-			executed++
-		}
-	}
+	summary := s.buildPlanStatusSummary(openPlans)
 
 	return map[string]interface{}{
 		"date":             today,
@@ -124,9 +114,9 @@ func (s *Service) BuildAgentDashboard() map[string]interface{} {
 		"decision_changes": decisionChanges,
 		"task_completed":   taskStatus,
 		"plan_summary": map[string]int{
-			"pending":   pending,
-			"confirmed": confirmed,
-			"executed":  executed,
+			"pending":   summary.Pending,
+			"confirmed": summary.Confirmed,
+			"executed":  summary.Executed,
 			"total":     len(openPlans),
 		},
 	}

@@ -183,9 +183,6 @@ func (s *Service) refreshMarketValueFromDB(pb *broker.PaperBroker) {
 		logger.L().Warnw("[持仓导入] 库内无持仓股票行情, 市值暂为0, 由 15:10 快照补正")
 		return
 	}
-	barMap := make(map[string]*model.Bar, len(bars))
-	for i := range bars {
-		barMap[bars[i].TsCode] = &bars[i]
-	}
+	barMap := barsToMap(bars)
 	pb.UpdateMarketValue(barMap)
 }

@@ -52,10 +52,7 @@ func (s *Service) RecordLiveSnapshot(date string) error {
 	if len(bars) == 0 {
 		return errors.New("无当日行情, 跳过快照")
 	}
-	barMap := make(map[string]*model.Bar, len(bars))
-	for i := range bars {
-		barMap[bars[i].TsCode] = &bars[i]
-	}
+	barMap := barsToMap(bars)
 	s.brk.UpdateMarketValue(barMap)
 	asset, err := s.brk.QueryAsset()
 	if err != nil {
