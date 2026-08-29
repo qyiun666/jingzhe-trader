@@ -2,9 +2,11 @@ package analysis
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 
+	"jingzhe-trader/internal/indicator"
 	"jingzhe-trader/internal/model"
 )
 
@@ -149,8 +151,8 @@ func judgeMarketCondition(recentReturns []float64, marketBars map[string]*model.
 	}
 
 	// 计算MA5和MA20
-	ma5 := calcMA(prices, 5)
-	ma20 := calcMA(prices, 20)
+	ma5 := lastSMA(prices, 5)
+	ma20 := lastSMA(prices, 20)
 
 	// 判断逻辑
 	if len(prices) >= 20 {
@@ -183,6 +185,17 @@ func calcMA(prices []float64, period int) float64 {
 		sum += prices[i]
 	}
 	return sum / float64(period)
+}
+
+// lastSMA 取周期均线的最新有效值 (复用 indicator.SMA, 禁止重复实现)
+func lastSMA(prices []float64, period int) float64 {
+	ma := indicator.SMA(prices, period)
+	for i := len(ma) - 1; i >= 0; i-- {
+		if !math.IsNaN(ma[i]) {
+			return ma[i]
+		}
+	}
+	return 0
 }
 
 // getCandidateStrategies 根据市场环境获取候选策略列表

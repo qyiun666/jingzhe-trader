@@ -126,8 +126,3 @@ func (r *AlertRepo) MarkAllRead() (int64, error) {
 	n, _ := res.RowsAffected()
 	return n, nil
 }
-
-// HasAlertsOnDate 判断指定日期是否有通知记录
-func (r *AlertRepo) HasAlertsOnDate(tradeDate string) (bool, error) {
-	return existsRow(r.db, `SELECT COUNT(1) FROM agent_alert WHERE trade_date = ?`, tradeDate)
-}

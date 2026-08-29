@@ -44,9 +44,9 @@ type Client struct {
 	temperature float64
 	maxTokens   int
 	jsonMode    bool
-	cache       sync.Map // 进程内缓存: key=date+symbol+role+输入hash, value=响应内容
-	sem         chan struct{}   // 并发在飞请求上限 (nil=不限制)
-	limiter     *rate.Limiter   // 每秒请求数限速 (nil=不限速)
+	cache       sync.Map      // 进程内缓存: key=date+symbol+role+输入hash, value=响应内容
+	sem         chan struct{} // 并发在飞请求上限 (nil=不限制)
+	limiter     *rate.Limiter // 每秒请求数限速 (nil=不限速)
 }
 
 // Config LLM 配置

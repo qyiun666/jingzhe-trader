@@ -331,28 +331,6 @@ func (q *QMTBridge) UpdateMarketValue(bars map[string]*model.Bar) {
 	// QMT 通过 QueryPositions / QueryAsset 获取真实市值，无需用行情数据覆盖
 }
 
-// Health 检查 sidecar 健康状态
-func (q *QMTBridge) Health() (bool, error) {
-	respBody, err := q.get("/health")
-	if err != nil {
-		return false, err
-	}
-
-	// 尝试解析为通用响应
-	var generic map[string]interface{}
-	if err := json.Unmarshal(respBody, &generic); err == nil {
-		if success, ok := generic["success"].(bool); ok {
-			return success, nil
-		}
-		if status, ok := generic["status"].(string); ok {
-			return status == "ok" || status == "healthy", nil
-		}
-	}
-
-	// 只要能响应且状态码为 200，即认为健康
-	return true, nil
-}
-
 // Connect 连接 miniQMT
 func (q *QMTBridge) Connect(path string, sessionID int, accountID string) error {
 	req := qmtConnectReq{

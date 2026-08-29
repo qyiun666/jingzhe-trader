@@ -211,94 +211,6 @@ func (s *IntradayTStrategy) OnBar(_ context.Context, barCtx *BarContext) ([]mode
 	return signals, nil
 }
 
-// ShouldDoT 判断某只股票今天是否适合做T
-//
-// 参数：
-//   - tsCode: 股票代码
-//   - currentPrice: 当前价格
-//   - pos: 持仓信息
-//   - closes: 历史收盘价序列
-//
-// 返回：
-//   - bool: 是否适合做T
-//   - int: 建议做T数量（100股取整）
-//   - float64: 预期收益金额
-func (s *IntradayTStrategy) ShouldDoT(tsCode string, currentPrice float64, pos *model.Position, closes []float64) (bool, int, float64) {
-	if pos == nil || pos.TotalQty < 200 {
-		return false, 0, 0 // 底仓太少
-	}
-	if currentPrice <= 0 {
-		return false, 0, 0
-	}
-
-	avgRange := s.avgDailyRange(closes)
-	if avgRange < 0.01 {
-		return false, 0, 0 // 波动太小
-	}
-
-	tQty := int(float64(pos.TotalQty)*s.TAmountPct/100) * 100
-	if tQty < 100 {
-		return false, 0, 0
-	}
-
-	expectedProfit := currentPrice * float64(tQty) * s.ProfitTarget
-	return true, tQty, expectedProfit
-}
-
-// CalcTEntryPoint 计算做T入场点
-//
-// 参数：
-//   - closes: 历史收盘价序列
-//   - currentPrice: 当前价格
-//   - direction: "buy" 先买后卖的买点（正T买点），"sell" 先卖后买的卖点（倒T卖点）
-//
-// 返回：建议的入场价格
-//
-// 计算逻辑：
-//   - 正T买点：现价 - 0.5 * 平均振幅（下探时买入）
-//   - 倒T卖点：现价 + 0.5 * 平均振幅（冲高时卖出）
-func (s *IntradayTStrategy) CalcTEntryPoint(closes []float64, currentPrice float64, direction string) float64 {
-	avgRange := s.avgDailyRange(closes)
-	if direction == "buy" {
-		// 下探时买入：现价 - 0.5 * 平均振幅
-		return currentPrice * (1 - avgRange*0.5)
-	}
-	// 冲高时卖出：现价 + 0.5 * 平均振幅
-	return currentPrice * (1 + avgRange*0.5)
-}
-
-// CalcTExitPoint 计算做T出场点（止盈价）
-//
-// 参数：
-//   - entryPrice: 入场价格
-//   - direction: "buy" 正T（先买后卖，出场是卖出），"sell" 倒T（先卖后买，出场是买回）
-//
-// 返回：止盈出场价格
-func (s *IntradayTStrategy) CalcTExitPoint(entryPrice float64, direction string) float64 {
-	if direction == "buy" {
-		// 正T：买入后反弹卖出止盈
-		return entryPrice * (1 + s.ProfitTarget)
-	}
-	// 倒T：卖出后回落买回止盈
-	return entryPrice * (1 - s.ProfitTarget)
-}
-
-// CalcTStopLossPoint 计算做T止损价
-//
-// 参数：
-//   - entryPrice: 入场价格
-//   - direction: "buy" 正T，"sell" 倒T
-//
-// 返回：止损价格
-func (s *IntradayTStrategy) CalcTStopLossPoint(entryPrice float64, direction string) float64 {
-	if direction == "buy" {
-		// 正T止损：买入后继续下跌，跌破止损价卖出底仓止损
-		return entryPrice * (1 + s.StopLossPct)
-	}
-	// 倒T止损：卖出后继续上涨，突破止损价买回止损
-	return entryPrice * (1 - s.StopLossPct)
-}
-
 // avgDailyRange 计算平均日振幅
 // 用历史日涨跌幅的绝对值近似日内振幅
 //
@@ -322,22 +234,4 @@ func (s *IntradayTStrategy) avgDailyRange(closes []float64) float64 {
 		return 0
 	}
 	return sum / float64(count)
-}
-
-// GetTPosition 获取某只股票的做T状态
-func (s *IntradayTStrategy) GetTPosition(tsCode string) (*tPosition, bool) {
-	pos, ok := s.tPositions[tsCode]
-	return pos, ok
-}
-
-// ResetDaily 每日开盘前重置做T状态
-// 每个交易日开盘前调用，重置日内做T状态
-func (s *IntradayTStrategy) ResetDaily() {
-	for tsCode := range s.tPositions {
-		s.tPositions[tsCode].Mode = "none"
-		s.tPositions[tsCode].Status = "idle"
-		s.tPositions[tsCode].EntryPrice = 0
-		s.tPositions[tsCode].EntryQty = 0
-		s.tPositions[tsCode].EntryTime = ""
-	}
 }

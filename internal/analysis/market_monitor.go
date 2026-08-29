@@ -177,77 +177,6 @@ func MonitorMarket(
 	return snapshot
 }
 
-// MonitorPortfolio 监控持仓告警
-// holdings: 当前持仓 map[tsCode]position
-// todayBars: 当日行情
-// targetBuys: 目标买入列表 (策略信号产生的买入候选)
-func (s *MarketSnapshot) MonitorPortfolio(
-	holdings map[string]*model.Position,
-	todayBars map[string]*model.Bar,
-	targetBuys []string,
-) {
-	for tsCode, _ := range holdings {
-		bar, ok := todayBars[tsCode]
-		if !ok {
-			continue
-		}
-
-		// 持仓股跌停 -> danger
-		if bar.PctChg < -9.5 {
-			s.Alarms = append(s.Alarms, MarketAlarm{
-				Level:   "danger",
-				Type:    "limit_down",
-				TsCode:  tsCode,
-				Message: fmt.Sprintf("持仓股 %s 跌停 (%.2f%%), 建议风控处理", tsCode, bar.PctChg),
-			})
-			continue
-		}
-
-		// 持仓股放量下跌（量比>2且跌>5%）-> warning
-		prevBar, hasPrev := prevBarsForCheck[tsCode]
-		volumeRatio := 0.0
-		if hasPrev && prevBar.Vol > 0 {
-			volumeRatio = bar.Vol / prevBar.Vol
-		}
-		if volumeRatio > 2.0 && bar.PctChg < -5.0 {
-			s.Alarms = append(s.Alarms, MarketAlarm{
-				Level:   "warning",
-				Type:    "large_drop",
-				TsCode:  tsCode,
-				Message: fmt.Sprintf("持仓股 %s 放量下跌 %.2f%% (量比%.2f), 建议关注", tsCode, bar.PctChg, volumeRatio),
-			})
-		}
-	}
-
-	// 目标买入股涨停 -> info
-	targetSet := make(map[string]bool)
-	for _, tsCode := range targetBuys {
-		targetSet[tsCode] = true
-	}
-	for tsCode := range targetSet {
-		bar, ok := todayBars[tsCode]
-		if !ok {
-			continue
-		}
-		if bar.PctChg > 9.5 {
-			s.Alarms = append(s.Alarms, MarketAlarm{
-				Level:   "info",
-				Type:    "limit_up",
-				TsCode:  tsCode,
-				Message: fmt.Sprintf("目标股 %s 涨停, 可能买不到", tsCode),
-			})
-		}
-	}
-}
-
-// prevBarsForCheck 用于 MonitorPortfolio 计算量比的临时存储
-var prevBarsForCheck map[string]*model.Bar
-
-// SetPrevBars 设置前一日行情 (供 MonitorPortfolio 使用)
-func SetPrevBars(prev map[string]*model.Bar) {
-	prevBarsForCheck = prev
-}
-
 // groupBySector 按行业/板块分组 (简单按代码前缀或市场分组)
 func groupBySector(bars []model.Bar) map[string][]model.Bar {
 	result := make(map[string][]model.Bar)
@@ -279,25 +208,4 @@ func inferSector(tsCode string) string {
 	default:
 		return "其他"
 	}
-}
-
-// AlarmCountByLevel 按级别统计告警数量
-func (s *MarketSnapshot) AlarmCountByLevel(level string) int {
-	count := 0
-	for _, a := range s.Alarms {
-		if a.Level == level {
-			count++
-		}
-	}
-	return count
-}
-
-// HasDangerAlarm 是否存在危险级别告警
-func (s *MarketSnapshot) HasDangerAlarm() bool {
-	for _, a := range s.Alarms {
-		if a.Level == "danger" {
-			return true
-		}
-	}
-	return false
 }

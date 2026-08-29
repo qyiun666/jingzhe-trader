@@ -120,13 +120,6 @@ func (o *OMS) CancelOrder(orderID string) bool {
 	return false
 }
 
-// GetOrder 获取订单
-func (o *OMS) GetOrder(orderID string) *OrderRecord {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-	return o.orders[orderID]
-}
-
 // GetAllOrders 获取所有订单
 func (o *OMS) GetAllOrders() []*OrderRecord {
 	o.mu.RLock()
@@ -136,22 +129,4 @@ func (o *OMS) GetAllOrders() []*OrderRecord {
 		result = append(result, rec)
 	}
 	return result
-}
-
-// Stats 统计
-func (o *OMS) Stats() (total, filled, canceled, rejected int) {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-	for _, rec := range o.orders {
-		total++
-		switch rec.State {
-		case model.StatusFilled:
-			filled++
-		case model.StatusCanceled:
-			canceled++
-		case model.StatusRejected:
-			rejected++
-		}
-	}
-	return
 }

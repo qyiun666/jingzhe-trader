@@ -21,11 +21,9 @@ func (s *Service) RunPositions(date string) (*PortfolioJSON, error) {
 		todayBars[b.TsCode] = b
 	}
 
-	positions := s.getPositions()
-	asset := s.getAsset()
 	s.brk.UpdateMarketValue(todayBars)
-	positions, _ = s.brk.QueryPositions()
-	asset, _ = s.brk.QueryAsset()
+	positions, _ := s.brk.QueryPositions()
+	asset, _ := s.brk.QueryAsset()
 
 	result := s.buildPortfolioJSON(positions, asset, todayBars)
 	s.enrichPortfolioAnalysis(result, positions, todayBars)

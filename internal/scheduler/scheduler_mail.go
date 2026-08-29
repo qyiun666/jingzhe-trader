@@ -273,7 +273,7 @@ func alertsSection(alerts []store.AgentAlert) string {
 		return ""
 	}
 	levelColor := map[string]string{
-		store.AlertLevelUrgent: "#d63a3a",
+		store.AlertLevelUrgent:  "#d63a3a",
 		store.AlertLevelWarning: "#e08a00",
 		store.AlertLevelSuccess: "#1a8f4c",
 		store.AlertLevelInfo:    "#555555",

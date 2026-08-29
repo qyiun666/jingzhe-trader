@@ -59,24 +59,6 @@ func (r *CalendarRepo) GetByDate(date string) (*model.TradeCal, error) {
 	return &c, nil
 }
 
-// IsTradeDay 判断指定日期是否为交易日
-func (r *CalendarRepo) IsTradeDay(date string) (bool, error) {
-	c, err := r.GetByDate(date)
-	if err != nil {
-		return false, err
-	}
-	if c == nil {
-		return false, nil
-	}
-	return c.IsOpen == 1, nil
-}
-
-// HasDate 检查日历中是否存在指定日期的记录
-// 区分"不在日历中"(日历数据可能过期)和"在日历中但非交易日"(周末/节假日)
-func (r *CalendarRepo) HasDate(date string) (bool, error) {
-	return existsRow(r.db, `SELECT COUNT(1) FROM trade_cal WHERE cal_date = ?`, date)
-}
-
 // GetPreTradeDate 获取指定日期的上一交易日
 // 优先使用日历表中的 pretrade_date; 若无则向上回溯查找最近一个交易日
 func (r *CalendarRepo) GetPreTradeDate(date string) (string, error) {

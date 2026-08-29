@@ -34,7 +34,7 @@ type AgentBrief struct {
 	DecisionChanges   []agent.DecisionChange `json:"decision_changes"`    // 决策变更记录
 	PlanStatusSummary PlanStatusSummary      `json:"plan_status_summary"` // 交易计划状态汇总
 	TaskCompleted     map[string]bool        `json:"task_completed"`      // 当日各任务是否已完成
-	Goal              *goal.Status           `json:"goal,omitempty"`           // 季度目标状态 (目标跟踪启用时)
+	Goal              *goal.Status           `json:"goal,omitempty"`      // 季度目标状态 (目标跟踪启用时)
 }
 
 // PlanStatusSummary 交易计划状态汇总

@@ -8,34 +8,7 @@ import (
 	"jingzhe-trader/internal/market"
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/risk"
-	"jingzhe-trader/pkg/logger"
 )
-
-// RunRebalance 调仓建议
-func (s *Service) RunRebalance(date string, strategyName string) (*RebalanceJSON, error) {
-	allBars, err := s.barRepo.GetBarsByDate(date)
-	if err != nil {
-		return nil, fmt.Errorf("获取行情失败: %w", err)
-	}
-
-	todayBars := make(map[string]*model.Bar, len(allBars))
-	for i := range allBars {
-		b := &allBars[i]
-		todayBars[b.TsCode] = b
-	}
-
-	positions := s.getPositions()
-	asset := s.getAsset()
-	s.brk.UpdateMarketValue(todayBars)
-	positions, _ = s.brk.QueryPositions()
-	asset, _ = s.brk.QueryAsset()
-
-	signals, sigErr := s.runStrategy(date, strategyName, todayBars, positions, asset)
-	if sigErr != nil {
-		logger.L().Errorf("[%s] 调仓建议策略信号生成失败: %v", date, sigErr)
-	}
-	return s.buildRebalanceJSON(date, signals, positions, asset, todayBars), nil
-}
 
 // buildRebalanceJSON 构建调仓计划 JSON
 func (s *Service) buildRebalanceJSON(

@@ -59,32 +59,6 @@ func (r *DebateRepo) GetByDate(tradeDate string) ([]DebateResult, error) {
 	return results, nil
 }
 
-func (r *DebateRepo) GetByCode(tsCode string, limit int) ([]DebateResult, error) {
-	if limit <= 0 {
-		limit = 5
-	}
-	var results []DebateResult
-	err := r.db.Select(&results,
-		`SELECT * FROM agent_debate WHERE ts_code = ? ORDER BY created_at DESC LIMIT ?`, tsCode, limit)
-	if err != nil {
-		return nil, fmt.Errorf("查询辩论结果失败: %w", err)
-	}
-	return results, nil
-}
-
-func (r *DebateRepo) GetRecent(limit int) ([]DebateResult, error) {
-	if limit <= 0 {
-		limit = 20
-	}
-	var results []DebateResult
-	err := r.db.Select(&results,
-		`SELECT * FROM agent_debate ORDER BY created_at DESC LIMIT ?`, limit)
-	if err != nil {
-		return nil, fmt.Errorf("查询最近辩论结果失败: %w", err)
-	}
-	return results, nil
-}
-
 // GetPreviousDebates 获取指定日期之前每个股票最近一次辩论结果 (用于决策变更对比)
 // 返回 map[ts_code]DebateResult
 func (r *DebateRepo) GetPreviousDebates(beforeDate string) (map[string]DebateResult, error) {
@@ -104,11 +78,6 @@ func (r *DebateRepo) GetPreviousDebates(beforeDate string) (map[string]DebateRes
 		m[r.TsCode] = r
 	}
 	return m, nil
-}
-
-// HasDebatesOnDate 判断指定日期是否已有辩论记录 (用于检测是否已执行)
-func (r *DebateRepo) HasDebatesOnDate(tradeDate string) (bool, error) {
-	return existsRow(r.db, `SELECT COUNT(1) FROM agent_debate WHERE trade_date = ?`, tradeDate)
 }
 
 // GetPendingReview 获取待复盘的辩论结论:

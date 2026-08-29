@@ -303,8 +303,3 @@ func diversifyByIndustry(candidates []ScreenResult, industries map[string]string
 	}
 	return result
 }
-
-// GetLatestResults 获取最新选股结果
-func (s *Screener) GetLatestResults() ([]ScreenResult, error) {
-	return s.screenRepo.GetLatest()
-}

@@ -30,7 +30,6 @@ type PipelineConfig struct {
 	TradeRepo *store.TradeRepo        // 成交/快照持久化, nil 时不落库
 	FillMode  string                  // "next_open"(默认) 或 "close"
 	Stocks    map[string]*model.Stock // 股票信息(风控用), nil 时按universe构建默认值
-	DryRun    bool                    // true=只生成信号不下单 (交易计划模式)
 }
 
 // Pipeline 统一执行管道
@@ -41,17 +40,8 @@ type Pipeline struct {
 	mu        sync.Mutex // 保护 trades (OnTrade 回调可能来自其他 goroutine)
 	trades    []model.Trade
 	snapshots []model.AccountSnapshot
-	// DryRun 模式下收集的通过风控的信号
-	planSignals []PlanSignal
 	// strategyErrDays 策略执行失败的天数 (OnBar 报错不应静默吞掉)
 	strategyErrDays int
-}
-
-// PlanSignal 交易计划信号 (DryRun 模式产出)
-type PlanSignal struct {
-	TradeDate string
-	Signal    model.Signal
-	RefPrice  float64 // 参考价 (信号日收盘价)
 }
 
 // NewPipeline 创建执行管道
@@ -179,16 +169,6 @@ func (p *Pipeline) executeSignals(date, nextDate string, signals []model.Signal,
 			continue
 		}
 
-		// DryRun: 只收集交易计划, 不下单
-		if p.cfg.DryRun {
-			refPrice := fillPrice
-			if bar := bars[sig.TsCode]; bar != nil {
-				refPrice = bar.Close
-			}
-			p.planSignals = append(p.planSignals, PlanSignal{TradeDate: date, Signal: sig, RefPrice: refPrice})
-			continue
-		}
-
 		if pb, ok := p.cfg.Broker.(*broker.PaperBroker); ok {
 			pb.SetTradeDate(date, nextDate)
 		}
@@ -299,9 +279,4 @@ func (p *Pipeline) Trades() []model.Trade {
 // StrategyErrorDays 返回策略执行失败的天数 (0=策略全程正常)
 func (p *Pipeline) StrategyErrorDays() int {
 	return p.strategyErrDays
-}
-
-// PlanSignals 获取 DryRun 模式收集的交易计划信号
-func (p *Pipeline) PlanSignals() []PlanSignal {
-	return p.planSignals
 }

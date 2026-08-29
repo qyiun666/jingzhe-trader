@@ -2,7 +2,6 @@ package store
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/jmoiron/sqlx"
 
@@ -42,19 +41,6 @@ func (r *NewsRepo) GetRecent(n int) ([]model.News, error) {
 	query := fmt.Sprintf(`SELECT %s FROM news ORDER BY datetime DESC LIMIT ?`, newsSelectCols)
 	var newsList []model.News
 	if err := selectList(r.db, query, &newsList, "查询新闻失败", n); err != nil {
-		return nil, err
-	}
-	return newsList, nil
-}
-
-// GetByKeyword 按关键词模糊搜索新闻标题和内容
-func (r *NewsRepo) GetByKeyword(keyword string) ([]model.News, error) {
-	query := fmt.Sprintf(`SELECT %s FROM news
-		WHERE title LIKE ? OR content LIKE ?
-		ORDER BY datetime DESC`, newsSelectCols)
-	var newsList []model.News
-	like := "%" + strings.TrimSpace(keyword) + "%"
-	if err := selectList(r.db, query, &newsList, "搜索新闻失败", like, like); err != nil {
 		return nil, err
 	}
 	return newsList, nil

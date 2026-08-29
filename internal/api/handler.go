@@ -141,7 +141,6 @@ type Service struct {
 	strategyCache      map[string]strategy.Strategy // 策略实例缓存 (避免每次重建丢失状态)
 	strategyCacheMu    sync.RWMutex                 // 保护策略缓存并发读写
 	llmClient          *llm.Client                  // LLM 客户端
-	llmNews            *llm.NewsAnalyzer            // LLM 新闻分析器
 	debateOrchestrator *agent.DebateOrchestrator    // 智能体辩论编排器
 	startTime          time.Time                    // 服务启动时间 (uptime用)
 	updateMu           sync.Mutex                   // 数据更新互斥 (防并发重入)
@@ -224,7 +223,6 @@ func NewService(cfg *config.Config) (*Service, error) {
 		RPS:            cfg.LLM.RPS,
 	}
 	svc.llmClient = llm.NewClient(llmCfg)
-	svc.llmNews = llm.NewNewsAnalyzer(svc.llmClient)
 
 	// 初始化智能体辩论编排器 (复用 Service 的共享 Repo, 避免重复实例化)
 	svc.debateOrchestrator = agent.NewDebateOrchestrator(

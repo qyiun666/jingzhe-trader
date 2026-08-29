@@ -1,7 +1,6 @@
 package analysis
 
 import (
-	"regexp"
 	"strings"
 	"unicode"
 
@@ -197,6 +196,3 @@ func isAllDigits(s string) bool {
 	}
 	return len(s) > 0
 }
-
-// regexpNonWord 用于替换非单词字符
-var regexpNonWord = regexp.MustCompile(`[^\p{L}\p{N}]+`)

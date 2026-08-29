@@ -111,16 +111,5 @@ func (p *FactorDataProvider) GetBars(tsCode, startDate, endDate string) ([]model
 	})
 }
 
-// ClearCache 清空所有缓存
-func (p *FactorDataProvider) ClearCache() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.dailyBasicCache = make(map[string][]model.DailyBasic)
-	p.dailyBasicCodeCache = make(map[string][]model.DailyBasic)
-	p.finaCache = make(map[string][]model.FinaIndicator)
-	p.stockCache = make(map[string]*model.Stock)
-	p.barCache = make(map[string][]model.Bar)
-}
-
 // 编译期接口检查
 var _ factor.DataProvider = (*FactorDataProvider)(nil)

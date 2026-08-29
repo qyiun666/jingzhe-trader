@@ -127,11 +127,6 @@ func (pb *PaperBroker) notifyTrade(trade model.Trade) {
 	}
 }
 
-// GetOMS 获取OMS实例
-func (pb *PaperBroker) GetOMS() *OMS {
-	return pb.oms
-}
-
 // GetPositions 获取持仓 (直接引用, 注意并发安全)
 func (pb *PaperBroker) GetPositions() map[string]*model.Position {
 	pb.mu.RLock()
@@ -151,17 +146,6 @@ func (pb *PaperBroker) TotalAsset() float64 {
 	pb.mu.RLock()
 	defer pb.mu.RUnlock()
 	return pb.account.totalAsset()
-}
-
-// GetTrades 获取所有成交记录
-func (pb *PaperBroker) GetTrades() []model.Trade {
-	pb.mu.RLock()
-	defer pb.mu.RUnlock()
-	var trades []model.Trade
-	for _, rec := range pb.oms.GetAllOrders() {
-		trades = append(trades, rec.Trades...)
-	}
-	return trades
 }
 
 // ImportPositions 从外部导入持仓（覆盖当前持仓）

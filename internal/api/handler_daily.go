@@ -3,7 +3,6 @@ package api
 import (
 	"fmt"
 
-	"jingzhe-trader/internal/analysis"
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/pkg/logger"
 )
@@ -28,14 +27,11 @@ func (s *Service) RunDaily(date string, strategyName string) (*DailyReportJSON, 
 
 	// 3. 获取上一交易日行情
 	prevBars := s.getPrevBars(date)
-	analysis.SetPrevBars(prevBars)
 
 	// 4. 获取持仓和资产
-	positions := s.getPositions()
-	asset := s.getAsset()
 	s.brk.UpdateMarketValue(todayBars)
-	positions, _ = s.brk.QueryPositions()
-	asset, _ = s.brk.QueryAsset()
+	positions, _ := s.brk.QueryPositions()
+	asset, _ := s.brk.QueryAsset()
 
 	// 5. 市场快照
 	marketSnapshot := s.buildMarketSnapshot(date, allBars, prevBars)

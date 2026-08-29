@@ -11,32 +11,6 @@ import (
 	"jingzhe-trader/pkg/logger"
 )
 
-// RunStrategy 策略建议
-func (s *Service) RunStrategy(date string, strategyName string) (*StrategyJSON, error) {
-	allBars, err := s.barRepo.GetBarsByDate(date)
-	if err != nil {
-		return nil, fmt.Errorf("获取行情失败: %w", err)
-	}
-
-	todayBars := make(map[string]*model.Bar, len(allBars))
-	for i := range allBars {
-		b := &allBars[i]
-		todayBars[b.TsCode] = b
-	}
-
-	positions := s.getPositions()
-	asset := s.getAsset()
-	s.brk.UpdateMarketValue(todayBars)
-	positions, _ = s.brk.QueryPositions()
-	asset, _ = s.brk.QueryAsset()
-
-	signals, sigErr := s.runStrategy(date, strategyName, todayBars, positions, asset)
-	if sigErr != nil {
-		logger.L().Errorf("[%s] 策略建议信号生成失败: %v", date, sigErr)
-	}
-	return s.buildStrategyJSON(date, signals, todayBars, nil), nil
-}
-
 // buildStrategyJSON 构建策略建议 JSON
 func (s *Service) buildStrategyJSON(
 	date string,

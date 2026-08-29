@@ -7,11 +7,6 @@ import (
 	"jingzhe-trader/internal/model"
 )
 
-// RunNews 新闻舆情
-func (s *Service) RunNews() (*NewsJSON, error) {
-	return s.buildNewsJSON(), nil
-}
-
 // buildNewsJSON 构建新闻摘要 JSON
 // 优先展示与配置股票池相关的新闻, 不足时补充近期热点新闻
 func (s *Service) buildNewsJSON() *NewsJSON {

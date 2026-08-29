@@ -20,13 +20,13 @@ type Strategy interface {
 
 // BarContext 策略上下文, 聚合策略所需的全部信息
 type BarContext struct {
-	TradeDate string                       // 当前交易日期 YYYYMMDD
-	Universe  []string                     // 当前股票池
-	Bars      map[string]*model.Bar        // 当日各标的行情 (前复权)
-	Positions map[string]*model.Position   // 当前持仓
-	Cash      float64                      // 可用现金
-	TotalAsset float64                     // 总资产
-	History   HistoryProvider              // 历史数据访问器
+	TradeDate  string                     // 当前交易日期 YYYYMMDD
+	Universe   []string                   // 当前股票池
+	Bars       map[string]*model.Bar      // 当日各标的行情 (前复权)
+	Positions  map[string]*model.Position // 当前持仓
+	Cash       float64                    // 可用现金
+	TotalAsset float64                    // 总资产
+	History    HistoryProvider            // 历史数据访问器
 }
 
 // HistoryProvider 历史数据提供者
