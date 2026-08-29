@@ -1,34 +1,27 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- macOS launchd 部署示例: 复制到 ~/Library/LaunchAgents/ 后
-     launchctl load ~/Library/LaunchAgents/com.jingzhe.trader.plist
-     路径按实际部署位置修改 -->
+<!-- 惊蛰交易系统常驻守护: 开机自启 + 崩溃自动拉起 (ThrottleInterval 限频防刷) -->
+<!-- 安装: cp scripts/com.jingzhe.trader.plist ~/Library/LaunchAgents/ && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.jingzhe.trader.plist -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
     <string>com.jingzhe.trader</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/opt/jingzhe-trader/bin/server</string>
-        <string>-config</string>
-        <string>/opt/jingzhe-trader/config/config.yaml</string>
+        <string>/bin/zsh</string>
+        <string>/Volumes/zt_hd/projects/jingzhe-trader/scripts/start-server.sh</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/opt/jingzhe-trader</string>
+    <string>/Volumes/zt_hd/projects/jingzhe-trader</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
     <key>StandardOutPath</key>
-    <string>/opt/jingzhe-trader/logs/launchd.out.log</string>
+    <string>/Volumes/zt_hd/projects/jingzhe-trader/logs/launchd-stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/opt/jingzhe-trader/logs/launchd.err.log</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <!-- 敏感配置走环境变量, 勿写入 config.yaml -->
-        <!-- <key>TUSHARE_TOKEN</key><string>xxx</string> -->
-        <!-- <key>JZ_API_TOKEN</key><string>xxx</string> -->
-        <!-- <key>FEISHU_WEBHOOK</key><string>https://open.feishu.cn/open-apis/bot/v2/hook/xxx</string> -->
-    </dict>
+    <string>/Volumes/zt_hd/projects/jingzhe-trader/logs/launchd-stderr.log</string>
 </dict>
 </plist>
