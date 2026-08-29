@@ -315,6 +315,21 @@ func (pa *PortfolioAnalysis) calculateRiskMetrics(
 	pa.RiskMetrics.VaR95 = pa.calculateVaR(posList, tradeDate, historyProvider)
 }
 
+// fetchPositionBars 批量预取各持仓最近 n 根日线 (每只股票仅查询一次)
+// 避免逐日循环内重复执行同一查询 (此前 Beta/VaR 对 20 日窗口每天重查一次, 20 只持仓 ≈ 800 次 SQL)
+func fetchPositionBars(historyProvider strategy.HistoryProvider, posList []posWeight,
+	tradeDate string, n int) map[string][]model.Bar {
+	barsByCode := make(map[string][]model.Bar, len(posList))
+	for _, pw := range posList {
+		bars, err := historyProvider.GetBars(pw.tsCode, tradeDate, n)
+		if err != nil || len(bars) == 0 {
+			continue
+		}
+		barsByCode[pw.tsCode] = bars
+	}
+	return barsByCode
+}
+
 // calculateBeta 计算简化版 Beta
 func (pa *PortfolioAnalysis) calculateBeta(
 	posList []posWeight,
@@ -341,14 +356,15 @@ func (pa *PortfolioAnalysis) calculateBeta(
 	}
 
 	// 计算组合收益率序列 (按市值加权)
+	barsByCode := fetchPositionBars(historyProvider, posList, tradeDate, 20)
 	var portfolioReturns []float64
 	for i := range marketBars {
 		var dailyReturn float64
 		var totalWeight float64
 
 		for _, pw := range posList {
-			stockBars, err := historyProvider.GetBars(pw.tsCode, tradeDate, 20)
-			if err != nil || len(stockBars) != len(marketBars) {
+			stockBars, ok := barsByCode[pw.tsCode]
+			if !ok || len(stockBars) != len(marketBars) {
 				continue
 			}
 			if i < len(stockBars) {
@@ -408,6 +424,7 @@ func (pa *PortfolioAnalysis) calculateVaR(
 	}
 
 	// 收集每只股票最近20日的日收益率, 按持仓权重加权得到组合日收益率序列
+	barsByCode := fetchPositionBars(historyProvider, posList, tradeDate, 20)
 	var portfolioReturns []float64
 
 	for day := 0; day < 20; day++ {
@@ -415,8 +432,8 @@ func (pa *PortfolioAnalysis) calculateVaR(
 		var hasData bool
 
 		for _, pw := range posList {
-			bars, err := historyProvider.GetBars(pw.tsCode, tradeDate, 20)
-			if err != nil || len(bars) == 0 {
+			bars, ok := barsByCode[pw.tsCode]
+			if !ok {
 				continue
 			}
 			idx := len(bars) - 20 + day

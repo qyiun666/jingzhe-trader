@@ -66,6 +66,7 @@ func (l *Loader) Run(opts Options) error {
 	if l.cfg.Tushare.Token == "" {
 		return fmt.Errorf("未配置 tushare.token (可用环境变量 TUSHARE_TOKEN)")
 	}
+	defer l.ts.Close() // 进程内短生命周期 Loader: 用完停掉限流补充 goroutine, 否则每次调用泄漏一个
 	if opts.StartDate == "" {
 		opts.StartDate = time.Now().AddDate(-3, 0, 0).Format("20060102")
 	}
@@ -320,6 +321,7 @@ func (l *Loader) SyncCalendarOnly(start, end string) error {
 	if l.cfg.Tushare.Token == "" {
 		return fmt.Errorf("未配置 tushare.token (可用环境变量 TUSHARE_TOKEN)")
 	}
+	defer l.ts.Close()
 	l.syncCalendar(start, end)
 	return nil
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"jingzhe-trader/internal/config"
@@ -22,6 +23,8 @@ type Client struct {
 	rateBucket    chan struct{} // 令牌桶: 缓冲大小为每分钟配额, 取走一个令牌才能发起请求
 	maxRetries    int           // 最大重试次数
 	retryInterval time.Duration // 基础重试间隔, 实际退避按指数增长
+	quit          chan struct{} // refillTicker 退出信号 (Close 关闭)
+	closeOnce     sync.Once
 }
 
 // NewClient 根据 TushareConfig 构造一个客户端
@@ -37,6 +40,7 @@ func NewClient(cfg config.TushareConfig) *Client {
 
 	// 构造令牌桶限流器
 	if cfg.RateLimit > 0 {
+		c.quit = make(chan struct{})
 		capacity := cfg.RateLimit
 		c.rateBucket = make(chan struct{}, capacity)
 		// 预先填满令牌, 允许开始时的突发请求
@@ -51,16 +55,29 @@ func NewClient(cfg config.TushareConfig) *Client {
 	return c
 }
 
+// Close 停止限流令牌补充 goroutine
+// 进程内短生命周期 Client (如每次手动触发数据更新) 用完必须调用, 否则每次 NewClient 泄漏一个 goroutine
+func (c *Client) Close() {
+	if c.quit != nil {
+		c.closeOnce.Do(func() { close(c.quit) })
+	}
+}
+
 // refillTicker 启动一个定时器, 按固定间隔向令牌桶补充令牌
 func (c *Client) refillTicker(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
 		select {
-		case c.rateBucket <- struct{}{}:
-			// 成功放入一个令牌
-		default:
-			// 桶已满, 丢弃本次令牌
+		case <-c.quit:
+			return
+		case <-ticker.C:
+			select {
+			case c.rateBucket <- struct{}{}:
+				// 成功放入一个令牌
+			default:
+				// 桶已满, 丢弃本次令牌
+			}
 		}
 	}
 }

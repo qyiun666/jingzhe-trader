@@ -121,6 +121,13 @@ func loadBacktestData(db *sqlx.DB, cfg RunConfig) (*market.Calendar, *backtest.D
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("加载数据失败: %w", err)
 	}
+	// 基准指数行情一并预载 (不进交易股票池): 策略大盘过滤依赖 GetBars(指数代码),
+	// 缺数据时过滤恒为放行, 回测会高估熊市防御力 (与实盘行为分叉)
+	if cfg.Benchmark != "" {
+		if err := dataProvider.LoadExtra(store.NewBarRepo(db), []string{cfg.Benchmark}, preStartDate, cfg.EndDate); err != nil {
+			return nil, nil, nil, fmt.Errorf("加载基准指数失败: %w", err)
+		}
+	}
 
 	validUniverse := make([]string, 0, len(cfg.Universe))
 	for _, code := range cfg.Universe {

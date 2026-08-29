@@ -26,27 +26,49 @@ func NewDataProvider(barRepo *store.BarRepo, universe []string, startDate, endDa
 	}
 
 	for _, tsCode := range universe {
-		bars, err := barRepo.GetBars(tsCode, startDate, endDate)
-		if err != nil {
+		if err := dp.loadCode(barRepo, tsCode, startDate, endDate); err != nil {
 			return nil, err
 		}
-		if len(bars) == 0 {
-			continue
-		}
-		// 前复权前缓存原始因子比值 (复权后因子归一化, 涨跌停换算需原始比值)
-		dp.adjRatio[tsCode] = adjRatiosOf(bars)
-		// 前复权 (以最后一天有效因子为基准, 成交量反向调整; 因子缺失沿用上日)
-		model.AdjustBarsForward(bars)
-
-		idxMap := make(map[string]int, len(bars))
-		for i, b := range bars {
-			idxMap[b.TradeDate] = i
-		}
-		dp.barsByCode[tsCode] = bars
-		dp.dateIndex[tsCode] = idxMap
 	}
 
 	return dp, nil
+}
+
+// LoadExtra 加载额外代码的行情 (如大盘指数, 供策略大盘过滤使用, 不进交易股票池)
+// 策略的大盘熔断过滤依赖 History.GetBars(指数代码), 若回测未预载指数数据,
+// 过滤恒为放行, 回测会高估熊市防御力 (回测/实盘行为分叉)
+func (dp *DataProvider) LoadExtra(barRepo *store.BarRepo, codes []string, startDate, endDate string) error {
+	for _, tsCode := range codes {
+		if tsCode == "" || dp.HasData(tsCode) {
+			continue
+		}
+		if err := dp.loadCode(barRepo, tsCode, startDate, endDate); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (dp *DataProvider) loadCode(barRepo *store.BarRepo, tsCode, startDate, endDate string) error {
+	bars, err := barRepo.GetBars(tsCode, startDate, endDate)
+	if err != nil {
+		return err
+	}
+	if len(bars) == 0 {
+		return nil
+	}
+	// 前复权前缓存原始因子比值 (复权后因子归一化, 涨跌停换算需原始比值)
+	dp.adjRatio[tsCode] = adjRatiosOf(bars)
+	// 前复权 (以最后一天有效因子为基准, 成交量反向调整; 因子缺失沿用上日)
+	model.AdjustBarsForward(bars)
+
+	idxMap := make(map[string]int, len(bars))
+	for i, b := range bars {
+		idxMap[b.TradeDate] = i
+	}
+	dp.barsByCode[tsCode] = bars
+	dp.dateIndex[tsCode] = idxMap
+	return nil
 }
 
 // adjRatiosOf 计算每根K线复权因子相对最新因子的比值 (adj_i/adj_last)
