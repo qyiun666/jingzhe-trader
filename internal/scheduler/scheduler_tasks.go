@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"jingzhe-trader/internal/agent"
-	"jingzhe-trader/internal/broker"
 	"jingzhe-trader/internal/goal"
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/report"
@@ -119,8 +118,10 @@ func (s *Scheduler) runDebateReview(date string) error {
 }
 
 // runReconcile 15:35 对账 (仅 QMT 实盘): 本地记录 vs 券商
+// 复用组合根注入的长生命周期 broker (新建 QMTBridge 会丢失 OnTrade 成交回调,
+// 导致 PollTrades 触发时回调列表为空, 真实成交静默丢弃)
 func (s *Scheduler) runReconcile(date string) error {
-	brk := broker.NewQMTBridge(s.cfg.Broker.QMT.URL)
+	brk := s.svc.Broker()
 	result, err := report.Reconcile(brk, store.NewTradeRepo(s.db), date)
 	if err != nil {
 		return fmt.Errorf("对账执行失败: %w", err)
@@ -129,7 +130,7 @@ func (s *Scheduler) runReconcile(date string) error {
 		s.alert("⚠️ 惊蛰对账差异", report.GenerateReconcileReport(result))
 	}
 	// 成交回报轮询: 把券商端真实成交落库 (OnTrade 回调 → trades 表, run_id=live)
-	if err := brk.PollTrades(); err != nil {
+	if err := s.svc.PollBrokerTrades(); err != nil {
 		logger.L().Warnw("成交回报轮询失败", "date", date, "err", err)
 	}
 	return nil

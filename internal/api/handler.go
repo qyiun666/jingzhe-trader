@@ -179,9 +179,15 @@ func NewService(cfg *config.Config) (*Service, error) {
 	// 加载股票名称映射
 	svc.loadStockMap()
 
-	// 初始化券商 (使用 paper broker)
+	// 初始化券商: QMT 实盘模式用长生命周期 QMTBridge (成交回报轮询依赖其上注册的回调),
+	// 其余模式用 paper 模拟盘。此前硬编码 PaperBroker 导致 QMT 模式下 PollBrokerTrades
+	// 的类型断言永远失败, 真实成交无法落库 (2026-08 审计 P0)
 	costModel := market.NewCostModel(cfg.Cost)
-	svc.brk = broker.NewPaperBroker("api", cfg.Backtest.InitialCapital, costModel)
+	if cfg.Broker.Type == "qmt" && cfg.Broker.QMT.URL != "" {
+		svc.brk = broker.NewQMTBridge(cfg.Broker.QMT.URL)
+	} else {
+		svc.brk = broker.NewPaperBroker("api", cfg.Backtest.InitialCapital, costModel)
+	}
 
 	// 成交回调 → trades 表落库 (回测管道之外, 实盘成交的持久化入口; run_id=live)
 	// QMT 模式下由调度器对账任务 PollTrades 触发; paper 模式下由 RecordTrade/confirm 路径触发
@@ -250,6 +256,12 @@ func barsToMap(bars []model.Bar) map[string]*model.Bar {
 		m[b.TsCode] = b
 	}
 	return m
+}
+
+// Broker 返回组合根注入的长生命周期 broker 实例
+// 调度器等外部组件应复用此实例, 禁止自行 NewQMTBridge (新建实例丢失 OnTrade 成交回调)
+func (s *Service) Broker() broker.Broker {
+	return s.brk
 }
 
 // loadStockMap 加载股票名称映射 (线程安全)

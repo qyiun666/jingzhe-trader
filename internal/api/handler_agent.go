@@ -243,8 +243,12 @@ func (s *Service) ConfirmPlan(id int64) (*store.TradePlan, error) {
 }
 
 // executePlanViaQMT 通过 QMT 桥执行交易计划, 成功后同步本地持仓
+// 复用组合根注入的 broker 实例 (禁止内部 new, 且新建实例会丢失 OnTrade 回调)
 func (s *Service) executePlanViaQMT(plan *store.TradePlan) error {
-	bridge := broker.NewQMTBridge(s.cfg.Broker.QMT.URL)
+	bridge, ok := s.brk.(*broker.QMTBridge)
+	if !ok {
+		return fmt.Errorf("broker 类型为 %T, 非 QMT 实盘模式, 拒绝自动下单", s.brk)
+	}
 	side := model.SideBuy
 	if plan.Direction == "sell" {
 		side = model.SideSell
