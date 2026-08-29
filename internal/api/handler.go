@@ -228,6 +228,9 @@ func NewService(cfg *config.Config) (*Service, error) {
 		svc.finaRepo,
 		svc.newsRepo,
 		svc.debateRepo,
+		store.NewDebateReviewRepo(db),
+		store.NewMoneyFlowRepo(db),
+		store.NewTopListRepo(db),
 	)
 
 	// 初始化自动选股器 (全市场筛选, 补充配置股票池)

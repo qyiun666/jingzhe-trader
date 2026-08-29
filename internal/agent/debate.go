@@ -13,23 +13,30 @@ import (
 )
 
 type DebateOrchestrator struct {
-	llm        *llm.Client
-	barRepo    *store.BarRepo
-	basicRepo  *store.BasicRepo
-	finaRepo   *store.FinaRepo
-	newsRepo   *store.NewsRepo
-	debateRepo *store.DebateRepo
-	tech       *TechnicalAnalyst
-	fund       *FundamentalAnalyst
-	news       *NewsAnalyst
-	market     *MarketAnalyst
-	bull       *researcher
-	bear       *researcher
-	riskMgr    *RiskManagerAgent
+	llm           *llm.Client
+	barRepo       *store.BarRepo
+	basicRepo     *store.BasicRepo
+	finaRepo      *store.FinaRepo
+	newsRepo      *store.NewsRepo
+	debateRepo    *store.DebateRepo
+	reviewRepo    *store.DebateReviewRepo
+	moneyflowRepo *store.MoneyFlowRepo
+	toplistRepo   *store.TopListRepo
+	tech          *TechnicalAnalyst
+	fund          *FundamentalAnalyst
+	news          *NewsAnalyst
+	market        *MarketAnalyst
+	bull          *researcher
+	bear          *researcher
+	riskMgr       *RiskManagerAgent
 }
 
-func NewDebateOrchestrator(llmClient *llm.Client, barRepo *store.BarRepo, basicRepo *store.BasicRepo, finaRepo *store.FinaRepo, newsRepo *store.NewsRepo, debateRepo *store.DebateRepo) *DebateOrchestrator {
-	o := &DebateOrchestrator{llm: llmClient, barRepo: barRepo, basicRepo: basicRepo, finaRepo: finaRepo, newsRepo: newsRepo, debateRepo: debateRepo}
+func NewDebateOrchestrator(llmClient *llm.Client, barRepo *store.BarRepo, basicRepo *store.BasicRepo,
+	finaRepo *store.FinaRepo, newsRepo *store.NewsRepo, debateRepo *store.DebateRepo,
+	reviewRepo *store.DebateReviewRepo, moneyflowRepo *store.MoneyFlowRepo, toplistRepo *store.TopListRepo) *DebateOrchestrator {
+	o := &DebateOrchestrator{llm: llmClient, barRepo: barRepo, basicRepo: basicRepo, finaRepo: finaRepo,
+		newsRepo: newsRepo, debateRepo: debateRepo, reviewRepo: reviewRepo,
+		moneyflowRepo: moneyflowRepo, toplistRepo: toplistRepo}
 	o.tech = NewTechnicalAnalyst(llmClient, barRepo)
 	o.fund = NewFundamentalAnalyst(llmClient, basicRepo, finaRepo)
 	o.news = NewNewsAnalyst(llmClient, newsRepo)
@@ -214,7 +221,29 @@ func (o *DebateOrchestrator) buildContext(date, tsCode string, stockNames map[st
 	if p, ok := positions[tsCode]; ok {
 		pos = p
 	}
-	return &DebateContext{TradeDate: date, TsCode: tsCode, Name: name, Bars: history, Position: pos, TotalAsset: totalAsset, MarketBars: marketBars}
+	// 资金面数据 (近2周): 数据缺失不影响辩论, 仅上下文变薄
+	var flows []model.MoneyFlow
+	if o.moneyflowRepo != nil {
+		if f, err := o.moneyflowRepo.GetByCode(tsCode, dateMinusDays(date, 14), date); err == nil {
+			flows = f
+		}
+	}
+	var tops []model.TopList
+	if o.toplistRepo != nil {
+		if t, err := o.toplistRepo.GetByCode(tsCode, dateMinusDays(date, 14), date); err == nil {
+			tops = t
+		}
+	}
+	// 历史辩论复盘 (反思闭环: 最近5次有方向决策的实际结果)
+	var reviewSummary string
+	if o.reviewRepo != nil {
+		if reviews, err := o.reviewRepo.GetRecentByCode(tsCode, 5); err == nil && len(reviews) > 0 {
+			reviewSummary = formatReviews(reviews, 5)
+		}
+	}
+	return &DebateContext{TradeDate: date, TsCode: tsCode, Name: name, Bars: history,
+		Position: pos, TotalAsset: totalAsset, MarketBars: marketBars,
+		MoneyFlows: flows, TopLists: tops, ReviewSummary: reviewSummary}
 }
 
 // appendStopPriceReason 将风险管理员裁决的止损价附到买入信号原因中, 便于用户参考

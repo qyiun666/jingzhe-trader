@@ -20,13 +20,16 @@ type AnalysisReport struct {
 
 // DebateContext 辩论上下文
 type DebateContext struct {
-	TradeDate  string
-	TsCode     string
-	Name       string
-	Bars       []model.Bar
-	Position   *model.Position
-	TotalAsset float64
-	MarketBars map[string]*model.Bar
+	TradeDate     string
+	TsCode        string
+	Name          string
+	Bars          []model.Bar
+	Position      *model.Position
+	TotalAsset    float64
+	MarketBars    map[string]*model.Bar
+	MoneyFlows    []model.MoneyFlow // 近期资金流向 (nil=无数据, 辩论照常进行)
+	TopLists      []model.TopList   // 近期龙虎榜 (nil=无数据)
+	ReviewSummary string            // 历史辩论复盘文本 (空=无历史)
 }
 
 // Analyst 分析师接口
