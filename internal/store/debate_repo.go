@@ -110,3 +110,20 @@ func (r *DebateRepo) GetPreviousDebates(beforeDate string) (map[string]DebateRes
 func (r *DebateRepo) HasDebatesOnDate(tradeDate string) (bool, error) {
 	return existsRow(r.db, `SELECT COUNT(1) FROM agent_debate WHERE trade_date = ?`, tradeDate)
 }
+
+// GetPendingReview 获取待复盘的辩论结论:
+// 仅限有方向的决策 (buy/sell/reject, hold 无方向不可验证), 未复盘过, 决策日 <= beforeDate
+func (r *DebateRepo) GetPendingReview(beforeDate string, limit int) ([]DebateResult, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	var results []DebateResult
+	err := r.db.Select(&results, `SELECT d.* FROM agent_debate d
+		WHERE d.trade_date <= ? AND d.decision IN ('buy','sell','reject')
+		AND NOT EXISTS (SELECT 1 FROM agent_debate_review v WHERE v.debate_id = d.id)
+		ORDER BY d.trade_date ASC LIMIT ?`, beforeDate, limit)
+	if err != nil {
+		return nil, fmt.Errorf("查询待复盘辩论失败: %w", err)
+	}
+	return results, nil
+}
