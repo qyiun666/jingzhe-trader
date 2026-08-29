@@ -140,6 +140,7 @@ scheduler:
   data_update_time: "15:10"  # 收盘后更新行情数据
   screener_time: "15:15"     # 全市场自动选股 (数据更新后, 信号生成前)
   signal_time: "15:30"       # 生成次日交易计划
+  debate_review_time: "15:20" # 辩论复盘回填 (结论满5个自然日后验证, 反思闭环)
   report_time: "15:45"       # 日报生成+飞书推送
   intraday:
     enabled: true            # 盘中止损监控

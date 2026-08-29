@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"jingzhe-trader/internal/agent"
 	"jingzhe-trader/internal/broker"
 	"jingzhe-trader/internal/goal"
 	"jingzhe-trader/internal/model"
@@ -86,6 +87,34 @@ func (s *Scheduler) runScreener(date string) error {
 	s.alert("🔍 惊蛰自动选股", strings.Join(lines, "\n"))
 
 	logger.L().Infow("选股任务完成", "date", date, "candidates", len(results))
+	return nil
+}
+
+// runDebateReview 辩论决策复盘: 回填满窗口期(5自然日)辩论结论的实际收益
+// 反思闭环数据源: 复盘结果通过 DebateContext.ReviewSummary 注入后续辩论
+func (s *Scheduler) runDebateReview(date string) error {
+	reviewed, err := agent.ReviewDebates(
+		store.NewDebateRepo(s.db),
+		store.NewDebateReviewRepo(s.db),
+		store.NewBarRepo(s.db),
+		date,
+	)
+	if err != nil {
+		return fmt.Errorf("辩论复盘失败: %w", err)
+	}
+	if len(reviewed) == 0 {
+		return nil
+	}
+	correct := 0
+	for _, r := range reviewed {
+		if r.Correct == 1 {
+			correct++
+		}
+	}
+	logger.L().Infow("辩论复盘回填完成", "date", date, "reviewed", len(reviewed), "correct", correct)
+	s.alert("🧠 惊蛰辩论复盘", fmt.Sprintf(
+		"%s 回填 %d 条辩论结论验证: 命中 %d/%d (%.0f%%)\n复盘数据将注入后续辩论上下文 (反思闭环)",
+		date, len(reviewed), correct, len(reviewed), float64(correct)/float64(len(reviewed))*100))
 	return nil
 }
 

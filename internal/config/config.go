@@ -42,13 +42,14 @@ type GoalConfig struct {
 
 // SchedulerConfig 内置调度器配置
 type SchedulerConfig struct {
-	Enabled        bool           `mapstructure:"enabled"`          // 是否启用调度器
-	PremarketTime  string         `mapstructure:"premarket_time"`   // 盘前总结时间 HH:MM
-	DataUpdateTime string         `mapstructure:"data_update_time"` // 数据更新时间 HH:MM
-	ScreenerTime   string         `mapstructure:"screener_time"`    // 自动选股时间 HH:MM
-	SignalTime     string         `mapstructure:"signal_time"`      // EOD信号生成时间 HH:MM
-	ReportTime     string         `mapstructure:"report_time"`      // 日报生成时间 HH:MM
-	Intraday       IntradayConfig `mapstructure:"intraday"`         // 盘中监控
+	Enabled          bool           `mapstructure:"enabled"`            // 是否启用调度器
+	PremarketTime    string         `mapstructure:"premarket_time"`     // 盘前总结时间 HH:MM
+	DataUpdateTime   string         `mapstructure:"data_update_time"`   // 数据更新时间 HH:MM
+	ScreenerTime     string         `mapstructure:"screener_time"`      // 自动选股时间 HH:MM
+	SignalTime       string         `mapstructure:"signal_time"`        // EOD信号生成时间 HH:MM
+	ReportTime       string         `mapstructure:"report_time"`        // 日报生成时间 HH:MM
+	DebateReviewTime string         `mapstructure:"debate_review_time"` // 辩论复盘回填时间 HH:MM
+	Intraday         IntradayConfig `mapstructure:"intraday"`           // 盘中监控
 }
 
 // IntradayConfig 盘中止损监控配置
@@ -107,16 +108,16 @@ type DataloaderConfig struct {
 // 用于新闻深度分析和选股辅助，不直接做交易决策
 // 默认关闭，不影响系统核心功能
 type LLMConfig struct {
-	Enabled        bool    `mapstructure:"enabled"`          // 是否启用 LLM
-	APIKey         string  `mapstructure:"api_key"`          // API Key
-	BaseURL        string  `mapstructure:"base_url"`         // API 地址，默认 DeepSeek
-	Model          string  `mapstructure:"model"`            // 模型名称，默认 deepseek-chat
-	Temperature    float64 `mapstructure:"temperature"`      // 采样温度, 默认 0.3
-	MaxTokens      int     `mapstructure:"max_tokens"`       // 输出上限, 默认 2048
-	TimeoutSeconds int     `mapstructure:"timeout_seconds"`  // HTTP 超时秒数, 默认 30
-	JSONMode       bool    `mapstructure:"json_mode"`        // 强制 JSON 输出 (response_format), 默认 true
-	MaxConcurrency int     `mapstructure:"max_concurrency"`  // 并发在飞请求上限, 默认 3
-	RPS            float64 `mapstructure:"rps"`              // 每秒请求数上限 (0=不限速), 默认 2
+	Enabled        bool    `mapstructure:"enabled"`         // 是否启用 LLM
+	APIKey         string  `mapstructure:"api_key"`         // API Key
+	BaseURL        string  `mapstructure:"base_url"`        // API 地址，默认 DeepSeek
+	Model          string  `mapstructure:"model"`           // 模型名称，默认 deepseek-chat
+	Temperature    float64 `mapstructure:"temperature"`     // 采样温度, 默认 0.3
+	MaxTokens      int     `mapstructure:"max_tokens"`      // 输出上限, 默认 2048
+	TimeoutSeconds int     `mapstructure:"timeout_seconds"` // HTTP 超时秒数, 默认 30
+	JSONMode       bool    `mapstructure:"json_mode"`       // 强制 JSON 输出 (response_format), 默认 true
+	MaxConcurrency int     `mapstructure:"max_concurrency"` // 并发在飞请求上限, 默认 3
+	RPS            float64 `mapstructure:"rps"`             // 每秒请求数上限 (0=不限速), 默认 2
 }
 
 // ServerConfig HTTP 服务配置
@@ -210,7 +211,7 @@ type MACrossConfig struct {
 	EnableAdaptive bool    `mapstructure:"enable_adaptive"`
 	// 信号过滤器阈值 (0=用策略内置默认值; 金叉信号需通过趋势强度+量能确认, 过严会导致长期无交易)
 	VolConfirmRatio float64 `mapstructure:"vol_confirm_ratio"` // 量能确认倍数, 默认1.2 (当日量>过去5日均量×倍数)
-	TrendThreshold  float64 `mapstructure:"trend_threshold"`  // 趋势强度阈值(小数), 默认0.005 (金叉日短均线须高于长均线0.5%%)
+	TrendThreshold  float64 `mapstructure:"trend_threshold"`   // 趋势强度阈值(小数), 默认0.005 (金叉日短均线须高于长均线0.5%%)
 }
 
 // MACDConfig MACD策略配置
@@ -344,6 +345,7 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("scheduler.screener_time", "15:15")
 	v.SetDefault("scheduler.signal_time", "18:00")
 	v.SetDefault("scheduler.report_time", "18:00")
+	v.SetDefault("scheduler.debate_review_time", "15:20")
 	v.SetDefault("scheduler.intraday.enabled", true)
 	v.SetDefault("scheduler.intraday.interval_min", 5)
 	v.SetDefault("scheduler.intraday.start", "09:30")

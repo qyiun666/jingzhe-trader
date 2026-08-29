@@ -133,6 +133,7 @@ func (s *Scheduler) tick() {
 		s.maybeRunDaily(store.JobSettleT1, settleT1Time, now, today, s.runSettleT1)
 		s.maybeRunDataUpdateWithRetry(now, today)
 		s.maybeRunDaily(store.JobScreener, s.cfg.Scheduler.ScreenerTime, now, today, s.runScreener)
+		s.maybeRunDaily(store.JobDebateReview, s.cfg.Scheduler.DebateReviewTime, now, today, s.runDebateReview)
 		s.maybeRunDaily(store.JobSignal, s.cfg.Scheduler.SignalTime, now, today, s.runSignalWithFreshnessCheck)
 		if s.cfg.Broker.Type == "qmt" {
 			s.maybeRunDaily(store.JobReconcile, reconcileTime(s.cfg.Scheduler.SignalTime), now, today, s.runReconcile)

@@ -16,19 +16,20 @@ const (
 
 // 任务名常量 (job_run 表 / 健康度展示 / API 共用, 避免各包硬编码字面量)
 const (
-	JobDataUpdate = "data_update"
-	JobScreener   = "screener"
-	JobSignal     = "signal"
-	JobReconcile  = "reconcile"
-	JobReport     = "report"
-	JobIntraday   = "intraday_monitor"
-	JobRetention  = "retention"
-	JobSettleT1   = "settle_t1"
-	JobPremarket  = "premarket"
+	JobDataUpdate   = "data_update"
+	JobScreener     = "screener"
+	JobSignal       = "signal"
+	JobReconcile    = "reconcile"
+	JobReport       = "report"
+	JobIntraday     = "intraday_monitor"
+	JobRetention    = "retention"
+	JobSettleT1     = "settle_t1"
+	JobPremarket    = "premarket"
+	JobDebateReview = "debate_review"
 )
 
 // JobNames 全部任务名列表 (健康度/变更报告展示用, 新增任务时同步追加)
-var JobNames = []string{JobDataUpdate, JobScreener, JobSignal, JobReconcile, JobReport, JobIntraday, JobRetention, JobSettleT1, JobPremarket}
+var JobNames = []string{JobDataUpdate, JobScreener, JobSignal, JobReconcile, JobReport, JobIntraday, JobRetention, JobSettleT1, JobPremarket, JobDebateReview}
 
 // JobRun 调度任务执行记录
 type JobRun struct {
