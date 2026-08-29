@@ -97,10 +97,17 @@ func (p *FactorDataProvider) GetStockByCode(tsCode string) (*model.Stock, error)
 }
 
 // GetBars 获取指定股票在 [startDate, endDate] 区间内的日线数据 (实现 factor.DataProvider 接口)
+// 返回前复权价格: 与回测 DataProvider / dbHistoryAdapter 口径对齐,
+// 否则除权日跳空会系统性低估动量类因子 (见 factor/momentum.go)
 func (p *FactorDataProvider) GetBars(tsCode, startDate, endDate string) ([]model.Bar, error) {
 	key := tsCode + ":" + startDate + ":" + endDate
 	return cached(p, p.barCache, key, func() ([]model.Bar, error) {
-		return p.barRepo.GetBars(tsCode, startDate, endDate)
+		bars, err := p.barRepo.GetBars(tsCode, startDate, endDate)
+		if err != nil {
+			return nil, err
+		}
+		model.AdjustBarsForward(bars)
+		return bars, nil
 	})
 }
 
