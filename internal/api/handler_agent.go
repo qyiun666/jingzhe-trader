@@ -103,8 +103,8 @@ func (s *Service) BuildAgentBrief() *AgentBrief {
 		}
 	}
 
-	// 任务健康度
-	for _, name := range []string{"data_update", "signal", "report", "intraday_monitor", "retention", "premarket"} {
+	// 任务健康度 (遍历全部注册任务, 避免硬编码遗漏新增任务)
+	for _, name := range store.JobNames {
 		if run, jerr := s.jobRepo.LastSuccess(name); jerr == nil && run != nil {
 			brief.Jobs[name] = run.FinishedAt
 		}
@@ -148,7 +148,7 @@ func (s *Service) buildPlanStatusSummary(plans []store.TradePlan) PlanStatusSumm
 // buildTaskCompletedStatus 构建当日任务完成状态
 func (s *Service) buildTaskCompletedStatus(today string) map[string]bool {
 	status := map[string]bool{}
-	for _, name := range []string{"data_update", "signal", "report", "intraday_monitor", "retention", "premarket"} {
+	for _, name := range store.JobNames {
 		done, err := s.jobRepo.HasSucceeded(name, today)
 		if err == nil {
 			status[name] = done
@@ -259,8 +259,10 @@ func (s *Service) executePlanViaQMT(plan *store.TradePlan) error {
 	}); err != nil {
 		return fmt.Errorf("下单失败: %w", err)
 	}
-	// 同步本地持仓记录 (与 /api/trade/confirm 同一逻辑)
-	s.applyTradeToPortfolio(plan.TsCode, side, plan.Qty, plan.RefPrice)
+	// 同步本地持仓记录 (与 /api/trade/confirm 同一逻辑); 失败必须报错, 防止内存与 DB 持仓不一致
+	if _, err := s.applyTradeToPortfolio(plan.TsCode, side, plan.Qty, plan.RefPrice); err != nil {
+		return fmt.Errorf("QMT成交同步持仓失败: %w", err)
+	}
 	return nil
 }
 
@@ -300,7 +302,7 @@ func (s *Service) BuildHealthStatus() *HealthStatus {
 		}
 	}
 	jobRepo := store.NewJobRepo(s.db)
-	for _, name := range []string{"data_update", "signal", "report", "intraday_monitor", "retention", "premarket"} {
+	for _, name := range store.JobNames {
 		if run, err := jobRepo.LastSuccess(name); err == nil && run != nil {
 			hs.Jobs[name] = run.FinishedAt
 		}

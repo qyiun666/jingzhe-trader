@@ -61,7 +61,10 @@ func (s *Service) ConfirmTrade(req TradeConfirmRequest) (*TradeConfirmResponse, 
 		side = model.SideSell
 	}
 
-	asset := s.applyTradeToPortfolio(req.TsCode, side, req.Qty, req.Price)
+	asset, err := s.applyTradeToPortfolio(req.TsCode, side, req.Qty, req.Price)
+	if err != nil {
+		return nil, fmt.Errorf("成交同步持仓失败: %w", err)
+	}
 
 	return &TradeConfirmResponse{
 		TsCode:     req.TsCode,
@@ -96,7 +99,8 @@ func (s *Service) SettleT1(date string) error {
 }
 
 // applyTradeToPortfolio 将成交同步到内存持仓与数据库 (trade/confirm 与 plan/confirm 共用)
-func (s *Service) applyTradeToPortfolio(tsCode string, side model.Side, qty int, price float64) *broker.AssetInfo {
+// 持仓写库失败必须上抛: 内存已成交而 DB 未更新时, 重启后会以 DB 为准恢复, 成交将静默丢失
+func (s *Service) applyTradeToPortfolio(tsCode string, side model.Side, qty int, price float64) (*broker.AssetInfo, error) {
 	// 1. 更新 PaperBroker 内存持仓
 	if pb, ok := s.brk.(*broker.PaperBroker); ok {
 		pb.RecordTrade(tsCode, side, qty, price)
@@ -104,7 +108,10 @@ func (s *Service) applyTradeToPortfolio(tsCode string, side model.Side, qty int,
 
 	// 2. 更新数据库持仓
 	portRepo := store.NewPortfolioRepo(s.db)
-	pos, _ := portRepo.GetPosition(tsCode)
+	pos, err := portRepo.GetPosition(tsCode)
+	if err != nil {
+		return nil, fmt.Errorf("查询持仓失败 %s: %w", tsCode, err)
+	}
 	if pos == nil {
 		pos = &store.PortfolioSyncItem{} // 买入新股票时 pos 为 nil
 	}
@@ -124,14 +131,16 @@ func (s *Service) applyTradeToPortfolio(tsCode string, side model.Side, qty int,
 		if price > highPrice {
 			highPrice = price // 买入价也可能是持仓期新高
 		}
-		portRepo.UpsertPosition(store.PortfolioSyncItem{
+		if err := portRepo.UpsertPosition(store.PortfolioSyncItem{
 			TsCode:       tsCode,
 			TotalQty:     newQty,
 			AvailableQty: pos.AvailableQty, // T+1: 今日买入明日可卖
 			TodayBought:  pos.TodayBought + qty,
 			HighPrice:    highPrice,
 			CostPrice:    newCost,
-		})
+		}); err != nil {
+			return nil, fmt.Errorf("买入更新持仓失败 %s: %w", tsCode, err)
+		}
 	} else {
 		// 卖出: 减少持仓与可卖量, 清仓则删除记录
 		newQty := pos.TotalQty - qty
@@ -140,16 +149,18 @@ func (s *Service) applyTradeToPortfolio(tsCode string, side model.Side, qty int,
 			newAvail = 0
 		}
 		if newQty <= 0 {
-			portRepo.RemovePosition(tsCode)
-		} else {
-			portRepo.UpsertPosition(store.PortfolioSyncItem{
-				TsCode:       tsCode,
-				TotalQty:     newQty,
-				AvailableQty: newAvail,
-				TodayBought:  pos.TodayBought,
-				HighPrice:    pos.HighPrice,
-				CostPrice:    pos.CostPrice,
-			})
+			if err := portRepo.RemovePosition(tsCode); err != nil {
+				return nil, fmt.Errorf("清仓删除持仓失败 %s: %w", tsCode, err)
+			}
+		} else if err := portRepo.UpsertPosition(store.PortfolioSyncItem{
+			TsCode:       tsCode,
+			TotalQty:     newQty,
+			AvailableQty: newAvail,
+			TodayBought:  pos.TodayBought,
+			HighPrice:    pos.HighPrice,
+			CostPrice:    pos.CostPrice,
+		}); err != nil {
+			return nil, fmt.Errorf("卖出更新持仓失败 %s: %w", tsCode, err)
 		}
 	}
 
@@ -176,5 +187,5 @@ func (s *Service) applyTradeToPortfolio(tsCode string, side model.Side, qty int,
 	} else {
 		asset = &broker.AssetInfo{}
 	}
-	return asset
+	return asset, nil
 }
