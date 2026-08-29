@@ -72,11 +72,27 @@ func (s *Service) UpdateDataBlocking() error {
 
 // doUpdateData 增量数据更新核心逻辑
 func (s *Service) doUpdateData() error {
+	opts := s.buildUpdateOptions()
+	return dataloader.New(s.cfg, s.db).Run(opts)
+}
+
+// buildUpdateOptions 构造每日增量更新的同步选项:
+// 核心数据 (日线/基本面/涨跌停) 总是同步; 可选数据 (新股/新闻/资金流/龙虎榜/财务指标)
+// 由 dataloader.sync_optional 控制 (默认开)。可选数据是辩论 Agent 与选股因子的输入,
+// 不同步则新闻分析师/资金面上下文空转 (2026-08 审计发现三表均 0 行的根因)
+func (s *Service) buildUpdateOptions() dataloader.Options {
 	opts := dataloader.Options{}
 	if maxDate, err := s.barRepo.GetMaxTradeDate(); err == nil && maxDate != "" {
 		opts.StartDate = maxDate // 增量: 从库内最新日期补起 (含当日, 幂等覆盖)
 	}
-	return dataloader.New(s.cfg, s.db).Run(opts)
+	if s.cfg.Dataloader.SyncOptional {
+		opts.SyncNewShare = true
+		opts.SyncNews = true
+		opts.SyncMoneyFlow = true
+		opts.SyncTopList = true
+		opts.SyncFina = true
+	}
+	return opts
 }
 
 // SyncCalendar 仅同步交易日历 (轻量级, 供调度器打破日历死锁)

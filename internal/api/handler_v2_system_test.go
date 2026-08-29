@@ -63,3 +63,26 @@ func TestRestorePortfolioRefreshesMarketValue(t *testing.T) {
 		t.Errorf("总资产应为 %.2f (现金+现算市值), 实际 %.2f", want, asset.TotalAsset)
 	}
 }
+
+// TestBuildUpdateOptions 可选数据同步开关映射: sync_optional=false 时全关, true 时全开
+func TestBuildUpdateOptions(t *testing.T) {
+	db, err := store.NewDB(":memory:")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	defer db.Close()
+
+	// 关闭: 不应携带任何可选同步
+	svc := &Service{cfg: &config.Config{}, barRepo: store.NewBarRepo(db)}
+	opts := svc.buildUpdateOptions()
+	if opts.SyncNews || opts.SyncMoneyFlow || opts.SyncTopList || opts.SyncNewShare || opts.SyncFina {
+		t.Fatalf("sync_optional=false 时可选同步应全关: %+v", opts)
+	}
+
+	// 开启: 可选同步全开 (新闻/资金流/龙虎榜是辩论与选股的输入)
+	svc.cfg.Dataloader.SyncOptional = true
+	opts = svc.buildUpdateOptions()
+	if !opts.SyncNews || !opts.SyncMoneyFlow || !opts.SyncTopList || !opts.SyncNewShare || !opts.SyncFina {
+		t.Fatalf("sync_optional=true 时可选同步应全开: %+v", opts)
+	}
+}
