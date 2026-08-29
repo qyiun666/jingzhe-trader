@@ -138,15 +138,14 @@ func (s *Scheduler) tick() {
 		if s.cfg.Broker.Type == "qmt" {
 			s.maybeRunDaily(store.JobReconcile, reconcileTime(s.cfg.Scheduler.SignalTime), now, today, s.runReconcile)
 		}
-		s.maybeRunDaily(store.JobReport, s.cfg.Scheduler.ReportTime, now, today, func(date string) error {
-			// 日报依赖信号完成 (18:00 同时到点, 信号含 LLM 辩论可能耗时数分钟):
-			// 信号运行中则本轮跳过, 下一 tick 再检查; 信号已结束(成功或失败)则正常生成日报
-			if _, running := s.running.Load(store.JobSignal); running {
-				logger.L().Infow("调度器: 信号任务运行中, 日报等待下一轮", "date", date)
-				return nil
-			}
-			return s.runReport(date)
-		})
+		// 日报依赖信号完成 (18:00 同时到点, 信号含 LLM 辩论可能耗时数分钟):
+		// 信号运行中则本轮不触发, 下个 tick 信号结束后自然补跑。
+		// 注意: 检查必须放在 maybeRunDaily 之前 —— 若放进任务函数内跳过(return nil),
+		// runJob 会把该次跳过记为 success, HasSucceeded 会阻止当天所有后续重试,
+		// 导致日报静默缺失但任务全绿 (20260828 日报未发送的根因)
+		if _, running := s.running.Load(store.JobSignal); !running {
+			s.maybeRunDaily(store.JobReport, s.cfg.Scheduler.ReportTime, now, today, s.runReport)
+		}
 		s.maybeRunIntraday(now, today)
 	} else {
 		logger.L().Infow("调度器: 今天是节假日(数据库确认), 跳过交易任务", "date", today)

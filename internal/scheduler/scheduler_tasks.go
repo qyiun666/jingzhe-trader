@@ -196,7 +196,9 @@ func (s *Scheduler) runReport(date string) error {
 		return nil
 	}
 	if err := s.mailer.SendHTML("📊 惊蛰日报 "+date, buildDailyMailHTML(daily, alerts)); err != nil {
-		logger.L().Warnw("日报邮件发送失败", "err", err)
+		// 返回错误让 job_run 记为 failed 并触发冷却重试, 与 runPremarket 一致;
+		// 否则发送失败也会全绿 (无声故障)
+		return fmt.Errorf("日报邮件发送失败: %w", err)
 	}
 	return nil
 }
