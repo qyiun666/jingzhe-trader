@@ -21,9 +21,14 @@ func (rm *RiskManagerAgent) Judge(ctx *DebateContext, reports []*AnalysisReport,
 	reportsText := formatReports(reports)
 	bullText := formatArguments(bull)
 	bearText := formatArguments(bear)
+	// 历史辩论复盘 (反思闭环): 有该股历史决策记录时注入, 提示 LLM 参考过往决策的实际结果
+	reviewSection := ""
+	if ctx.ReviewSummary != "" {
+		reviewSection = fmt.Sprintf("\n该股历史辩论复盘 (近期有方向决策的实际结果):\n%s请特别参考: 若此前 buy 决策多次亏损, 本次应更保守; 若 sell/reject 后多次踏空上涨, 对看空论点要求更严格证据。\n", ctx.ReviewSummary)
+	}
 	userPrompt := fmt.Sprintf(`股票: %s (%s)  日期: %s
 当前持仓: %s  总资产: %.0f
-
+%s
 分析师报告:
 %s
 
@@ -48,6 +53,7 @@ func (rm *RiskManagerAgent) Judge(ctx *DebateContext, reports []*AnalysisReport,
 }`,
 		ctx.TsCode, ctx.Name, ctx.TradeDate,
 		posStr(ctx.Position), ctx.TotalAsset,
+		reviewSection,
 		reportsText, bullText, bearText)
 	raw, err := callLLMJSON[judgeRaw](rm.llm, ctx.TsCode, ctx.TradeDate, "risk_manager", riskMgrSysPrompt, userPrompt)
 	if err != nil {
