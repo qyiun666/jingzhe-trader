@@ -3,6 +3,17 @@
 > 面向在部署机上执行本次升级的自动化 Agent 或运维人员。
 > 本文档不含任何密钥与私密信息；所有凭据一律走环境变量注入。
 
+## 〇、launchd 常驻守护（2026-08-29 新增，macOS 部署必读）
+
+08-28 整个交易日服务静默（进程停止后无人拉起），根因：无进程守护。
+
+- 安装（已执行）：`cp scripts/com.jingzhe.trader.plist ~/Library/LaunchAgents/` → `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.jingzhe.trader.plist`
+- 行为：开机自启 + 崩溃自动拉起（ThrottleInterval 30s 限频）
+- **凭据注入**：`cp scripts/jingzhe.env.example ~/.jingzhe.env && chmod 600 ~/.jingzhe.env` 后编辑填入真实值（TUSHARE_TOKEN 必需）；服务启动脚本检测到该文件缺失时**拒绝启动**（防空配置乱跑产生错误指令）
+- 手动重启守护：`launchctl bootout gui/$(id -u)/com.jingzhe.trader && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.jingzhe.trader.plist`
+- 验证守护：`kill` 服务进程后 30 秒内应自动重生；`logs/launchd-stderr.log` 显示缺凭据拒绝属预期行为
+- 注意：不要再用 `go run` 或手动 `bin/server` 长驻（`bin/server` 是旧二进制，正确产物是 `bin/jingzhe-server`）
+
 ## 一、事故摘要与根因
 
 ### 1. 任务全部成功但收不到任何邮件
