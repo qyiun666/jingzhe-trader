@@ -117,7 +117,8 @@ func (d *DailyWriteSyncer) cleanup() {
 }
 
 // Init 初始化日志
-func Init(level, format, output, filePath string) error {
+// retainDays: file 输出时日志保留天数 (<=0 回退 7 天), 由调用方传入配置值避免双重标准
+func Init(level, format, output, filePath string, retainDays int) error {
 	var zapLevel zapcore.Level
 	switch level {
 	case "debug":
@@ -159,8 +160,9 @@ func Init(level, format, output, filePath string) error {
 		base := filepath.Base(filePath)
 		// 从 base 提取前缀 (去掉 .log 后缀)
 		prefix := strings.TrimSuffix(base, filepath.Ext(base))
-		// 默认保留 7 天
-		retainDays := 7
+		if retainDays <= 0 {
+			retainDays = 7
+		}
 		daily, err := NewDailyWriteSyncer(dir, prefix, retainDays)
 		if err != nil {
 			return err

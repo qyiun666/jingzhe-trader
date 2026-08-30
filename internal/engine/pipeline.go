@@ -242,16 +242,8 @@ func (p *Pipeline) recordSnapshot(date string) {
 		MarketValue: asset.MarketValue,
 	}
 	if len(p.snapshots) > 0 {
-		prev := p.snapshots[len(p.snapshots)-1]
-		snap.PnL = snap.TotalAsset - prev.TotalAsset
-		if prev.TotalAsset > 0 {
-			snap.PnLPct = snap.PnL / prev.TotalAsset
-		}
-		initial := p.snapshots[0].TotalAsset
-		if initial > 0 {
-			snap.TotalPnL = snap.TotalAsset - initial
-			snap.TotalPnLPct = snap.TotalPnL / initial
-		}
+		// 当日盈亏对比上一快照, 累计盈亏基准为首日快照总资产
+		snap.FillPnL(&p.snapshots[len(p.snapshots)-1], p.snapshots[0].TotalAsset)
 	}
 	p.snapshots = append(p.snapshots, snap)
 

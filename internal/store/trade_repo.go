@@ -140,6 +140,18 @@ func (r *TradeRepo) GetAccountSnapshotsByRunID(runID string) ([]model.AccountSna
 	return snaps, nil
 }
 
+// GetRecentAccountSnapshots 查询某次运行最近 limit 个交易日的快照, 返回按日期升序
+// (供实盘收益曲线展示: 只取指定 run_id, 避免回测 bt_* 快照混入实盘)
+func (r *TradeRepo) GetRecentAccountSnapshots(runID string, limit int) ([]model.AccountSnapshot, error) {
+	query := fmt.Sprintf(`SELECT %s FROM (SELECT %s FROM account_snapshot WHERE run_id = ? ORDER BY trade_date DESC LIMIT ?) ORDER BY trade_date ASC`,
+		accountSnapshotSelectCols, accountSnapshotSelectCols)
+	var snaps []model.AccountSnapshot
+	if err := r.db.Select(&snaps, query, runID, limit); err != nil {
+		return nil, fmt.Errorf("查询账户快照失败: %w", err)
+	}
+	return snaps, nil
+}
+
 // GetLatestAccountSnapshot 查询某次运行最近一个交易日的账户快照
 func (r *TradeRepo) GetLatestAccountSnapshot(runID string) (*model.AccountSnapshot, error) {
 	query := fmt.Sprintf(`SELECT %s FROM account_snapshot WHERE run_id = ? ORDER BY trade_date DESC LIMIT 1`, accountSnapshotSelectCols)

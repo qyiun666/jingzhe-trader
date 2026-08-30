@@ -6,6 +6,8 @@ import (
 	"jingzhe-trader/internal/analysis"
 	"jingzhe-trader/internal/broker"
 	"jingzhe-trader/internal/model"
+	"jingzhe-trader/internal/store"
+	"jingzhe-trader/pkg/logger"
 )
 
 // RunPositions 持仓诊断
@@ -21,7 +23,7 @@ func (s *Service) RunPositions(date string) (*PortfolioJSON, error) {
 	positions, _ := s.brk.QueryPositions()
 	asset, _ := s.brk.QueryAsset()
 
-	result := s.buildPortfolioJSON(positions, asset, todayBars)
+	result := s.buildPortfolioJSON(date, positions, asset, todayBars)
 	s.enrichPortfolioAnalysis(result, positions, todayBars)
 	return result, nil
 }
@@ -70,6 +72,7 @@ func (s *Service) enrichPortfolioAnalysis(result *PortfolioJSON,
 
 // buildPortfolioJSON 构建持仓诊断 JSON
 func (s *Service) buildPortfolioJSON(
+	date string,
 	positions map[string]*model.Position,
 	asset *broker.AssetInfo,
 	todayBars map[string]*model.Bar,
@@ -248,11 +251,12 @@ func (s *Service) buildPortfolioJSON(
 	}
 	result.HealthScore = healthScore
 
-	// 计算日收益率（对比昨日快照）
-	var prevTotalAsset float64
-	err := s.db.Get(&prevTotalAsset, "SELECT total_asset FROM account_snapshot ORDER BY trade_date DESC LIMIT 1")
-	if err == nil && prevTotalAsset > 0 {
-		result.DailyPnLPct = (totalAsset - prevTotalAsset) / prevTotalAsset
+	// 计算日收益率: 对比上一交易日实盘快照 (限 run_id 且早于当日, 避免回测快照或当日自身污染基准)
+	prev, err := store.NewTradeRepo(s.db).GetAccountSnapshotBefore(liveSnapshotRunID, date)
+	if err != nil {
+		logger.L().Warnf("[持仓诊断] 查询上一交易日快照失败: %v", err)
+	} else if prev != nil && prev.TotalAsset > 0 {
+		result.DailyPnLPct = (totalAsset - prev.TotalAsset) / prev.TotalAsset
 	}
 
 	return result

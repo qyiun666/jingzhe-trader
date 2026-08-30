@@ -38,6 +38,20 @@ type AccountSnapshot struct {
 	TotalPnLPct float64 `json:"total_pnl_pct" db:"total_pnl_pct"` // 累计盈亏比例
 }
 
+// FillPnL 依据上一交易日快照与累计基准计算当日/累计盈亏并回填 (单一算法来源)
+// prev 为上一交易日快照 (nil 或资产<=0 则当日盈亏留零); baseline 为累计盈亏基准
+// (实盘=初始资金, 回测=首日快照总资产)
+func (s *AccountSnapshot) FillPnL(prev *AccountSnapshot, baseline float64) {
+	if prev != nil && prev.TotalAsset > 0 {
+		s.PnL = s.TotalAsset - prev.TotalAsset
+		s.PnLPct = s.PnL / prev.TotalAsset
+	}
+	if baseline > 0 {
+		s.TotalPnL = s.TotalAsset - baseline
+		s.TotalPnLPct = s.TotalPnL / baseline
+	}
+}
+
 // Signal 交易信号
 type Signal struct {
 	TsCode    string  `json:"ts_code"`

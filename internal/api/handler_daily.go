@@ -39,7 +39,7 @@ func (s *Service) RunDaily(date string, strategyName string) (*DailyReportJSON, 
 	}
 
 	// 7. 持仓诊断
-	portfolioJSON := s.buildPortfolioJSON(positions, asset, todayBars)
+	portfolioJSON := s.buildPortfolioJSON(date, positions, asset, todayBars)
 
 	// 8. 调仓计划
 	rebalanceJSON := s.buildRebalanceJSON(date, signals, positions, asset, todayBars)

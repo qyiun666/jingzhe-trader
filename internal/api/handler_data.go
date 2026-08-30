@@ -6,6 +6,7 @@ import (
 
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/store"
+	"jingzhe-trader/pkg/logger"
 )
 
 // GetKline returns K-line bars for a stock in a date range.
@@ -32,51 +33,45 @@ func (s *Service) GetKline(code, start, end string) ([]model.Bar, error) {
 // BuildSnapshots returns historical account snapshots, generating a live one
 // when the database has no snapshot records.
 func (s *Service) BuildSnapshots(limit int) []model.AccountSnapshot {
-	var snaps []model.AccountSnapshot
-	query := `SELECT trade_date, total_asset, cash, market_value, pnl, pnl_pct, total_pnl, total_pnl_pct
-	          FROM account_snapshot ORDER BY trade_date DESC LIMIT ?`
-	if err := s.db.Select(&snaps, query, limit); err != nil {
-		snaps = []model.AccountSnapshot{}
-	}
-	if snaps == nil {
-		snaps = []model.AccountSnapshot{}
+	tradeRepo := store.NewTradeRepo(s.db)
+	snaps, err := tradeRepo.GetRecentAccountSnapshots(liveSnapshotRunID, limit)
+	if err != nil {
+		logger.L().Warnf("[快照查询] 失败: %v", err)
+		snaps = nil
 	}
 
 	// 如果没有历史数据，用当前 portfolio 生成一个实时快照
 	if len(snaps) == 0 {
-		// 先刷新市值
-		date := time.Now().Format("20060102")
-		allBars, _ := s.barRepo.GetBarsByDate(date)
-		todayBars := barsToMap(allBars)
-		s.brk.UpdateMarketValue(todayBars)
-
-		asset, _ := s.brk.QueryAsset()
-		if asset != nil && asset.TotalAsset > 0 {
-			var totalPnL, totalPnLPct float64
-			portfolioRepo := store.NewPortfolioRepo(s.db)
-			initialStr, _ := portfolioRepo.GetMeta("initial_capital")
-			if initialStr != "" {
-				var ic float64
-				fmt.Sscanf(initialStr, "%f", &ic)
-				if ic > 0 {
-					totalPnL = asset.TotalAsset - ic
-					totalPnLPct = totalPnL / ic
-				}
-			}
-			snaps = append(snaps, model.AccountSnapshot{
-				TradeDate:   date,
-				TotalAsset:  asset.TotalAsset,
-				Cash:        asset.Cash,
-				MarketValue: asset.MarketValue,
-				TotalPnL:    totalPnL,
-				TotalPnLPct: totalPnLPct,
-			})
-		}
+		snaps = s.liveSnapshotFallback()
 	}
-
-	// 反转为升序
-	for i, j := 0, len(snaps)-1; i < j; i, j = i+1, j-1 {
-		snaps[i], snaps[j] = snaps[j], snaps[i]
+	if snaps == nil {
+		snaps = []model.AccountSnapshot{}
 	}
 	return snaps
+}
+
+// liveSnapshotFallback 数据库无快照记录时, 用券商实时资产生成当日快照 (仅展示用, 不落库)
+func (s *Service) liveSnapshotFallback() []model.AccountSnapshot {
+	date := time.Now().Format("20060102")
+	// 先刷新市值
+	allBars, _ := s.barRepo.GetBarsByDate(date)
+	s.brk.UpdateMarketValue(barsToMap(allBars))
+
+	asset, err := s.brk.QueryAsset()
+	if err != nil || asset == nil || asset.TotalAsset <= 0 {
+		return nil
+	}
+	initial, err := s.liveInitialCapital()
+	if err != nil {
+		logger.L().Warnf("[实时快照] 查询初始资金失败, 使用配置回退: %v", err)
+		initial = s.cfg.Backtest.InitialCapital
+	}
+	snap := model.AccountSnapshot{
+		TradeDate:   date,
+		TotalAsset:  asset.TotalAsset,
+		Cash:        asset.Cash,
+		MarketValue: asset.MarketValue,
+	}
+	snap.FillPnL(nil, initial)
+	return []model.AccountSnapshot{snap}
 }

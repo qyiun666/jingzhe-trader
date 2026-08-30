@@ -65,7 +65,7 @@ func main() {
 	}
 
 	// 2. 初始化日志: 批量回测时抑制 info 级别日志, 仅保留 warn/error, 避免刷屏
-	_ = logger.Init("warn", cfg.Log.Format, "stdout", "")
+	_ = logger.Init("warn", cfg.Log.Format, "stdout", "", 0)
 
 	// 3. 解析股票池 (缺省用配置 universe)
 	universe := config.ParseUniverseCSV(*universeStr)

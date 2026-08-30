@@ -72,30 +72,29 @@ func (s *Service) RecordLiveSnapshot(date string) error {
 	if err != nil {
 		return fmt.Errorf("查询上一交易日快照失败: %w", err)
 	}
-	if prev != nil && prev.TotalAsset > 0 {
-		snap.PnL = snap.TotalAsset - prev.TotalAsset
-		snap.PnLPct = snap.PnL / prev.TotalAsset
-	}
-	// 累计盈亏: 对比初始资金 (查询错误同样中止, 避免用 config 回退值覆盖已写对的累计值)
-	portRepo := store.NewPortfolioRepo(s.db)
-	initial := s.cfg.Backtest.InitialCapital
-	v, err := portRepo.GetMeta("initial_capital")
+	// 累计盈亏基准: 错误同样中止, 避免用 config 回退值覆盖已写对的累计值
+	initial, err := s.liveInitialCapital()
 	if err != nil {
-		return fmt.Errorf("查询 initial_capital 失败: %w", err)
+		return err
 	}
-	if v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
-			initial = f
-		}
-	}
-	if initial > 0 {
-		snap.TotalPnL = snap.TotalAsset - initial
-		snap.TotalPnLPct = snap.TotalPnL / initial
-	}
+	snap.FillPnL(prev, initial)
 	if err := tradeRepo.InsertAccountSnapshot(liveSnapshotRunID, snap); err != nil {
 		return fmt.Errorf("快照落库失败: %w", err)
 	}
 	logger.L().Infof("[实盘快照] %s 总资产 %.2f 当日盈亏 %.2f (%.2f%%) 累计 %.2f%%",
 		date, snap.TotalAsset, snap.PnL, snap.PnLPct*100, snap.TotalPnLPct*100)
 	return nil
+}
+
+// liveInitialCapital 实盘累计盈亏基准: 优先 portfolio_meta.initial_capital,
+// 无记录或非正数时回退配置的回测初始资金; 仅 meta 查询失败返回 error
+func (s *Service) liveInitialCapital() (float64, error) {
+	v, err := store.NewPortfolioRepo(s.db).GetMeta("initial_capital")
+	if err != nil {
+		return 0, fmt.Errorf("查询 initial_capital 失败: %w", err)
+	}
+	if f, perr := strconv.ParseFloat(v, 64); perr == nil && f > 0 {
+		return f, nil
+	}
+	return s.cfg.Backtest.InitialCapital, nil
 }

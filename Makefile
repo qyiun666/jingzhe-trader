@@ -1,4 +1,4 @@
-.PHONY: build test vet clean deps dataloader backtest backtest-macd backtest-boll backtest-multi optimize run email-report backtest-small datasync datasync-full server-small build-small
+.PHONY: build test vet clean deps dataloader backtest backtest-macd backtest-boll backtest-multi optimize run email-report backtest-small datasync datasync-full server-small build-small watchdog
 
 # 编译所有二进制
 build:
@@ -6,7 +6,12 @@ build:
 	go build -o bin/backtest ./cmd/backtest
 	go build -o bin/optimizer ./cmd/optimizer
 	go build -o bin/jingzhe-server ./cmd/server
-	@echo "编译完成: bin/dataloader, bin/backtest, bin/optimizer, bin/jingzhe-server"
+	go build -o bin/watchdog ./cmd/watchdog
+	@echo "编译完成: bin/dataloader, bin/backtest, bin/optimizer, bin/jingzhe-server, bin/watchdog"
+
+# 单独编译看门狗 (进程外信号链路截止时间检查)
+watchdog:
+	go build -o bin/watchdog ./cmd/watchdog
 
 # 数据采集
 dataloader:

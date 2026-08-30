@@ -44,6 +44,7 @@ func RunRetention(db *sqlx.DB, p RetentionPolicy, fullClean bool) error {
 		}
 	}
 	cleanOldFiles(p.LogDir, p.LogDays)
+	capStdoutLogs(p.LogDir)
 	keepNewestFiles(p.ReportDir, p.ReportFiles)
 
 	// SQLite 瘦身: 每日 checkpoint 防 -wal 无限增长; 周日回收空间
@@ -289,6 +290,11 @@ func cleanOldFiles(dir string, days int) {
 		if e.IsDir() {
 			continue
 		}
+		// launchd-*.log 由进程管理器持有 fd 常驻, 删除会导致后续写入落到隐形 inode
+		// (磁盘不回收), 体积控制交给 capStdoutLogs 截断, 这里跳过
+		if isStdoutLog(e.Name()) {
+			continue
+		}
 		info, err := e.Info()
 		if err != nil || info.ModTime().After(cutoff) {
 			continue
@@ -298,6 +304,41 @@ func cleanOldFiles(dir string, days int) {
 			logger.L().Warnw("删除过期文件失败", "path", path, "err", err)
 		} else {
 			logger.L().Infow("删除过期文件", "path", path)
+		}
+	}
+}
+
+// stdoutLogMaxBytes launchd stdout/stderr 单个日志体积上限 (超出截断清空)
+const stdoutLogMaxBytes = 16 << 20 // 16MB
+
+// isStdoutLog 判定是否为进程管理器重定向的标准输出日志 (launchd-*.log)
+func isStdoutLog(name string) bool {
+	return strings.HasPrefix(name, "launchd-") && strings.HasSuffix(name, ".log")
+}
+
+// capStdoutLogs 截断超体积的 launchd-*.log: launchd 以 O_APPEND 持有 fd,
+// 截断到 0 后下次写入自动从文件头继续, 既不破坏 fd 又回收空间
+func capStdoutLogs(dir string) {
+	if dir == "" {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() || !isStdoutLog(e.Name()) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || info.Size() <= stdoutLogMaxBytes {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		if err := os.Truncate(path, 0); err != nil {
+			logger.L().Warnw("截断标准输出日志失败", "path", path, "err", err)
+		} else {
+			logger.L().Infow("标准输出日志超上限已清空", "path", path, "size_bytes", info.Size())
 		}
 	}
 }

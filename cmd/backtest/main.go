@@ -28,7 +28,7 @@ func main() {
 	}
 
 	// 初始化日志
-	logger.Init(cfg.Log.Level, cfg.Log.Format, cfg.Log.Output, cfg.Log.FilePath)
+	logger.Init(cfg.Log.Level, cfg.Log.Format, cfg.Log.Output, cfg.Log.FilePath, cfg.Retention.LogDays)
 	defer logger.Sync()
 
 	// 使用配置默认值
