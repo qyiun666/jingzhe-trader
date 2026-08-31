@@ -145,7 +145,10 @@ func (l *Loader) syncFina(startDate, endDate string) error {
 
 	periods := genReportPeriods(startDate, endDate)
 	if len(periods) == 0 {
-		return fmt.Errorf("区间 %s~%s 内无报告期", startDate, endDate)
+		// 增量窗口通常落在两个季度末之间, 无报告期是正常情形而非故障;
+		// 当失败返回会让 data_update 每个交易日都误报
+		logger.L().Infof("区间 %s~%s 内无报告期, 跳过财务指标同步", startDate, endDate)
+		return nil
 	}
 	logger.L().Infof("待同步报告期: %v, 股票数: %d", periods, len(allStocks))
 

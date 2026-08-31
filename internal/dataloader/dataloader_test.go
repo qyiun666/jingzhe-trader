@@ -150,3 +150,22 @@ func TestSyncByTradeDayConcurrencySafety(t *testing.T) {
 		t.Errorf("并发同步不完整: synced=%d fetch=%d store=%d", synced, fetchCalls.Load(), storeCalls.Load())
 	}
 }
+
+// TestGenReportPeriodsEmptyOnIncrementWindow 增量窗口落在两个季度末之间时不应产生报告期。
+// syncFina 必须把这种情况当"无事可做"而非失败, 否则 data_update 每个交易日都会误报。
+func TestGenReportPeriodsEmptyOnIncrementWindow(t *testing.T) {
+	if got := genReportPeriods("20260828", "20260831"); len(got) != 0 {
+		t.Errorf("8月末~8月末之间无季度末, 期望空列表, 实际 %v", got)
+	}
+	// 跨季正常返回, 降序且去重
+	got := genReportPeriods("20251201", "20260630")
+	want := []string{"20260630", "20260331", "20251231"}
+	if len(got) != len(want) {
+		t.Fatalf("报告期数 = %v, 期望 %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("第 %d 个报告期 = %s, 期望 %s", i, got[i], want[i])
+		}
+	}
+}
