@@ -102,7 +102,7 @@ type DataloaderConfig struct {
 	EnableBasic   bool     `mapstructure:"enable_basic"`   // 是否同步每日基本面
 	EnableFund    bool     `mapstructure:"enable_fund"`    // 是否同步ETF/基金日线
 	EnableCleanup bool     `mapstructure:"enable_cleanup"` // 是否允许清理非关注股票数据(危险操作, 默认关闭)
-	SyncOptional  bool     `mapstructure:"sync_optional"`  // server每日更新是否同步可选数据(新股/新闻/资金流/龙虎榜/财务指标)
+	SyncOptional  bool     `mapstructure:"sync_optional"`  // server每日更新是否同步可选数据(新闻/资金流/龙虎榜/财务指标)
 }
 
 // LLMConfig LLM 配置

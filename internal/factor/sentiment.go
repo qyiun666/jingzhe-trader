@@ -3,6 +3,8 @@ package factor
 import (
 	"context"
 	"fmt"
+
+	"jingzhe-trader/internal/model"
 )
 
 // TurnoverFactor 换手率因子 (最近N日平均换手率, 越高越好)
@@ -172,8 +174,7 @@ func (f *LimitMotionFactor) Name() string {
 
 // Compute 计算涨跌停因子值
 // 最近 period 个交易日内 (涨停次数 - 跌停次数)
-// 使用 limit_status 字段判断: 1涨停, -1跌停, 0正常
-// 如果没有 limit_status 数据, 则用涨跌幅判断 (涨幅>=9.8%视为涨停, 跌幅<=-9.8%视为跌停)
+// 涨跌停判定统一走 model.IsLimitUp / model.IsLimitDown
 func (f *LimitMotionFactor) Compute(ctx context.Context, date string, universe []string, provider DataProvider) (map[string]float64, error) {
 	period := f.Period
 	if period <= 0 {
@@ -208,9 +209,9 @@ func (f *LimitMotionFactor) Compute(ctx context.Context, date string, universe [
 		limitDownCount := 0
 
 		for _, b := range recent {
-			if b.LimitStatus == 1 {
+			if model.IsLimitUp(b.LimitStatus) {
 				limitUpCount++
-			} else if b.LimitStatus == -1 {
+			} else if model.IsLimitDown(b.LimitStatus) {
 				limitDownCount++
 			}
 		}

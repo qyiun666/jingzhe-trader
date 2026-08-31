@@ -37,10 +37,10 @@ type Scheduler struct {
 	mailer   *notify.MailNotifier
 	quoteSrc quote.Source
 
-	jobRepo     *store.JobRepo
-	planRepo    *store.PlanRepo
-	calRepo     *store.CalendarRepo
-	actionRepo  *store.ActionRepo
+	jobRepo    *store.JobRepo
+	planRepo   *store.PlanRepo
+	calRepo    *store.CalendarRepo
+	actionRepo *store.ActionRepo
 
 	running      sync.Map       // job_name -> bool, 防止同名任务重叠执行
 	goalMu       sync.Mutex     // 串行化 checkGoalMode: data_update 重试与 signal 补记可能同日并发评估 (读-改-写非原子, 防重复告警)

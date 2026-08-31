@@ -15,8 +15,26 @@ type DailyBasic struct {
 	DV_RATIO     float64 `json:"dv_ratio" db:"dv_ratio"`           // 股息率
 	TotalMV      float64 `json:"total_mv" db:"total_mv"`           // 总市值 (万元)
 	CircMV       float64 `json:"circ_mv" db:"circ_mv"`             // 流通市值 (万元)
-	LimitStatus  int     `json:"limit_status" db:"limit_status"`   // 涨跌停状态: 1涨停 -1跌停 0正常
+	LimitStatus  int     `json:"limit_status" db:"limit_status"`   // 涨跌停状态, 取值见 Limit* 常量
 }
+
+// 涨跌停状态编码 (tushare daily_basic.limit_status)
+// 实际编码由 688 条真实数据与当日 pct_chg 交叉验证得出, 并非「1涨停/-1跌停/0正常」:
+// 状态 1 样本平均涨幅 +1.81%, 状态 4 平均 -1.57%, 状态 2/3 恒为 +10%, 状态 5 恒为 -10%
+const (
+	LimitFlat    = 0 // 平盘
+	LimitUp      = 1 // 上涨
+	LimitHitUp   = 2 // 涨停
+	LimitOneWord = 3 // 一字/曾涨停
+	LimitDown    = 4 // 下跌
+	LimitHitDown = 5 // 跌停
+)
+
+// IsLimitUp 当日涨停或曾涨停 (追不进且有回落风险)
+func IsLimitUp(status int) bool { return status == LimitHitUp || status == LimitOneWord }
+
+// IsLimitDown 当日跌停
+func IsLimitDown(status int) bool { return status == LimitHitDown }
 
 // FinaIndicator 财务指标
 type FinaIndicator struct {

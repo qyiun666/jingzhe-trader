@@ -18,10 +18,10 @@ const liveSnapshotRunID = store.RunIDLive
 
 // TradeConfirmRequest 交易确认请求
 type TradeConfirmRequest struct {
-	TsCode string  `json:"ts_code"`        // 股票代码
-	Side   string  `json:"side"`           // "buy" 或 "sell"
-	Qty    int     `json:"qty"`            // 成交数量
-	Price  float64 `json:"price"`          // 成交价格
+	TsCode string  `json:"ts_code"`           // 股票代码
+	Side   string  `json:"side"`              // "buy" 或 "sell"
+	Qty    int     `json:"qty"`               // 成交数量
+	Price  float64 `json:"price"`             // 成交价格
 	PlanID int64   `json:"plan_id,omitempty"` // 关联的交易计划ID (人工确认后删除该计划)
 }
 

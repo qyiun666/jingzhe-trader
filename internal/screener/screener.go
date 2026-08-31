@@ -115,8 +115,8 @@ func (s *Screener) Screen(date string) ([]ScreenResult, error) {
 			}
 		}
 
-		// 涨跌停过滤 (limit_status: 1涨停 -1跌停 0正常)
-		if basic.LimitStatus != 0 {
+		// 涨跌停过滤: 涨停追不进且易回落, 跌停次日抛压大
+		if model.IsLimitUp(basic.LimitStatus) || model.IsLimitDown(basic.LimitStatus) {
 			continue
 		}
 

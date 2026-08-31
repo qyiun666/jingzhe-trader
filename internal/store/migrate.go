@@ -132,22 +132,6 @@ func migrate(db *sqlx.DB) error {
 		CREATE INDEX IF NOT EXISTS idx_account_snapshot_run_id ON account_snapshot(run_id);
 		CREATE UNIQUE INDEX IF NOT EXISTS idx_account_snapshot_run_date ON account_snapshot(run_id, trade_date);`,
 
-		// 新股申购
-		`CREATE TABLE IF NOT EXISTS new_shares (
-			ts_code TEXT PRIMARY KEY,
-			sub_code TEXT,
-			name TEXT,
-			ipo_date TEXT,
-			issue_date TEXT,
-			amount REAL,
-			market_amount REAL,
-			price REAL,
-			pe REAL,
-			limit_amount REAL,
-			funds REAL,
-			ballot REAL
-		);`,
-
 		// 新闻快讯
 		`CREATE TABLE IF NOT EXISTS news (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,

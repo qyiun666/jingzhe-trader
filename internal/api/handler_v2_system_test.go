@@ -75,14 +75,14 @@ func TestBuildUpdateOptions(t *testing.T) {
 	// 关闭: 不应携带任何可选同步
 	svc := &Service{cfg: &config.Config{}, barRepo: store.NewBarRepo(db)}
 	opts := svc.buildUpdateOptions()
-	if opts.SyncNews || opts.SyncMoneyFlow || opts.SyncTopList || opts.SyncNewShare || opts.SyncFina {
+	if opts.SyncNews || opts.SyncMoneyFlow || opts.SyncTopList || opts.SyncFina {
 		t.Fatalf("sync_optional=false 时可选同步应全关: %+v", opts)
 	}
 
 	// 开启: 可选同步全开 (新闻/资金流/龙虎榜是辩论与选股的输入)
 	svc.cfg.Dataloader.SyncOptional = true
 	opts = svc.buildUpdateOptions()
-	if !opts.SyncNews || !opts.SyncMoneyFlow || !opts.SyncTopList || !opts.SyncNewShare || !opts.SyncFina {
+	if !opts.SyncNews || !opts.SyncMoneyFlow || !opts.SyncTopList || !opts.SyncFina {
 		t.Fatalf("sync_optional=true 时可选同步应全开: %+v", opts)
 	}
 }

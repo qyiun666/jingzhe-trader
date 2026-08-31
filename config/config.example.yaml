@@ -117,7 +117,7 @@ dataloader:
   enable_basic: true        # 每日基本面（多因子策略需要）
   enable_fund: true         # ETF/基金日线
   enable_cleanup: false     # 危险: 清理非关注股票历史数据, 需同时加 --confirm-cleanup
-  sync_optional: true       # server每日更新同步可选数据: 新股/新闻/资金流/龙虎榜/财务指标 (辩论与选股的输入)
+  sync_optional: true       # server每日更新同步可选数据: 新闻/资金流/龙虎榜/财务指标 (辩论与选股的输入)
 
 # 股票池 (可选, 留空则完全依赖自动选股)
 # 手动填写的股票会与选股结果合并扫描

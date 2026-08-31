@@ -258,34 +258,6 @@ func (c *Client) FinaIndicator(tsCode string, period string) ([]model.FinaIndica
 	})
 }
 
-// NewShare 获取新股申购数据
-// startDate/endDate 格式: YYYYMMDD, 为空则返回全部
-func (c *Client) NewShare(startDate, endDate string) ([]model.NewShare, error) {
-	fields := []string{
-		"ts_code", "sub_code", "name", "ipo_date", "issue_date",
-		"amount", "market_amount", "price", "pe", "limit_amount", "funds", "ballot",
-	}
-	params := map[string]interface{}{}
-	setOpt(params, "start_date", startDate)
-	setOpt(params, "end_date", endDate)
-	return fetchRows(c, "new_share", params, fields, func(row map[string]interface{}) model.NewShare {
-		return model.NewShare{
-			TsCode:       fieldStr(row, "ts_code"),
-			SubCode:      fieldStr(row, "sub_code"),
-			Name:         fieldStr(row, "name"),
-			IpoDate:      fieldStr(row, "ipo_date"),
-			IssueDate:    fieldStr(row, "issue_date"),
-			Amount:       fieldFloat(row, "amount"),
-			MarketAmount: fieldFloat(row, "market_amount"),
-			Price:        fieldFloat(row, "price"),
-			PE:           fieldFloat(row, "pe"),
-			LimitAmount:  fieldFloat(row, "limit_amount"),
-			Funds:        fieldFloat(row, "funds"),
-			Ballot:       fieldFloat(row, "ballot"),
-		}
-	})
-}
-
 // MajorNews 获取新闻快讯
 // startDate/endDate 格式: YYYYMMDD, src 为新闻来源, 空则返回全部
 func (c *Client) MajorNews(startDate, endDate string, src string) ([]model.News, error) {

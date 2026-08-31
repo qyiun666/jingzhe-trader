@@ -19,7 +19,6 @@ import (
 type Options struct {
 	StartDate     string // 起始日期 YYYYMMDD, 空则默认3年前
 	EndDate       string // 结束日期 YYYYMMDD, 空则默认今天
-	SyncNewShare  bool   // 同步新股申购
 	SyncNews      bool   // 同步新闻快讯
 	SyncMoneyFlow bool   // 同步资金流向
 	SyncTopList   bool   // 同步龙虎榜

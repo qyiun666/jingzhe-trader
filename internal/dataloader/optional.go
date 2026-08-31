@@ -11,11 +11,8 @@ import (
 	"jingzhe-trader/pkg/logger"
 )
 
-// syncOptional 同步可选数据 (新股/新闻/资金流/龙虎榜/财务指标)
+// syncOptional 同步可选数据 (新闻/资金流/龙虎榜/财务指标)
 func (l *Loader) syncOptional(opts Options, tradeCals []model.TradeCal) {
-	if opts.SyncNewShare {
-		l.syncNewShares(opts.StartDate, opts.EndDate)
-	}
 	if opts.SyncNews {
 		l.syncNews(opts.StartDate, opts.EndDate)
 	}
@@ -28,22 +25,6 @@ func (l *Loader) syncOptional(opts Options, tradeCals []model.TradeCal) {
 	if opts.SyncFina {
 		l.syncFina(opts.StartDate, opts.EndDate)
 	}
-}
-
-// syncNewShares 同步新股申购数据
-func (l *Loader) syncNewShares(startDate, endDate string) {
-	logger.L().Info("=== 同步新股申购数据 ===")
-	newShares, err := l.ts.NewShare(startDate, endDate)
-	if err != nil {
-		logger.L().Errorf("获取新股申购数据失败: %v", err)
-		return
-	}
-	nsRepo := store.NewNewShareRepo(l.db)
-	if err := nsRepo.BatchInsert(newShares); err != nil {
-		logger.L().Errorf("存储新股申购数据失败: %v", err)
-		return
-	}
-	logger.L().Infof("新股申购数据同步完成: %d 条", len(newShares))
 }
 
 // syncNews 同步新闻快讯

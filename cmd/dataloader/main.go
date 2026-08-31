@@ -17,7 +17,6 @@ func main() {
 	endDate := flag.String("end", time.Now().Format("20060102"), "结束日期 YYYYMMDD")
 
 	// 可选数据同步开关
-	syncNewShare := flag.Bool("newshare", false, "同步新股申购数据")
 	syncNews := flag.Bool("news", false, "同步新闻快讯")
 	syncMoneyFlow := flag.Bool("moneyflow", false, "同步个股资金流向")
 	syncTopList := flag.Bool("toplist", false, "同步龙虎榜数据")
@@ -65,7 +64,6 @@ func main() {
 	opts := dataloader.Options{
 		StartDate:     *startDate,
 		EndDate:       *endDate,
-		SyncNewShare:  *syncNewShare,
 		SyncNews:      *syncNews,
 		SyncMoneyFlow: *syncMoneyFlow,
 		SyncTopList:   *syncTopList,
