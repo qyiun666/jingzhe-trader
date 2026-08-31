@@ -217,7 +217,7 @@ func cleanBacktestRuns(db *sqlx.DB, keepRuns int) error {
 
 	var total int64
 	for _, runID := range runIDs[keepRuns:] {
-		for _, table := range []string{"trades", "account_snapshot", "position_snapshot", "orders"} {
+		for _, table := range []string{"trades", "account_snapshot"} {
 			res, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE run_id = ?`, table), runID)
 			if err != nil {
 				return fmt.Errorf("清理 %s(run=%s) 失败: %w", table, runID, err)

@@ -30,6 +30,11 @@ config/.tmp*
 data/*.db
 data/*.db-journal
 
+# Syncthing sync metadata under data/ (versioning, ignore rules, folder marker)
+data/.stignore
+data/.stfolder/
+data/.stversions/
+
 # Log files
 logs/
 *.log
@@ -77,3 +82,6 @@ signals.json
 .gocache/
 .gomodcache/
 /optimizer
+
+# 本机环境标记 (开发环境声明, 不推送)
+agent.md

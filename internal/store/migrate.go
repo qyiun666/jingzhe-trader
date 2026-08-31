@@ -19,7 +19,8 @@ func migrate(db *sqlx.DB) error {
 			is_st        INTEGER,
 			list_status  TEXT,
 			list_date    TEXT,
-			delist_date  TEXT
+			delist_date  TEXT,
+			industry     TEXT
 		);`,
 
 		// 交易日历
@@ -95,23 +96,6 @@ func migrate(db *sqlx.DB) error {
 			PRIMARY KEY (ts_code, trade_date)
 		);`,
 
-		// 订单
-		`CREATE TABLE IF NOT EXISTS orders (
-			id           INTEGER PRIMARY KEY AUTOINCREMENT,
-			run_id       TEXT,
-			ts_code      TEXT,
-			side         INTEGER,
-			price        REAL,
-			qty          INTEGER,
-			filled_qty   INTEGER,
-			avg_price    REAL,
-			status       INTEGER,
-			reason       TEXT,
-			create_time  TEXT,
-			update_time  TEXT
-		);
-		CREATE INDEX IF NOT EXISTS idx_orders_run_id ON orders(run_id);`,
-
 		// 成交记录
 		`CREATE TABLE IF NOT EXISTS trades (
 			id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,6 +110,7 @@ func migrate(db *sqlx.DB) error {
 			stamp_tax    REAL,
 			transfer_fee REAL,
 			total_cost   REAL,
+			strategy     TEXT,
 			trade_date   TEXT,
 			trade_time   TEXT
 		);
@@ -144,22 +129,8 @@ func migrate(db *sqlx.DB) error {
 			total_pnl      REAL,
 			total_pnl_pct  REAL
 		);
-		CREATE INDEX IF NOT EXISTS idx_account_snapshot_run_id ON account_snapshot(run_id);`,
-
-		// 持仓快照
-		`CREATE TABLE IF NOT EXISTS position_snapshot (
-			id             INTEGER PRIMARY KEY AUTOINCREMENT,
-			run_id         TEXT,
-			trade_date     TEXT,
-			ts_code        TEXT,
-			total_qty      INTEGER,
-			available_qty  INTEGER,
-			cost_price     REAL,
-			market_price   REAL,
-			market_value   REAL,
-			floating_pnl   REAL
-		);
-		CREATE INDEX IF NOT EXISTS idx_position_snapshot_run_id ON position_snapshot(run_id);`,
+		CREATE INDEX IF NOT EXISTS idx_account_snapshot_run_id ON account_snapshot(run_id);
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_account_snapshot_run_date ON account_snapshot(run_id, trade_date);`,
 
 		// 新股申购
 		`CREATE TABLE IF NOT EXISTS new_shares (
@@ -220,15 +191,32 @@ func migrate(db *sqlx.DB) error {
 			total_qty      INTEGER NOT NULL DEFAULT 0,
 			available_qty  INTEGER NOT NULL DEFAULT 0,
 			today_bought   INTEGER NOT NULL DEFAULT 0,
+			high_price     REAL NOT NULL DEFAULT 0,
 			cost_price     REAL NOT NULL DEFAULT 0,
 			updated_at     TEXT NOT NULL
 		);`,
 
-		// 持仓元数据（如 initial_capital 等）
-		`CREATE TABLE IF NOT EXISTS portfolio_meta (
-			key   TEXT PRIMARY KEY,
-			value TEXT NOT NULL
+		// 配置键值表 (运行期配置: initial_capital/cash/goal_risk_mode 等; 原 portfolio_meta 迁移而来)
+		`CREATE TABLE IF NOT EXISTS config_kv (
+			key        TEXT PRIMARY KEY,
+			value      TEXT NOT NULL,
+			updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 		);`,
+
+		// 统一动作日志 (任务/接口/人工成交执行记录; 每动作一条, 可按日汇总)
+		`CREATE TABLE IF NOT EXISTS action_log (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			trade_date  TEXT NOT NULL,
+			kind        TEXT NOT NULL,
+			name        TEXT NOT NULL,
+			status      TEXT NOT NULL,
+			summary     TEXT,
+			detail      TEXT,
+			duration_ms INTEGER,
+			created_at  TEXT NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_action_log_date ON action_log(trade_date);
+		CREATE INDEX IF NOT EXISTS idx_action_log_name ON action_log(name);`,
 
 		// 交易计划 (EOD信号/盘中止损产出, Agent读取确认后执行)
 		`CREATE TABLE IF NOT EXISTS trade_plan (
@@ -337,56 +325,6 @@ func migrate(db *sqlx.DB) error {
 		if _, err := db.Exec(s); err != nil {
 			return fmt.Errorf("建表失败: %w, sql=%s", err, s)
 		}
-	}
-	return migrateLegacy(db)
-}
-
-// migrateLegacy 历史库兼容迁移
-// 旧版曾在 account_snapshot(trade_date) 上建全局唯一索引, 多 run 共库时写入冲突;
-// 改为 (run_id, trade_date) 唯一
-func migrateLegacy(db *sqlx.DB) error {
-	var legacy int
-	if err := db.Get(&legacy, `SELECT COUNT(1) FROM sqlite_master
-		WHERE type='index' AND name='idx_account_snapshot_date'
-		AND sql LIKE '%UNIQUE%' AND sql NOT LIKE '%run_id%'`); err == nil && legacy > 0 {
-		if _, err := db.Exec(`DROP INDEX idx_account_snapshot_date`); err != nil {
-			return fmt.Errorf("删除旧快照唯一索引失败: %w", err)
-		}
-	}
-	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_account_snapshot_run_date
-		ON account_snapshot(run_id, trade_date)`); err != nil {
-		return fmt.Errorf("创建快照唯一索引失败: %w", err)
-	}
-	// portfolio 表补充 today_bought 列 (T+1 台账, 旧库升级)
-	if err := ensureColumn(db, "portfolio", "today_bought", "INTEGER NOT NULL DEFAULT 0"); err != nil {
-		return err
-	}
-	// portfolio 表补充 high_price 列 (移动止盈历史最高价, 旧库升级)
-	if err := ensureColumn(db, "portfolio", "high_price", "REAL NOT NULL DEFAULT 0"); err != nil {
-		return err
-	}
-	// trades 表补充 strategy 列 (绩效归因: 每笔成交来源策略, 旧库升级)
-	if err := ensureColumn(db, "trades", "strategy", "TEXT"); err != nil {
-		return err
-	}
-	// stock_basic 表补充 industry 列 (行业分散: 真实行业分组, 旧库升级)
-	if err := ensureColumn(db, "stock_basic", "industry", "TEXT"); err != nil {
-		return err
-	}
-	return nil
-}
-
-// ensureColumn 若列不存在则 ALTER TABLE 添加 (SQLite 不支持 IF NOT EXISTS 加列, 先查 PRAGMA)
-func ensureColumn(db *sqlx.DB, table, column, def string) error {
-	var count int
-	if err := db.Get(&count, `SELECT COUNT(1) FROM pragma_table_info(?) WHERE name = ?`, table, column); err != nil {
-		return fmt.Errorf("查询表结构失败(%s.%s): %w", table, column, err)
-	}
-	if count > 0 {
-		return nil
-	}
-	if _, err := db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, def)); err != nil {
-		return fmt.Errorf("添加列失败(%s.%s): %w", table, column, err)
 	}
 	return nil
 }

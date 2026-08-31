@@ -146,6 +146,18 @@ func (r *PlanRepo) UpdatePlanStatus(id int64, status string) error {
 	return nil
 }
 
+// DeletePlan 删除指定计划 (人工成交确认后剔除; 成交审计在 action_log, 无需保留计划行)
+func (r *PlanRepo) DeletePlan(id int64) error {
+	res, err := r.db.Exec(`DELETE FROM trade_plan WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("删除交易计划失败(id=%d): %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("交易计划不存在(id=%d)", id)
+	}
+	return nil
+}
+
 // ExpireOldPlans 将指定日期之前仍pending的计划标记为过期
 func (r *PlanRepo) ExpireOldPlans(beforeDate string) (int64, error) {
 	now := time.Now().Format(TimeLayout)

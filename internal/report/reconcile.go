@@ -3,6 +3,7 @@ package report
 import (
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 
 	"jingzhe-trader/internal/broker"
@@ -51,7 +52,7 @@ const reconcileThreshold = 0.01
 
 // Reconcile 执行对账
 // 对比本地记录与券商实际数据，返回对账结果
-func Reconcile(brk broker.Broker, tradeRepo *store.TradeRepo, tradeDate string) (*ReconcileResult, error) {
+func Reconcile(brk broker.Broker, portRepo *store.PortfolioRepo, actionRepo *store.ActionRepo, tradeDate string) (*ReconcileResult, error) {
 	result := &ReconcileResult{
 		TradeDate:       tradeDate,
 		LocalPositions:  make(map[string]*model.Position),
@@ -66,13 +67,14 @@ func Reconcile(brk broker.Broker, tradeRepo *store.TradeRepo, tradeDate string) 
 	}
 	result.BrokerCash = asset.Cash
 
-	// 2. 获取本地最新的账户快照 (实盘 run_id: 传空串永远查不到, 对账基准会退化为 0)
-	snap, err := tradeRepo.GetLatestAccountSnapshot(store.RunIDLive)
+	// 2. 获取本地记录的最新可用现金 (config_kv.cash 是人工成交后写入的权威现金源,
+	//    而非从 broker 同源导出的 account_snapshot(日终快照), 后者同源比较无对账意义)
+	cash, err := portRepo.GetMeta("cash")
 	if err != nil {
-		return nil, fmt.Errorf("查询本地账户快照失败: %w", err)
+		return nil, fmt.Errorf("查询本地现金失败: %w", err)
 	}
-	if snap != nil {
-		result.LocalCash = snap.Cash
+	if f, perr := strconv.ParseFloat(cash, 64); perr == nil && f >= 0 {
+		result.LocalCash = f
 	}
 	result.CashDiff = math.Abs(result.BrokerCash - result.LocalCash)
 
@@ -91,17 +93,12 @@ func Reconcile(brk broker.Broker, tradeRepo *store.TradeRepo, tradeDate string) 
 	// 5. 对比持仓
 	result.PositionDiffs = reconcilePositions(result.LocalPositions, result.BrokerPositions)
 
-	// 6. 获取本地成交记录 (按日期查询, 限实盘)
-	localTrades, err := tradeRepo.GetTradesByRunID(store.RunIDLive)
+	// 6. 获取本地成交记录 (人工成交流水, 来自 action_log kind=trade; trades 表仅存回测 bt_*)
+	localTrades, err := actionRepo.ListTrades(tradeDate)
 	if err != nil {
 		return nil, fmt.Errorf("查询本地成交记录失败: %w", err)
 	}
-	// 过滤出当天的成交记录
-	for _, t := range localTrades {
-		if t.TradeDate == tradeDate {
-			result.LocalTrades = append(result.LocalTrades, t)
-		}
-	}
+	result.LocalTrades = localTrades
 
 	// 7. 对比成交 (券商端暂无独立查询成交接口, 标记为待实现)
 	result.TradeDiffs = []TradeDiff{}

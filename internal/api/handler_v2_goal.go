@@ -86,7 +86,7 @@ func (s *Service) RecordLiveSnapshot(date string) error {
 	return nil
 }
 
-// liveInitialCapital 实盘累计盈亏基准: 优先 portfolio_meta.initial_capital,
+// liveInitialCapital 实盘累计盈亏基准: 优先 config_kv.initial_capital,
 // 无记录或非正数时回退配置的回测初始资金; 仅 meta 查询失败返回 error
 func (s *Service) liveInitialCapital() (float64, error) {
 	v, err := store.NewPortfolioRepo(s.db).GetMeta("initial_capital")

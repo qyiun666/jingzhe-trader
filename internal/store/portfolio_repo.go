@@ -19,7 +19,7 @@ type PortfolioSyncItem struct {
 }
 
 // PortfolioRepo 持仓持久化仓储
-// 负责 portfolio 和 portfolio_meta 表的读写
+// 负责 portfolio 持仓表与 config_kv 配置表的读写
 type PortfolioRepo struct {
 	db *sqlx.DB
 }
@@ -151,28 +151,28 @@ func (r *PortfolioRepo) UpdateHighPrice(tsCode string, price float64) error {
 	return nil
 }
 
-// SetMeta 设置持仓元数据（如 initial_capital）
+// SetMeta 设置配置键值 (如 initial_capital) — 写入 config_kv 表
 func (r *PortfolioRepo) SetMeta(key, value string) error {
 	_, err := r.db.Exec(
-		`INSERT INTO portfolio_meta (key, value) VALUES (?, ?)
-		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-		key, value,
+		`INSERT INTO config_kv (key, value, updated_at) VALUES (?, ?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+		key, value, time.Now().Format(TimeLayout),
 	)
 	if err != nil {
-		return fmt.Errorf("设置元数据失败(key=%s): %w", key, err)
+		return fmt.Errorf("设置配置失败(key=%s): %w", key, err)
 	}
 	return nil
 }
 
-// GetMeta 获取持仓元数据
+// GetMeta 获取配置键值 (如 initial_capital)
 func (r *PortfolioRepo) GetMeta(key string) (string, error) {
 	var value string
-	err := r.db.Get(&value, `SELECT value FROM portfolio_meta WHERE key = ?`, key)
+	err := r.db.Get(&value, `SELECT value FROM config_kv WHERE key = ?`, key)
 	if err != nil {
 		if isNoRowsErr(err) {
 			return "", nil
 		}
-		return "", fmt.Errorf("获取元数据失败(key=%s): %w", key, err)
+		return "", fmt.Errorf("获取配置失败(key=%s): %w", key, err)
 	}
 	return value, nil
 }

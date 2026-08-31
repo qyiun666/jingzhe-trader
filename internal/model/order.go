@@ -1,7 +1,5 @@
 package model
 
-import "time"
-
 // Side 买卖方向
 type Side int
 
@@ -16,14 +14,6 @@ func (s Side) String() string {
 	}
 	return "sell"
 }
-
-// OrderType 订单类型
-type OrderType int
-
-const (
-	OrderMarket OrderType = iota // 市价单
-	OrderLimit                   // 限价单
-)
 
 // OrderStatus 订单状态
 type OrderStatus int
@@ -54,23 +44,6 @@ func (s OrderStatus) String() string {
 	default:
 		return "unknown"
 	}
-}
-
-// Order 订单
-type Order struct {
-	ID         int64       `json:"id"`
-	RunID      string      `json:"run_id"` // 回测/实盘运行批次
-	TsCode     string      `json:"ts_code"`
-	Side       Side        `json:"side"`
-	OrderType  OrderType   `json:"order_type"`
-	Price      float64     `json:"price"`      // 限价单价格
-	Qty        int         `json:"qty"`        // 委托数量
-	FilledQty  int         `json:"filled_qty"` // 已成交数量
-	AvgPrice   float64     `json:"avg_price"`  // 成交均价
-	Status     OrderStatus `json:"status"`
-	Reason     string      `json:"reason"` // 下单原因
-	CreateTime time.Time   `json:"create_time"`
-	UpdateTime time.Time   `json:"update_time"`
 }
 
 // Trade 成交记录

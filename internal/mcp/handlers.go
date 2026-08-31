@@ -138,6 +138,7 @@ func (s *Server) handleConfirmTrade(_ context.Context, req mcp.CallToolRequest) 
 		Side:   s.getString(req.GetArguments(), "side", ""),
 		Qty:    int(s.getNumber(req.GetArguments(), "qty", 0)),
 		Price:  s.getNumber(req.GetArguments(), "price", 0),
+		PlanID: int64(s.getNumber(req.GetArguments(), "plan_id", 0)),
 	}
 	resp, err := s.svc.ConfirmTrade(tr)
 	if err != nil {

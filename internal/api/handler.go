@@ -130,6 +130,7 @@ type Service struct {
 	debateRepo         *store.DebateRepo
 	alertRepo          *store.AlertRepo
 	planRepo           *store.PlanRepo
+	actionRepo         *store.ActionRepo
 	jobRepo            *store.JobRepo
 	stockRepo          *store.StockRepo
 	screenRepo         *store.ScreenRepo  // 选股结果仓库
@@ -165,6 +166,7 @@ func NewService(cfg *config.Config) (*Service, error) {
 		debateRepo:    store.NewDebateRepo(db),
 		alertRepo:     store.NewAlertRepo(db),
 		planRepo:      store.NewPlanRepo(db),
+		actionRepo:    store.NewActionRepo(db),
 		jobRepo:       store.NewJobRepo(db),
 		stockRepo:     store.NewStockRepo(db),
 		screenRepo:    store.NewScreenRepo(db),
@@ -188,20 +190,19 @@ func NewService(cfg *config.Config) (*Service, error) {
 		svc.brk = broker.NewPaperBroker("api", cfg.Backtest.InitialCapital, costModel)
 	}
 
-	// 成交回调 → trades 表落库 (回测管道之外, 实盘成交的持久化入口; run_id=live)
-	// QMT 模式下由调度器对账任务 PollTrades 触发; paper 模式下由 RecordTrade/confirm 路径触发
-	tradeRepo := store.NewTradeRepo(db)
+	// 成交回调 → action_log(kind=trade) 落库 (broker 侧成交/人工确认之外实盘成交的持久化入口)
+	// QMT 模式下由调度器对账任务 PollTrades 触发; paper 模式下由 RecordTrade/auto-execute 触发
 	svc.brk.OnTrade(func(trade model.Trade) {
 		if trade.TsCode == "" || trade.Qty <= 0 {
 			return
 		}
-		if trade.RunID == "" {
-			trade.RunID = liveSnapshotRunID
-		}
-		if trade.TradeDate == "" {
-			trade.TradeDate = time.Now().Format("20060102")
-		}
-		if _, err := tradeRepo.InsertTrade(&trade); err != nil {
+		if err := svc.actionRepo.AddTrade(trade.TradeDate, store.TradeFill{
+			TsCode: trade.TsCode,
+			Side:   trade.Side.String(),
+			Qty:    trade.Qty,
+			Price:  trade.Price,
+			Amount: trade.Amount,
+		}); err != nil {
 			logger.L().Warnw("成交回调落库失败", "ts_code", trade.TsCode, "err", err)
 		}
 	})

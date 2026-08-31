@@ -36,7 +36,7 @@
 
 **异常处理**: `warnings` 非空或 `data_fresh=false` → 先报告异常，不确认计划；LLM 不可用时辩论自动跳过，不影响信号生成
 
-**资金口径**（字段都存在 `portfolio_meta` 表，勿手工臆改）：
+**资金口径**（字段都存在 `config_kv` 表，勿手工臆改）：
 
 - `initial_capital` 本金：首次持仓同步时写入 = 现金 + Σ(数量×成本价)，**仅写一次永不更新**（累计盈亏/季初基准都以它为锚，本金变动走人工 SQL 修正）
 - `cash` 可用资金：每笔成交确认后自动更新；总资产不落库，实时 = cash + Σ持仓市值，每日收盘后记入 `account_snapshot`
@@ -47,7 +47,7 @@
 
 - 代码更新后必须重新编译并重启服务，旧 binary 不含邮件折行/快照补记修复（NAS 长行邮件会被 QQ 邮箱拒收："Line too long"）
 - 存量库若 `initial_capital == cash` 且持仓非空，属于旧版只记现金的脏基准，需一次性 SQL 校正：
-  `UPDATE portfolio_meta SET value='<现金+持仓成本>' WHERE key='initial_capital';` 随后 `DELETE FROM portfolio_meta WHERE key='goal_risk_mode';` 触发重评
+  `UPDATE config_kv SET value='<现金+持仓成本>' WHERE key='initial_capital';` 随后 `DELETE FROM config_kv WHERE key='goal_risk_mode';` 触发重评
 - 持仓同步接口的 `initial_capital` 只在首次同步生效，后续同步改不了本金，不存在"同步把本金刷小"的风险
 
 详细操作见下方 [Agent 接入指南](#agent-接入指南hermes--任意-ai-agent)。

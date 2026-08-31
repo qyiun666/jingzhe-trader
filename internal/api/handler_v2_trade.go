@@ -18,10 +18,11 @@ const liveSnapshotRunID = store.RunIDLive
 
 // TradeConfirmRequest 交易确认请求
 type TradeConfirmRequest struct {
-	TsCode string  `json:"ts_code"` // 股票代码
-	Side   string  `json:"side"`    // "buy" 或 "sell"
-	Qty    int     `json:"qty"`     // 成交数量
-	Price  float64 `json:"price"`   // 成交价格
+	TsCode string  `json:"ts_code"`        // 股票代码
+	Side   string  `json:"side"`           // "buy" 或 "sell"
+	Qty    int     `json:"qty"`            // 成交数量
+	Price  float64 `json:"price"`          // 成交价格
+	PlanID int64   `json:"plan_id,omitempty"` // 关联的交易计划ID (人工确认后删除该计划)
 }
 
 // TradeConfirmResponse 交易确认响应
@@ -66,6 +67,13 @@ func (s *Service) ConfirmTrade(req TradeConfirmRequest) (*TradeConfirmResponse, 
 		return nil, fmt.Errorf("成交同步持仓失败: %w", err)
 	}
 
+	// 人工成交完成后删除关联计划 (成交审计在 action_log, 计划不再保留)
+	if req.PlanID > 0 {
+		if err := s.closePlan(req.PlanID, req.TsCode, req.Side); err != nil {
+			logger.L().Warnw("关闭交易计划失败", "plan_id", req.PlanID, "err", err)
+		}
+	}
+
 	return &TradeConfirmResponse{
 		TsCode:     req.TsCode,
 		Name:       s.stockName(req.TsCode),
@@ -76,6 +84,18 @@ func (s *Service) ConfirmTrade(req TradeConfirmRequest) (*TradeConfirmResponse, 
 		Cash:       asset.Cash,
 		TotalAsset: asset.TotalAsset,
 	}, nil
+}
+
+// closePlan 人工成交后关闭关联计划: 校验代码/方向一致后删除 (成交审计在 action_log)
+func (s *Service) closePlan(planID int64, tsCode, direction string) error {
+	plan, err := s.planRepo.GetPlanByID(planID)
+	if err != nil {
+		return err
+	}
+	if plan.TsCode != tsCode || strings.ToLower(plan.Direction) != direction {
+		return fmt.Errorf("计划(%s %s)与成交(%s %s)不一致", plan.TsCode, plan.Direction, tsCode, direction)
+	}
+	return s.planRepo.DeletePlan(planID)
 }
 
 // PollBrokerTrades 轮询券商端成交回报 (QMT 模式由对账任务调用, paper 模式无操作)
@@ -164,22 +184,25 @@ func (s *Service) applyTradeToPortfolio(tsCode string, side model.Side, qty int,
 		}
 	}
 
-	// 3. 成交落库 (绩效归因/收益曲线的数据源, 与回测 trades 同表区分 run_id)
-	if _, err := store.NewTradeRepo(s.db).InsertTrade(&model.Trade{
-		RunID:     liveSnapshotRunID,
-		TsCode:    tsCode,
-		Side:      side,
-		Price:     price,
-		Qty:       qty,
-		Amount:    price * float64(qty),
-		TradeDate: time.Now().Format("20060102"),
-		TradeTime: time.Now().Format("20060102 150405"),
+	// 3. 人工成交流水落库到 action_log (kind=trade; 人工成交的唯一数据源, 不再写 trades 表)
+	asset, _ := s.brk.QueryAsset()
+	var cash, totalAsset float64
+	if asset != nil {
+		cash, totalAsset = asset.Cash, asset.TotalAsset
+	}
+	if err := s.actionRepo.AddTrade(time.Now().Format("20060102"), store.TradeFill{
+		TsCode:     tsCode,
+		Side:       side.String(),
+		Qty:        qty,
+		Price:      price,
+		Amount:     price * float64(qty),
+		Cash:       cash,
+		TotalAsset: totalAsset,
 	}); err != nil {
-		logger.L().Warnw("成交落库失败", "ts_code", tsCode, "err", err)
+		logger.L().Warnw("人工成交流水记录失败", "ts_code", tsCode, "err", err)
 	}
 
-	// 4. 查询更新后的资产并持久化 cash
-	asset, _ := s.brk.QueryAsset()
+	// 4. 持久化 cash (重启后以 DB 为准)
 	if asset != nil {
 		if err := portRepo.SetMeta("cash", fmt.Sprintf("%.2f", asset.Cash)); err != nil {
 			logger.L().Warnw("成交后持久化 cash 失败, 重启后现金将回退到旧值", "ts_code", tsCode, "err", err)

@@ -147,7 +147,9 @@ func (s *Server) registerTools() {
 		mcp.WithString("ts_code", mcp.Required(), mcp.Description("Stock code, e.g. 000001.SZ")),
 		mcp.WithString("side", mcp.Required(), mcp.Description("buy or sell")),
 		mcp.WithNumber("qty", mcp.Required(), mcp.Description("Trade quantity (must be a multiple of 100)")),
-		mcp.WithNumber("price", mcp.Required(), mcp.Description("Trade price")))
+		mcp.WithNumber("price", mcp.Required(), mcp.Description("Trade price")),
+		mcp.WithNumber("plan_id", mcp.Description("Optional trade plan ID to close after confirmation"),
+			mcp.DefaultNumber(0)))
 
 	s.addTool("sync_portfolio",
 		"Synchronize the local portfolio with real broker positions.",

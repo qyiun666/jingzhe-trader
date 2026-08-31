@@ -122,14 +122,14 @@ func (s *Scheduler) runDebateReview(date string) error {
 // 导致 PollTrades 触发时回调列表为空, 真实成交静默丢弃)
 func (s *Scheduler) runReconcile(date string) error {
 	brk := s.svc.Broker()
-	result, err := report.Reconcile(brk, store.NewTradeRepo(s.db), date)
+	result, err := report.Reconcile(brk, store.NewPortfolioRepo(s.db), store.NewActionRepo(s.db), date)
 	if err != nil {
 		return fmt.Errorf("对账执行失败: %w", err)
 	}
 	if !result.IsBalanced {
 		s.alert("⚠️ 惊蛰对账差异", report.GenerateReconcileReport(result))
 	}
-	// 成交回报轮询: 把券商端真实成交落库 (OnTrade 回调 → trades 表, run_id=live)
+	// 成交回报轮询: 把券商端真实成交落库 (OnTrade 回调 → action_log, kind=trade)
 	if err := s.svc.PollBrokerTrades(); err != nil {
 		logger.L().Warnw("成交回报轮询失败", "date", date, "err", err)
 	}

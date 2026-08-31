@@ -37,9 +37,10 @@ type Scheduler struct {
 	mailer   *notify.MailNotifier
 	quoteSrc quote.Source
 
-	jobRepo  *store.JobRepo
-	planRepo *store.PlanRepo
-	calRepo  *store.CalendarRepo
+	jobRepo     *store.JobRepo
+	planRepo    *store.PlanRepo
+	calRepo     *store.CalendarRepo
+	actionRepo  *store.ActionRepo
 
 	running      sync.Map       // job_name -> bool, 防止同名任务重叠执行
 	goalMu       sync.Mutex     // 串行化 checkGoalMode: data_update 重试与 signal 补记可能同日并发评估 (读-改-写非原子, 防重复告警)
@@ -56,14 +57,15 @@ func New(cfg *config.Config, db *sqlx.DB, svc *api.Service) *Scheduler {
 		src = quote.NewQMTQuote(cfg.Broker.QMT.URL)
 	}
 	return &Scheduler{
-		cfg:      cfg,
-		db:       db,
-		svc:      svc,
-		mailer:   notify.NewMailNotifier(cfg.Mail.Enabled, cfg.Mail.From, cfg.Mail.Password),
-		quoteSrc: src,
-		jobRepo:  store.NewJobRepo(db),
-		planRepo: store.NewPlanRepo(db),
-		calRepo:  store.NewCalendarRepo(db),
+		cfg:        cfg,
+		db:         db,
+		svc:        svc,
+		mailer:     notify.NewMailNotifier(cfg.Mail.Enabled, cfg.Mail.From, cfg.Mail.Password),
+		quoteSrc:   src,
+		jobRepo:    store.NewJobRepo(db),
+		planRepo:   store.NewPlanRepo(db),
+		calRepo:    store.NewCalendarRepo(db),
+		actionRepo: store.NewActionRepo(db),
 	}
 }
 
@@ -241,6 +243,7 @@ func (s *Scheduler) runJob(name, date string, fn func(date string) error) {
 	go func() {
 		defer s.jobWg.Done()
 		defer s.running.Delete(name)
+		started := time.Now()
 
 		jobID, err := s.jobRepo.StartJob(name, date)
 		if err != nil {
@@ -252,6 +255,7 @@ func (s *Scheduler) runJob(name, date string, fn func(date string) error) {
 				msg := fmt.Sprintf("任务 %s panic: %v", name, rec)
 				logger.L().Errorw("调度器: 任务panic", "job", name, "panic", rec, "stack", string(debug.Stack()))
 				s.finishJob(jobID, store.JobStatusFailed, msg)
+				s.logTask(name, date, "fail", msg, time.Since(started).Milliseconds())
 				s.alert("⚠️ 惊蛰调度任务崩溃", msg)
 			}
 		}()
@@ -260,12 +264,28 @@ func (s *Scheduler) runJob(name, date string, fn func(date string) error) {
 		if err := fn(date); err != nil {
 			logger.L().Errorw("调度器: 任务失败", "job", name, "err", err)
 			s.finishJob(jobID, store.JobStatusFailed, err.Error())
+			s.logTask(name, date, "fail", err.Error(), time.Since(started).Milliseconds())
 			s.alert("⚠️ 惊蛰调度任务失败", fmt.Sprintf("任务 %s (%s) 失败: %v", name, date, err))
 			return
 		}
 		s.finishJob(jobID, store.JobStatusSuccess, "")
+		s.logTask(name, date, "success", "任务完成", time.Since(started).Milliseconds())
 		logger.L().Infow("调度器: 任务完成", "job", name, "date", date)
 	}()
+}
+
+// logTask 记录任务执行到 action_log (kind=task; action_log 面向用户的任务/接口/成交汇总)
+func (s *Scheduler) logTask(name, date, status, summary string, durationMs int64) {
+	if err := s.actionRepo.Insert(store.ActionLog{
+		TradeDate:  date,
+		Kind:       "task",
+		Name:       name,
+		Status:     status,
+		Summary:    summary,
+		DurationMs: durationMs,
+	}); err != nil {
+		logger.L().Warnw("记录任务日志失败", "job", name, "err", err)
+	}
 }
 
 // finishJob 记录任务结束 (jobID<=0 时跳过)
