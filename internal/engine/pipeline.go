@@ -30,6 +30,7 @@ type PipelineConfig struct {
 	TradeRepo *store.TradeRepo        // 成交/快照持久化, nil 时不落库
 	FillMode  string                  // "next_open"(默认) 或 "close"
 	Stocks    map[string]*model.Stock // 股票信息(风控用), nil 时按universe构建默认值
+	Cost      *market.CostModel       // 交易费用模型, nil 时资金核算按成交额毛额
 }
 
 // Pipeline 统一执行管道
@@ -154,9 +155,12 @@ func (p *Pipeline) collectSignals(date string, bars map[string]*model.Bar,
 		stratSignals = nil
 	}
 
-	// 合并 (剔除重复/建议信号) → 风控检查 → 卖单优先排序 (与实盘共用同一套语义)
+	// 合并 (剔除重复/建议信号) → 风控检查 → 资金核算 → 卖单优先排序 (与实盘共用同一套语义)
 	merged := MergeStrategySignals(date, stopSignals, stopCodes, stratSignals)
-	passed, _ := CheckAndSortSignals(date, p.cfg.Risk, merged, positions, asset.TotalAsset, p.stocks, bars)
+	passed, _ := CheckAndSortSignals(SignalInput{
+		Date: date, Risk: p.cfg.Risk, Signals: merged, Positions: positions,
+		Stocks: p.stocks, Bars: bars, TotalAsset: asset.TotalAsset, Cash: asset.Cash, Cost: p.cfg.Cost,
+	})
 	return passed
 }
 

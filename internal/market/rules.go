@@ -83,13 +83,16 @@ func IsCloseAuction(t time.Time) bool {
 	return minutes >= 14*60+57 && minutes <= 15*60
 }
 
+// LotSize A股 1 手 = 100 股, 买入申报数量须为其整数倍
+const LotSize = 100
+
 // RoundLot 买入手数向下取整到 100 股 (A 股 1 手 = 100 股)
 // 买入申报数量须为 100 股的整数倍, 不足 100 股部分舍去
 func RoundLot(qty int) int {
 	if qty <= 0 {
 		return 0
 	}
-	return (qty / 100) * 100
+	return (qty / LotSize) * LotSize
 }
 
 // IsvalidLot 判断申报数量是否为有效手数

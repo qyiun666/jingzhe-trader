@@ -138,6 +138,7 @@ type Service struct {
 	stockMap           map[string]string  // ts_code -> name
 	stockMapMu         sync.RWMutex       // 保护 stockMap 并发读写
 	brk                broker.Broker
+	cost               *market.CostModel            // 交易费用模型 (资金核算/计划可买量共用)
 	dynamicSelector    *strategy.DynamicSelector    // 动态策略选择器
 	strategyCache      map[string]strategy.Strategy // 策略实例缓存 (避免每次重建丢失状态)
 	strategyCacheMu    sync.RWMutex                 // 保护策略缓存并发读写
@@ -185,6 +186,7 @@ func NewService(db *sqlx.DB, cfg *config.Config) (*Service, error) {
 	// 其余模式用 paper 模拟盘。此前硬编码 PaperBroker 导致 QMT 模式下 PollBrokerTrades
 	// 的类型断言永远失败, 真实成交无法落库 (2026-08 审计 P0)
 	costModel := market.NewCostModel(cfg.Cost)
+	svc.cost = costModel
 	if cfg.Broker.Type == "qmt" && cfg.Broker.QMT.URL != "" {
 		svc.brk = broker.NewQMTBridge(cfg.Broker.QMT.URL)
 	} else {
@@ -228,17 +230,18 @@ func NewService(db *sqlx.DB, cfg *config.Config) (*Service, error) {
 
 	// 初始化智能体辩论编排器 (复用 Service 的共享 Repo, 避免重复实例化)
 	// 风控约束与指数清单由配置注入: 此前提示词把仓位上限写死成 60%, 而 risk.max_position_pct=0.40
-	svc.debateOrchestrator = agent.NewDebateOrchestrator(
-		svc.llmClient,
-		svc.barRepo,
-		svc.basicRepo,
-		svc.finaRepo,
-		svc.newsRepo,
-		svc.debateRepo,
-		store.NewDebateReviewRepo(db),
-		store.NewMoneyFlowRepo(db),
-		store.NewTopListRepo(db),
-		agent.DebateSettings{
+	svc.debateOrchestrator = agent.NewDebateOrchestrator(agent.DebateDeps{
+		LLM:           svc.llmClient,
+		BarRepo:       svc.barRepo,
+		BasicRepo:     svc.basicRepo,
+		FinaRepo:      svc.finaRepo,
+		NewsRepo:      svc.newsRepo,
+		StockRepo:     svc.stockRepo,
+		DebateRepo:    svc.debateRepo,
+		ReviewRepo:    store.NewDebateReviewRepo(db),
+		MoneyFlowRepo: store.NewMoneyFlowRepo(db),
+		TopListRepo:   store.NewTopListRepo(db),
+		Settings: agent.DebateSettings{
 			Positions: agent.PositionLimits{
 				MaxPositionPct:      cfg.Risk.MaxPositionPct,
 				MaxTotalPositionPct: cfg.Risk.MaxTotalPositionPct,
@@ -246,13 +249,22 @@ func NewService(db *sqlx.DB, cfg *config.Config) (*Service, error) {
 			},
 			MarketIndexes: watchlistIndexCodes(cfg.Dataloader.Watchlist),
 		},
-	)
+	})
 
 	// 初始化自动选股器 (全市场筛选, 补充配置股票池)
 	tsClient := tushare.NewClient(cfg.Tushare)
-	screenerCfg := cfg.Screener
 	// 不再排除配置池, universe 可以为空 (全部依赖自动选股)
-	svc.screener = screener.New(tsClient, svc.stockRepo, svc.barRepo, svc.screenRepo, screenerCfg)
+	// 资金快照与基本面仓库一并注入: 选股必须落在"买得起 1 手"的价格带内,
+	// 且候选当日基本面要落库, 否则辩论的基本面分析师只能拿到全 0 数值
+	svc.screener = screener.New(screener.Deps{
+		TS:         tsClient,
+		StockRepo:  svc.stockRepo,
+		BarRepo:    svc.barRepo,
+		BasicRepo:  svc.basicRepo,
+		ScreenRepo: svc.screenRepo,
+		Cfg:        cfg.Screener,
+		Capital:    svc,
+	})
 
 	return svc, nil
 }
@@ -308,6 +320,18 @@ func (s *Service) Screener() *screener.Screener {
 	return s.screener
 }
 
+// Capital 实现 screener.CapitalSource: 选股时的资金快照
+// 单票仓位上限与最小单笔金额一并给出, 选股器据此把价格带裁到"真正可执行"的区间
+func (s *Service) Capital() screener.Capital {
+	asset := s.getAsset()
+	return screener.Capital{
+		TotalAsset:     asset.TotalAsset,
+		Cash:           asset.Cash,
+		MaxPositionPct: s.cfg.Risk.MaxPositionPct,
+		MinTradeAmount: s.cfg.Trading.MinTradeAmount,
+	}
+}
+
 // ScreenRepo 返回选股结果仓库
 func (s *Service) ScreenRepo() *store.ScreenRepo {
 	return s.screenRepo
@@ -336,6 +360,7 @@ func (s *Service) getPrevBars(date string) map[string]*model.Bar {
 
 // getPositions 获取持仓 (出错返回空 map)
 func (s *Service) getPositions() map[string]*model.Position {
+	s.markToMarket()
 	positions, err := s.brk.QueryPositions()
 	if err != nil {
 		return make(map[string]*model.Position)
@@ -348,11 +373,42 @@ func (s *Service) getPositions() map[string]*model.Position {
 
 // getAsset 获取资产信息 (出错返回默认)
 func (s *Service) getAsset() *broker.AssetInfo {
+	s.markToMarket()
 	asset, err := s.brk.QueryAsset()
 	if err != nil {
 		return &broker.AssetInfo{Cash: s.cfg.Backtest.InitialCapital}
 	}
 	return asset
+}
+
+// markToMarket 用库内最新行情刷新持仓市价
+//
+// 此前只有计划生成路径调 UpdateMarketValue, 其余只读接口拿到的是库内持久化值 ——
+// 新载入的账户里那个值等于成本价, 于是浮盈恒为 0: 用户从 get_portfolio / 盘前总结 /
+// 健康分 看到的持仓是"不涨不跌", 实际可能已经在止损线附近。
+// 盘前 09:00 用上一交易日收盘刷新, 正是当时唯一正确的估值口径。
+func (s *Service) markToMarket() {
+	positions, err := s.brk.QueryPositions()
+	if err != nil || len(positions) == 0 {
+		return
+	}
+	codes := make([]string, 0, len(positions))
+	for code, pos := range positions {
+		if pos != nil && pos.TotalQty > 0 {
+			codes = append(codes, code)
+		}
+	}
+	if len(codes) == 0 {
+		return
+	}
+	bars, err := s.barRepo.GetLatestBars(codes)
+	if err != nil || len(bars) == 0 {
+		if err != nil {
+			logger.L().Warnw("查询最新行情失败, 持仓市价不刷新", "err", err)
+		}
+		return
+	}
+	s.brk.UpdateMarketValue(barsToMap(bars))
 }
 
 // dbHistoryAdapter 基于数据库的历史数据适配器 (策略均线计算/持仓分析 Beta/VaR 用)

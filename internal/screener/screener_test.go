@@ -7,46 +7,55 @@ import (
 	"jingzhe-trader/internal/store"
 )
 
-// TestCalcTrend 满5日数据时 MA 为最近5日均价, 动量基于最远一日
+// TestCalcTrend 满5日数据时 MA5 为最近5日均价, 动量基于第5个交易日前收盘
 func TestCalcTrend(t *testing.T) {
 	// recentCloses 从近到远: [d-1, d-2, d-3, d-4, d-5]
-	recent := []float64{110, 108, 106, 104, 100}
-	ma5, momentum, days := calcTrend(recent, 112)
-	if days != 5 {
-		t.Errorf("days 应为 5, 实际 %d", days)
+	got := calcTrend([]float64{110, 108, 106, 104, 100}, 112)
+	if got.Days != 5 {
+		t.Errorf("days 应为 5, 实际 %d", got.Days)
 	}
 	wantMA := (110 + 108 + 106 + 104 + 100) / 5.0
-	if math.Abs(ma5-wantMA) > 1e-9 {
-		t.Errorf("MA5 应为 %.2f, 实际 %.2f", wantMA, ma5)
+	if math.Abs(got.MA5-wantMA) > 1e-9 {
+		t.Errorf("MA5 应为 %.2f, 实际 %.2f", wantMA, got.MA5)
 	}
 	// 动量 = (112-100)/100*100 = 12
-	if math.Abs(momentum-12) > 1e-9 {
-		t.Errorf("动量应为 12, 实际 %.2f", momentum)
+	if math.Abs(got.Momentum-12) > 1e-9 {
+		t.Errorf("动量应为 12, 实际 %.2f", got.Momentum)
 	}
 }
 
-// TestCalcTrendInsufficient 数据不足5日时按实际天数计算, 动量仍基于最远一日
-func TestCalcTrendInsufficient(t *testing.T) {
-	recent := []float64{110, 105} // 2 日
-	ma5, momentum, days := calcTrend(recent, 112)
-	if days != 2 {
-		t.Errorf("days 应为 2, 实际 %d", days)
+// TestCalcTrendInsufficientSamples 样本不足 5 日时 MA5 留 0 (方向未知), 不得用"部分均值"冒充 MA5
+func TestCalcTrendInsufficientSamples(t *testing.T) {
+	got := calcTrend([]float64{110, 105}, 112)
+	if got.MA5 != 0 {
+		t.Errorf("样本不足时 MA5 必须为 0, 实际 %.2f", got.MA5)
 	}
-	wantMA := (110 + 105) / 2.0
-	if math.Abs(ma5-wantMA) > 1e-9 {
-		t.Errorf("MA 应为 %.2f, 实际 %.2f", wantMA, ma5)
+	if got.Days != 2 {
+		t.Errorf("days 应为 2, 实际 %d", got.Days)
 	}
+	// 动量按实际可得的最远一日计算
 	wantMomentum := (112.0 - 105) / 105 * 100
-	if math.Abs(momentum-wantMomentum) > 1e-9 {
-		t.Errorf("动量应为 %.2f, 实际 %.2f", wantMomentum, momentum)
+	if math.Abs(got.Momentum-wantMomentum) > 1e-9 {
+		t.Errorf("动量应为 %.2f, 实际 %.2f", wantMomentum, got.Momentum)
 	}
 }
 
 // TestCalcTrendEmpty 空输入时全部返回 0
 func TestCalcTrendEmpty(t *testing.T) {
-	ma5, momentum, days := calcTrend(nil, 112)
-	if ma5 != 0 || momentum != 0 || days != 0 {
-		t.Errorf("空输入应返回 0,0,0, 实际 %.2f %.2f %d", ma5, momentum, days)
+	got := calcTrend(nil, 112)
+	if got != (Trend{}) {
+		t.Errorf("空输入应返回零值 Trend, 实际 %+v", got)
+	}
+}
+
+// TestCalcTrendWindowKeepsFiveDayMomentum 样本多于 5 日时动量仍按 5 日口径, 评分阈值才不会被稀释
+func TestCalcTrendWindowKeepsFiveDayMomentum(t *testing.T) {
+	got := calcTrend([]float64{110, 108, 106, 104, 100, 50, 50}, 112)
+	if math.Abs(got.Momentum-12) > 1e-9 {
+		t.Errorf("动量应只看最近5日 (期望12), 实际 %.2f", got.Momentum)
+	}
+	if got.Days != 7 {
+		t.Errorf("days 应为 7, 实际 %d", got.Days)
 	}
 }
 

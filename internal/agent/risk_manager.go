@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 
 	"jingzhe-trader/internal/llm"
@@ -32,13 +33,14 @@ func (rm *RiskManagerAgent) Judge(ctx *DebateContext, reports []*AnalysisReport,
 	reportsText := formatReports(reports)
 	bullText := formatArguments(bull)
 	bearText := formatArguments(bear)
+	price, pctChg := barQuote(ctx.Bars)
 	// 历史辩论复盘 (反思闭环): 有该股历史决策记录时注入, 提示 LLM 参考过往决策的实际结果
 	reviewSection := ""
 	if ctx.ReviewSummary != "" {
 		reviewSection = fmt.Sprintf("\n该股历史辩论复盘 (近期有方向决策的实际结果):\n%s请特别参考: 若此前 buy 决策多次亏损, 本次应更保守; 若 sell/reject 后多次踏空上涨, 对看空论点要求更严格证据。\n", ctx.ReviewSummary)
 	}
 	userPrompt := fmt.Sprintf(`股票: %s (%s)  日期: %s
-当前持仓: %s  总资产: %.0f
+现价: %.2f (当日%+.2f%%)  当前持仓: %s  总资产: %.0f
 %s
 分析师报告:
 %s
@@ -55,7 +57,7 @@ func (rm *RiskManagerAgent) Judge(ctx *DebateContext, reports []*AnalysisReport,
   "decision": "buy"或"sell"或"hold"或"reject",
   "confidence": 0到1,
   "position_pct": 拟买入金额占总资产的比例, 0~%.2f (上限即单票风控线),
-  "stop_price": 止损价(0表示不设),
+  "stop_price": 决策为 buy 时必须给出低于现价 %.2f 的具体止损价格; 非 buy 决策填 0,
   "risk_level": "low"或"medium"或"high",
   "bull_args": ["看涨理由1"],
   "bear_args": ["看跌理由1"],
@@ -63,10 +65,10 @@ func (rm *RiskManagerAgent) Judge(ctx *DebateContext, reports []*AnalysisReport,
   "summary": "50字以内的决策摘要"
 }`,
 		ctx.TsCode, ctx.Name, ctx.TradeDate,
-		posStr(ctx.Position), ctx.TotalAsset,
+		price, pctChg, posStr(ctx.Position), ctx.TotalAsset,
 		reviewSection,
 		reportsText, bullText, bearText,
-		rm.limits.MaxPositionPct)
+		rm.positionCap(), price)
 	raw, err := callLLMJSON[judgeRaw](rm.llm, ctx.TsCode, ctx.TradeDate, "risk_manager", rm.systemPrompt(), userPrompt)
 	if err != nil {
 		return nil, err
@@ -76,15 +78,16 @@ func (rm *RiskManagerAgent) Judge(ctx *DebateContext, reports []*AnalysisReport,
 		TsCode:      ctx.TsCode,
 		Name:        ctx.Name,
 		Decision:    raw.Decision,
-		Confidence:  raw.Confidence,
-		PositionPct: raw.PositionPct,
+		Confidence:  clamp(raw.Confidence, 0, 1),
+		PositionPct: clamp(raw.PositionPct, 0, rm.positionCap()),
 		StopPrice:   raw.StopPrice,
 		RiskLevel:   raw.RiskLevel,
 		RiskNote:    raw.RiskNote,
 		Summary:     raw.Summary,
 	}
+	rm.sanitizeStopPrice(result, price)
 	if result.Summary == "" {
-		result.Summary = fmt.Sprintf("%s: %s (置信度%.0f%%)", ctx.TsCode, raw.Decision, raw.Confidence*100)
+		result.Summary = fmt.Sprintf("%s: %s (置信度%.0f%%)", ctx.TsCode, raw.Decision, result.Confidence*100)
 	}
 	if b, err := json.Marshal(raw.BullArgs); err == nil {
 		result.BullArgs = string(b)
@@ -93,6 +96,43 @@ func (rm *RiskManagerAgent) Judge(ctx *DebateContext, reports []*AnalysisReport,
 		result.BearArgs = string(b)
 	}
 	return result, nil
+}
+
+// sanitizeStopPrice 保证买入决策带有一个可执行的止损价
+// 提示词已要求给出低于现价的具体价格; 模型仍可能回 0 (把它当成"不设止损") 或回一个高于现价的价格,
+// 这样的价格写进计划原因会误导人工执行, 因此按风控止损线兜底
+func (rm *RiskManagerAgent) sanitizeStopPrice(result *DebateResult, price float64) {
+	if result.Decision != "buy" {
+		result.StopPrice = 0
+		return
+	}
+	if price <= 0 {
+		result.StopPrice = 0 // 无现价可比对, 不编造止损价
+		return
+	}
+	if result.StopPrice > 0 && result.StopPrice < price {
+		return
+	}
+	fallback := math.Round(price*(1-rm.stopLossPct())*100) / 100
+	logger.L().Warnw("风控裁决止损价不可用, 按止损线兜底", "ts_code", result.TsCode,
+		"llm_stop_price", result.StopPrice, "price", price, "fallback", fallback)
+	result.StopPrice = fallback
+}
+
+// positionCap 单票仓位上限 (提示词与结果裁剪共用同一口径)
+func (rm *RiskManagerAgent) positionCap() float64 {
+	if rm.limits.MaxPositionPct > 0 {
+		return rm.limits.MaxPositionPct
+	}
+	return 0.2 // 未配置时按保守值, 避免提示词出现 0% 仓位这种无意义区间
+}
+
+// stopLossPct 止损线 (提示词与止损价兜底共用)
+func (rm *RiskManagerAgent) stopLossPct() float64 {
+	if rm.limits.StopLossPct > 0 {
+		return rm.limits.StopLossPct
+	}
+	return 0.08
 }
 
 // judgeRaw LLM 风控裁决的原始 JSON 结构 (字段与 DebateResult 对应)
@@ -140,7 +180,7 @@ func (rm *RiskManagerAgent) fallbackJudge(ctx *DebateContext, reports []*Analysi
 	decision := "hold"
 	positionPct := 0.0
 	// 与 systemPrompt 告知 LLM 的口径一致: 常规档 = 风控上限 × 0.6, 绝不超过上限
-	stdPct := rm.limits.MaxPositionPct * 0.6
+	stdPct := rm.positionCap() * 0.6
 	if valid == 0 {
 		// 全部分析师无依据: 不凭多空情绪就给出买入, 宁可观望
 		logger.L().Warnw("辩论降级: 无任何有效分析师报告, 维持 hold", "ts_code", ctx.TsCode)
@@ -207,19 +247,11 @@ func formatArguments(arg *ResearchArgument) string {
 // 仓位与止损数字必须来自配置: 写死过一次 (prompt 建议 0.5-0.6 重仓而 risk.max_position_pct=0.40),
 // LLM 就会稳定产出被风控裁掉的建议, 且没人能从结果里看出原因
 func (rm *RiskManagerAgent) systemPrompt() string {
-	maxPos := rm.limits.MaxPositionPct
-	if maxPos <= 0 {
-		maxPos = 0.2 // 未配置时按保守值, 避免提示词出现 0% 仓位这种无意义区间
-	}
+	maxPos := rm.positionCap()
+	totalCap := rm.totalCap()
 	stdPct, heavyPct := maxPos*0.6, maxPos
-	cashPct := 1.0 - rm.limits.MaxTotalPositionPct
-	if rm.limits.MaxTotalPositionPct <= 0 {
-		cashPct = 0.1
-	}
-	stopPct := rm.limits.StopLossPct
-	if stopPct <= 0 {
-		stopPct = 0.08
-	}
+	cashPct := (1.0 - totalCap) * 100
+	stopPct := rm.stopLossPct()
 
 	return fmt.Sprintf(`你是专业的风险管理经理，负责最终投资决策。你需要权衡多空双方论点，结合当前持仓和资金状况，做出审慎决策。
 
@@ -234,7 +266,11 @@ func (rm *RiskManagerAgent) systemPrompt() string {
 - 常规仓位约 %.2f，打满上限 %.2f 属重仓（需高置信度才给）
 - 总仓位上限 %.0f%%，即至少保留 %.0f%% 现金
 - 已有持仓时，新买入信号应降低仓位（避免过度集中）
-- stop_price: 建议设在支撑位下方3-5%%，或成本价下方 %.0f%%
+
+止损价（stop_price）：
+- 决策为 buy 时必须给出一个具体的、低于现价的价格，不要用 0 表示"不设止损"
+- 常规取现价下方约 %.0f%%（即本系统止损线），或近期支撑位下方 3-5%%
+- 已持仓要卖出时无需给止损价，填 0
 
 风险考量：
 - A股T+1，买入后当日无法卖出，需承担隔夜风险
@@ -250,8 +286,15 @@ func (rm *RiskManagerAgent) systemPrompt() string {
 - summary: 必须包含决策核心理由（如"技术面多头+估值合理，建议小仓位买入"）
 
 必须输出合法JSON。`,
-		maxPos, stdPct, heavyPct,
-		rm.limits.MaxTotalPositionPct*100, cashPct*100, stopPct*100)
+		maxPos, stdPct, heavyPct, totalCap*100, cashPct, stopPct*100)
+}
+
+// totalCap 总仓位上限 (未配置时按 90% 留出安全垫, 避免提示词出现"总仓位上限 0%")
+func (rm *RiskManagerAgent) totalCap() float64 {
+	if rm.limits.MaxTotalPositionPct > 0 {
+		return rm.limits.MaxTotalPositionPct
+	}
+	return 0.9
 }
 
 // marshalStrList 将字符串列表序列化为 JSON 字符串

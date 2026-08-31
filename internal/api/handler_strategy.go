@@ -97,13 +97,16 @@ func (s *Service) runStrategy(
 		}
 	}
 	// 合并自动选股结果 (选股器每日自动发现的候选股票)
+	// 新鲜度以本次运行的交易日为准: 用墙钟 today 判断会让跨日重试/回测静默丢掉整个选股池
 	if s.screenRepo != nil {
-		if screenedCodes, err := s.screenRepo.GetScreenedCodes(); err == nil {
-			for _, code := range screenedCodes {
-				if !seen[code] && bars[code] != nil {
-					seen[code] = true
-					universe = append(universe, code)
-				}
+		screenedCodes, err := s.screenRepo.GetScreenedCodes(date)
+		if err != nil {
+			logger.L().Warnw("查询选股候选失败, 本次仅用配置池", "date", date, "err", err)
+		}
+		for _, code := range screenedCodes {
+			if !seen[code] && bars[code] != nil {
+				seen[code] = true
+				universe = append(universe, code)
 			}
 		}
 	}

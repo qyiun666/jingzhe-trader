@@ -2,7 +2,6 @@ package store
 
 import (
 	"fmt"
-	"time"
 
 	"github.com/jmoiron/sqlx"
 )
@@ -103,16 +102,14 @@ func (r *ScreenRepo) GetLatestDate() (string, error) {
 	return maxTableDate(r.db, "screen_result")
 }
 
-// GetScreenedCodes 获取最新选股代码列表 (供策略合并股票池用)
-// 仅返回当日选股结果, 过期返回空列表 (避免空候选日静默使用过期股票池)
-func (r *ScreenRepo) GetScreenedCodes() ([]string, error) {
+// GetScreenedCodes 获取指定交易日的选股代码列表 (供策略合并股票池用)
+// asOfDate 非当次选股日期时返回空列表: 过期候选不能静默充当今日股票池
+func (r *ScreenRepo) GetScreenedCodes(asOfDate string) ([]string, error) {
 	latestDate, err := r.GetLatestDate()
 	if err != nil {
 		return nil, fmt.Errorf("查询最新选股日期失败: %w", err)
 	}
-	today := time.Now().Format("20060102")
-	if latestDate != today {
-		// 选股结果过期, 返回空列表 (不合并过期股票池)
+	if latestDate != asOfDate {
 		return []string{}, nil
 	}
 	var codes []string

@@ -111,7 +111,7 @@ func TestFallbackJudgeAllMissing(t *testing.T) {
 func TestSystemPromptReflectsRiskLimits(t *testing.T) {
 	rm := NewRiskManagerAgent(nil, PositionLimits{MaxPositionPct: 0.4, MaxTotalPositionPct: 0.9, StopLossPct: 0.08})
 	p := rm.systemPrompt()
-	for _, want := range []string{"0~0.40", "总仓位上限 90%", "成本价下方 8%"} {
+	for _, want := range []string{"0~0.40", "总仓位上限 90%", "现价下方约 8%"} {
 		if !strings.Contains(p, want) {
 			t.Errorf("提示词缺少基于配置生成的 %q", want)
 		}
@@ -121,5 +121,54 @@ func TestSystemPromptReflectsRiskLimits(t *testing.T) {
 		if strings.Contains(p, forbidden) {
 			t.Errorf("提示词残留硬编码值 %q", forbidden)
 		}
+	}
+}
+
+// TestSanitizeStopPrice 买入决策的止损价必须可执行: 0 或高于现价的价格都要被换掉
+func TestSanitizeStopPrice(t *testing.T) {
+	rm := NewRiskManagerAgent(nil, PositionLimits{MaxPositionPct: 0.4, MaxTotalPositionPct: 0.9, StopLossPct: 0.08})
+
+	// 模型回 0 (当成"不设止损") → 按现价下方 8% 兜底
+	res := &DebateResult{TsCode: "A.SH", Decision: "buy", StopPrice: 0}
+	rm.sanitizeStopPrice(res, 10.0)
+	if res.StopPrice != 9.2 {
+		t.Errorf("止损价应按止损线兜底为 9.20, 实际 %.2f", res.StopPrice)
+	}
+
+	// 模型回一个高于现价的价格 → 照它做会立刻触发卖出, 必须换掉
+	res = &DebateResult{TsCode: "A.SH", Decision: "buy", StopPrice: 12.5}
+	rm.sanitizeStopPrice(res, 10.0)
+	if res.StopPrice != 9.2 {
+		t.Errorf("高于现价的止损价不可用, 实际 %.2f", res.StopPrice)
+	}
+
+	// 合理价格原样保留
+	res = &DebateResult{TsCode: "A.SH", Decision: "buy", StopPrice: 9.55}
+	rm.sanitizeStopPrice(res, 10.0)
+	if res.StopPrice != 9.55 {
+		t.Errorf("合理止损价不应被改写, 实际 %.2f", res.StopPrice)
+	}
+
+	// 非买入决策不带止损价; 无现价时也不编造
+	res = &DebateResult{TsCode: "A.SH", Decision: "reject", StopPrice: 9.55}
+	rm.sanitizeStopPrice(res, 10.0)
+	if res.StopPrice != 0 {
+		t.Errorf("reject 决策不应保留止损价, 实际 %.2f", res.StopPrice)
+	}
+	res = &DebateResult{TsCode: "A.SH", Decision: "buy", StopPrice: 9.55}
+	rm.sanitizeStopPrice(res, 0)
+	if res.StopPrice != 0 {
+		t.Errorf("无现价时不得凭空给止损价, 实际 %.2f", res.StopPrice)
+	}
+}
+
+// TestNoDataReportExcludedFromMean 无输入维度 (无新闻/无基本面) 必须与"分析失败"一样不计入均值
+func TestNoDataReportExcludedFromMean(t *testing.T) {
+	r := noDataReport("news", "A.SH", "近7日无该股相关新闻")
+	if !r.IsMissingData() {
+		t.Fatal("无输入报告应识别为数据缺失")
+	}
+	if !strings.Contains(r.KeyPoints[0], "近7日无该股相关新闻") {
+		t.Errorf("应保留具体缺失原因, 实际 %q", r.KeyPoints[0])
 	}
 }

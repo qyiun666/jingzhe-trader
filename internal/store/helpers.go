@@ -70,10 +70,13 @@ func getOne(db sqlxGetter, query string, dest any, errMsg string, args ...any) (
 	return true, nil
 }
 
-// maxTableDate 查询表的最大 trade_date
+// maxTableDate 查询表的最大 trade_date; 空表返回空字符串
 func maxTableDate(db sqlxGetter, table string) (string, error) {
 	var d string
-	query := fmt.Sprintf(`SELECT MAX(trade_date) FROM %s`, table)
+	// COALESCE 必需: 空表时 MAX() 结果是 NULL, scan 进 string 会报
+	// "converting NULL to string is unsupported", 于是"还没同步过数据"这个再正常不过的
+	// 初始状态在所有调用点 (含调度器的数据新鲜度检查) 都变成了查询失败
+	query := fmt.Sprintf(`SELECT COALESCE(MAX(trade_date), '') FROM %s`, table)
 	if err := db.Get(&d, query); err != nil {
 		return "", fmt.Errorf("查询最大交易日失败: %w", err)
 	}

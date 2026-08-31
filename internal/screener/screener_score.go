@@ -12,7 +12,7 @@ import (
 // calcScore 评分: 综合活跃度、资金关注度、估值、趋势、动量
 // 权重: 换手20% + 量比20% + 估值15% + 趋势20% + 动量15% + 当日涨跌10%
 // 量纲: 仅用于候选排序比较, 分数会随权重调整变化, 禁止下游按绝对值设阈值
-func (s *Screener) calcScore(basic model.DailyBasic, pctChg, ma5, momentum5d float64) float64 {
+func (s *Screener) calcScore(basic model.DailyBasic, pctChg float64, t Trend) float64 {
 	// 活跃度: 换手率 (1-10% 最佳, 过高可能是炒作)
 	turnoverScore := 0.0
 	if basic.TurnoverRate > 0 {
@@ -49,8 +49,8 @@ func (s *Screener) calcScore(basic model.DailyBasic, pctChg, ma5, momentum5d flo
 
 	// 趋势分: 收盘价高于MA5越多越好 (上限3分)
 	trendScore := 0.0
-	if ma5 > 0 {
-		deviation := (basic.Close - ma5) / ma5 * 100 // 偏离百分比
+	if t.MA5 > 0 {
+		deviation := (basic.Close - t.MA5) / t.MA5 * 100 // 偏离百分比
 		if deviation >= 0 && deviation <= 3 {
 			trendScore = 2.0 + deviation/3 // 2~3分
 		} else if deviation > 3 && deviation <= 8 {
@@ -64,6 +64,7 @@ func (s *Screener) calcScore(basic model.DailyBasic, pctChg, ma5, momentum5d flo
 
 	// 动量分: 5日涨幅 (温和上涨最佳, 暴涨递减; 含走平消除 0 分空洞)
 	momentumScore := 0.0
+	momentum5d := t.Momentum
 	if momentum5d >= 0 && momentum5d <= 5 {
 		momentumScore = 3.0 // 含走平
 	} else if momentum5d > 5 && momentum5d <= 10 {
@@ -101,7 +102,7 @@ func (s *Screener) fetchRecentCloses(today string) map[string][]float64 {
 
 	result := make(map[string][]float64)
 	collected := 0
-	for i := 1; i <= 15 && collected < 5; i++ { // 15 个自然日覆盖春节/国庆长假
+	for i := 1; i <= 15 && collected < trendSamples; i++ { // 15 个自然日覆盖春节/国庆长假
 		date := t.AddDate(0, 0, -i)
 		if date.Weekday() == time.Saturday || date.Weekday() == time.Sunday {
 			continue
@@ -136,35 +137,47 @@ func (s *Screener) closesOfDate(dateStr string) []model.Bar {
 	return bars
 }
 
-// calcTrend 根据近N日收盘价计算均线和N日动量, days 为实际收集到的天数
-// recentCloses 按日期从近到远排列 (index 0 为最近一天)
-func calcTrend(recentCloses []float64, todayClose float64) (ma5, momentum5d float64, days int) {
-	days = len(recentCloses)
-	if days == 0 {
-		return 0, 0, 0
-	}
-	// 均线 = 最近5日 (不足5日时按实际天数) 均价, 不含今天
-	sum := 0.0
-	count := 0
-	for _, c := range recentCloses {
-		if count >= 5 {
-			break
-		}
-		sum += c
-		count++
-	}
-	ma5 = sum / float64(count)
+// trendSamples 判定方向所需的最小样本交易日数 (不含当日)
+// 不能放宽: daily_bar 只在 store.StaleKeepRecentDays 窗口内保留全市场日线,
+// 超出窗口的日期只剩股票池, 样本会被静默截断成几只票的收盘价
+const trendSamples = 5
 
-	// 动量 = (今天收盘 - N日前收盘) / N日前收盘 * 100
-	oldest := recentCloses[days-1]
-	if oldest > 0 {
-		momentum5d = (todayClose - oldest) / oldest * 100
-	}
-	return ma5, momentum5d, days
+// Trend 个股近期方向指标; recentCloses 按日期由近及远排列 (index 0 为最近一日)
+// 样本不足的字段留 0, 由调用方按"方向未知"处理 —— 不能拿不足样本的均线冒充有效信号
+type Trend struct {
+	MA5      float64 // 近 5 日均价 (不含当日); 样本不足 5 日为 0
+	Momentum float64 // 5 日动量 %: 当日收盘相对 5 个交易日前收盘
+	Days     int     // 实际收集到的交易日样本数
 }
 
-// buildReason 构建入选理由
-func (s *Screener) buildReason(basic model.DailyBasic, pctChg, ma5, momentum5d float64, trendDays int) string {
+// calcTrend 由近及远的收盘价序列与当日收盘算出方向指标
+func calcTrend(recentCloses []float64, todayClose float64) Trend {
+	t := Trend{Days: len(recentCloses)}
+	if t.Days == 0 {
+		return t
+	}
+	t.MA5 = avgLatest(recentCloses, trendSamples)
+	if oldest := recentCloses[min(t.Days, trendSamples)-1]; oldest > 0 {
+		t.Momentum = (todayClose - oldest) / oldest * 100
+	}
+	return t
+}
+
+// avgLatest 序列最近 n 个样本的均值; 样本不足 n 时返回 0 (不返回"部分均值",
+// 否则 3 个样本算出的"MA5"会与真正的 MA5 混淆)
+func avgLatest(recentCloses []float64, n int) float64 {
+	if len(recentCloses) < n {
+		return 0
+	}
+	sum := 0.0
+	for _, c := range recentCloses[:n] {
+		sum += c
+	}
+	return sum / float64(n)
+}
+
+// buildReason 构建入选理由 (随候选落库, 是候选为何通过方向门槛的唯一留痕)
+func (s *Screener) buildReason(basic model.DailyBasic, pctChg float64, t Trend) string {
 	var parts []string
 	if basic.TurnoverRate >= 3 {
 		parts = append(parts, fmt.Sprintf("换手率%.1f%%(活跃)", basic.TurnoverRate))
@@ -185,14 +198,10 @@ func (s *Screener) buildReason(basic model.DailyBasic, pctChg, ma5, momentum5d f
 		mvYi := basic.CircMV / 10000 // 万元→亿元
 		parts = append(parts, fmt.Sprintf("流通市值%.0f亿", mvYi))
 	}
-	if ma5 > 0 && trendDays >= 3 { // 数据不足 3 日时省略均线文案
-		if basic.Close > ma5 {
-			parts = append(parts, fmt.Sprintf("MA%d=%.2f(线上)", trendDays, ma5))
-		}
+	if t.MA5 > 0 {
+		parts = append(parts, fmt.Sprintf("MA%d=%.2f(线上)", t.Days, t.MA5))
 	}
-	if trendDays >= 2 {
-		parts = append(parts, fmt.Sprintf("%d日动量%.1f%%", trendDays, momentum5d))
-	}
+	parts = append(parts, fmt.Sprintf("%d日动量%+.1f%%(方向向上)", t.Days, t.Momentum))
 	if len(parts) == 0 {
 		return "综合评分入选"
 	}

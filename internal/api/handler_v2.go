@@ -2,7 +2,6 @@ package api
 
 import (
 	"fmt"
-	"time"
 
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/store"
@@ -167,11 +166,19 @@ func (s *Service) BuildPortfolio() []PositionDetail {
 		return []PositionDetail{}
 	}
 
-	// 获取最新行情来计算市值
-	today := time.Now().Format("20060102")
-	bars, _ := s.barRepo.GetBarsByDate(today)
-	barMap := make(map[string]float64)
-	for _, b := range bars {
+	// 最新行情: 按各标的自身最新一根日线估值
+	// 不能只取"今天"的 bar —— 盘前与当日收盘数据到位之前今天是空的,
+	// 那样每个持仓都会退化成按成本价估值, 浮盈恒为 0, 止损与回撤判断失去依据
+	codes := make([]string, 0, len(positions))
+	for _, p := range positions {
+		codes = append(codes, p.TsCode)
+	}
+	latest, err := s.barRepo.GetLatestBars(codes)
+	if err != nil {
+		logger.L().Warnw("查询持仓最新行情失败, 退化为按成本价估值", "err", err)
+	}
+	barMap := make(map[string]float64, len(latest))
+	for _, b := range latest {
 		barMap[b.TsCode] = b.Close
 	}
 

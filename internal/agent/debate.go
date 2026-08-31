@@ -26,6 +26,7 @@ type DebateOrchestrator struct {
 	basicRepo     *store.BasicRepo
 	finaRepo      *store.FinaRepo
 	newsRepo      *store.NewsRepo
+	stockRepo     *store.StockRepo
 	debateRepo    *store.DebateRepo
 	reviewRepo    *store.DebateReviewRepo
 	moneyflowRepo *store.MoneyFlowRepo
@@ -40,20 +41,32 @@ type DebateOrchestrator struct {
 	riskMgr       *RiskManagerAgent
 }
 
-func NewDebateOrchestrator(llmClient *llm.Client, barRepo *store.BarRepo, basicRepo *store.BasicRepo,
-	finaRepo *store.FinaRepo, newsRepo *store.NewsRepo, debateRepo *store.DebateRepo,
-	reviewRepo *store.DebateReviewRepo, moneyflowRepo *store.MoneyFlowRepo, toplistRepo *store.TopListRepo,
-	settings DebateSettings) *DebateOrchestrator {
-	o := &DebateOrchestrator{llm: llmClient, barRepo: barRepo, basicRepo: basicRepo, finaRepo: finaRepo,
-		newsRepo: newsRepo, debateRepo: debateRepo, reviewRepo: reviewRepo,
-		moneyflowRepo: moneyflowRepo, toplistRepo: toplistRepo, settings: settings}
-	o.tech = NewTechnicalAnalyst(llmClient, barRepo)
-	o.fund = NewFundamentalAnalyst(llmClient, basicRepo, finaRepo)
-	o.news = NewNewsAnalyst(llmClient, newsRepo)
-	o.market = NewMarketAnalyst(llmClient, barRepo, settings.MarketIndexes)
-	o.bull = NewResearcher(llmClient, "bull")
-	o.bear = NewResearcher(llmClient, "bear")
-	o.riskMgr = NewRiskManagerAgent(llmClient, settings.Positions)
+// DebateDeps 辩论编排器依赖, 由组合根一次性装配
+type DebateDeps struct {
+	LLM           *llm.Client
+	BarRepo       *store.BarRepo
+	BasicRepo     *store.BasicRepo
+	FinaRepo      *store.FinaRepo
+	NewsRepo      *store.NewsRepo
+	StockRepo     *store.StockRepo // 所属行业 (消息面在本数据档位下只能按行业检索)
+	DebateRepo    *store.DebateRepo
+	ReviewRepo    *store.DebateReviewRepo
+	MoneyFlowRepo *store.MoneyFlowRepo
+	TopListRepo   *store.TopListRepo
+	Settings      DebateSettings
+}
+
+func NewDebateOrchestrator(d DebateDeps) *DebateOrchestrator {
+	o := &DebateOrchestrator{llm: d.LLM, barRepo: d.BarRepo, basicRepo: d.BasicRepo, finaRepo: d.FinaRepo,
+		newsRepo: d.NewsRepo, stockRepo: d.StockRepo, debateRepo: d.DebateRepo, reviewRepo: d.ReviewRepo,
+		moneyflowRepo: d.MoneyFlowRepo, toplistRepo: d.TopListRepo, settings: d.Settings}
+	o.tech = NewTechnicalAnalyst(o.llm, o.barRepo)
+	o.fund = NewFundamentalAnalyst(o.llm, o.basicRepo, o.finaRepo)
+	o.news = NewNewsAnalyst(o.llm, o.newsRepo)
+	o.market = NewMarketAnalyst(o.llm, o.barRepo, o.settings.MarketIndexes)
+	o.bull = NewResearcher(o.llm, "bull")
+	o.bear = NewResearcher(o.llm, "bear")
+	o.riskMgr = NewRiskManagerAgent(o.llm, o.settings.Positions)
 	return o
 }
 
@@ -128,14 +141,20 @@ func (o *DebateOrchestrator) runResearchersParallel(ctx *DebateContext, reports 
 	bullArg := bullRes.arg
 	if bullRes.err != nil {
 		logger.L().Warnw("看涨研究员失败", "ts_code", ctx.TsCode, "err", bullRes.err)
-		bullArg = &ResearchArgument{Side: "bull", Sentiment: 0, Confidence: 0.1}
+		bullArg = missingArgument("bull")
 	}
 	bearArg := bearRes.arg
 	if bearRes.err != nil {
 		logger.L().Warnw("看跌研究员失败", "ts_code", ctx.TsCode, "err", bearRes.err)
-		bearArg = &ResearchArgument{Side: "bear", Sentiment: 0, Confidence: 0.1}
+		bearArg = missingArgument("bear")
 	}
 	return bullArg, bearArg
+}
+
+// missingArgument 研究员调用失败时的占位论点
+// Confidence 取 0 而非 0.1: 后者与模型真实给出的低置信度无法区分, 会被风控当成一条有效意见
+func missingArgument(side string) *ResearchArgument {
+	return &ResearchArgument{Side: side, Sentiment: 0, Confidence: 0, Arguments: []string{reportMissingData}}
 }
 
 // debateConcurrency 同时辩论的股票数上限 (LLM 全局限流在 client 层统一控制, 此上限防资源峰值)
@@ -165,12 +184,6 @@ func (o *DebateOrchestrator) EnhanceSignals(date string, signals []model.Signal,
 	if !o.IsEnabled() {
 		return signals, nil
 	}
-	marketBars := make(map[string]*model.Bar)
-	for _, code := range o.settings.MarketIndexes {
-		if bar, ok := bars[code]; ok {
-			marketBars[code] = bar
-		}
-	}
 
 	// 股票间并行辩论: 每只股票独立 (LLM 调用已在 client 层限流), 按下标收集保证信号顺序稳定
 	enhanced := make([]model.Signal, len(signals))
@@ -192,7 +205,7 @@ func (o *DebateOrchestrator) EnhanceSignals(date string, signals []model.Signal,
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			ctx := o.buildContext(date, sig.TsCode, stockNames, bars, positions, totalAsset, marketBars)
+			ctx := o.buildContext(date, sig.TsCode, stockNames, bars, positions, totalAsset)
 			if ctx == nil {
 				enhanced[idx] = sig
 				kept[idx] = true
@@ -216,8 +229,8 @@ func (o *DebateOrchestrator) EnhanceSignals(date string, signals []model.Signal,
 			switch result.Decision {
 			case "reject", "hold", "sell":
 				// reject=否决买入, hold=建议观望, sell=建议卖出(对买入信号而言都意味着不买入)
-				logger.L().Infof("[智能体辩论] %s 信号被过滤 %s: decision=%s summary=%s",
-					result.Decision, sig.TsCode, result.Decision, result.Summary)
+				logger.L().Infof("[智能体辩论] %s 信号被过滤: decision=%s summary=%s",
+					sig.TsCode, result.Decision, result.Summary)
 				return // 过滤, kept 保持 false
 			case "buy":
 				// position_pct 口径 = 拟买入金额占总资产比例 (与提示词一致), 按策略下单同一公式换算成数量。
@@ -248,10 +261,19 @@ func (o *DebateOrchestrator) EnhanceSignals(date string, signals []model.Signal,
 	return out, persistFailures
 }
 
-func (o *DebateOrchestrator) buildContext(date, tsCode string, stockNames map[string]string, bars map[string]*model.Bar, positions map[string]*model.Position, totalAsset float64, marketBars map[string]*model.Bar) *DebateContext {
+func (o *DebateOrchestrator) buildContext(date, tsCode string, stockNames map[string]string, bars map[string]*model.Bar, positions map[string]*model.Position, totalAsset float64) *DebateContext {
 	name := tsCode
 	if n, ok := stockNames[tsCode]; ok {
 		name = n
+	}
+	industry := ""
+	if o.stockRepo != nil {
+		st, err := o.stockRepo.GetByCode(tsCode)
+		if err != nil {
+			logger.L().Warnw("查询所属行业失败, 消息面将只按名称/代码检索", "ts_code", tsCode, "err", err)
+		} else if st != nil {
+			industry = st.Industry
+		}
 	}
 	startDate := dateMinusDays(date, 90)
 	history, err := o.barRepo.GetBars(tsCode, startDate, date)
@@ -283,8 +305,8 @@ func (o *DebateOrchestrator) buildContext(date, tsCode string, stockNames map[st
 			reviewSummary = formatReviews(reviews, 5)
 		}
 	}
-	return &DebateContext{TradeDate: date, TsCode: tsCode, Name: name, Bars: history,
-		Position: pos, TotalAsset: totalAsset, MarketBars: marketBars,
+	return &DebateContext{TradeDate: date, TsCode: tsCode, Name: name, Industry: industry, Bars: history,
+		Position: pos, TotalAsset: totalAsset,
 		MoneyFlows: flows, TopLists: tops, ReviewSummary: reviewSummary}
 }
 
@@ -302,6 +324,16 @@ func dateMinusDays(date string, days int) string {
 		return date
 	}
 	return t.AddDate(0, 0, -days).Format("20060102")
+}
+
+// dashedDate 把内部 YYYYMMDD 日期转成 news.datetime 使用的 "2006-01-02" 前缀形式
+// 两种格式并存是历史原因 (行情表按交易日、新闻表按带时区的发布时间字符串), 转换只在此处发生一次
+func dashedDate(date string) string {
+	t, err := time.Parse("20060102", date)
+	if err != nil {
+		return date
+	}
+	return t.Format("2006-01-02")
 }
 
 func ParseDebateArgs(s string) []string {

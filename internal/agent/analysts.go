@@ -10,7 +10,6 @@ import (
 	"jingzhe-trader/internal/llm"
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/store"
-	"jingzhe-trader/pkg/logger"
 )
 
 type TechnicalAnalyst struct {
@@ -27,7 +26,8 @@ func (a *TechnicalAnalyst) Analyze(ctx *DebateContext) (*AnalysisReport, error) 
 	bars := ctx.Bars
 	if len(bars) < 20 {
 		// 需至少 20 根 K 线才能计算 MA20, 否则 ma20=0 会导致误导性的"金叉"信号
-		return &AnalysisReport{Agent: a.Name(), TsCode: ctx.TsCode, Confidence: 0.1}, nil
+		// 返回缺失占位而非 Confidence=0.1 的空报告: 后者会被当成一张偏空的票计入均值
+		return noDataReport(a.Name(), ctx.TsCode, fmt.Sprintf("K线仅%d根, 不足20根无法判断技术形态", len(bars))), nil
 	}
 	last := bars[len(bars)-1]
 	closes := extractCloses(bars)
@@ -95,30 +95,51 @@ func (a *FundamentalAnalyst) Name() string { return "fundamental" }
 func (a *FundamentalAnalyst) Analyze(ctx *DebateContext) (*AnalysisReport, error) {
 	basics, err := a.basicRepo.GetByCode(ctx.TsCode, ctx.TradeDate, ctx.TradeDate)
 	var basic *model.DailyBasic
-	if err == nil && len(basics) > 0 {
+	if err != nil {
+		return nil, fmt.Errorf("查询 %s 基本面失败: %w", ctx.TsCode, err)
+	}
+	if len(basics) > 0 {
 		basic = &basics[0]
 	}
-	finas, _ := a.finaRepo.GetByCode(ctx.TsCode)
+	finas, err := a.finaRepo.GetByCode(ctx.TsCode)
+	if err != nil {
+		return nil, fmt.Errorf("查询 %s 财务指标失败: %w", ctx.TsCode, err)
+	}
 	var fina *model.FinaIndicator
 	if len(finas) > 0 {
 		fina = &finas[0]
 	}
 	if basic == nil && fina == nil {
-		return &AnalysisReport{Agent: a.Name(), TsCode: ctx.TsCode, Confidence: 0.2, KeyPoints: []string{"无基本面数据"}}, nil
+		return noDataReport(a.Name(), ctx.TsCode, "无当日基本面与财务指标数据"), nil
 	}
 	userPrompt := fmt.Sprintf(`股票: %s (%s)  日期: %s
-基本面: PE=%.1f PE_TTM=%.1f PB=%.2f 换手率=%.2f%% 量比=%.2f 市值=%.0f万
-财务: EPS=%.2f ROE=%.2f%% 毛利率=%.1f%% 净利率=%.1f%% 资产负债率=%.1f%% 营收增速=%.1f%%
+%s
+%s
 
 请从基本面分析该股票投资价值，输出JSON:
-{"sentiment": -1到1, "key_points": ["要点1","要点2"], "risks": ["风险1"], "confidence": 0到1}`,
-		ctx.TsCode, ctx.Name, ctx.TradeDate,
-		safeFloat(basic, "PE"), safeFloat(basic, "PE_TTM"), safeFloat(basic, "PB"),
-		safeFloat(basic, "TurnoverRate"), safeFloat(basic, "VolumeRatio"), safeFloat(basic, "TotalMV"),
-		safeFinaFloat(fina, "EPS"), safeFinaFloat(fina, "ROE"),
-		safeFinaFloat(fina, "GrossProfitMargin"), safeFinaFloat(fina, "NetProfitMargin"),
-		safeFinaFloat(fina, "DebtToAssets"), safeFinaFloat(fina, "NetProfitYoy"))
+{"sentiment": -1到1, "key_points": ["要点1","要点2"], "risks": ["风险1"], "confidence": 0到1}
+缺失的一栏请按"信息不足"处理，不得当作 0 值指标解读。`,
+		ctx.TsCode, ctx.Name, ctx.TradeDate, basicLine(basic), finaLine(fina))
 	return callLLMCommon(a.llm, ctx.TsCode, ctx.TradeDate, "fundamental", fundamentalSysPrompt, userPrompt)
+}
+
+// basicLine 估值/成交一行; 无当日 daily_basic 时明写缺失
+// 不能输出 PE=0.0 PB=0.00: 模型会把 0 当成真实测量值, 判成"亏损/异常低估"给出方向错误的结论
+func basicLine(b *model.DailyBasic) string {
+	if b == nil {
+		return "基本面: 当日无数据 (缺失, 非 0)"
+	}
+	return fmt.Sprintf("基本面: PE=%.1f PE_TTM=%.1f PB=%.2f 换手率=%.2f%% 量比=%.2f 市值=%.0f万",
+		b.PE, b.PE_TTM, b.PB, b.TurnoverRate, b.VolumeRatio, b.TotalMV)
+}
+
+// finaLine 财务一行; 无财报数据时明写缺失
+func finaLine(f *model.FinaIndicator) string {
+	if f == nil {
+		return "财务: 无数据 (缺失, 非 0)"
+	}
+	return fmt.Sprintf("财务: EPS=%.2f ROE=%.2f%% 毛利率=%.1f%% 净利率=%.1f%% 资产负债率=%.1f%% 营收增速=%.1f%%",
+		f.EPS, f.ROE, f.GrossProfitMargin, f.NetProfitMargin, f.DebtToAssets, f.NetProfitYoy)
 }
 
 type NewsAnalyst struct {
@@ -131,24 +152,44 @@ func NewNewsAnalyst(llmClient *llm.Client, newsRepo *store.NewsRepo) *NewsAnalys
 }
 func (a *NewsAnalyst) Name() string { return "news" }
 
-func (a *NewsAnalyst) Analyze(ctx *DebateContext) (*AnalysisReport, error) {
-	news, err := a.newsRepo.GetRecent(20)
-	if err != nil || len(news) == 0 {
-		return &AnalysisReport{Agent: a.Name(), TsCode: ctx.TsCode, Confidence: 0.2, KeyPoints: []string{"无近期新闻"}}, nil
-	}
-	relevant := filterRelevantNews(news, ctx.Name, ctx.TsCode)
-	if len(relevant) == 0 {
-		// 无相关新闻时明确输出, 不拿全局热点充数(无关新闻会误导后续辩论)
-		return &AnalysisReport{Agent: a.Name(), TsCode: ctx.TsCode, Confidence: 0.2, KeyPoints: []string{"无相关新闻"}}, nil
-	}
-	userPrompt := fmt.Sprintf(`股票: %s (%s)  日期: %s
-近期新闻:
-%s
+// newsWindowDays 个股相关新闻回溯自然日数 (消息面时效性强于财报, 一周足够)
+const newsWindowDays = 7
 
+// newsLimit 喂给模型的相关新闻条数上限
+const newsLimit = 20
+
+func (a *NewsAnalyst) Analyze(ctx *DebateContext) (*AnalysisReport, error) {
+	keywords := newsKeywords(ctx.Name, ctx.TsCode, ctx.Industry)
+	news, err := a.newsRepo.GetMatching(dashedDate(dateMinusDays(ctx.TradeDate, newsWindowDays)), keywords, newsLimit)
+	if err != nil {
+		return nil, fmt.Errorf("检索 %s 相关新闻失败: %w", ctx.TsCode, err)
+	}
+	if len(news) == 0 {
+		// 无相关新闻按"该维度无输入"处理: 拿全局热点充数会误导辩论, 当成偏空意见同样错
+		return noDataReport(a.Name(), ctx.TsCode, fmt.Sprintf("近%d日无该股及其行业(%s)相关新闻",
+			newsWindowDays, orUnknown(ctx.Industry))), nil
+	}
+	userPrompt := fmt.Sprintf(`股票: %s (%s)  所属行业: %s  日期: %s
+相关新闻 (按名称/代码/行业检索, 共%d条, 最新在前; 其中多数可能只是行业或宏观消息):
+%s
 请分析新闻对%s的影响，输出JSON:
 {"sentiment": -1到1, "key_points": ["要点1","要点2"], "risks": ["风险1"], "confidence": 0到1}`,
-		ctx.TsCode, ctx.Name, ctx.TradeDate, formatNews(relevant), ctx.Name)
+		ctx.TsCode, ctx.Name, orUnknown(ctx.Industry), ctx.TradeDate, len(news), formatNews(news), ctx.Name)
 	return callLLMCommon(a.llm, ctx.TsCode, ctx.TradeDate, "news", newsSysPrompt, userPrompt)
+}
+
+// newsKeywords 新闻检索关键字: 股票简称 + 六位代码 + 所属行业
+// 行业是本数据档位下唯一稳定可得的消息面入口 (个股级新闻接口无权限, major_news 只给宏观/行业条目)
+func newsKeywords(name, tsCode, industry string) []string {
+	return []string{name, strings.Split(tsCode, ".")[0], industry}
+}
+
+// orUnknown 空字段的可读占位, 避免提示词里出现空括号
+func orUnknown(s string) string {
+	if s == "" {
+		return "未知"
+	}
+	return s
 }
 
 type MarketAnalyst struct {
@@ -162,31 +203,58 @@ func NewMarketAnalyst(llmClient *llm.Client, repo *store.BarRepo, indexCodes []s
 }
 func (a *MarketAnalyst) Name() string { return "market" }
 
+// indexLookbackDays 大盘趋势取近多少个自然日 (约 5 个交易日)
+const indexLookbackDays = 12
+
 func (a *MarketAnalyst) Analyze(ctx *DebateContext) (*AnalysisReport, error) {
-	var indexText strings.Builder
+	var lines []string
 	for _, code := range a.indexCodes {
-		if bar, ok := ctx.MarketBars[code]; ok {
-			indexText.WriteString(fmt.Sprintf("%s: 收盘%.2f 涨跌%.2f%%  |  ", code, bar.Close, bar.PctChg))
+		line, err := a.indexLine(code, ctx.TradeDate)
+		if err != nil {
+			return nil, fmt.Errorf("查询指数 %s 日线失败: %w", code, err)
+		}
+		if line != "" {
+			lines = append(lines, line)
 		}
 	}
-	// 一个指数 bar 都没有: 让 LLM 判断大盘只会得到编造的结论, 直接标记缺失 (也省一次调用)
-	if indexText.Len() == 0 {
-		logger.L().Warnw("无大盘指数数据, 大盘分析跳过", "ts_code", ctx.TsCode,
-			"expected", a.indexCodes, "hint", "确认 dataloader.watchlist 与指数日线同步是否生效")
-		return &AnalysisReport{
-			Agent:     a.Name(),
-			TsCode:    ctx.TsCode,
-			KeyPoints: []string{reportMissingData},
-		}, nil
+	// 一个有效指数都没有: 让 LLM 判断大盘只会得到编造的结论, 直接标记缺失 (也省一次调用)
+	if len(lines) == 0 {
+		return noDataReport(a.Name(), ctx.TsCode,
+			fmt.Sprintf("无当日大盘指数行情 (期望 %v), 需确认指数日线同步", a.indexCodes)), nil
 	}
+	_, stockPct := barQuote(ctx.Bars)
 	userPrompt := fmt.Sprintf(`股票: %s (%s)  日期: %s
-大盘指数: %s
+大盘指数:
+%s
 该股当日涨跌: %.2f%%
 
 请分析当前市场环境对该股的影响，输出JSON:
 {"sentiment": -1到1, "key_points": ["要点1","要点2"], "risks": ["风险1"], "confidence": 0到1}`,
-		ctx.TsCode, ctx.Name, ctx.TradeDate, indexText.String(), safeBarPctChg(ctx.Bars))
+		ctx.TsCode, ctx.Name, ctx.TradeDate, strings.Join(lines, "\n"), stockPct)
 	return callLLMCommon(a.llm, ctx.TsCode, ctx.TradeDate, "market", marketSysPrompt, userPrompt)
+}
+
+// indexLine 单个指数的近期走势一行; 无当日数据时返回空串 (不把旧行情说成当日)
+func (a *MarketAnalyst) indexLine(code, tradeDate string) (string, error) {
+	bars, err := a.repo.GetBars(code, dateMinusDays(tradeDate, indexLookbackDays), tradeDate)
+	if err != nil {
+		return "", err
+	}
+	if len(bars) == 0 || bars[len(bars)-1].TradeDate != tradeDate {
+		return "", nil
+	}
+	last := bars[len(bars)-1]
+	start := 0
+	if len(bars) > 5 {
+		start = len(bars) - 5
+	}
+	first := bars[start]
+	chg := 0.0
+	if first.Close > 0 {
+		chg = (last.Close - first.Close) / first.Close * 100
+	}
+	return fmt.Sprintf("  %s: 收盘%.2f 当日%+.2f%% 近%d个交易日%+.2f%%",
+		code, last.Close, last.PctChg, len(bars)-start, chg), nil
 }
 
 func callLLMCommon(client *llm.Client, tsCode, tradeDate, agentType, sysPrompt, userPrompt string) (*AnalysisReport, error) {
@@ -196,6 +264,8 @@ func callLLMCommon(client *llm.Client, tsCode, tradeDate, agentType, sysPrompt, 
 	}
 	report.Agent = agentType
 	report.TsCode = tsCode
+	report.Sentiment = clamp(report.Sentiment, -1, 1)
+	report.Confidence = clamp(report.Confidence, 0, 1)
 	return report, nil
 }
 
@@ -274,53 +344,13 @@ func posStr(p *model.Position) string {
 	return fmt.Sprintf("%d股 成本%.2f 浮动%.2f%%", p.TotalQty, p.CostPrice, p.FloatingPnLPct*100)
 }
 
-func safeFloat(b *model.DailyBasic, field string) float64 {
-	if b == nil {
-		return 0
-	}
-	switch field {
-	case "PE":
-		return b.PE
-	case "PE_TTM":
-		return b.PE_TTM
-	case "PB":
-		return b.PB
-	case "TurnoverRate":
-		return b.TurnoverRate
-	case "VolumeRatio":
-		return b.VolumeRatio
-	case "TotalMV":
-		return b.TotalMV
-	}
-	return 0
-}
-
-func safeFinaFloat(f *model.FinaIndicator, field string) float64 {
-	if f == nil {
-		return 0
-	}
-	switch field {
-	case "EPS":
-		return f.EPS
-	case "ROE":
-		return f.ROE
-	case "GrossProfitMargin":
-		return f.GrossProfitMargin
-	case "NetProfitMargin":
-		return f.NetProfitMargin
-	case "DebtToAssets":
-		return f.DebtToAssets
-	case "NetProfitYoy":
-		return f.NetProfitYoy
-	}
-	return 0
-}
-
-func safeBarPctChg(bars []model.Bar) float64 {
+// barQuote 最后一根K线的收盘价与当日涨跌幅; 无K线时返回 (0,0) 表示行情未知
+func barQuote(bars []model.Bar) (close, pctChg float64) {
 	if len(bars) == 0 {
-		return 0
+		return 0, 0
 	}
-	return bars[len(bars)-1].PctChg
+	last := bars[len(bars)-1]
+	return last.Close, last.PctChg
 }
 
 func filterRelevantNews(news []model.News, name, tsCode string) []model.News {
@@ -406,13 +436,14 @@ const newsSysPrompt = `你是专业的A股新闻舆情分析师，擅长解读�
 - 中性：例行公告、常规调研、信息披露
 
 注意：
-- 只分析与该股票直接相关的新闻，不发散到行业整体
+- 区分两类消息：直接提到该股（名称或代码）的个股消息，与只涉及其行业/宏观的行业消息
+- 只有个股消息才足以支撑较强方向判断；行业消息最多给 ±0.3，且需在 key_points 里写明是行业层面
 - 新闻有时效性，3天内的新闻权重高于1周前的
 - 如果没有相关新闻，明确说"无相关新闻"，不要编造
 
 评分标准：
-- sentiment: -1(重大利空)到1(重大利好)，0.3以上为偏多，-0.3以下为偏空；无相关新闻时给0
-- confidence: 0到1，无相关新闻或新闻与该股本弱相关时给0.2-0.4
+- sentiment: -1(重大利空)到1(重大利好)，0.3以上为偏多，-0.3以下为偏空；仅有行业消息时不超过 ±0.3
+- confidence: 0到1，仅有行业消息或消息与该股本弱相关时给0.2-0.4
 - key_points: 1-3条，每条须能对应到具体新闻标题或时间
 - risks: 1-2条消息面风险（如传闻未证实、利好已兑现、减持公告待落地）
 

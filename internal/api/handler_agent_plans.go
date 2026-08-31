@@ -78,7 +78,17 @@ func (s *Service) GenerateTradePlans(date string) ([]*store.TradePlan, error) {
 		s.escalateDebatePersistFailures(date, persistFailures)
 	}
 
-	passed, rejections := engine.CheckAndSortSignals(date, rm, merged, positions, asset.TotalAsset, s.loadRiskStocks(merged), todayBars)
+	passed, rejections := engine.CheckAndSortSignals(engine.SignalInput{
+		Date:       date,
+		Risk:       rm,
+		Signals:    merged,
+		Positions:  positions,
+		Stocks:     s.loadRiskStocks(merged),
+		Bars:       todayBars,
+		TotalAsset: asset.TotalAsset,
+		Cash:       asset.Cash,
+		Cost:       s.cost,
+	})
 
 	// 升级告警: 止损信号被风控拦截 (如跌停无法卖出/持仓不足) 必须让用户知道, 不能静默丢失
 	s.escalateStopLossRejections(date, rejections, stopCodes)

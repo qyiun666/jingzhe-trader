@@ -96,6 +96,7 @@ func (r *researcher) Research(ctx *DebateContext, reports []*AnalysisReport) (*R
 	} else if r.side == "bear" {
 		arg.Sentiment = math.Max(-1, math.Min(0, arg.Sentiment))
 	}
+	arg.Confidence = clamp(arg.Confidence, 0, 1)
 	return arg, nil
 }
 

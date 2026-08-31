@@ -94,6 +94,7 @@ func NewBacktestRunner(db *sqlx.DB, cfg RunConfig, appCfg *config.Config) (*Back
 		TradeRepo: store.NewTradeRepo(db),
 		FillMode:  cfg.FillPrice,
 		Stocks:    stocks,
+		Cost:      costModel,
 	})
 
 	return &BacktestRunner{cfg: cfg, appCfg: appCfg, db: db, pipeline: pipeline, runID: runID}, nil
