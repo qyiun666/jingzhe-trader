@@ -18,15 +18,14 @@ vendor/
 go.work
 
 # ==================== Sensitive Data ====================
-# 配置白名单: config/ 下除 example 外的所有 yaml 一律不提交 (防密钥泄露)
-config/*.yaml
-config/*.yml
-config/.tmp*
-!config/config.example.yaml
+# 配置文件体系已废除: 整棵配置连同凭据存在 data/jingzhe.db 的 config_kv 表内。
+# 下面几条是"有人又把密钥写回配置文件"的防线, 一律不提交 (不再有 example 白名单例外)
+config/
 .env
 .env.*
 
-# SQLite database (contains market data, not redistributable)
+# SQLite database — 现含凭据 (tushare token / LLM key / SMTP 授权码), 绝不提交
+# 建议同时 chmod 600; 若经 Syncthing 同步, 注意 .stversions 会保留历史版本里的旧凭据
 data/*.db
 data/*.db-journal
 

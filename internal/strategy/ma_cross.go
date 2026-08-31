@@ -160,7 +160,7 @@ func (s *MACrossStrategy) OnBar(_ context.Context, barCtx *BarContext) ([]model.
 			if !ok || bar.Close <= 0 {
 				continue
 			}
-			qty := calcBuyQty(barCtx.TotalAsset, bar.Close, positionPct)
+			qty := CalcBuyQty(barCtx.TotalAsset, bar.Close, positionPct)
 			if qty > 0 {
 				reason := fmt.Sprintf("均线金叉: MA%d=%.2f上穿MA%d=%.2f", shortPeriod, currShort, longPeriod, currLong)
 				if s.EnableAdaptive {

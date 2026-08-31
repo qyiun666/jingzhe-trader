@@ -1,17 +1,17 @@
 #!/bin/zsh
 # 惊蛰服务 launchd 启动脚本
-# 职责: 注入环境变量凭据 → 进入项目目录 → exec 前台运行服务 (launchd 需要前台进程才能 KeepAlive)
-# 凭据一律来自 ~/.jingzhe.env (权限 600, 已 gitignore), 禁止写入本脚本/代码/配置
+# 职责: 注入应急凭据覆盖 → 进入项目目录 → exec 前台运行服务 (launchd 需要前台进程才能 KeepAlive)
+# 配置与凭据本体都在数据库 data/jingzhe.db 的 config_kv 配置文档内;
+# ~/.jingzhe.env 只是"变量非空才顶换库内值"的应急通道 (如库损坏/紧急轮换密钥)
 ENV_FILE="$HOME/.jingzhe.env"
 
 if [[ ! -f "$ENV_FILE" ]]; then
-  echo "[jingzhe] 缺少 $ENV_FILE (参考 scripts/jingzhe.env.example), 无法注入 TUSHARE_TOKEN 等凭据, 拒绝空配置启动" >&2
-  exit 1
+  echo "[jingzhe] 无 $ENV_FILE, 使用库内配置的凭据启动" >&2
+else
+  set -a
+  source "$ENV_FILE"
+  set +a
 fi
 
-set -a
-source "$ENV_FILE"
-set +a
-
 cd /Volumes/zt_hd/projects/jingzhe-trader || exit 1
-exec /Volumes/zt_hd/projects/jingzhe-trader/bin/jingzhe-server -config /Volumes/zt_hd/projects/jingzhe-trader/config/config.yaml
+exec /Volumes/zt_hd/projects/jingzhe-trader/bin/jingzhe-server

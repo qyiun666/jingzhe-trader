@@ -17,7 +17,9 @@ func setupChangeTest(t *testing.T) (*DebateOrchestrator, *store.DebateRepo) {
 	}
 	t.Cleanup(func() { db.Close() })
 	repo := store.NewDebateRepo(db)
-	return NewDebateOrchestrator(nil, nil, nil, nil, nil, repo, nil, nil, nil), repo
+	return NewDebateOrchestrator(nil, nil, nil, nil, nil, repo, nil, nil, nil, DebateSettings{
+		Positions: PositionLimits{MaxPositionPct: 0.4, MaxTotalPositionPct: 0.9, StopLossPct: 0.08},
+	}), repo
 }
 
 // TestDetectDecisionChangesNewSymbol 新增标的应单独标记为 new_symbol, 与决策变更区分

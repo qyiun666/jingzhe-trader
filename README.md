@@ -17,9 +17,9 @@
 
 > 你是惊蛰交易系统的 AI 助手。系统 24h 常驻 NAS，自动完成数据→选股→信号→日报→监控全链路。你只需通过 MCP 调用工具读结果、审批计划、反馈成交。
 
-**部署**: `git clone` → 环境变量(`.env`) → `go build` → `systemd` 自启 → cron 健康检查
+**部署**: `git clone` → `go build` → 首次启动自动把默认配置种子进库 → `bin/config set` 写凭据 → `systemd` 自启 → cron 健康检查
 
-**密钥**: 全部走环境变量（`TUSHARE_TOKEN` / `LLM_API_KEY` / `JZ_API_TOKEN`），config.yaml 已 gitignore 不提交
+**密钥**: 与配置一起存在 `data/jingzhe.db` 的 `config_kv` 表内（该库已 gitignore 不提交，建议 `chmod 600`）；`TUSHARE_TOKEN` / `LLM_API_KEY` / `JZ_API_TOKEN` / `JZ_MAIL_PASSWORD` 作为应急覆盖通道保留，非空才顶换库内值
 
 **核心 MCP 工具**（`get_*` 为读工具，其余为写工具）：
 
@@ -142,30 +142,35 @@ go build -o bin/optimizer ./cmd/optimizer
 
 ### 2. 配置
 
-```bash
-cp config/config.example.yaml config/config.yaml
-```
+没有配置文件。**全部配置（含凭据）存在数据库的 `config_kv` 表里**，键为 `config` 的单行 JSON 文档。
 
-> **安全模型**: `config/config.yaml` 已在 `.gitignore` 中，**永远不会提交到 Git**。所有密钥（Tushare Token、DeepSeek Key、API Token、SMTP 授权码）一律通过环境变量注入，源码和配置文件均不含任何密钥。部署时创建 `.env` 文件（同样 gitignore），systemd/cron 自动读取。
-
-**密钥一律走环境变量，不要写进配置文件**（配置文件中的同名项会被环境变量覆盖）：
+首次启动时若库内还没有配置文档，会用代码里的默认值自动种子一份，因此 clone 完直接跑就行：
 
 ```bash
-export TUSHARE_TOKEN=你的tushare token       # 必需, 行情数据源
-export JZ_API_TOKEN=随机长字符串              # 推荐, API鉴权token
-export LLM_API_KEY=deepseek密钥              # 可选, 新闻分析+多智能体辩论
-export QMT_SIDECAR_TOKEN=随机长字符串         # QMT实盘时, sidecar鉴权
+bin/config dump                        # 查看生效配置 (合并默认值, 凭据掩码)
+bin/config get  screener.max_pe        # 读单项
+bin/config set  screener.max_pe 80     # 改单项, 值按 JSON 解析 (数字/布尔/数组均可)
+bin/config dump -show-secrets          # 需要看凭据明文时
 ```
 
-> ⚠️ 如果你的 token 曾经写在配置文件里提交过 git，请立即到对应平台**轮换**。
+库路径是唯一的外部输入，优先级为 `-db` 参数 → `JZ_DB_PATH` 环境变量 → `data/jingzhe.db`。
+
+> **安全模型**：凭据与行情同在 `data/jingzhe.db`，该文件已在 `.gitignore` 中（`data/*.db`），
+> **永远不会提交到 Git**。请保持其权限为 `600`（`chmod 600 data/jingzhe.db`）。
+> `cmd/config dump`、`get`、以及所有日志输出通道默认都对凭据掩码，明文只在显式 `-show-secrets` 时给出。
+> 四个环境变量（`TUSHARE_TOKEN` / `LLM_API_KEY` / `JZ_API_TOKEN` / `JZ_MAIL_PASSWORD`）仍可用，
+> 但已降级为**非空才顶换库内值**的应急通道，用于库损坏或需要紧急轮换密钥的场景。
+
+> ⚠️ 用 `bin/config set` 换密钥后，旧的明文密钥若曾写进过任何被同步/备份的位置（例如
+> Syncthing 的 `data/.stversions/` 版本历史），仍可被恢复——轮换后请到对应平台吊销旧值。
 
 ### 3. 拉取数据 & 回测
 
 ```bash
-bin/dataloader -config config/config.yaml          # 首次约拉3年数据
-bin/dataloader -config config/config.yaml -adj     # 历史库升级后回填复权因子 (一次性)
-bin/backtest -config config/config.yaml            # 回测并生成HTML报告 (前复权+真实T+1+滑点+涨跌停)
-bin/optimizer -config config/config.yaml -walkforward -folds 3   # 样本外验证参数寻优
+bin/dataloader                         # 首次约拉3年数据
+bin/dataloader -adj                    # 历史库升级后回填复权因子 (一次性)
+bin/backtest                           # 回测并生成HTML报告 (前复权+真实T+1+滑点+涨跌停)
+bin/optimizer -walkforward -folds 3    # 样本外验证参数寻优
 ```
 
 > **复权说明**：系统全链路使用前复权价格（回测与实盘同一口径），数据同步自动合并复权因子；
@@ -175,8 +180,8 @@ bin/optimizer -config config/config.yaml -walkforward -folds 3   # 样本外验�
 ### 4. 启动常驻服务
 
 ```bash
-bin/server -config config/config.yaml
-# 监听端口取自 config.yaml 的 server.port (example 默认 11270)
+bin/server
+# 监听端口取自库内配置 server.port (默认 11270; 改值: bin/config set server.port 11270)
 curl http://127.0.0.1:11270/health              # 健康检查 (无需鉴权)
 # MCP 端点: http://127.0.0.1:11270/mcp
 # 在支持 MCP 的客户端（Claude/Cursor/任意 MCP inspector）中配置以上 URL
@@ -184,7 +189,7 @@ curl http://127.0.0.1:11270/health              # 健康检查 (无需鉴权)
 
 ## 小资金配置指南（1 万元档）
 
-`config.example.yaml` 默认即为 1 万资金调好的参数：
+代码内置的默认值即为 1 万资金调好的参数（首次启动自动种子进库）：
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
@@ -262,16 +267,14 @@ curl http://127.0.0.1:11270/health              # 健康检查 (无需鉴权)
 
 ### 前置配置：启用多智能体辩论
 
-在 `config.yaml` 中启用 LLM，辩论系统自动生效（不启用则仅用策略信号，跳过辩论）。**仅支持 DeepSeek API**（OpenAI 兼容接口）：
+用 `bin/config set` 开启 LLM，辩论系统自动生效（不启用则仅用策略信号，跳过辩论）。**仅支持 DeepSeek API**（OpenAI 兼容接口）：
 
-```yaml
-# config.yaml
-llm:
-  enabled: true              # 改为 true 启用
-  api_key: ""                # 留空，用环境变量 LLM_API_KEY 注入
-  base_url: "https://api.deepseek.com/v1"  # DeepSeek API 地址
-  model: "deepseek-chat"     # deepseek-chat 或 deepseek-reasoner
-  json_mode: true            # DeepSeek 支持 response_format: json_object
+```bash
+bin/config set llm.enabled true
+bin/config set llm.api_key 你的deepseek密钥     # 写入库内; 读取默认掩码, 需明文加 -show-secrets
+bin/config set llm.base_url https://api.deepseek.com/v1
+bin/config set llm.model    deepseek-chat       # 或 deepseek-reasoner
+bin/config set llm.json_mode true               # DeepSeek 支持 response_format: json_object
 ```
 
 ```bash
@@ -613,29 +616,27 @@ go build -o bin/optimizer  ./cmd/optimizer
 > scp bin/server  nas:/opt/jingzhe-trader/bin/
 > ```
 
-#### 2. 配置文件 + 环境变量
+#### 2. 配置与凭据（都在数据库里）
+
+没有配置文件。首次执行任意命令时会用代码默认值在库内种子一份配置文档，之后按需改：
 
 ```bash
-cp config/config.example.yaml config/config.yaml
-# 按需修改 config.yaml (股票池、资金量、策略参数)
+cd /opt/jingzhe-trader
+./bin/config set tushare.token 你的tushare_token
+./bin/config set server.api_token 随机长字符串_用于API鉴权   # 务必配置, 否则局域网无鉴权可调 MCP
+./bin/config set llm.api_key   你的deepseek密钥             # 可选, 不配则跳过辩论
+./bin/config dump                                            # 确认生效值 (凭据掩码)
+chmod 600 data/jingzhe.db                                    # 库内含凭据, 仅 owner 可读
 ```
 
-**密钥一律走环境变量**，写入 `.env` 文件（systemd 会读取）：
-
-```bash
-cat > /opt/jingzhe-trader/.env <<'EOF'
-TUSHARE_TOKEN=你的tushare_token
-JZ_API_TOKEN=随机长字符串_用于API鉴权
-LLM_API_KEY=你的deepseek密钥
-EOF
-chmod 600 /opt/jingzhe-trader/.env      # 仅 owner 可读
-```
+> 若希望凭据不落进同步/备份覆盖的库文件，可继续用 systemd 的 `EnvironmentFile=/opt/jingzhe-trader/.env`
+> 注入 `TUSHARE_TOKEN` 等变量——非空即顶换库内值，属应急通道；该文件同样要 `chmod 600`。
 
 #### 3. 首次拉取历史数据
 
 ```bash
 cd /opt/jingzhe-trader
-./bin/dataloader -config config/config.yaml   # 首次约 10-20 分钟, 拉取 3 年数据
+./bin/dataloader                        # 首次约 10-20 分钟, 拉取 3 年数据
 ```
 
 确认数据已入库：
@@ -692,7 +693,7 @@ tail -50 /opt/jingzhe-trader/logs/health_check.log
 #### 6. 防火墙放行（远程访问）
 
 ```bash
-# 仅放行局域网访问 API (11270 为默认端口, 见 config.yaml server.port)
+# 仅放行局域网访问 API (11270 为默认端口, 见库内配置 server.port)
 sudo iptables -A INPUT -p tcp --dport 11270 -s 192.168.1.0/24 -j ACCEPT
 ```
 
@@ -724,20 +725,20 @@ sudo systemctl status jingzhe
 curl -s http://127.0.0.1:11270/health
 ```
 
-> **更新 config.yaml 时**：直接编辑后 `sudo systemctl restart jingzhe` 即可，无需重新编译。
+> **改配置时**：`bin/config set <key> <value>` 写库后 `sudo systemctl restart jingzhe` 即可，无需重新编译。
 
 ### 常见问题排查
 
 | 现象 | 排查 |
 |---|---|
-| 服务启动后立即退出 | `journalctl -u jingzhe -n 50` 看日志；多为 config.yaml 路径或 `.env` 缺失 |
-| 数据一直不更新 | 检查 Tushare token 是否过期；`./bin/dataloader -config config/config.yaml` 手动跑看报错 |
-| 今天不在交易日历 | 健康检查脚本会自动补；也可手动 `./bin/dataloader -config config/config.yaml` |
+| 服务启动后立即退出 | `journalctl -u jingzhe -n 50` 看日志；多为 `-db`/`JZ_DB_PATH` 指向的库不可用，或库内配置文档损坏（`bin/config dump` 验证） |
+| 数据一直不更新 | 检查 Tushare token 是否过期（`bin/config get tushare.token`）；`./bin/dataloader` 手动跑看报错 |
+| 今天不在交易日历 | 健康检查脚本会自动补；也可手动 `./bin/dataloader` |
 | 周末调度器不工作 | 正常，调度器用系统时间判断周末，非交易日不执行数据/信号任务 |
 | MCP 返回 401 | MCP 请求需 `Authorization: Bearer $JZ_API_TOKEN`（仅 `/health` 豁免） |
-| 策略信号丢失 | 策略实例已缓存，重启服务后会重新初始化；检查 `config.yaml` 股票池是否有当日行情 |
+| 策略信号丢失 | 策略实例已缓存，重启服务后会重新初始化；检查库内股票池配置（`bin/config get universe.bluechip`）是否有当日行情 |
 | 磁盘空间告警 | 调度器每日 16:30 自动清理；紧急可 `sqlite3 data/jingzhe.db "VACUUM;"` |
-| LLM 辩论无结果 | 检查 `llm.enabled: true` 和 `LLM_API_KEY` 环境变量；仅支持 DeepSeek API；LLM 失败时会输出 Warn 日志而非静默降级 |
+| LLM 辩论无结果 | `bin/config get llm.enabled` 应为 true、`bin/config get llm.api_key -show-secrets` 应有值；仅支持 DeepSeek API；LLM 失败时会输出 Warn 日志而非静默降级 |
 
 ### macOS (launchd)
 
@@ -772,7 +773,7 @@ internal/
   mcp/          MCP over Streamable HTTP 对外接口
   dataloader/   Tushare 数据同步 (库化, CLI与调度器共用)
   llm/          LLM 客户端 (仅 DeepSeek/新闻分析/带缓存)
-  config/       配置管理 (环境变量覆盖敏感项)
+  config/       配置声明与默认值目录 (整棵配置存于 SQLite config_kv, 无配置文件)
 ```
 
 ## 免责声明

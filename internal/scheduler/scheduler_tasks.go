@@ -18,8 +18,17 @@ import (
 
 // runDataUpdate 15:10 数据更新 (进程内调用 dataloader)
 func (s *Scheduler) runDataUpdate(date string) error {
-	if err := s.svc.UpdateData(); err != nil {
+	report, err := s.svc.UpdateDataReport()
+	if err != nil {
 		return fmt.Errorf("数据更新失败: %w", err)
+	}
+	// 辅助数据源 (新闻/资金流/龙虎榜/财务指标) 失败: 不影响核心行情与信号,
+	// 但必须显式告警 —— 此前只写日志, 结果四张表长期 0 行而任务始终显示成功
+	if len(report.OptionalFailures) > 0 {
+		msg := "以下辅助数据源本次同步失败, 相关表将缺数据 (辩论/基本面分析会受影响), 核心行情与信号不受影响:\n- " +
+			strings.Join(report.OptionalFailures, "\n- ")
+		logger.L().Errorw("辅助数据源同步失败", "date", date, "failures", report.OptionalFailures)
+		s.alert("⚠️ 惊蛰辅助数据缺失", msg)
 	}
 	// 数据新鲜后记录实盘账户快照 (收益曲线; 失败不阻断主任务)
 	// 与信号任务同策略: 快照成功才重评风险模式, 避免用未收盘的旧市值误切模式 (18:00 信号补记会再评)
@@ -318,6 +327,11 @@ func (s *Scheduler) runRetention(date string, fullClean bool) error {
 		BarYears:     rc.BarYears,
 		NewsDays:     rc.NewsDays,
 		PlanDays:     rc.PlanDays,
+		ActionDays:   rc.ActionDays,
+		AlertDays:    rc.AlertDays,
+		ScreenDays:   rc.ScreenDays,
+		DebateDays:   rc.DebateDays,
+		FinaQuarters: rc.FinaQuarters,
 		BacktestRuns: rc.BacktestRuns,
 		LogDays:      rc.LogDays,
 		ReportFiles:  rc.ReportFiles,

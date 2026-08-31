@@ -6,17 +6,19 @@ package main
 // 对每组参数运行完整回测, 计算绩效指标, 最后按多个维度排序输出 TOP N。
 //
 // 用法:
-//   go run ./cmd/optimizer -config config/config.yaml -strategy ma_cross \
+//   go run ./cmd/optimizer -strategy ma_cross \
 //       -start 20240101 -end 20260715 -capital 10000
 //
 // Walk-Forward 样本外验证 (切 K 段, 每段前 2/3 训练选参, 后 1/3 样本外评估):
-//   go run ./cmd/optimizer -config config/config.yaml -walkforward -folds 3
+//   go run ./cmd/optimizer -walkforward -folds 3
 //
 // 说明:
+//   - 配置与行情都在 -db 指定的库里 (默认取 JZ_DB_PATH 或 data/jingzhe.db)
 //   - 回测引擎内部已计算好 Metrics (CalculateMetrics), 这里直接读取 result.Metrics
 //   - ma_cross 策略 Init 用 v.(float64) 解析参数, 因此 short/long 必须传 float64
 //   - 批量回测时设置 Silent=true 并把日志级别调到 warn, 避免单次回测日志刷屏
-//   - 每次回测后调用 engine.Close() 释放数据库连接, 防止连接泄漏
+//   - 每组参数各开一条数据库连接跑完即关: 单条连接被 SetMaxOpenConns(1) 限死,
+//     共享给 worker 池会让并行回测退化成串行
 
 import (
 	"flag"
@@ -26,6 +28,7 @@ import (
 	"sort"
 	"time"
 
+	"jingzhe-trader/internal/appcfg"
 	"jingzhe-trader/internal/config"
 	"jingzhe-trader/pkg/logger"
 )
@@ -45,7 +48,7 @@ type OptResult struct {
 }
 
 func main() {
-	configPath := flag.String("config", "config/config.yaml", "配置文件路径")
+	dbPath := flag.String("db", "", "数据库路径 (配置即存于此库, 默认取 "+appcfg.EnvDBPath+" 或 "+config.DefaultDBPath()+")")
 	strategyName := flag.String("strategy", "ma_cross", "策略名称")
 	startDate := flag.String("start", "20240101", "回测起始日期 YYYYMMDD")
 	endDate := flag.String("end", "20260715", "回测结束日期 YYYYMMDD")
@@ -57,8 +60,17 @@ func main() {
 	parallel := flag.Int("parallel", defaultParallelWorkers(), "并行回测 worker 数 (0=串行)")
 	flag.Parse()
 
-	// 1. 加载配置
-	cfg, err := config.Load(*configPath)
+	// 1. 先开库读配置, 读完即关: 后续每组参数各开自己的连接, 以免 worker 池挤同一条被串行化
+	resolvedDB := appcfg.ResolveDBPath(*dbPath)
+	bootstrapDB, err := appcfg.Open(resolvedDB)
+	if err != nil {
+		fmt.Printf("打开数据库失败: %v\n", err)
+		os.Exit(1)
+	}
+	cfg, err := appcfg.Load(bootstrapDB)
+	if closeErr := bootstrapDB.Close(); closeErr != nil {
+		fmt.Printf("关闭配置连接失败: %v\n", closeErr)
+	}
 	if err != nil {
 		fmt.Printf("加载配置失败: %v\n", err)
 		os.Exit(1)
@@ -82,7 +94,7 @@ func main() {
 
 	// Walk-Forward 样本外验证模式: 切窗后在每段训练窗网格搜索、测试窗样本外评估
 	if *walkForward {
-		runWalkForward(cfg, *strategyName, *startDate, *endDate, *capital, universe, grid, *folds, *parallel)
+		runWalkForward(resolvedDB, cfg, *strategyName, *startDate, *endDate, *capital, universe, grid, *folds, *parallel)
 		return
 	}
 
@@ -100,7 +112,7 @@ func main() {
 
 	// 5. 并行遍历所有参数组合运行回测 (结果按组合顺序收集, 与串行输出一致)
 	start := time.Now()
-	results := runParallelBacktests(cfg, *strategyName, *startDate, *endDate, *capital, universe, grid.combos(), *parallel)
+	results := runParallelBacktests(resolvedDB, cfg, *strategyName, *startDate, *endDate, *capital, universe, grid.combos(), *parallel)
 
 	elapsed := time.Since(start)
 	fmt.Printf("\r完成: %d 组合, 耗时 %s                      \n\n", len(results), elapsed.Truncate(time.Second))

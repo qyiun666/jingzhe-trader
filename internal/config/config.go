@@ -1,18 +1,21 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
+	"reflect"
 	"strings"
 
 	"github.com/spf13/viper"
 )
 
 // Config 全局配置
+// 注意: 不含 database.path —— 配置本体就存在该库内, 路径不可能由配置给出 (自指),
+// 统一由 -db flag / JZ_DB_PATH 决定, 见 appcfg.ResolveDBPath
 type Config struct {
 	Tushare    TushareConfig    `mapstructure:"tushare"`
-	Database   DatabaseConfig   `mapstructure:"database"`
 	Cost       CostConfig       `mapstructure:"cost"`
 	Backtest   BacktestConfig   `mapstructure:"backtest"`
 	Risk       RiskConfig       `mapstructure:"risk"`
@@ -71,7 +74,12 @@ type TradingConfig struct {
 type RetentionConfig struct {
 	BarYears     int    `mapstructure:"bar_years"`     // 行情数据保留年数
 	NewsDays     int    `mapstructure:"news_days"`     // 新闻保留天数
-	PlanDays     int    `mapstructure:"plan_days"`     // 交易计划保留天数
+	PlanDays     int    `mapstructure:"plan_days"`     // 交易计划/任务记录保留天数
+	ActionDays   int    `mapstructure:"action_days"`   // 动作日志(action_log)保留天数 (每任务每笔都写, 增长最快)
+	AlertDays    int    `mapstructure:"alert_days"`    // 告警(agent_alert)保留天数
+	ScreenDays   int    `mapstructure:"screen_days"`   // 选股结果(screen_result)保留天数
+	DebateDays   int    `mapstructure:"debate_days"`   // 辩论与复盘记录保留天数
+	FinaQuarters int    `mapstructure:"fina_quarters"` // 财务指标保留最近N个报告期
 	BacktestRuns int    `mapstructure:"backtest_runs"` // 保留最近N个回测run
 	LogDays      int    `mapstructure:"log_days"`      // 日志文件保留天数
 	ReportFiles  int    `mapstructure:"report_files"`  // 保留最近N个报告文件
@@ -116,7 +124,7 @@ type LLMConfig struct {
 	Temperature    float64 `mapstructure:"temperature"`     // 采样温度, 默认 0.3
 	MaxTokens      int     `mapstructure:"max_tokens"`      // 输出上限, 默认 2048
 	TimeoutSeconds int     `mapstructure:"timeout_seconds"` // HTTP 超时秒数, 默认 30
-	JSONMode       bool    `mapstructure:"json_mode"`       // 强制 JSON 输出 (response_format), 默认 true
+	JSONMode       bool    `mapstructure:"json_mode"`       // 强制 JSON 输出 (response_format=json_object), 仅 DeepSeek 支持
 	MaxConcurrency int     `mapstructure:"max_concurrency"` // 并发在飞请求上限, 默认 3
 	RPS            float64 `mapstructure:"rps"`             // 每秒请求数上限 (0=不限速), 默认 2
 }
@@ -129,12 +137,12 @@ type ServerConfig struct {
 	AllowedOrigins []string `mapstructure:"allowed_origins"` // CORS允许的来源列表
 }
 
-// MailConfig 邮件通知配置 (QQ 邮箱 SMTP)
-// Password 为 SMTP 授权码, 仅通过环境变量 JZ_MAIL_PASSWORD 注入, 不写入配置文件
+// MailConfig 邮件通知配置 (QQ 邮箱, smtp.qq.com:465)
+// Password 为 SMTP 授权码; 随整棵配置存于 config_kv, 环境变量 JZ_MAIL_PASSWORD 非空时应急覆盖
 type MailConfig struct {
-	Enabled  bool   `mapstructure:"enabled"` // 是否启用邮件通知
-	From     string `mapstructure:"from"`    // 发件邮箱 (即收件人)
-	Password string // SMTP 授权码 (环境变量注入)
+	Enabled  bool   `mapstructure:"enabled"`  // 是否启用邮件通知
+	From     string `mapstructure:"from"`     // 发件邮箱 (即收件人)
+	Password string `mapstructure:"password"` // SMTP 授权码
 }
 
 type TushareConfig struct {
@@ -143,10 +151,6 @@ type TushareConfig struct {
 	RateLimit     int    `mapstructure:"rate_limit"`
 	MaxRetries    int    `mapstructure:"max_retries"`
 	RetryInterval int    `mapstructure:"retry_interval"`
-}
-
-type DatabaseConfig struct {
-	Path string `mapstructure:"path"`
 }
 
 type CostConfig struct {
@@ -226,11 +230,12 @@ type MACDConfig struct {
 
 // MultiFactorConfig 多因子策略配置
 type MultiFactorConfig struct {
-	TopN          int     `mapstructure:"top_n"`
-	RebalanceFreq string  `mapstructure:"rebalance_freq"`
-	PositionPct   float64 `mapstructure:"position_pct"`
-	StopLossPct   float64 `mapstructure:"stop_loss_pct"`
-	TakeProfitPct float64 `mapstructure:"take_profit_pct"`
+	TopN           int     `mapstructure:"top_n"`
+	RebalanceFreq  string  `mapstructure:"rebalance_freq"`
+	PositionPct    float64 `mapstructure:"position_pct"`
+	StopLossPct    float64 `mapstructure:"stop_loss_pct"`
+	TakeProfitPct  float64 `mapstructure:"take_profit_pct"`
+	EnableAdaptive bool    `mapstructure:"enable_adaptive"`
 }
 
 // UniverseConfig 股票池配置
@@ -292,17 +297,25 @@ func (c *Config) StrategyParams(name string) map[string]interface{} {
 		params["position_pct"] = c.Strategy.MACD.PositionPct
 		params["enable_adaptive"] = c.Strategy.MACD.EnableAdaptive
 	case "multi_factor":
+		// 策略 Init 读这几个键, 必须全部透传: 此前只传 position_pct,
+		// 其余配置项写了也不生效
+		params["top_n"] = float64(c.Strategy.MultiFactor.TopN)
 		params["position_pct"] = c.Strategy.MultiFactor.PositionPct
+		params["stop_loss_pct"] = c.Strategy.MultiFactor.StopLossPct
+		params["take_profit_pct"] = c.Strategy.MultiFactor.TakeProfitPct
+		params["enable_adaptive"] = c.Strategy.MultiFactor.EnableAdaptive
+		params["rebalance_freq"] = c.Strategy.MultiFactor.RebalanceFreq
 	default:
 		params["position_pct"] = 0.15
 	}
 	return params
 }
 
-// Load 加载配置文件
-func Load(path string) (*Config, error) {
+// newViper 构造装载了全部默认值的 viper 实例 (默认值目录的唯一来源)
+// 基线类型固定 json: viper 从字节流装载时必须预先知道类型, 运行期来源就是库里的 JSON 文档
+func newViper() *viper.Viper {
 	v := viper.New()
-	v.SetConfigFile(path)
+	v.SetConfigType("json")
 	v.AutomaticEnv()
 
 	// 设置默认值
@@ -310,7 +323,6 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("tushare.rate_limit", 450)
 	v.SetDefault("tushare.max_retries", 3)
 	v.SetDefault("tushare.retry_interval", 2)
-	v.SetDefault("database.path", "data/jingzhe.db")
 	v.SetDefault("cost.commission_rate", 0.000085)
 	v.SetDefault("cost.min_commission", 5.0)
 	v.SetDefault("cost.stamp_tax_rate", 0.0005)
@@ -332,7 +344,7 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("llm.temperature", 0.3)
 	v.SetDefault("llm.max_tokens", 2048)
 	v.SetDefault("llm.timeout_seconds", 30)
-	v.SetDefault("llm.json_mode", false) // 仅 DeepSeek 支持, 默认关闭
+	v.SetDefault("llm.json_mode", true) // 实测 DeepSeek 支持; 全部内置 prompt 均含「JSON」字样, 满足前置条件
 	v.SetDefault("llm.max_concurrency", 3)
 	v.SetDefault("llm.rps", 2) // DeepSeek 免费档保守值, 0 表示不限速
 	v.SetDefault("dataloader.filter_mode", false)
@@ -358,6 +370,11 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("retention.bar_years", 3)
 	v.SetDefault("retention.news_days", 30)
 	v.SetDefault("retention.plan_days", 90)
+	v.SetDefault("retention.action_days", 90)
+	v.SetDefault("retention.alert_days", 90)
+	v.SetDefault("retention.screen_days", 90)
+	v.SetDefault("retention.debate_days", 180)
+	v.SetDefault("retention.fina_quarters", 8)
 	v.SetDefault("retention.backtest_runs", 20)
 	v.SetDefault("retention.log_days", 30)
 	v.SetDefault("retention.report_files", 30)
@@ -374,30 +391,229 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("screener.min_circ_mv", 50000.0)
 	v.SetDefault("screener.max_circ_mv", 0.0)
 
+	// 以下段落此前只存在于配置文件、没有代码默认值。配置源改成 SQLite 后,
+	// 空库种子出的这些键会落到 Go 零值, 而零值在这套系统里不是"未配置"而是"危险配置":
+	// risk.max_position_pct=0 会让风控把每笔买入裁成 0 股, ma_cross.short_period=0 会让均线计算失效。
+	// 取值沿用 README 承诺的 1 万元档画像。凭据键 (tushare.token / llm.api_key) 故意不给默认值。
+	v.SetDefault("goal.enabled", true)
+	v.SetDefault("goal.quarterly_target_pct", 0.15)
+	v.SetDefault("goal.max_drawdown_budget", 0.10)
+	v.SetDefault("goal.auto_adjust", true)
+	v.SetDefault("risk.max_position_pct", 0.40)
+	v.SetDefault("risk.max_total_position_pct", 0.90)
+	v.SetDefault("risk.max_sector_pct", 0.60)
+	v.SetDefault("risk.stop_loss_pct", 0.08)
+	v.SetDefault("risk.take_profit_pct", 0.15)
+	v.SetDefault("risk.trailing_stop_pct", 0.05)
+	v.SetDefault("risk.exclude_st", true)
+	v.SetDefault("risk.min_list_days", 60)
+	v.SetDefault("strategy.ma_cross.short_period", 3)
+	v.SetDefault("strategy.ma_cross.long_period", 25)
+	v.SetDefault("strategy.ma_cross.position_pct", 0.50)
+	v.SetDefault("strategy.ma_cross.enable_adaptive", false)
+	v.SetDefault("strategy.ma_cross.vol_confirm_ratio", 1.05)
+	v.SetDefault("strategy.ma_cross.trend_threshold", 0.001)
+	v.SetDefault("strategy.macd.fast", 12)
+	v.SetDefault("strategy.macd.slow", 26)
+	v.SetDefault("strategy.macd.signal", 9)
+	v.SetDefault("strategy.macd.position_pct", 0.30)
+	v.SetDefault("strategy.macd.enable_adaptive", true)
+	v.SetDefault("strategy.multi_factor.top_n", 3)
+	v.SetDefault("strategy.multi_factor.rebalance_freq", "weekly")
+	v.SetDefault("strategy.multi_factor.position_pct", 0.30)
+	v.SetDefault("strategy.multi_factor.stop_loss_pct", 0.08)
+	v.SetDefault("strategy.multi_factor.take_profit_pct", 0.15)
+	v.SetDefault("strategy.multi_factor.enable_adaptive", false)
+	v.SetDefault("strategy.intraday_t.t_amount_pct", 0.40)
+	v.SetDefault("strategy.intraday_t.profit_target", 0.012)
+	v.SetDefault("strategy.intraday_t.stop_loss_pct", -0.005)
+	v.SetDefault("strategy.intraday_t.lookback_days", 20)
+	v.SetDefault("broker.type", "paper")
+	v.SetDefault("broker.qmt.url", "http://127.0.0.1:16888")
+	v.SetDefault("broker.qmt.path", "")
+	v.SetDefault("broker.qmt.account_id", "")
+	v.SetDefault("broker.qmt.session_id", 123456)
+	v.SetDefault("screener.exclude_codes", []string{})
+	v.SetDefault("backtest.start_date", "20240101")
+	v.SetDefault("backtest.end_date", "20261231")
+	// 沪深300: 大盘过滤策略与辩论的大盘分析师都依赖指数日线, 空 watchlist 会让大盘分析恒为"数据缺失"
+	v.SetDefault("dataloader.watchlist", []string{"000300.SH"})
+	v.SetDefault("log.file_path", "logs/chaogu.log")
+	v.SetDefault("screener.enabled", true)
+	v.SetDefault("universe.bluechip", "")
+	v.SetDefault("universe.tech", "")
+	v.SetDefault("server.api_token", "")
+	v.SetDefault("mail.from", "")
+	return v
+}
+
+// LoadFile 从 YAML/JSON 文件装载配置
+// 仅供一次性 `cmd/config import` 把旧 config.yaml 搬进 SQLite 时使用, 运行期配置一律走 LoadFromJSON
+func LoadFile(path string) (*Config, error) {
+	v := newViper()
+	if strings.HasSuffix(strings.ToLower(path), ".json") {
+		v.SetConfigType("json")
+	} else {
+		v.SetConfigType("yaml")
+	}
+	v.SetConfigFile(path)
 	if err := v.ReadInConfig(); err != nil {
 		return nil, fmt.Errorf("读取配置文件失败: %w", err)
 	}
+	return resolve(v)
+}
 
+// readDoc 把库内配置文档读入 viper; 空文档表示尚未种子, 此时全部键取代码默认值
+// (全新库第一次 dump/get 就会走到这个分支, 直接喂给 viper 会报 unexpected end of JSON input)
+func readDoc(v *viper.Viper, doc []byte) error {
+	if len(doc) == 0 {
+		return nil
+	}
+	if err := v.ReadConfig(bytes.NewReader(doc)); err != nil {
+		return fmt.Errorf("解析配置文档失败: %w", err)
+	}
+	return nil
+}
+
+// LoadFromJSON 从 JSON 文档装载配置 (运行期唯一入口, 数据源为 config_kv 的 config 行)
+func LoadFromJSON(data []byte) (*Config, error) {
+	v := newViper()
+	if err := readDoc(v, data); err != nil {
+		return nil, err
+	}
+	return resolve(v)
+}
+
+// resolve 反序列化 + 环境变量应急覆盖 (非空才生效, 便于故障时不落库直接顶掉密钥)
+func resolve(v *viper.Viper) (*Config, error) {
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("解析配置失败: %w", err)
 	}
-
-	// 敏感项环境变量优先, 避免密钥写入配置文件
 	applyEnvOverrides(&cfg)
-
-	// 确保数据目录存在
-	dbDir := filepath.Dir(cfg.Database.Path)
-	if dbDir != "" && dbDir != "." {
-		if err := os.MkdirAll(dbDir, 0755); err != nil {
-			return nil, fmt.Errorf("创建数据目录失败: %w", err)
-		}
-	}
-
 	return &cfg, nil
 }
 
-// applyEnvOverrides 用环境变量覆盖敏感配置项
+// DefaultJSON 输出全默认值 JSON 文档, 供首次种子写入 config_kv
+func DefaultJSON() ([]byte, error) {
+	return dumpJSON(newViper())
+}
+
+// EffectiveJSON 输出配置文档合并默认值后的"生效值", 凭据字段掩码
+// 供 cmd/config dump 与旧 YAML 逐段比对, 确认搬运无丢项
+func EffectiveJSON(data []byte) ([]byte, error) {
+	v := newViper()
+	if err := readDoc(v, data); err != nil {
+		return nil, err
+	}
+	for _, p := range SecretPaths() {
+		if v.GetString(p) != "" {
+			v.Set(p, maskedValue)
+		}
+	}
+	return dumpJSON(v)
+}
+
+func dumpJSON(v *viper.Viper) ([]byte, error) {
+	b, err := json.MarshalIndent(v.AllSettings(), "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("序列化配置失败: %w", err)
+	}
+	return b, nil
+}
+
+// RawFileJSON 原样读取 YAML/JSON 文件并转为 JSON 文档, 不合并任何默认值
+// 供一次性 import 使用: 库里只存"用户显式配置过的项", 默认值继续由 newViper 单点提供,
+// 否则默认值会被固化进文档, 日后改代码默认值压不住
+func RawFileJSON(path string) ([]byte, error) {
+	v := viper.New()
+	if strings.HasSuffix(strings.ToLower(path), ".json") {
+		v.SetConfigType("json")
+	} else {
+		v.SetConfigType("yaml")
+	}
+	v.SetConfigFile(path)
+	if err := v.ReadInConfig(); err != nil {
+		return nil, fmt.Errorf("读取配置文件失败: %w", err)
+	}
+	return dumpJSON(v)
+}
+
+// DocSet 按点路径改写文档中的一处, 返回新文档 (同样不注入默认值)
+func DocSet(doc []byte, key, rawValue string) ([]byte, error) {
+	section, _, found := strings.Cut(key, ".")
+	if !found || !isKnownSection(section) {
+		return nil, fmt.Errorf("未知配置段 %q, 写入后服务读不到; 可用段: %s",
+			section, strings.Join(Sections(), ", "))
+	}
+	v := viper.New()
+	v.SetConfigType("json")
+	if err := readDoc(v, doc); err != nil {
+		return nil, err
+	}
+	v.Set(key, parseScalar(rawValue))
+	return dumpJSON(v)
+}
+
+// Sections 返回全部顶层配置段名, 取自 Config 的 mapstructure tag, 不另立清单
+func Sections() []string {
+	t := reflect.TypeOf(Config{})
+	out := make([]string, 0, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		if tag := t.Field(i).Tag.Get("mapstructure"); tag != "" {
+			out = append(out, tag)
+		}
+	}
+	return out
+}
+
+func isKnownSection(section string) bool {
+	for _, s := range Sections() {
+		if strings.EqualFold(s, section) {
+			return true
+		}
+	}
+	return false
+}
+
+// DocGet 返回 key 的生效值 (代码默认值已合并)
+func DocGet(doc []byte, key string) (any, error) {
+	v := newViper()
+	if err := readDoc(v, doc); err != nil {
+		return nil, err
+	}
+	return v.Get(key), nil
+}
+
+// parseScalar 优先按 JSON 解析, 使数字/布尔/数组/对象字面量各归其位; 失败则按原始字符串处理
+func parseScalar(raw string) any {
+	var v any
+	if err := json.Unmarshal([]byte(raw), &v); err == nil {
+		return v
+	}
+	return raw
+}
+
+// IsSecretPath 判断配置路径是否存放凭据
+func IsSecretPath(key string) bool {
+	for _, p := range SecretPaths() {
+		if strings.EqualFold(p, key) {
+			return true
+		}
+	}
+	return false
+}
+
+// maskedValue 凭据在 dump/日志中的替身
+const maskedValue = "***"
+
+// SecretPaths 返回存放凭据的配置路径, 任何 dump 与日志通道不得输出其明文
+func SecretPaths() []string {
+	return []string{"tushare.token", "llm.api_key", "mail.password", "server.api_token"}
+}
+
+// applyEnvOverrides 用环境变量覆盖凭据项 (非空才生效)
+// 凭据已随配置存于 config_kv, 这里保留一条不落库即可顶换密钥的应急通道 (如库损坏/紧急轮换)
 func applyEnvOverrides(cfg *Config) {
 	if t := os.Getenv("TUSHARE_TOKEN"); t != "" {
 		cfg.Tushare.Token = t
@@ -413,7 +629,8 @@ func applyEnvOverrides(cfg *Config) {
 	}
 }
 
-// DefaultConfigPath 返回默认配置文件路径
-func DefaultConfigPath() string {
-	return "config/config.yaml"
+// DefaultDBPath 返回默认数据库路径
+// 配置整体存放在该库的 config_kv 表内, 因此库路径是唯一必须先于配置确定的外部输入 (由 -db flag 或 JZ_DB_PATH 覆盖)
+func DefaultDBPath() string {
+	return "data/jingzhe.db"
 }

@@ -119,8 +119,9 @@ func paramStr(params map[string]interface{}, key string, def string) string {
 	return def
 }
 
-// calcBuyQty 按仓位占比计算买入数量 (向下取整到100股)
-func calcBuyQty(totalAsset, price, pct float64) int {
+// CalcBuyQty 按仓位占比计算买入数量 (向下取整到100股)
+// 导出供辩论增强复用: LLM 给出的仓位占比必须按与策略下单完全相同的口径换算, 否则两处规则会漂移
+func CalcBuyQty(totalAsset, price, pct float64) int {
 	if totalAsset <= 0 || price <= 0 || pct <= 0 {
 		return 0
 	}

@@ -6,9 +6,9 @@
 //
 // 用法:
 //
-//	watchdog -config config/config.yaml          # 检查今天
-//	watchdog -config config/config.yaml -date 20260831
-//	watchdog -config config/config.yaml -mail-ok  # 全通过也发心跳邮件
+//	watchdog                       # 检查今天 (库路径取 JZ_DB_PATH 或默认值)
+//	watchdog -db data/jingzhe.db -date 20260831
+//	watchdog -mail-ok              # 全通过也发心跳邮件
 //
 // 退出码: 0=全部通过或非交易日, 1=有缺失(已尝试发告警), 2=自身无法完成检查
 package main
@@ -24,6 +24,7 @@ import (
 
 	"github.com/jmoiron/sqlx"
 
+	"jingzhe-trader/internal/appcfg"
 	"jingzhe-trader/internal/config"
 	"jingzhe-trader/internal/notify"
 	"jingzhe-trader/internal/store"
@@ -41,27 +42,28 @@ var requiredJobs = []struct {
 
 func main() {
 	log.SetPrefix("[watchdog] ")
-	configPath := flag.String("config", "config/config.yaml", "配置文件路径")
+	dbPath := flag.String("db", "", "数据库路径 (配置即存于此库, 默认取 "+appcfg.EnvDBPath+" 或 "+config.DefaultDBPath()+")")
 	date := flag.String("date", "", "检查的交易日 YYYYMMDD (默认今天)")
 	mailOK := flag.Bool("mail-ok", false, "全部通过时也发送心跳邮件")
 	flag.Parse()
 
-	code := run(*configPath, *date, *mailOK)
+	code := run(appcfg.ResolveDBPath(*dbPath), *date, *mailOK)
 	os.Exit(code)
 }
 
-func run(configPath, date string, mailOK bool) int {
-	cfg, err := config.Load(configPath)
-	if err != nil {
-		log.Printf("加载配置失败: %v", err)
-		return 2
-	}
-	db, err := store.NewDB(cfg.Database.Path)
+func run(dbPath, date string, mailOK bool) int {
+	db, err := appcfg.Open(dbPath)
 	if err != nil {
 		log.Printf("打开数据库失败: %v", err)
 		return 2
 	}
 	defer db.Close()
+
+	cfg, err := appcfg.Load(db)
+	if err != nil {
+		log.Printf("加载配置失败: %v", err)
+		return 2
+	}
 
 	today := time.Now().Format("20060102")
 	if date != "" {

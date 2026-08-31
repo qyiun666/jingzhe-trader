@@ -18,6 +18,24 @@ type AnalysisReport struct {
 	Confidence float64  `json:"confidence"`
 }
 
+// reportMissingData 标记该分析师报告无有效依据 (LLM 调用失败, 或输入数据完全缺失)
+// 用它而不是 Confidence=0.1: 后者与模型真实给出的 0.1 无法区分, 会把"没有意见"
+// 当成一个偏空的意见计入风控的平均 sentiment
+const reportMissingData = "数据缺失: 本报告无有效依据, 不计入均值"
+
+// IsMissingData 判断报告是否为无依据的占位报告
+func (r *AnalysisReport) IsMissingData() bool {
+	if r == nil {
+		return true
+	}
+	for _, p := range r.KeyPoints {
+		if p == reportMissingData {
+			return true
+		}
+	}
+	return false
+}
+
 // DebateContext 辩论上下文
 type DebateContext struct {
 	TradeDate     string

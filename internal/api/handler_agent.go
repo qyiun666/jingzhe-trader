@@ -295,8 +295,12 @@ func (s *Service) BuildHealthStatus() *HealthStatus {
 		hs.Status = "db_error"
 		return hs
 	}
-	if info, err := os.Stat(s.cfg.Database.Path); err == nil {
-		hs.DBSizeBytes = info.Size()
+	// 库文件路径取自连接自身: 配置本体就存在这个库里, 路径不可能再由配置给出
+	var dbFile string
+	if err := s.db.Get(&dbFile, `SELECT file FROM pragma_database_list WHERE name='main'`); err == nil {
+		if info, statErr := os.Stat(dbFile); statErr == nil {
+			hs.DBSizeBytes = info.Size()
+		}
 	}
 	if lastDate, err := s.barRepo.GetMaxTradeDate(); err == nil {
 		hs.DataLastDate = lastDate

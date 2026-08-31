@@ -10,6 +10,7 @@ import (
 	"jingzhe-trader/internal/llm"
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/store"
+	"jingzhe-trader/pkg/logger"
 )
 
 type TechnicalAnalyst struct {
@@ -151,21 +152,32 @@ func (a *NewsAnalyst) Analyze(ctx *DebateContext) (*AnalysisReport, error) {
 }
 
 type MarketAnalyst struct {
-	llm  *llm.Client
-	repo *store.BarRepo
+	llm        *llm.Client
+	repo       *store.BarRepo
+	indexCodes []string // 参与判断的大盘指数, 由 dataloader.watchlist 注入
 }
 
-func NewMarketAnalyst(llmClient *llm.Client, repo *store.BarRepo) *MarketAnalyst {
-	return &MarketAnalyst{llm: llmClient, repo: repo}
+func NewMarketAnalyst(llmClient *llm.Client, repo *store.BarRepo, indexCodes []string) *MarketAnalyst {
+	return &MarketAnalyst{llm: llmClient, repo: repo, indexCodes: indexCodes}
 }
 func (a *MarketAnalyst) Name() string { return "market" }
 
 func (a *MarketAnalyst) Analyze(ctx *DebateContext) (*AnalysisReport, error) {
 	var indexText strings.Builder
-	for _, code := range []string{"000300.SH", "000001.SH", "399001.SZ"} {
+	for _, code := range a.indexCodes {
 		if bar, ok := ctx.MarketBars[code]; ok {
 			indexText.WriteString(fmt.Sprintf("%s: 收盘%.2f 涨跌%.2f%%  |  ", code, bar.Close, bar.PctChg))
 		}
+	}
+	// 一个指数 bar 都没有: 让 LLM 判断大盘只会得到编造的结论, 直接标记缺失 (也省一次调用)
+	if indexText.Len() == 0 {
+		logger.L().Warnw("无大盘指数数据, 大盘分析跳过", "ts_code", ctx.TsCode,
+			"expected", a.indexCodes, "hint", "确认 dataloader.watchlist 与指数日线同步是否生效")
+		return &AnalysisReport{
+			Agent:     a.Name(),
+			TsCode:    ctx.TsCode,
+			KeyPoints: []string{reportMissingData},
+		}, nil
 	}
 	userPrompt := fmt.Sprintf(`股票: %s (%s)  日期: %s
 大盘指数: %s
@@ -397,6 +409,12 @@ const newsSysPrompt = `你是专业的A股新闻舆情分析师，擅长解读�
 - 只分析与该股票直接相关的新闻，不发散到行业整体
 - 新闻有时效性，3天内的新闻权重高于1周前的
 - 如果没有相关新闻，明确说"无相关新闻"，不要编造
+
+评分标准：
+- sentiment: -1(重大利空)到1(重大利好)，0.3以上为偏多，-0.3以下为偏空；无相关新闻时给0
+- confidence: 0到1，无相关新闻或新闻与该股本弱相关时给0.2-0.4
+- key_points: 1-3条，每条须能对应到具体新闻标题或时间
+- risks: 1-2条消息面风险（如传闻未证实、利好已兑现、减持公告待落地）
 
 必须输出合法JSON，格式：{"sentiment": float, "key_points": [], "risks": [], "confidence": float}`
 

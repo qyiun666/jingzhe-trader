@@ -102,6 +102,11 @@ func (r *researcher) Research(ctx *DebateContext, reports []*AnalysisReport) (*R
 func formatReports(reports []*AnalysisReport) string {
 	var sb strings.Builder
 	for _, r := range reports {
+		if r.IsMissingData() {
+			// 不给情绪/置信度数值: 否则下游会把"没数据"读成一条中性偏空的意见
+			sb.WriteString(fmt.Sprintf("【%s分析师】 数据缺失, 不计入均值\n", r.Agent))
+			continue
+		}
 		sb.WriteString(fmt.Sprintf("【%s分析师】 情绪: %.2f 置信度: %.2f\n", r.Agent, r.Sentiment, r.Confidence))
 		for _, p := range r.KeyPoints {
 			sb.WriteString(fmt.Sprintf("  + %s\n", p))

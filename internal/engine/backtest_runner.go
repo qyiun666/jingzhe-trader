@@ -44,21 +44,21 @@ type BacktestRunner struct {
 }
 
 // NewBacktestRunner 创建回测运行器
-func NewBacktestRunner(cfg RunConfig, appCfg *config.Config) (*BacktestRunner, error) {
-	db, err := store.NewDB(appCfg.Database.Path)
-	if err != nil {
-		return nil, fmt.Errorf("打开数据库失败: %w", err)
+// db 由组合根注入并持有: 配置就存在这个库里, 组件内再按 appCfg 路径开一次会造成
+// "-db 指测试库、回测却读生产库" 的错位; 且参数优化循环反复构造 runner,
+// 共用一条连接比每次新开库更省 (SQLite 单连接模型)
+func NewBacktestRunner(db *sqlx.DB, cfg RunConfig, appCfg *config.Config) (*BacktestRunner, error) {
+	if db == nil {
+		return nil, fmt.Errorf("缺少数据库连接")
 	}
 
 	calendar, dataProvider, validUniverse, err := loadBacktestData(db, cfg)
 	if err != nil {
-		db.Close()
 		return nil, err
 	}
 
 	strat, err := buildStrategy(db, cfg, calendar)
 	if err != nil {
-		db.Close()
 		return nil, err
 	}
 
@@ -180,15 +180,6 @@ func loadStocks(db *sqlx.DB, universe []string) map[string]*model.Stock {
 		}
 	}
 	return stocks
-}
-
-// Close 释放运行器持有的资源 (数据库连接)
-// 批量回测/参数优化场景每次运行完毕后必须调用, 避免连接泄漏
-func (r *BacktestRunner) Close() error {
-	if r.db != nil {
-		return r.db.Close()
-	}
-	return nil
 }
 
 // Run 执行回测并计算绩效

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"jingzhe-trader/internal/broker"
@@ -13,6 +14,19 @@ import (
 	"jingzhe-trader/internal/strategy"
 	"jingzhe-trader/pkg/logger"
 )
+
+// watchlistIndexCodes 从 dataloader.watchlist 挑出大盘指数代码 (保持配置顺序)
+// 判定复用 dataloader.IsIndexCode, 避免同步侧与辩论侧各自维护前缀规则导致漂移
+func watchlistIndexCodes(watchlist []string) []string {
+	var codes []string
+	for _, code := range watchlist {
+		code = strings.TrimSpace(code)
+		if dataloader.IsIndexCode(code) {
+			codes = append(codes, code)
+		}
+	}
+	return codes
+}
 
 // ==================== 系统维护 ====================
 
@@ -55,23 +69,32 @@ func (s *Service) BuildSystemStatus() SystemStatus {
 
 // UpdateData 进程内执行增量数据更新 (从库内最新日期补到今天); 同一时刻只允许一个更新任务
 // 非阻塞: 如果有其他更新在执行, 立即返回错误
+// 只反映核心行情同步结果; 辅助数据失败请用 UpdateDataReport 取回
 func (s *Service) UpdateData() error {
+	_, err := s.UpdateDataReport()
+	return err
+}
+
+// UpdateDataReport 执行增量更新并返回完整结果 (含辅助数据源失败清单, 供调度器告警)
+func (s *Service) UpdateDataReport() (dataloader.Report, error) {
 	if !s.updateMu.TryLock() {
-		return fmt.Errorf("数据更新任务正在执行中, 请稍后重试")
+		return dataloader.Report{}, fmt.Errorf("数据更新任务正在执行中, 请稍后重试")
 	}
 	defer s.updateMu.Unlock()
 	return s.doUpdateData()
 }
 
 // UpdateDataBlocking 阻塞版数据更新: 等待其他更新完成后执行 (供信号任务前置调用)
+// 同 UpdateData, 辅助数据源不可用不阻断信号生成 (见 dataloader.Report)
 func (s *Service) UpdateDataBlocking() error {
 	s.updateMu.Lock()
 	defer s.updateMu.Unlock()
-	return s.doUpdateData()
+	_, err := s.doUpdateData()
+	return err
 }
 
 // doUpdateData 增量数据更新核心逻辑
-func (s *Service) doUpdateData() error {
+func (s *Service) doUpdateData() (dataloader.Report, error) {
 	opts := s.buildUpdateOptions()
 	return dataloader.New(s.cfg, s.db).Run(opts)
 }

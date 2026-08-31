@@ -6,14 +6,25 @@ import (
 	"strings"
 
 	"jingzhe-trader/internal/llm"
+	"jingzhe-trader/pkg/logger"
 )
 
 type RiskManagerAgent struct {
-	llm *llm.Client
+	llm    *llm.Client
+	limits PositionLimits
 }
 
-func NewRiskManagerAgent(client *llm.Client) *RiskManagerAgent {
-	return &RiskManagerAgent{llm: client}
+// PositionLimits 风控仓位约束, 由组合根从 config.RiskConfig 映射注入
+// 必须注入而非写死在提示词里: 此前 prompt 写着「0.5-0.6 重仓 / 单票≤60%」,
+// 而实际 risk.max_position_pct=0.40 —— LLM 被鼓励给出必然被风控裁掉的建议
+type PositionLimits struct {
+	MaxPositionPct      float64 // 单票最大仓位占总资产比例
+	MaxTotalPositionPct float64 // 总仓位上限
+	StopLossPct         float64 // 止损比例
+}
+
+func NewRiskManagerAgent(client *llm.Client, limits PositionLimits) *RiskManagerAgent {
+	return &RiskManagerAgent{llm: client, limits: limits}
 }
 func (rm *RiskManagerAgent) Name() string { return "risk_manager" }
 
@@ -43,7 +54,7 @@ func (rm *RiskManagerAgent) Judge(ctx *DebateContext, reports []*AnalysisReport,
 {
   "decision": "buy"或"sell"或"hold"或"reject",
   "confidence": 0到1,
-  "position_pct": 0到0.6的仓位建议,
+  "position_pct": 拟买入金额占总资产的比例, 0~%.2f (上限即单票风控线),
   "stop_price": 止损价(0表示不设),
   "risk_level": "low"或"medium"或"high",
   "bull_args": ["看涨理由1"],
@@ -54,8 +65,9 @@ func (rm *RiskManagerAgent) Judge(ctx *DebateContext, reports []*AnalysisReport,
 		ctx.TsCode, ctx.Name, ctx.TradeDate,
 		posStr(ctx.Position), ctx.TotalAsset,
 		reviewSection,
-		reportsText, bullText, bearText)
-	raw, err := callLLMJSON[judgeRaw](rm.llm, ctx.TsCode, ctx.TradeDate, "risk_manager", riskMgrSysPrompt, userPrompt)
+		reportsText, bullText, bearText,
+		rm.limits.MaxPositionPct)
+	raw, err := callLLMJSON[judgeRaw](rm.llm, ctx.TsCode, ctx.TradeDate, "risk_manager", rm.systemPrompt(), userPrompt)
 	if err != nil {
 		return nil, err
 	}
@@ -97,12 +109,18 @@ type judgeRaw struct {
 }
 
 func (rm *RiskManagerAgent) fallbackJudge(ctx *DebateContext, reports []*AnalysisReport, bull, bear *ResearchArgument) *DebateResult {
+	// 只对有依据的报告求均值: 缺失报告以 0.0 计入会把结果系统性拉向保守侧
 	avgSentiment := 0.0
+	valid := 0
 	for _, r := range reports {
+		if r.IsMissingData() {
+			continue
+		}
 		avgSentiment += r.Sentiment
+		valid++
 	}
-	if len(reports) > 0 {
-		avgSentiment /= float64(len(reports))
+	if valid > 0 {
+		avgSentiment /= float64(valid)
 	}
 
 	// 结合多空研究员情绪 (bull∈[0,1], bear∈[-1,0], 已在 callResearcherLLM 中 clamp)
@@ -121,9 +139,14 @@ func (rm *RiskManagerAgent) fallbackJudge(ctx *DebateContext, reports []*Analysi
 	// 降级路径无 bull/bear 明细, 用 blended 近似; 阈值取保守值 (宁缺毋滥)
 	decision := "hold"
 	positionPct := 0.0
-	if blended > 0.15 {
+	// 与 systemPrompt 告知 LLM 的口径一致: 常规档 = 风控上限 × 0.6, 绝不超过上限
+	stdPct := rm.limits.MaxPositionPct * 0.6
+	if valid == 0 {
+		// 全部分析师无依据: 不凭多空情绪就给出买入, 宁可观望
+		logger.L().Warnw("辩论降级: 无任何有效分析师报告, 维持 hold", "ts_code", ctx.TsCode)
+	} else if blended > 0.15 {
 		decision = "buy"
-		positionPct = 0.3
+		positionPct = stdPct
 	} else if blended < -0.15 {
 		decision = "reject"
 	}
@@ -180,7 +203,25 @@ func formatArguments(arg *ResearchArgument) string {
 	return sb.String()
 }
 
-const riskMgrSysPrompt = `你是专业的风险管理经理，负责最终投资决策。你需要权衡多空双方论点，结合当前持仓和资金状况，做出审慎决策。
+// systemPrompt 按注入的风控参数生成系统提示词
+// 仓位与止损数字必须来自配置: 写死过一次 (prompt 建议 0.5-0.6 重仓而 risk.max_position_pct=0.40),
+// LLM 就会稳定产出被风控裁掉的建议, 且没人能从结果里看出原因
+func (rm *RiskManagerAgent) systemPrompt() string {
+	maxPos := rm.limits.MaxPositionPct
+	if maxPos <= 0 {
+		maxPos = 0.2 // 未配置时按保守值, 避免提示词出现 0% 仓位这种无意义区间
+	}
+	stdPct, heavyPct := maxPos*0.6, maxPos
+	cashPct := 1.0 - rm.limits.MaxTotalPositionPct
+	if rm.limits.MaxTotalPositionPct <= 0 {
+		cashPct = 0.1
+	}
+	stopPct := rm.limits.StopLossPct
+	if stopPct <= 0 {
+		stopPct = 0.08
+	}
+
+	return fmt.Sprintf(`你是专业的风险管理经理，负责最终投资决策。你需要权衡多空双方论点，结合当前持仓和资金状况，做出审慎决策。
 
 决策规则：
 - buy: 看涨理由充分（≥2个分析师偏多），技术面+基本面共振，风险可控
@@ -188,11 +229,12 @@ const riskMgrSysPrompt = `你是专业的风险管理经理，负责最终投资
 - hold: 多空不明，维持现状（已持仓继续持有，未持仓继续观望）
 - reject: 风险过高（技术面+基本面同时恶化），不应买入
 
-仓位管理（小资金1万级别）：
-- position_pct: 0.3-0.4 为标准仓位，0.5-0.6 为重仓（需高置信度）
-- 单票不超过总资产60%，保留至少10%现金
+仓位管理（本系统实际风控约束，超出上限的建议会被风控直接裁掉）：
+- position_pct 指"拟买入金额占总资产的比例"，取值 0~%.2f
+- 常规仓位约 %.2f，打满上限 %.2f 属重仓（需高置信度才给）
+- 总仓位上限 %.0f%%，即至少保留 %.0f%% 现金
 - 已有持仓时，新买入信号应降低仓位（避免过度集中）
-- stop_price: 建议设在支撑位下方3-5%或成本价下方8%
+- stop_price: 建议设在支撑位下方3-5%%，或成本价下方 %.0f%%
 
 风险考量：
 - A股T+1，买入后当日无法卖出，需承担隔夜风险
@@ -201,12 +243,16 @@ const riskMgrSysPrompt = `你是专业的风险管理经理，负责最终投资
 - 若多空分歧大（bull和bear情绪接近），降低置信度
 
 决策标准：
-- 4个分析师平均sentiment > 0.3 + 看涨研究员 > 0.4 → 倾向buy
-- 4个分析师平均sentiment < -0.2 + 看跌研究员 < -0.3 → 倾向sell/reject
+- 分析师报告标注「数据缺失」的条目不计入均值，也不要当作看空依据
+- 有效分析师平均sentiment > 0.3 + 看涨研究员 > 0.4 → 倾向buy
+- 有效分析师平均sentiment < -0.2 + 看跌研究员 < -0.3 → 倾向sell/reject
 - 已持仓+情绪转负 → 建议 sell
 - summary: 必须包含决策核心理由（如"技术面多头+估值合理，建议小仓位买入"）
 
-必须输出合法JSON。`
+必须输出合法JSON。`,
+		maxPos, stdPct, heavyPct,
+		rm.limits.MaxTotalPositionPct*100, cashPct*100, stopPct*100)
+}
 
 // marshalStrList 将字符串列表序列化为 JSON 字符串
 func marshalStrList(list []string) string {

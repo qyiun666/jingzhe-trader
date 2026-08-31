@@ -2,6 +2,7 @@ package api
 
 import (
 	"fmt"
+	"strings"
 
 	"jingzhe-trader/internal/engine"
 	"jingzhe-trader/internal/model"
@@ -72,7 +73,9 @@ func (s *Service) GenerateTradePlans(date string) ([]*store.TradePlan, error) {
 
 	// 智能体辩论增强 (LLM可用时对买入信号跑辩论; 回测中可通过同款 hook 验证)
 	if s.debateOrchestrator != nil && s.debateOrchestrator.IsEnabled() {
-		merged = s.debateOrchestrator.EnhanceSignals(date, merged, todayBars, positions, asset.TotalAsset, s.stockMap)
+		enhanced, persistFailures := s.debateOrchestrator.EnhanceSignals(date, merged, todayBars, positions, asset.TotalAsset, s.stockMap)
+		merged = enhanced
+		s.escalateDebatePersistFailures(date, persistFailures)
 	}
 
 	passed, rejections := engine.CheckAndSortSignals(date, rm, merged, positions, asset.TotalAsset, s.loadRiskStocks(merged), todayBars)
@@ -81,6 +84,26 @@ func (s *Service) GenerateTradePlans(date string) ([]*store.TradePlan, error) {
 	s.escalateStopLossRejections(date, rejections, stopCodes)
 
 	return s.signalsToPlans(date, strategyName, passed, todayBars, stopCodes), nil
+}
+
+// escalateDebatePersistFailures 辩论结论落库失败时汇总一条告警
+// 信号本身已按结论增强完毕, 但 agent_debate 缺行会让 ReviewDebates 拿不到样本,
+// 反思闭环 (复盘命中率回填后续辩论) 就静默失效了 —— 花了 LLM 调用却没留下可验证的记录
+func (s *Service) escalateDebatePersistFailures(date string, failures []string) {
+	if len(failures) == 0 || s.alertRepo == nil {
+		return
+	}
+	logger.L().Errorf("[%s] %d 条辩论结论落库失败: %s", date, len(failures), strings.Join(failures, "; "))
+	if _, err := s.alertRepo.Insert(&store.AgentAlert{
+		TradeDate: date,
+		JobName:   "signal",
+		Level:     store.AlertLevelWarning,
+		Title:     "⚠️ 辩论结论未入库",
+		Content: fmt.Sprintf("%d 条辩论结论落库失败, 反思闭环当日无样本可回填:\n- %s",
+			len(failures), strings.Join(failures, "\n- ")),
+	}); err != nil {
+		logger.L().Warnw("辩论落库失败告警入库失败", "err", err)
+	}
 }
 
 // escalateStopLossRejections 止损类信号被风控拦截时写告警并记录错误日志

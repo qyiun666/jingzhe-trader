@@ -57,11 +57,11 @@ func runParallel(combos [][3]interface{}, workers int, run func(c [3]interface{}
 }
 
 // runParallelBacktests 并行运行多组参数回测 (包装 runSingleBacktest)
-func runParallelBacktests(cfg *config.Config, strategyName, startDate, endDate string,
+func runParallelBacktests(dbPath string, cfg *config.Config, strategyName, startDate, endDate string,
 	capital float64, universe []string, combos [][3]interface{}, workers int) []OptResult {
 
 	return runParallel(combos, workers, func(c [3]interface{}) OptResult {
 		sp, lp, pp := c[0].(int), c[1].(int), c[2].(float64)
-		return runSingleBacktest(cfg, strategyName, startDate, endDate, capital, universe, sp, lp, pp)
+		return runSingleBacktest(dbPath, cfg, strategyName, startDate, endDate, capital, universe, sp, lp, pp)
 	})
 }

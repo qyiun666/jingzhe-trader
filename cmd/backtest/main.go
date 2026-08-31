@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 
+	"jingzhe-trader/internal/appcfg"
 	"jingzhe-trader/internal/backtest"
 	"jingzhe-trader/internal/config"
 	"jingzhe-trader/internal/engine"
@@ -11,7 +12,7 @@ import (
 )
 
 func main() {
-	configPath := flag.String("config", "config/config.yaml", "配置文件路径")
+	dbPath := flag.String("db", "", "数据库路径 (配置即存于此库, 默认取 "+appcfg.EnvDBPath+" 或 "+config.DefaultDBPath()+")")
 	strategyName := flag.String("strategy", "ma_cross", "策略名称: ma_cross / macd / boll_breakout")
 	startDate := flag.String("start", "", "回测起始日期 YYYYMMDD")
 	endDate := flag.String("end", "", "回测结束日期 YYYYMMDD")
@@ -20,8 +21,15 @@ func main() {
 	reportPath := flag.String("report", "reports/backtest_report.html", "报告输出路径")
 	flag.Parse()
 
-	// 加载配置
-	cfg, err := config.Load(*configPath)
+	// 先开库再读配置 (配置本体存在 config_kv 里)
+	db, err := appcfg.Open(appcfg.ResolveDBPath(*dbPath))
+	if err != nil {
+		fmt.Printf("打开数据库失败: %v\n", err)
+		return
+	}
+	defer db.Close()
+
+	cfg, err := appcfg.Load(db)
 	if err != nil {
 		fmt.Printf("加载配置失败: %v\n", err)
 		return
@@ -68,12 +76,11 @@ func main() {
 	fmt.Printf("股票池: %v\n", universe)
 	fmt.Printf("================\n\n")
 
-	// 创建并运行回测 (统一执行管道, 含风控)
-	runner, err := engine.NewBacktestRunner(btCfg, cfg)
+	// 创建并运行回测 (统一执行管道, 含风控); 数据库连接由本组合根持有
+	runner, err := engine.NewBacktestRunner(db, btCfg, cfg)
 	if err != nil {
 		logger.L().Fatalf("创建回测运行器失败: %v", err)
 	}
-	defer runner.Close()
 
 	result, err := runner.Run()
 	if err != nil {

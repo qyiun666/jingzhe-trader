@@ -60,10 +60,19 @@ func New(cfg *config.Config, db *sqlx.DB) *Loader {
 // 写入受 SQLite 单连接 (SetMaxOpenConns(1)) 串行化, 不产生额外锁竞争
 const dataloaderConcurrency = 4
 
-// Run 执行数据同步 (核心 + 可选项)
-func (l *Loader) Run(opts Options) error {
+// Report 一次数据同步的结果
+// OptionalFailures 记录辅助数据源 (新闻/资金流/龙虎榜/财务指标) 的失败原因。
+// 它们刻意不与核心同步的 error 混为一谈: 辅助源不可用不影响行情与信号正确性,
+// 若一并返回 error 会让调度器把 data_update 判为失败, 进而中止当天信号生成 (宁缺毋滥逻辑)。
+// 但必须可见 —— 此前只记日志, 结果就是四张辅助表长期 0 行而任务一直显示成功。
+type Report struct {
+	OptionalFailures []string
+}
+
+// Run 执行数据同步: 核心数据失败返回 error, 辅助数据失败记入 Report 不影响返回值
+func (l *Loader) Run(opts Options) (Report, error) {
 	if l.cfg.Tushare.Token == "" {
-		return fmt.Errorf("未配置 tushare.token (可用环境变量 TUSHARE_TOKEN)")
+		return Report{}, fmt.Errorf("未配置 tushare.token (可用环境变量 TUSHARE_TOKEN)")
 	}
 	defer l.ts.Close() // 进程内短生命周期 Loader: 用完停掉限流补充 goroutine, 否则每次调用泄漏一个
 	if opts.StartDate == "" {
@@ -78,15 +87,15 @@ func (l *Loader) Run(opts Options) error {
 
 	tradeCals, err := l.calRepo.GetTradeDays(opts.StartDate, opts.EndDate)
 	if err != nil {
-		return fmt.Errorf("查询交易日失败: %w", err)
+		return Report{}, fmt.Errorf("查询交易日失败: %w", err)
 	}
 	l.syncIndexHistory(opts.StartDate, opts.EndDate)
 	l.syncDailyData(tradeCals)
 	l.backfillAdjFactors()
-	l.syncOptional(opts, tradeCals)
 
+	report := Report{OptionalFailures: l.syncOptional(opts, tradeCals)}
 	logger.L().Info("数据同步全部完成!")
-	return nil
+	return report, nil
 }
 
 // syncCalendar 同步交易日历
@@ -411,19 +420,24 @@ func (l *Loader) buildWatchCodeSet() map[string]bool {
 	return codeSet
 }
 
-// indexCodes 从 watchlist 中提取指数代码 (以 .SH 结尾且以 0/3 开头的通常是指数)
+// IsIndexCode 判断代码是否大盘指数 (000xxx.SH 或 399xxx.SZ)
 // 000300.SH 沪深300, 000001.SH 上证综指, 399001.SZ 深证成指 等
+// 导出供 api 层给大盘分析师注入指数清单时复用同一判定
+func IsIndexCode(code string) bool {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return false
+	}
+	return (strings.HasPrefix(code, "000") || strings.HasPrefix(code, "399")) &&
+		(strings.HasSuffix(code, ".SH") || strings.HasSuffix(code, ".SZ"))
+}
+
+// indexCodes 从 watchlist 中提取指数代码
 func (l *Loader) indexCodes() map[string]bool {
 	codeSet := make(map[string]bool)
 	for _, code := range l.cfg.Dataloader.Watchlist {
-		code = strings.TrimSpace(code)
-		if code == "" {
-			continue
-		}
-		// 指数代码: 000xxx.SH 或 399xxx.SZ
-		if (strings.HasPrefix(code, "000") || strings.HasPrefix(code, "399")) &&
-			(strings.HasSuffix(code, ".SH") || strings.HasSuffix(code, ".SZ")) {
-			codeSet[code] = true
+		if IsIndexCode(code) {
+			codeSet[strings.TrimSpace(code)] = true
 		}
 	}
 	return codeSet

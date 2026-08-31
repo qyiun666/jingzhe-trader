@@ -9,8 +9,16 @@ import (
 	"jingzhe-trader/internal/llm"
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/store"
+	"jingzhe-trader/internal/strategy"
 	"jingzhe-trader/pkg/logger"
 )
+
+// DebateSettings 辩论编排器的运行参数, 由组合根从 config 映射注入
+// (agent 不直接依赖 config 包, 保持能力包身份中立)
+type DebateSettings struct {
+	Positions     PositionLimits // 风控仓位约束, 用于生成提示词与换算建议仓位
+	MarketIndexes []string       // 参与大盘判断的指数代码 (来自 dataloader.watchlist)
+}
 
 type DebateOrchestrator struct {
 	llm           *llm.Client
@@ -22,6 +30,7 @@ type DebateOrchestrator struct {
 	reviewRepo    *store.DebateReviewRepo
 	moneyflowRepo *store.MoneyFlowRepo
 	toplistRepo   *store.TopListRepo
+	settings      DebateSettings
 	tech          *TechnicalAnalyst
 	fund          *FundamentalAnalyst
 	news          *NewsAnalyst
@@ -33,17 +42,18 @@ type DebateOrchestrator struct {
 
 func NewDebateOrchestrator(llmClient *llm.Client, barRepo *store.BarRepo, basicRepo *store.BasicRepo,
 	finaRepo *store.FinaRepo, newsRepo *store.NewsRepo, debateRepo *store.DebateRepo,
-	reviewRepo *store.DebateReviewRepo, moneyflowRepo *store.MoneyFlowRepo, toplistRepo *store.TopListRepo) *DebateOrchestrator {
+	reviewRepo *store.DebateReviewRepo, moneyflowRepo *store.MoneyFlowRepo, toplistRepo *store.TopListRepo,
+	settings DebateSettings) *DebateOrchestrator {
 	o := &DebateOrchestrator{llm: llmClient, barRepo: barRepo, basicRepo: basicRepo, finaRepo: finaRepo,
 		newsRepo: newsRepo, debateRepo: debateRepo, reviewRepo: reviewRepo,
-		moneyflowRepo: moneyflowRepo, toplistRepo: toplistRepo}
+		moneyflowRepo: moneyflowRepo, toplistRepo: toplistRepo, settings: settings}
 	o.tech = NewTechnicalAnalyst(llmClient, barRepo)
 	o.fund = NewFundamentalAnalyst(llmClient, basicRepo, finaRepo)
 	o.news = NewNewsAnalyst(llmClient, newsRepo)
-	o.market = NewMarketAnalyst(llmClient, barRepo)
+	o.market = NewMarketAnalyst(llmClient, barRepo, settings.MarketIndexes)
 	o.bull = NewResearcher(llmClient, "bull")
 	o.bear = NewResearcher(llmClient, "bear")
-	o.riskMgr = NewRiskManagerAgent(llmClient)
+	o.riskMgr = NewRiskManagerAgent(llmClient, settings.Positions)
 	return o
 }
 
@@ -51,6 +61,9 @@ func (o *DebateOrchestrator) IsEnabled() bool {
 	return o != nil && o.llm != nil && o.llm.IsEnabled()
 }
 
+// Debate 组织一轮完整辩论 (分析师并行 → 多空研究员 → 风险管理员裁决), 返回最终结论
+// 结论落库由调用方负责 (见 EnhanceSignals): 结论是 7 次 LLM 调用换来的, 不能因为存不下就丢弃,
+// 但落库失败必须可上报 —— 此前只记一条 Warn 便返回成功, 导致辩论表长期空表且无人察觉
 func (o *DebateOrchestrator) Debate(ctx *DebateContext) (*DebateResult, error) {
 	logger.L().Infof("[智能体辩论] 开始 %s (%s) %s", ctx.TsCode, ctx.Name, ctx.TradeDate)
 	reports := o.runAnalystsParallel(ctx)
@@ -62,11 +75,6 @@ func (o *DebateOrchestrator) Debate(ctx *DebateContext) (*DebateResult, error) {
 	}
 	if result == nil {
 		return nil, fmt.Errorf("辩论无结果: %s", ctx.TsCode)
-	}
-	if o.debateRepo != nil {
-		if _, err := o.debateRepo.Insert(result); err != nil {
-			logger.L().Warnw("辩论结果落库失败", "ts_code", ctx.TsCode, "err", err)
-		}
 	}
 	logger.L().Infof("[智能体辩论] 完成 %s: decision=%s confidence=%.2f", ctx.TsCode, result.Decision, result.Confidence)
 	return result, nil
@@ -83,7 +91,13 @@ func (o *DebateOrchestrator) runAnalystsParallel(ctx *DebateContext) []*Analysis
 			report, err := analyst.Analyze(ctx)
 			if err != nil {
 				logger.L().Warnw("分析师执行失败", "agent", analyst.Name(), "ts_code", ctx.TsCode, "err", err)
-				report = &AnalysisReport{Agent: analyst.Name(), TsCode: ctx.TsCode, Confidence: 0.1}
+				// 打缺失标记而非 Confidence=0.1: 后者无法与模型真实给出的低置信度区分,
+				// 会把"没有意见"当成一条偏空意见计入风控平均 sentiment
+				report = &AnalysisReport{
+					Agent:     analyst.Name(),
+					TsCode:    ctx.TsCode,
+					KeyPoints: []string{reportMissingData},
+				}
 			}
 			reports[idx] = report
 		}(i, a)
@@ -127,12 +141,32 @@ func (o *DebateOrchestrator) runResearchersParallel(ctx *DebateContext, reports 
 // debateConcurrency 同时辩论的股票数上限 (LLM 全局限流在 client 层统一控制, 此上限防资源峰值)
 const debateConcurrency = 4
 
-func (o *DebateOrchestrator) EnhanceSignals(date string, signals []model.Signal, bars map[string]*model.Bar, positions map[string]*model.Position, totalAsset float64, stockNames map[string]string) []model.Signal {
+// debateAdjustedQty 按 LLM 建议的仓位占比 (占总资产比例) 换算买入数量
+// 返回 min(计划量, 建议量): 计划量是策略结合风控与资金算出的上界, 辩论只能在其之下缩量。
+// 价格缺失或建议非正时原样返回, 不让换算失败反过来改变仓位。
+func debateAdjustedQty(plannedQty int, totalAsset float64, bar *model.Bar, suggestedPct, maxPositionPct float64) int {
+	if plannedQty <= 0 || bar == nil || bar.Close <= 0 || suggestedPct <= 0 {
+		return plannedQty
+	}
+	if maxPositionPct > 0 && suggestedPct > maxPositionPct {
+		suggestedPct = maxPositionPct // 提示词已声明该上限, 越界只可能是模型没守格式
+	}
+	qty := strategy.CalcBuyQty(totalAsset, bar.Close, suggestedPct)
+	if qty <= 0 || qty > plannedQty {
+		return plannedQty
+	}
+	return qty
+}
+
+// EnhanceSignals 对买入信号逐个跑辩论并按结论调整信号
+// 第二个返回值为"结论已产出但落库失败"的清单 (ts_code: 原因): 信号照常增强,
+// 但缺了库内记录就等于反思闭环 (ReviewDebates 回填命中率) 拿不到样本, 必须由调用方告警
+func (o *DebateOrchestrator) EnhanceSignals(date string, signals []model.Signal, bars map[string]*model.Bar, positions map[string]*model.Position, totalAsset float64, stockNames map[string]string) ([]model.Signal, []string) {
 	if !o.IsEnabled() {
-		return signals
+		return signals, nil
 	}
 	marketBars := make(map[string]*model.Bar)
-	for _, code := range []string{"000300.SH", "000001.SH", "399001.SZ"} {
+	for _, code := range o.settings.MarketIndexes {
 		if bar, ok := bars[code]; ok {
 			marketBars[code] = bar
 		}
@@ -143,6 +177,8 @@ func (o *DebateOrchestrator) EnhanceSignals(date string, signals []model.Signal,
 	kept := make([]bool, len(signals))
 
 	var wg sync.WaitGroup
+	var persistMu sync.Mutex
+	var persistFailures []string
 	sem := make(chan struct{}, debateConcurrency)
 	for i, sig := range signals {
 		if sig.Direction == model.DirSell {
@@ -168,6 +204,15 @@ func (o *DebateOrchestrator) EnhanceSignals(date string, signals []model.Signal,
 				kept[idx] = true
 				return
 			}
+			// 落库失败不回滚本次增强, 只登记待告警
+			if o.debateRepo != nil {
+				if _, err := o.debateRepo.Insert(result); err != nil {
+					logger.L().Errorf("[智能体辩论] %s 结论落库失败: %v", sig.TsCode, err)
+					persistMu.Lock()
+					persistFailures = append(persistFailures, fmt.Sprintf("%s: %v", sig.TsCode, err))
+					persistMu.Unlock()
+				}
+			}
 			switch result.Decision {
 			case "reject", "hold", "sell":
 				// reject=否决买入, hold=建议观望, sell=建议卖出(对买入信号而言都意味着不买入)
@@ -175,13 +220,10 @@ func (o *DebateOrchestrator) EnhanceSignals(date string, signals []model.Signal,
 					result.Decision, sig.TsCode, result.Decision, result.Summary)
 				return // 过滤, kept 保持 false
 			case "buy":
-				// 按辩论建议的仓位比例调整数量 (PositionPct 0~0.6, 不超过原始目标)
-				if result.PositionPct > 0 && result.PositionPct < 1 {
-					adjustedQty := int(float64(sig.TargetQty) * result.PositionPct)
-					if adjustedQty > 0 && adjustedQty <= sig.TargetQty {
-						sig.TargetQty = adjustedQty
-					}
-				}
+				// position_pct 口径 = 拟买入金额占总资产比例 (与提示词一致), 按策略下单同一公式换算成数量。
+				// 只收紧不放宽: 计划量已由策略结合风控与资金算出, 辩论只被允许缩量;
+				// 放大交给后续 CheckAndSortSignals 统一裁, 避免这里绕过风控
+				sig.TargetQty = debateAdjustedQty(sig.TargetQty, totalAsset, bars[sig.TsCode], result.PositionPct, o.settings.Positions.MaxPositionPct)
 				sig.Reason = fmt.Sprintf("%s | LLM辩论: %s", sig.Reason, result.Summary)
 				sig.Reason = appendStopPriceReason(sig.Reason, result.StopPrice)
 				sig.Strength = result.Confidence
@@ -203,7 +245,7 @@ func (o *DebateOrchestrator) EnhanceSignals(date string, signals []model.Signal,
 			out = append(out, enhanced[i])
 		}
 	}
-	return out
+	return out, persistFailures
 }
 
 func (o *DebateOrchestrator) buildContext(date, tsCode string, stockNames map[string]string, bars map[string]*model.Bar, positions map[string]*model.Position, totalAsset float64, marketBars map[string]*model.Bar) *DebateContext {

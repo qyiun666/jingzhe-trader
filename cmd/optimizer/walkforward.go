@@ -18,11 +18,14 @@ import (
 
 	"jingzhe-trader/internal/config"
 	"jingzhe-trader/internal/engine"
+	"jingzhe-trader/internal/store"
 )
 
 // runSingleBacktest 运行单组参数的回测, 返回统一结果 (出错时 Err 非空, 结果无效)。
 // 注意: ma_cross 策略 Init 用 v.(float64) 解析参数, short/long 必须传 float64 类型。
-func runSingleBacktest(cfg *config.Config, strategyName, startDate, endDate string,
+// dbPath 由 main 解析后显式传入 (而非取自配置): 每组参数各开一条连接跑完即关,
+// 因为单条连接被 SetMaxOpenConns(1) 限死, 共享给 worker 池会让并行回测退化成串行。
+func runSingleBacktest(dbPath string, cfg *config.Config, strategyName, startDate, endDate string,
 	capital float64, universe []string, sp, lp int, pp float64) OptResult {
 
 	btCfg := engine.RunConfig{
@@ -45,12 +48,17 @@ func runSingleBacktest(cfg *config.Config, strategyName, startDate, endDate stri
 	fail := func(err error) OptResult {
 		return OptResult{ShortPeriod: sp, LongPeriod: lp, PositionPct: pp, Err: err}
 	}
-	runner, err := engine.NewBacktestRunner(btCfg, cfg)
+	db, err := store.NewDB(dbPath)
+	if err != nil {
+		return fail(fmt.Errorf("打开数据库失败: %w", err))
+	}
+	defer db.Close()
+
+	runner, err := engine.NewBacktestRunner(db, btCfg, cfg)
 	if err != nil {
 		return fail(err)
 	}
 	result, err := runner.Run()
-	_ = runner.Close() // 释放数据库连接, 避免批量回测时连接泄漏
 	if err != nil {
 		return fail(err)
 	}
@@ -319,7 +327,7 @@ func stitchOOS(folds []foldResult) stitchedOOS {
 }
 
 // runWalkForward walk-forward 模式主流程
-func runWalkForward(cfg *config.Config, strategyName, startDate, endDate string,
+func runWalkForward(dbPath string, cfg *config.Config, strategyName, startDate, endDate string,
 	capital float64, universe []string, grid paramGrid, folds int, parallelWorkers int) {
 
 	windows, err := splitWalkForwardFolds(startDate, endDate, folds)
@@ -346,7 +354,7 @@ func runWalkForward(cfg *config.Config, strategyName, startDate, endDate string,
 			w.Index, len(windows), w.TrainStart, w.TrainEnd, w.TestStart, w.TestEnd)
 
 		// 1. 训练窗网格搜索 (并行, 结果按组合顺序收集)
-		trainResults := runParallelBacktests(cfg, strategyName, w.TrainStart, w.TrainEnd,
+		trainResults := runParallelBacktests(dbPath, cfg, strategyName, w.TrainStart, w.TrainEnd,
 			capital, universe, combos, parallelWorkers)
 		var valid []OptResult
 		for _, r := range trainResults {
@@ -362,7 +370,7 @@ func runWalkForward(cfg *config.Config, strategyName, startDate, endDate string,
 
 		// 2. 选样本内最优, 跑测试窗样本外回测
 		best, _ := bestByComposite(valid)
-		oos := runSingleBacktest(cfg, strategyName, w.TestStart, w.TestEnd, capital, universe,
+		oos := runSingleBacktest(dbPath, cfg, strategyName, w.TestStart, w.TestEnd, capital, universe,
 			best.ShortPeriod, best.LongPeriod, best.PositionPct)
 		if oos.Err != nil {
 			fmt.Printf("  段 %d 测试窗回测失败: %v, 跳过\n\n", w.Index, oos.Err)

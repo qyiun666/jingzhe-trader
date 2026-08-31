@@ -149,10 +149,11 @@ type Service struct {
 }
 
 // NewService 创建 API 服务
-func NewService(cfg *config.Config) (*Service, error) {
-	db, err := store.NewDB(cfg.Database.Path)
-	if err != nil {
-		return nil, fmt.Errorf("初始化数据库失败: %w", err)
+// db 由组合根 (cmd) 打开并注入: 配置本身就存在这个库里, 组件内再按 cfg 路径开一次库
+// 会出现 "-db 指测试库、服务却连生产库" 的错位, 故连接所有权始终留在 cmd
+func NewService(db *sqlx.DB, cfg *config.Config) (*Service, error) {
+	if db == nil {
+		return nil, fmt.Errorf("缺少数据库连接")
 	}
 
 	svc := &Service{
@@ -226,6 +227,7 @@ func NewService(cfg *config.Config) (*Service, error) {
 	svc.llmClient = llm.NewClient(llmCfg)
 
 	// 初始化智能体辩论编排器 (复用 Service 的共享 Repo, 避免重复实例化)
+	// 风控约束与指数清单由配置注入: 此前提示词把仓位上限写死成 60%, 而 risk.max_position_pct=0.40
 	svc.debateOrchestrator = agent.NewDebateOrchestrator(
 		svc.llmClient,
 		svc.barRepo,
@@ -236,6 +238,14 @@ func NewService(cfg *config.Config) (*Service, error) {
 		store.NewDebateReviewRepo(db),
 		store.NewMoneyFlowRepo(db),
 		store.NewTopListRepo(db),
+		agent.DebateSettings{
+			Positions: agent.PositionLimits{
+				MaxPositionPct:      cfg.Risk.MaxPositionPct,
+				MaxTotalPositionPct: cfg.Risk.MaxTotalPositionPct,
+				StopLossPct:         cfg.Risk.StopLossPct,
+			},
+			MarketIndexes: watchlistIndexCodes(cfg.Dataloader.Watchlist),
+		},
 	)
 
 	// 初始化自动选股器 (全市场筛选, 补充配置股票池)
@@ -304,16 +314,9 @@ func (s *Service) ScreenRepo() *store.ScreenRepo {
 }
 
 // DB 返回底层数据库连接 (供调度器等外部组件复用同一连接)
+// 连接由组合根打开并持有, 关闭责任也在组合根, Service 不得自行 Close
 func (s *Service) DB() *sqlx.DB {
 	return s.db
-}
-
-// Close 释放资源
-func (s *Service) Close() error {
-	if s.db != nil {
-		return s.db.Close()
-	}
-	return nil
 }
 
 // ==================== 共享内部方法 ====================

@@ -18,12 +18,20 @@ type RetentionPolicy struct {
 	BarYears     int    // 行情数据保留年数
 	NewsDays     int    // 新闻保留天数
 	PlanDays     int    // 交易计划/任务记录保留天数
+	ActionDays   int    // 动作日志(action_log)保留天数 (每任务每笔都写, 增长最快)
+	AlertDays    int    // 告警(agent_alert)保留天数
+	ScreenDays   int    // 选股结果(screen_result)保留天数
+	DebateDays   int    // 辩论/复盘记录保留天数
+	FinaQuarters int    // 财务指标保留最近N个报告期
 	BacktestRuns int    // 保留最近N个回测run (live_* 前缀永久保留)
 	LogDays      int    // 日志文件保留天数
 	ReportFiles  int    // 保留最近N个报告文件
 	LogDir       string // 日志目录 (空则跳过)
 	ReportDir    string // 报告目录 (空则跳过)
 }
+
+// alertUnreadGraceDays 超期告警中"未读"的额外宽限期: 没人看过的告警不随批抹掉, 但也不是永久保留
+const alertUnreadGraceDays = 7
 
 // RunRetention 执行数据保留清理
 // fullClean=false 时仅做文件清理 (非交易日跳过数据库大项)
@@ -34,6 +42,12 @@ func RunRetention(db *sqlx.DB, p RetentionPolicy, fullClean bool) error {
 	var errs []string
 	if fullClean {
 		if err := cleanMarketData(db, p); err != nil {
+			errs = append(errs, err.Error())
+		}
+		if err := cleanActivityTables(db, p); err != nil {
+			errs = append(errs, err.Error())
+		}
+		if err := cleanFinaPeriods(db, p.FinaQuarters); err != nil {
 			errs = append(errs, err.Error())
 		}
 		if err := cleanBacktestRuns(db, p.BacktestRuns); err != nil {
@@ -66,7 +80,7 @@ func RunRetention(db *sqlx.DB, p RetentionPolicy, fullClean bool) error {
 func cleanMarketData(db *sqlx.DB, p RetentionPolicy) error {
 	if p.BarYears > 0 {
 		cutoff := time.Now().AddDate(-p.BarYears, 0, 0).Format("20060102")
-		for _, table := range []string{"daily_bar", "daily_basic", "stk_limit", "moneyflow"} {
+		for _, table := range []string{"daily_bar", "daily_basic", "stk_limit", "moneyflow", "top_list"} {
 			if err := deleteRowsBatched(db, table,
 				`trade_date < ?`, 0, cutoff); err != nil {
 				return err
@@ -81,6 +95,59 @@ func cleanMarketData(db *sqlx.DB, p RetentionPolicy) error {
 		}
 	}
 	return nil
+}
+
+// cleanActivityTables 清理运行记录类表
+// 这几张表此前完全没有保留策略, 其中 action_log 由每个调度任务每笔写入
+// (盘中监控 5 分钟一次 ≈ 66 行/交易日), 不清理会成为库里增长最快的表
+func cleanActivityTables(db *sqlx.DB, p RetentionPolicy) error {
+	if p.ActionDays > 0 {
+		if err := deleteRowsBatched(db, "action_log", `trade_date < ?`, 0,
+			time.Now().AddDate(0, 0, -p.ActionDays).Format("20060102")); err != nil {
+			return err
+		}
+	}
+	if p.AlertDays > 0 {
+		cutoff := time.Now().AddDate(0, 0, -p.AlertDays).Format("20060102")
+		grace := time.Now().AddDate(0, 0, -(p.AlertDays + alertUnreadGraceDays)).Format("20060102")
+		// 未读告警多留 alertUnreadGraceDays 天: 没人看过的记录一旦删掉就彻底丢了线索
+		if err := deleteRowsBatched(db, "agent_alert",
+			`trade_date < ? AND NOT (status = 'unread' AND trade_date >= ?)`, 0, cutoff, grace); err != nil {
+			return err
+		}
+	}
+	if p.ScreenDays > 0 {
+		if err := deleteRowsBatched(db, "screen_result", `trade_date < ?`, 0,
+			time.Now().AddDate(0, 0, -p.ScreenDays).Format("20060102")); err != nil {
+			return err
+		}
+	}
+	if p.DebateDays > 0 {
+		cutoff := time.Now().AddDate(0, 0, -p.DebateDays).Format("20060102")
+		for _, table := range []string{"agent_debate", "agent_debate_review"} {
+			if err := deleteRowsBatched(db, table, `trade_date < ?`, 0, cutoff); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// cleanFinaPeriods 财务指标只保留最近 keep 个报告期
+// 该表按 end_date 组织 (季度末) 而非 trade_date, 不能用日期减法, 需按实际存在的报告期取序
+func cleanFinaPeriods(db *sqlx.DB, keep int) error {
+	if keep <= 0 {
+		return nil
+	}
+	var periods []string
+	if err := db.Select(&periods,
+		`SELECT end_date FROM fina_indicator WHERE end_date <> '' GROUP BY end_date ORDER BY end_date DESC`); err != nil {
+		return fmt.Errorf("查询报告期列表失败: %w", err)
+	}
+	if len(periods) <= keep {
+		return nil
+	}
+	return deleteRowsBatched(db, "fina_indicator", `end_date < ?`, 0, periods[keep-1])
 }
 
 // CleanStaleStocks 清理不在活跃股票池中的陈旧行情数据
@@ -433,7 +500,8 @@ func vacuumIfNeeded(db *sqlx.DB) []string {
 // logDBSize 打印主要表行数与db文件大小, 便于观察清理效果
 func logDBSize(db *sqlx.DB, stage string) {
 	counts := map[string]int{}
-	for _, table := range []string{"daily_bar", "news", "trades", "account_snapshot", "trade_plan", "job_run"} {
+	for _, table := range []string{"daily_bar", "news", "trades", "account_snapshot", "trade_plan", "job_run",
+		"action_log", "agent_alert", "screen_result", "top_list", "fina_indicator", "agent_debate"} {
 		var n int
 		if err := db.Get(&n, fmt.Sprintf(`SELECT COUNT(1) FROM %s`, table)); err == nil {
 			counts[table] = n

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"jingzhe-trader/internal/api"
+	"jingzhe-trader/internal/appcfg"
 	"jingzhe-trader/internal/config"
 	"jingzhe-trader/internal/mcp"
 	"jingzhe-trader/internal/scheduler"
@@ -22,12 +23,19 @@ import (
 
 func main() {
 	port := flag.String("port", "11270", "监听端口")
-	configPath := flag.String("config", "config/config.yaml", "配置文件路径")
+	dbPath := flag.String("db", "", "数据库路径 (配置即存于此库, 默认取 "+appcfg.EnvDBPath+" 或 "+config.DefaultDBPath()+")")
 	flag.Parse()
 
-	// 加载配置 (失败直接退出, 禁止空配置兼容运行导致数据落错库)
-	cfg, err := config.Load(*configPath)
+	// 先开库再读配置: 配置本体就存在 config_kv 里, 库是唯一前置输入
+	// 装载失败直接退出, 禁止空配置兼容运行导致数据落错库
+	resolvedDB := appcfg.ResolveDBPath(*dbPath)
+	db, err := appcfg.Open(resolvedDB)
 	if err != nil {
+		log.Fatalf("打开数据库失败: %v", err)
+	}
+	cfg, err := appcfg.Load(db)
+	if err != nil {
+		db.Close()
 		log.Fatalf("加载配置失败: %v", err)
 	}
 
@@ -41,9 +49,10 @@ func main() {
 		serverPort = fmt.Sprintf("%d", cfg.Server.Port)
 	}
 
-	// 创建 API 服务
-	svc, err := api.NewService(cfg)
+	// 创建 API 服务 (数据库由本组合根持有, 服务只借用)
+	svc, err := api.NewService(db, cfg)
 	if err != nil {
+		db.Close()
 		log.Fatalf("初始化 API 服务失败: %v", err)
 	}
 
@@ -104,7 +113,7 @@ func main() {
 	log.Printf("========================================")
 	log.Printf("惊蛰交易系统 server 启动")
 	log.Printf("地址: http://%s", addr)
-	log.Printf("配置: %s", *configPath)
+	log.Printf("数据库: %s", resolvedDB)
 	log.Printf("调度器: enabled=%v", cfg.Scheduler.Enabled)
 	log.Printf("========================================")
 
@@ -114,7 +123,7 @@ func main() {
 
 	// 等调度器 goroutine 收尾后再关数据库, 保证 SQLite 不留脏 WAL
 	wg.Wait()
-	if err := svc.Close(); err != nil {
+	if err := db.Close(); err != nil {
 		log.Printf("关闭数据库异常: %v", err)
 	}
 	log.Println("服务已停止")

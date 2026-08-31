@@ -12,35 +12,43 @@ import (
 )
 
 // syncOptional 同步可选数据 (新闻/资金流/龙虎榜/财务指标)
-func (l *Loader) syncOptional(opts Options, tradeCals []model.TradeCal) {
+// 返回各子任务的失败原因: 这些是辅助数据源, 失败不该阻断核心行情同步,
+// 但必须让调用方可见 —— 此前只记日志不上报, 导致四张表长期 0 行而任务仍记 success
+func (l *Loader) syncOptional(opts Options, tradeCals []model.TradeCal) []string {
+	var failures []string
+	report := func(name string, err error) {
+		if err != nil {
+			logger.L().Errorf("同步%s失败: %v", name, err)
+			failures = append(failures, fmt.Sprintf("%s: %v", name, err))
+		}
+	}
 	if opts.SyncNews {
-		l.syncNews(opts.StartDate, opts.EndDate)
+		report("新闻快讯", l.syncNews(opts.StartDate, opts.EndDate))
 	}
 	if opts.SyncMoneyFlow {
-		l.syncMoneyFlow(tradeCals)
+		report("个股资金流向", l.syncMoneyFlow(tradeCals))
 	}
 	if opts.SyncTopList {
-		l.syncTopList(tradeCals)
+		report("龙虎榜", l.syncTopList(tradeCals))
 	}
 	if opts.SyncFina {
-		l.syncFina(opts.StartDate, opts.EndDate)
+		report("财务指标", l.syncFina(opts.StartDate, opts.EndDate))
 	}
+	return failures
 }
 
 // syncNews 同步新闻快讯
-func (l *Loader) syncNews(startDate, endDate string) {
+func (l *Loader) syncNews(startDate, endDate string) error {
 	logger.L().Info("=== 同步新闻快讯 ===")
 	newsList, err := l.ts.MajorNews(startDate, endDate, "")
 	if err != nil {
-		logger.L().Errorf("获取新闻快讯失败: %v", err)
-		return
+		return fmt.Errorf("获取失败: %w", err)
 	}
-	newsRepo := store.NewNewsRepo(l.db)
-	if err := newsRepo.BatchInsert(newsList); err != nil {
-		logger.L().Errorf("存储新闻快讯失败: %v", err)
-		return
+	if err := store.NewNewsRepo(l.db).BatchInsert(newsList); err != nil {
+		return fmt.Errorf("入库失败: %w", err)
 	}
 	logger.L().Infof("新闻快讯同步完成: %d 条", len(newsList))
+	return nil
 }
 
 // maxDateRepo 支持查询最大交易日的 repo (增量同步判断用)
@@ -48,15 +56,16 @@ type maxDateRepo interface {
 	GetMaxTradeDate() (string, error)
 }
 
-// syncByTradeDay 按交易日增量同步 (交易日间并行拉取): 拉取 → 入库, 跳过已同步日期 (syncMoneyFlow/syncTopList 共用)
-// fetch: 拉取某交易日数据; store: 批量入库; 返回同步的交易日数
+// syncByTradeDay 按交易日增量同步 (交易日间并行拉取): 拉取 → 入库, 跳过已同步日期
+// 返回 (成功同步的交易日数, 尝试同步的交易日数)
 func syncByTradeDay[T any](repo maxDateRepo, tradeCals []model.TradeCal, name string,
-	fetch func(string) ([]T, error), store func([]T) error) int {
+	fetch func(string) ([]T, error), store func([]T) error) (int, int) {
 	logger.L().Infof("=== 同步%s ===", name)
 	lastDate, _ := repo.GetMaxTradeDate()
 
 	var mu sync.Mutex
 	synced := 0
+	attempts := 0
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, dataloaderConcurrency)
 	for _, cal := range tradeCals {
@@ -64,6 +73,7 @@ func syncByTradeDay[T any](repo maxDateRepo, tradeCals []model.TradeCal, name st
 			continue
 		}
 		calDate := cal.CalDate
+		attempts++
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -76,6 +86,9 @@ func syncByTradeDay[T any](repo maxDateRepo, tradeCals []model.TradeCal, name st
 				return
 			}
 			if len(items) == 0 {
+				mu.Lock()
+				synced++ // 当日确无数据 (如无上榜), 属成功
+				mu.Unlock()
 				return
 			}
 			if err := store(items); err != nil {
@@ -88,35 +101,52 @@ func syncByTradeDay[T any](repo maxDateRepo, tradeCals []model.TradeCal, name st
 		}()
 	}
 	wg.Wait()
-	logger.L().Infof("%s同步完成, 共 %d 个交易日", name, synced)
-	return synced
+	logger.L().Infof("%s同步完成, 共 %d/%d 个交易日", name, synced, attempts)
+	return synced, attempts
+}
+
+// daySyncError 判定"按交易日同步"是否整体失败
+// 只在有尝试且无一成功时报错: 个别交易日失败属常态 (停牌/无上榜), 天天告警会淹没真问题
+// 数据源名前缀由调用方 syncOptional 统一附加
+func daySyncError(synced, attempts int) error {
+	if attempts > 0 && synced == 0 {
+		return fmt.Errorf("%d 个交易日全部失败 (接口不可用或权限不足)", attempts)
+	}
+	return nil
 }
 
 // syncMoneyFlow 同步个股资金流向 (按交易日增量)
-func (l *Loader) syncMoneyFlow(tradeCals []model.TradeCal) {
+func (l *Loader) syncMoneyFlow(tradeCals []model.TradeCal) error {
 	repo := store.NewMoneyFlowRepo(l.db)
-	syncByTradeDay(repo, tradeCals, "个股资金流向", l.ts.MoneyFlow, repo.BatchInsert)
+	synced, attempts := syncByTradeDay(repo, tradeCals, "个股资金流向", l.ts.MoneyFlow, repo.BatchInsert)
+	return daySyncError(synced, attempts)
 }
 
 // syncTopList 同步龙虎榜 (按交易日增量)
-func (l *Loader) syncTopList(tradeCals []model.TradeCal) {
+func (l *Loader) syncTopList(tradeCals []model.TradeCal) error {
 	repo := store.NewTopListRepo(l.db)
-	syncByTradeDay(repo, tradeCals, "龙虎榜", l.ts.TopList, repo.BatchInsert)
+	synced, attempts := syncByTradeDay(repo, tradeCals, "龙虎榜", l.ts.TopList, repo.BatchInsert)
+	return daySyncError(synced, attempts)
 }
 
 // syncFina 同步财务指标 (逐股票并行, 股票内各报告期串行)
 // Tushare 500元档 fina_indicator 必须传 ts_code, 不能按报告期批量获取
-func (l *Loader) syncFina(startDate, endDate string) {
+func (l *Loader) syncFina(startDate, endDate string) error {
 	logger.L().Info("=== 同步财务指标 ===")
 	finaRepo := store.NewFinaRepo(l.db)
 
 	allStocks, err := l.stockRepo.GetAll()
-	if err != nil || len(allStocks) == 0 {
-		logger.L().Errorf("获取股票列表失败: %v", err)
-		return
+	if err != nil {
+		return fmt.Errorf("获取股票列表失败: %w", err)
+	}
+	if len(allStocks) == 0 {
+		return fmt.Errorf("股票列表为空, 无法按股票拉取财务指标")
 	}
 
 	periods := genReportPeriods(startDate, endDate)
+	if len(periods) == 0 {
+		return fmt.Errorf("区间 %s~%s 内无报告期", startDate, endDate)
+	}
 	logger.L().Infof("待同步报告期: %v, 股票数: %d", periods, len(allStocks))
 
 	var mu sync.Mutex
@@ -164,6 +194,11 @@ func (l *Loader) syncFina(startDate, endDate string) {
 	}
 	wg.Wait()
 	logger.L().Infof("财务指标同步完成, 共 %d 条, 失败 %d 次", finaSynced, failedCount)
+
+	if finaSynced == 0 && failedCount > 0 {
+		return fmt.Errorf("%d 只股票 × %d 个报告期全部拉取失败 (接口不可用或权限不足)", len(allStocks), len(periods))
+	}
+	return nil
 }
 
 // Cleanup 清理不在关注列表中的股票数据 (危险操作)

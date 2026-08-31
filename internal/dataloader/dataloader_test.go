@@ -48,7 +48,7 @@ func TestSyncByTradeDaySkipsSyncedDates(t *testing.T) {
 	var storeCalls atomic.Int64
 
 	cals := tradeCals(10)
-	synced := syncByTradeDay(repo, cals, "测试", fetch.fn, func(items []int) error {
+	synced, attempts := syncByTradeDay(repo, cals, "测试", fetch.fn, func(items []int) error {
 		storeCalls.Add(1)
 		return nil
 	})
@@ -60,6 +60,9 @@ func TestSyncByTradeDaySkipsSyncedDates(t *testing.T) {
 	if synced != 5 {
 		t.Errorf("同步数 = %d, 期望 5", synced)
 	}
+	if attempts != 5 {
+		t.Errorf("尝试数 = %d, 期望 5 (已同步日期应被跳过, 不计入尝试)", attempts)
+	}
 	if storeCalls.Load() != 5 {
 		t.Errorf("入库次数 = %d, 期望 5", storeCalls.Load())
 	}
@@ -70,12 +73,18 @@ func TestSyncByTradeDayStoreError(t *testing.T) {
 	fetch := &fakeFetch{}
 
 	cals := tradeCals(5)
-	synced := syncByTradeDay(repo, cals, "测试", fetch.fn, func(items []int) error {
+	synced, attempts := syncByTradeDay(repo, cals, "测试", fetch.fn, func(items []int) error {
 		return fmt.Errorf("模拟入库失败")
 	})
 
 	if synced != 0 {
 		t.Errorf("全部入库失败时同步数 = %d, 期望 0", synced)
+	}
+	if attempts != 5 {
+		t.Errorf("尝试数 = %d, 期望 5", attempts)
+	}
+	if daySyncError(synced, attempts) == nil {
+		t.Errorf("有尝试且零成功应判定为失败")
 	}
 	if len(fetch.calls) != 5 {
 		t.Errorf("入库失败也应拉取全部: calls=%v", fetch.calls)
@@ -85,28 +94,39 @@ func TestSyncByTradeDayStoreError(t *testing.T) {
 func TestSyncByTradeDayFetchError(t *testing.T) {
 	repo := &fakeMaxDateRepo{}
 	cals := tradeCals(5)
-	synced := syncByTradeDay(repo, cals, "测试", func(calDate string) ([]int, error) {
+	synced, attempts := syncByTradeDay(repo, cals, "测试", func(calDate string) ([]int, error) {
 		return nil, fmt.Errorf("模拟拉取失败")
 	}, func(items []int) error { return nil })
 
 	if synced != 0 {
 		t.Errorf("全部拉取失败时同步数 = %d, 期望 0", synced)
 	}
+	if daySyncError(synced, attempts) == nil {
+		t.Errorf("接口整体不可用应判定为失败")
+	}
 }
 
+// TestSyncByTradeDayEmptyResult 当日无数据属同步成功但不入库
+// 计为成功是必须的: 若按失败计, 只持 ETF 的账户龙虎榜长期空行会让 daySyncError 天天误报
 func TestSyncByTradeDayEmptyResult(t *testing.T) {
 	repo := &fakeMaxDateRepo{}
 	var storeCalls atomic.Int64
 	cals := tradeCals(5)
-	synced := syncByTradeDay(repo, cals, "测试", func(calDate string) ([]int, error) {
+	synced, attempts := syncByTradeDay(repo, cals, "测试", func(calDate string) ([]int, error) {
 		return nil, nil // 空结果
 	}, func(items []int) error {
 		storeCalls.Add(1)
 		return nil
 	})
 
-	if synced != 0 || storeCalls.Load() != 0 {
-		t.Errorf("空结果不入库: synced=%d storeCalls=%d", synced, storeCalls.Load())
+	if synced != 5 {
+		t.Errorf("空结果应计为同步成功: synced=%d, 期望 5", synced)
+	}
+	if storeCalls.Load() != 0 {
+		t.Errorf("空结果不应触发入库, storeCalls=%d", storeCalls.Load())
+	}
+	if err := daySyncError(synced, attempts); err != nil {
+		t.Errorf("全为空数据但接口正常, 不应判定为失败: %v", err)
 	}
 }
 
@@ -116,7 +136,7 @@ func TestSyncByTradeDayConcurrencySafety(t *testing.T) {
 	var fetchCalls atomic.Int64
 	var storeCalls atomic.Int64
 	cals := tradeCals(200)
-	synced := syncByTradeDay(repo, cals, "测试",
+	synced, _ := syncByTradeDay(repo, cals, "测试",
 		func(calDate string) ([]int, error) {
 			fetchCalls.Add(1)
 			return []int{1}, nil

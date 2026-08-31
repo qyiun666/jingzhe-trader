@@ -12,7 +12,6 @@
 
 # ===== 配置 (按实际部署路径修改) =====
 INSTALL_DIR="/opt/jingzhe-trader"
-CONFIG="${INSTALL_DIR}/config/config.yaml"
 BINARY="${INSTALL_DIR}/bin/jingzhe-server"
 DATA_LOADER="${INSTALL_DIR}/bin/dataloader"
 DB_PATH="${INSTALL_DIR}/data/jingzhe.db"
@@ -28,19 +27,24 @@ alert() {
     log "ALERT: $1"
 }
 
+# 进程匹配按可执行文件路径: 启动参数已不含 config.yaml, 用旧模式会永远误判为已死
+server_running() {
+    pgrep -f "bin/jingzhe-server" > /dev/null 2>&1
+}
+
 # ===== 1. 检查 server 进程 =====
 check_server_process() {
-    if pgrep -f "jingzhe-server.*config.yaml" > /dev/null 2>&1; then
+    if server_running; then
         log "OK: server process running"
         return 0
     fi
 
     log "WARN: server process not running, restarting..."
     cd "${INSTALL_DIR}" || return 1
-    nohup "${BINARY}" -config "${CONFIG}" > "${LOG_DIR}/server.out.log" 2>&1 &
+    nohup "${BINARY}" -db "${DB_PATH}" > "${LOG_DIR}/server.out.log" 2>&1 &
     sleep 3
 
-    if pgrep -f "jingzhe-server.*config.yaml" > /dev/null 2>&1; then
+    if server_running; then
         log "OK: server restarted"
     else
         alert "server restart failed! Check: ${LOG_DIR}/server.out.log"
@@ -75,7 +79,7 @@ check_data_freshness() {
     if [ "$today_in_cal" = "0" ]; then
         log "WARN: today not in trade calendar, triggering calendar sync..."
         cd "${INSTALL_DIR}" || return 1
-        "${DATA_LOADER}" -config "${CONFIG}" > "${LOG_DIR}/dataloader_auto.log" 2>&1
+        "${DATA_LOADER}" -db "${DB_PATH}" > "${LOG_DIR}/dataloader_auto.log" 2>&1
         log "OK: data sync done (calendar fix)"
         return 0
     fi
@@ -89,7 +93,7 @@ check_data_freshness() {
             if [ "$hour" -ge "15" ]; then
                 log "WARN: data stale (latest: ${max_bar_date}, today: ${today}), triggering update..."
                 cd "${INSTALL_DIR}" || return 1
-                "${DATA_LOADER}" -config "${CONFIG}" > "${LOG_DIR}/dataloader_auto.log" 2>&1
+                "${DATA_LOADER}" -db "${DB_PATH}" > "${LOG_DIR}/dataloader_auto.log" 2>&1
                 local new_max=$(sqlite3 "${DB_PATH}" "SELECT MAX(trade_date) FROM daily_bar;" 2>/dev/null)
                 if [ "$new_max" \> "$max_bar_date" ]; then
                     log "OK: data updated (latest: ${new_max})"
