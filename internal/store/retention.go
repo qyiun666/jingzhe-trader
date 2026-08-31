@@ -150,13 +150,20 @@ func cleanFinaPeriods(db *sqlx.DB, keep int) error {
 	return deleteRowsBatched(db, "fina_indicator", `end_date < ?`, 0, periods[keep-1])
 }
 
+// StaleKeepRecentDays 陈旧股票清理与日线同步共用的"全市场保留窗口" (自然日)
+// 必须覆盖选股器 fetchRecentCloses 的回溯深度 (15 自然日取 5 个交易日):
+// 全市场趋势过滤要读"非活跃股票"的近 5 日收盘价, 把这段删掉或不落库都会让过滤静默失效
+const StaleKeepRecentDays = 20
+
 // CleanStaleStocks 清理不在活跃股票池中的陈旧行情数据
 // keepCodes: 需要保留的股票代码集合 (选股结果 + 持仓 + watchlist + universe)
-// 删除这些股票的 daily_bar, daily_basic, stk_limit 数据, 释放空间
+// 删除这些股票在保留窗口之前的 daily_bar / daily_basic / stk_limit, 释放空间;
+// 保留窗口内的全市场行情始终不动 (选股器按日读全市场收盘价算均线)
 func CleanStaleStocks(db *sqlx.DB, keepCodes []string) error {
 	if len(keepCodes) == 0 {
 		return nil // 空集合不清理, 防止误删全表
 	}
+	recentCutoff := time.Now().AddDate(0, 0, -StaleKeepRecentDays).Format("20060102")
 
 	// 查询库中所有不同的 ts_code
 	var allCodes []string
@@ -196,13 +203,14 @@ func CleanStaleStocks(db *sqlx.DB, keepCodes []string) error {
 		// 构造 IN (?, ?, ...) 占位符
 		placeholders := strings.Repeat("?,", len(batch))
 		placeholders = placeholders[:len(placeholders)-1] // 去掉末尾逗号
-		args := make([]interface{}, len(batch))
-		for j, code := range batch {
-			args[j] = code
+		args := make([]interface{}, 0, len(batch)+1)
+		for _, code := range batch {
+			args = append(args, code)
 		}
+		args = append(args, recentCutoff) // 三张表共用的 trade_date 上限
 
 		for _, table := range []string{"daily_bar", "daily_basic", "stk_limit"} {
-			query := fmt.Sprintf(`DELETE FROM %s WHERE ts_code IN (%s)`, table, placeholders)
+			query := fmt.Sprintf(`DELETE FROM %s WHERE ts_code IN (%s) AND trade_date < ?`, table, placeholders)
 			res, err := db.Exec(query, args...)
 			if err != nil {
 				logger.L().Warnw("清理陈旧数据失败", "table", table, "err", err)

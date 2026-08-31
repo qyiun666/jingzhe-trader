@@ -38,10 +38,11 @@ type DynamicSelector struct {
 	enhanceStrategies []string // 当前建议的增强策略列表
 	// 环境检测用的指数代码
 	indexCodes []string
-	// 切换迟滞: 同一推荐连续出现 minHoldDays 次才执行切换, 避免按单日涨跌来回横跳
+	// 切换迟滞: 同一推荐连续出现 minHoldDays 个交易日才执行切换, 避免按单日涨跌来回横跳
 	minHoldDays    int
 	pendingName    string // 当前待确认的推荐
-	pendingDays    int    // 该推荐已连续出现的天数
+	pendingDays    int    // 该推荐已连续出现的交易日数
+	pendingDate    string // 已计入 pendingDays 的最近日期 (同日重复调用不重复计数)
 	recommendation string // 最近一次建议器推荐 (可能未注册, 如"空仓")
 	reduceExposure bool   // 建议器建议防守 (下跌市推荐空仓等)
 	lastSwitchDate string // 最近一次实际切换日期
@@ -88,12 +89,18 @@ func (ds *DynamicSelector) Select(date string, marketBars map[string]*model.Bar)
 	ds.reduceExposure = recommended == "空仓" ||
 		(ds.marketCondition == "下跌" && advice.Confidence < 0.6)
 
-	// 切换迟滞: 同一推荐需连续 minHoldDays 次才生效
+	// 切换迟滞: 同一推荐需连续 minHoldDays 个交易日才生效
+	// 计数以日期为推进单位: Select 也会被只读接口 (日报/策略状态) 反复调用,
+	// 按调用次数计数会让"连续3日"退化成"被看3次", 盘中刷几次仪表盘就把交易策略换掉
 	if recommended == ds.pendingName {
-		ds.pendingDays++
+		if date != ds.pendingDate {
+			ds.pendingDays++
+			ds.pendingDate = date
+		}
 	} else {
 		ds.pendingName = recommended
 		ds.pendingDays = 1
+		ds.pendingDate = date
 	}
 
 	// 确认推荐策略在注册表中存在且稳定, 才执行切换

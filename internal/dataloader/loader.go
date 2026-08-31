@@ -237,7 +237,11 @@ func (l *Loader) syncOneDayBars(calDate string) bool {
 	if bars, ok = validateBars(bars, calDate); !ok {
 		return false
 	}
-	if l.cfg.Dataloader.FilterMode {
+	// filter_mode 只裁剪历史日期: 近 StaleKeepRecentDays 内必须留全市场日线,
+	// 否则选股器按日读本地收盘价算 MA5 时只剩股票池里那几个代码 (多为 ETF),
+	// 趋势过滤与 5 日动量对全部 A 股候选静默失效 (与 CleanStaleStocks 同一窗口口径)
+	keepAllMarketSince := time.Now().AddDate(0, 0, -store.StaleKeepRecentDays).Format("20060102")
+	if l.cfg.Dataloader.FilterMode && calDate < keepAllMarketSince {
 		watchCodes := l.watchCodes()
 		filtered := make([]model.Bar, 0, len(bars))
 		for _, bar := range bars {

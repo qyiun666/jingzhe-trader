@@ -54,61 +54,57 @@ func (s *Service) buildRebalanceJSON(
 
 		sig, hasSignal := signalMap[tsCode]
 
-		// 止损/止盈检查 (统一走 StopLossManager, 消除与风控管道的规则漂移)
-		triggered, reason := sl.CheckSingle(pos, price)
-		if triggered {
-			sellQty := pos.AvailableQty
-			if sellQty > 0 {
-				sellList = append(sellList, TradeSuggestionJSON{
-					TsCode:   tsCode,
-					Name:     s.stockName(tsCode),
-					Action:   "sell",
-					DeltaQty: -sellQty,
-					Price:    price,
-					Amount:   price * float64(sellQty),
-					Priority: 1,
-					Reason:   reason,
-					Urgency:  "立即",
-				})
-			}
-			continue
-		}
-
-		// 策略信号卖出
-		if hasSignal && sig.Direction == model.DirSell {
-			sellQty := pos.AvailableQty
-			if sellQty > 0 {
-				sellList = append(sellList, TradeSuggestionJSON{
-					TsCode:   tsCode,
-					Name:     s.stockName(tsCode),
-					Action:   "sell",
-					DeltaQty: -sellQty,
-					Price:    price,
-					Amount:   price * float64(sellQty),
-					Priority: 3,
-					Reason:   "策略信号: " + sig.Reason,
-					Urgency:  "今日",
-				})
-			}
-			continue
-		}
-
-		// 持有
 		suggestion := "继续持有"
 		if pos.FloatingPnLPct < -0.03 {
 			suggestion = "关注止损位"
 		} else if pos.FloatingPnLPct > 0.15 {
 			suggestion = "接近止盈"
 		}
-		holdList = append(holdList, HoldSuggestionJSON{
-			TsCode:      tsCode,
-			Name:        s.stockName(tsCode),
-			Qty:         pos.TotalQty,
-			CostPrice:   pos.CostPrice,
-			MarketPrice: price,
-			FloatingPnL: pos.FloatingPnL,
-			Suggestion:  suggestion,
-		})
+		addHold := func(text string) {
+			holdList = append(holdList, HoldSuggestionJSON{
+				TsCode:      tsCode,
+				Name:        s.stockName(tsCode),
+				Qty:         pos.TotalQty,
+				CostPrice:   pos.CostPrice,
+				MarketPrice: price,
+				FloatingPnL: pos.FloatingPnL,
+				Suggestion:  text,
+			})
+		}
+		// 卖不出去 (T+1 锁仓) 时这笔持仓仍必须出现在报告里:
+		// 此前只判断 sellQty>0 就入卖出列表, 否则直接 continue,
+		// 结果用户当天买入的仓位在日报中凭空消失, 既不提示卖出也不列入持有
+		emitSell := func(priority int, reason, urgency string) {
+			if pos.AvailableQty <= 0 {
+				addHold("已触发卖出, 但当日不可卖 (T+1), 明日可卖后执行")
+				return
+			}
+			sellList = append(sellList, TradeSuggestionJSON{
+				TsCode:   tsCode,
+				Name:     s.stockName(tsCode),
+				Action:   "sell",
+				DeltaQty: -pos.AvailableQty,
+				Price:    price,
+				Amount:   price * float64(pos.AvailableQty),
+				Priority: priority,
+				Reason:   reason,
+				Urgency:  urgency,
+			})
+		}
+
+		// 止损/止盈检查 (统一走 StopLossManager, 消除与风控管道的规则漂移)
+		if triggered, reason := sl.CheckSingle(pos, price); triggered {
+			emitSell(1, reason, "立即")
+			continue
+		}
+
+		// 策略信号卖出
+		if hasSignal && sig.Direction == model.DirSell {
+			emitSell(3, "策略信号: "+sig.Reason, "今日")
+			continue
+		}
+
+		addHold(suggestion)
 	}
 
 	// 买入信号
