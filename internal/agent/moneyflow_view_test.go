@@ -29,10 +29,11 @@ func TestFormatTopLists(t *testing.T) {
 	if got := formatTopLists(nil, 3); got != "无" {
 		t.Fatalf("空数据应返回无, got %q", got)
 	}
-	lists := []model.TopList{{TradeDate: "20260820", PctChange: 9.98, NetAmount: 5432}}
+	// 库内 net_amount 单位为元: 125186146 元应展示为 12519 万
+	lists := []model.TopList{{TradeDate: "20260820", PctChange: 9.98, NetAmount: 125186146}}
 	got := formatTopLists(lists, 3)
-	if !strings.Contains(got, "上榜") || !strings.Contains(got, "5432") {
-		t.Fatalf("格式不符: %q", got)
+	if !strings.Contains(got, "上榜") || !strings.Contains(got, "净买入12519万") {
+		t.Fatalf("金额应按元→万元换算: %q", got)
 	}
 }
 

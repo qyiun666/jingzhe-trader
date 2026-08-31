@@ -38,8 +38,9 @@ func formatTopLists(lists []model.TopList, n int) string {
 	}
 	for i := len(lists) - 1; i >= start; i-- {
 		t := lists[i]
+		// 库内金额为元, 换算成万元再输出 (直接标注会放大一万倍)
 		sb.WriteString(fmt.Sprintf("  %s 上榜 涨跌%.2f%% 净买入%.0f万\n",
-			t.TradeDate, t.PctChange, t.NetAmount))
+			t.TradeDate, t.PctChange, t.NetAmount/10000))
 	}
 	return sb.String()
 }

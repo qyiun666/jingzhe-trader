@@ -103,20 +103,30 @@ func barParams(tradeDate, tsCode, startDate, endDate string) map[string]interfac
 	return params
 }
 
+// isSTName 由股票名称判定 ST 股
+// stock_basic 无 is_st 列 (请求不存在的列时 tushare 静默省略), 只能按命名规则判定:
+// A 股 ST 股名称形如 "ST某某" / "*ST某某", 剥离前导 "*" 后必以 ST 开头
+// 不用整名子串匹配, 避免 "TCL某某" 这类含拉丁字母的正常名称被误判
+func isSTName(name string) bool {
+	n := strings.TrimPrefix(strings.ToUpper(strings.TrimSpace(name)), "*")
+	return strings.HasPrefix(n, "ST")
+}
+
 // StockBasic 获取 A 股股票列表(基础信息)
 func (c *Client) StockBasic() ([]model.Stock, error) {
 	fields := []string{
 		"ts_code", "symbol", "name", "market", "exchange",
-		"is_st", "list_status", "list_date", "delist_date", "industry",
+		"list_status", "list_date", "delist_date", "industry",
 	}
 	return fetchRows(c, "stock_basic", map[string]interface{}{}, fields, func(row map[string]interface{}) model.Stock {
+		name := fieldStr(row, "name")
 		return model.Stock{
 			TsCode:     fieldStr(row, "ts_code"),
 			Symbol:     fieldStr(row, "symbol"),
-			Name:       fieldStr(row, "name"),
+			Name:       name,
 			Market:     fieldStr(row, "market"),
 			Exchange:   fieldStr(row, "exchange"),
-			IsST:       fieldInt(row, "is_st") != 0,
+			IsST:       isSTName(name),
 			ListStatus: fieldStr(row, "list_status"),
 			ListDate:   fieldStr(row, "list_date"),
 			DelistDate: fieldStr(row, "delist_date"),
@@ -260,18 +270,20 @@ func (c *Client) FinaIndicator(tsCode string, period string) ([]model.FinaIndica
 
 // MajorNews 获取新闻快讯
 // startDate/endDate 格式: YYYYMMDD, src 为新闻来源, 空则返回全部
+// 实测列名为 pub_time/src (该接口无 datetime/channels; 请求不存在的列时 tushare 静默省略,
+// 会让 Datetime 恒为空串, 进而被 retention 的 `datetime < cutoff` 全量误删)
 func (c *Client) MajorNews(startDate, endDate string, src string) ([]model.News, error) {
-	fields := []string{"datetime", "content", "title", "channels"}
+	fields := []string{"pub_time", "content", "title", "src"}
 	params := map[string]interface{}{}
 	setOpt(params, "start_date", startDate)
 	setOpt(params, "end_date", endDate)
 	setOpt(params, "src", src)
 	return fetchRows(c, "major_news", params, fields, func(row map[string]interface{}) model.News {
 		return model.News{
-			Datetime: fieldStr(row, "datetime"),
+			Datetime: fieldStr(row, "pub_time"),
 			Content:  fieldStr(row, "content"),
 			Title:    fieldStr(row, "title"),
-			Channels: fieldStr(row, "channels"),
+			Channels: fieldStr(row, "src"), // 该接口无频道列, 此列改存来源
 		}
 	})
 }
@@ -296,9 +308,10 @@ func (c *Client) MoneyFlow(tradeDate string) ([]model.MoneyFlow, error) {
 // TopList 获取龙虎榜数据(按交易日)
 // tradeDate 格式: YYYYMMDD
 func (c *Client) TopList(tradeDate string) ([]model.TopList, error) {
+	// 龙虎榜买入/卖出额的真实列名是 l_buy / l_sell (该接口无 buy_amount / sell_amount)
 	fields := []string{
 		"ts_code", "trade_date", "name", "close", "pct_change",
-		"turnover_rate", "amount", "net_amount", "buy_amount", "sell_amount",
+		"turnover_rate", "amount", "net_amount", "l_buy", "l_sell",
 	}
 	return fetchRows(c, "top_list", barParams(tradeDate, "", "", ""), fields, func(row map[string]interface{}) model.TopList {
 		return model.TopList{
@@ -310,8 +323,8 @@ func (c *Client) TopList(tradeDate string) ([]model.TopList, error) {
 			TurnoverRate: fieldFloat(row, "turnover_rate"),
 			Amount:       fieldFloat(row, "amount"),
 			NetAmount:    fieldFloat(row, "net_amount"),
-			BuyAmount:    fieldFloat(row, "buy_amount"),
-			SellAmount:   fieldFloat(row, "sell_amount"),
+			BuyAmount:    fieldFloat(row, "l_buy"),
+			SellAmount:   fieldFloat(row, "l_sell"),
 		}
 	})
 }

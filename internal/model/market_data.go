@@ -26,8 +26,8 @@ type TopList struct {
 	Close        float64 `json:"close" db:"close"`                 // 收盘价
 	PctChange    float64 `json:"pct_change" db:"pct_change"`       // 涨跌幅
 	TurnoverRate float64 `json:"turnover_rate" db:"turnover_rate"` // 换手率
-	Amount       float64 `json:"amount" db:"amount"`               // 成交额(万元)
-	NetAmount    float64 `json:"net_amount" db:"net_amount"`       // 龙虎榜净买入额(万元)
-	BuyAmount    float64 `json:"buy_amount" db:"buy_amount"`       // 龙虎榜买入额(万元)
-	SellAmount   float64 `json:"sell_amount" db:"sell_amount"`     // 龙虎榜卖出额(万元)
+	Amount       float64 `json:"amount" db:"amount"`               // 成交额(元, tushare top_list 原值单位)
+	NetAmount    float64 `json:"net_amount" db:"net_amount"`       // 龙虎榜净买入额(元)
+	BuyAmount    float64 `json:"buy_amount" db:"buy_amount"`       // 龙虎榜买入额(元, 来源列 l_buy)
+	SellAmount   float64 `json:"sell_amount" db:"sell_amount"`     // 龙虎榜卖出额(元, 来源列 l_sell)
 }
