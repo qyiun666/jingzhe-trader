@@ -506,12 +506,17 @@ func EffectiveJSON(data []byte) ([]byte, error) {
 	if err := readDoc(v, data); err != nil {
 		return nil, err
 	}
+	maskSecrets(v)
+	return dumpJSON(v)
+}
+
+// maskSecrets 就地把凭据路径替换为掩码
+func maskSecrets(v *viper.Viper) {
 	for _, p := range SecretPaths() {
 		if v.GetString(p) != "" {
 			v.Set(p, maskedValue)
 		}
 	}
-	return dumpJSON(v)
 }
 
 func dumpJSON(v *viper.Viper) ([]byte, error) {
@@ -583,6 +588,34 @@ func DocGet(doc []byte, key string) (any, error) {
 		return nil, err
 	}
 	return v.Get(key), nil
+}
+
+// DocGetMasked 与 DocGet 同样读取点路径, 但凭据一律先掩码
+// 必须整棵文档先脱敏再取值: 只判断叶子路径会漏掉父路径取值 (如 get mail 会带出 password)
+func DocGetMasked(doc []byte, key string) (any, error) {
+	v := newViper()
+	if err := readDoc(v, doc); err != nil {
+		return nil, err
+	}
+	maskSecrets(v)
+	// 只能走 AllSettings: viper 把嵌套 Set 当成整段覆盖, Get("llm") 会只剩 api_key
+	// 这一项, 表现为"整段配置凭空消失" (dump 一直用 AllSettings 所以没踩到)
+	return lookupPath(v.AllSettings(), strings.Split(key, ".")), nil
+}
+
+// lookupPath 按点路径在已合并的配置 map 中取值, 任一层不存在或类型不符返回 nil
+func lookupPath(root map[string]any, path []string) any {
+	var cur any = root
+	for _, p := range path {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return nil
+		}
+		if cur, ok = m[p]; !ok {
+			return nil
+		}
+	}
+	return cur
 }
 
 // parseScalar 优先按 JSON 解析, 使数字/布尔/数组/对象字面量各归其位; 失败则按原始字符串处理

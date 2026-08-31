@@ -20,7 +20,9 @@ go.work
 # ==================== Sensitive Data ====================
 # 配置文件体系已废除: 整棵配置连同凭据存在 data/jingzhe.db 的 config_kv 表内。
 # 下面几条是"有人又把密钥写回配置文件"的防线, 一律不提交 (不再有 example 白名单例外)
-config/
+# 必须带前导斜杠: 写成 config/ 会连 internal/config/ 与 cmd/config/ 一起忽略掉,
+# 那些包里的新文件会静默不进版本库 (曾因此漏提交 cmd/config/main.go)
+/config/
 .env
 .env.*
 

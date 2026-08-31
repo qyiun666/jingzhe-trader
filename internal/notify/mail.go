@@ -24,12 +24,15 @@ const mailSMTPHost = "smtp.qq.com"
 // 按字节而非字符计数: UTF-8 中文 1 字符=3 字节, 按字符折叠会突破 998 字节上限
 const mailMaxLineLen = 990
 
+// mailIODeadline 单次发送的绝对超时 (连接+TLS+认证+投递全过程)
+const mailIODeadline = 90 * time.Second
+
 // MailNotifier QQ 邮箱邮件通知器
 // 未启用时所有发送调用降级为告警日志+no-op, 调用方无需判空
 type MailNotifier struct {
 	enabled  bool   // 是否启用邮件通知
 	from     string // 发件邮箱 (即收件人)
-	password string // SMTP 授权码 (仅环境变量注入, 不落盘)
+	password string // SMTP 授权码 (来自库内配置, dump/日志一律脱敏)
 }
 
 // NewMailNotifier 创建邮件通知器
@@ -169,6 +172,11 @@ func sendSMTP(addr, host string, useTLS bool, from, password, to, msg string) er
 		return fmt.Errorf("连接SMTP服务器失败: %w", err)
 	}
 	defer conn.Close()
+	// 绝对超时覆盖握手与后续全部读写: 无超时的话一次 SMTP 卡死会让调度任务永久停在 running,
+	// 当天通知既发不出去也不会重试
+	if err := conn.SetDeadline(time.Now().Add(mailIODeadline)); err != nil {
+		return fmt.Errorf("设置SMTP超时失败: %w", err)
+	}
 
 	var rwc net.Conn = conn
 	if useTLS {
