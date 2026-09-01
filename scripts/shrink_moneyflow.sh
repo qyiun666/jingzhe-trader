@@ -73,6 +73,7 @@ if pgrep -f "$ROOT/bin/jingzhe-server" >/dev/null; then
 fi
 
 echo "=== 备份 → $BACKUP ==="
+mkdir -p data/backup
 sqlite3 "$DB" ".backup $BACKUP"
 chmod 600 "$BACKUP"
 sqlite3 "$BACKUP" "PRAGMA integrity_check;" | tail -1
