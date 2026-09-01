@@ -325,6 +325,7 @@ func (s *Scheduler) runRetention(date string, fullClean bool) error {
 	}
 	if err := store.RunRetention(s.db, store.RetentionPolicy{
 		BarYears:     rc.BarYears,
+		MfDays:       rc.MfDays,
 		NewsDays:     rc.NewsDays,
 		PlanDays:     rc.PlanDays,
 		ActionDays:   rc.ActionDays,

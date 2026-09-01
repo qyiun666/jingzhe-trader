@@ -31,6 +31,9 @@ go.work
 data/*.db
 data/*.db-journal
 
+# 手工备份落在子目录, data/*.db 的通配不跨目录 —— 备份同样含明文凭据
+data/backup/
+
 # Syncthing sync metadata under data/ (versioning, ignore rules, folder marker)
 data/.stignore
 data/.stfolder/

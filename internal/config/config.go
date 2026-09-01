@@ -73,6 +73,7 @@ type TradingConfig struct {
 // RetentionConfig 数据保留/自动清理配置
 type RetentionConfig struct {
 	BarYears     int    `mapstructure:"bar_years"`     // 行情数据保留年数
+	MfDays       int    `mapstructure:"mf_days"`       // 资金流向保留天数 (每日落全市场行, 不能复用 BarYears)
 	NewsDays     int    `mapstructure:"news_days"`     // 新闻保留天数
 	PlanDays     int    `mapstructure:"plan_days"`     // 交易计划/任务记录保留天数
 	ActionDays   int    `mapstructure:"action_days"`   // 动作日志(action_log)保留天数 (每任务每笔都写, 增长最快)
@@ -371,6 +372,7 @@ func newViper() *viper.Viper {
 	v.SetDefault("trading.min_trade_amount", 0)
 	v.SetDefault("trading.max_positions", 0)
 	v.SetDefault("retention.bar_years", 3)
+	v.SetDefault("retention.mf_days", 60)
 	v.SetDefault("retention.news_days", 30)
 	v.SetDefault("retention.plan_days", 90)
 	v.SetDefault("retention.action_days", 90)

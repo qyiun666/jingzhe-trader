@@ -150,8 +150,10 @@ func migrate(db *sqlx.DB) error {
 			sell_elg_amount REAL,
 			net_mf_amount REAL,
 			PRIMARY KEY (ts_code, trade_date)
-		);
-		CREATE INDEX IF NOT EXISTS idx_moneyflow_date ON moneyflow(trade_date);`,
+		);`,
+		// 按 trade_date 的索引服务于全市场单日查询, 该查询路径已不存在;
+		// 留在库里只是每次同步多写一份 67MB, 历史库启动时自行回收
+		`DROP INDEX IF EXISTS idx_moneyflow_date;`,
 
 		// 龙虎榜
 		`CREATE TABLE IF NOT EXISTS top_list (

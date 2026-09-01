@@ -16,6 +16,7 @@ import (
 // RetentionPolicy 数据保留策略 (来自 retention 配置段)
 type RetentionPolicy struct {
 	BarYears     int    // 行情数据保留年数
+	MfDays       int    // 资金流向保留天数: 该表按交易日落全市场行, 与日线共用 BarYears 会让体积膨胀一个数量级
 	NewsDays     int    // 新闻保留天数
 	PlanDays     int    // 交易计划/任务记录保留天数
 	ActionDays   int    // 动作日志(action_log)保留天数 (每任务每笔都写, 增长最快)
@@ -80,11 +81,19 @@ func RunRetention(db *sqlx.DB, p RetentionPolicy, fullClean bool) error {
 func cleanMarketData(db *sqlx.DB, p RetentionPolicy) error {
 	if p.BarYears > 0 {
 		cutoff := time.Now().AddDate(-p.BarYears, 0, 0).Format("20060102")
-		for _, table := range []string{"daily_bar", "daily_basic", "stk_limit", "moneyflow", "top_list"} {
+		for _, table := range []string{"daily_bar", "daily_basic", "stk_limit", "top_list"} {
 			if err := deleteRowsBatched(db, table,
 				`trade_date < ?`, 0, cutoff); err != nil {
 				return err
 			}
+		}
+	}
+	// moneyflow 单独计窗口: 每个交易日落全市场约 5652 行 (日线只留候选股, 不同量级),
+	// 与 BarYears 共用会让它膨胀成全库最大的一张表
+	if p.MfDays > 0 {
+		if err := deleteRowsBatched(db, "moneyflow", `trade_date < ?`, 0,
+			time.Now().AddDate(0, 0, -p.MfDays).Format("20060102")); err != nil {
+			return err
 		}
 	}
 	if p.NewsDays > 0 {

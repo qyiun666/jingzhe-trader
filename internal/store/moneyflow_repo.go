@@ -38,16 +38,6 @@ func (r *MoneyFlowRepo) BatchInsert(flows []model.MoneyFlow) error {
 	})
 }
 
-// GetByDate 查询某交易日全市场资金流向
-func (r *MoneyFlowRepo) GetByDate(tradeDate string) ([]model.MoneyFlow, error) {
-	query := fmt.Sprintf(`SELECT %s FROM moneyflow WHERE trade_date = ? ORDER BY net_mf_amount DESC`, moneyflowSelectCols)
-	var flows []model.MoneyFlow
-	if err := selectList(r.db, query, &flows, "查询资金流向失败", tradeDate); err != nil {
-		return nil, err
-	}
-	return flows, nil
-}
-
 // GetByCode 查询指定股票在 [startDate, endDate] 区间内的资金流向
 func (r *MoneyFlowRepo) GetByCode(tsCode, startDate, endDate string) ([]model.MoneyFlow, error) {
 	query := fmt.Sprintf(`SELECT %s FROM moneyflow
