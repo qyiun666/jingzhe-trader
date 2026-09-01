@@ -632,6 +632,13 @@ chmod 600 data/jingzhe.db                                    # 库内含凭据, 
 > 若希望凭据不落进同步/备份覆盖的库文件，可继续用 systemd 的 `EnvironmentFile=/opt/jingzhe-trader/.env`
 > 注入 `TUSHARE_TOKEN` 等变量——非空即顶换库内值，属应急通道；该文件同样要 `chmod 600`。
 
+> **`data/jingzhe.db` 只能有一个写入者，别让它走文件级同步。** SQLite 在写入过程中被
+> Syncthing/网盘同步，`-wal`/`-shm` 会以半截状态落到对端，实测已经产生过
+> `jingzhe.sync-conflict-*.db-wal` 冲突副本 —— 再往上是库腐坏，表现为一堆查不出原因的脏数据。
+> 跨机读结果走局域网：`server.host` 设 `0.0.0.0`、配好 `server.api_token`，其它设备调 MCP 或
+> `/health`。macOS 上把库文件加进 `data/.stignore` 时要带 `(?d)` 前缀（该文件夹没开
+> ignoreDelete，不加前缀会把对端已有的库直接删掉）。
+
 #### 3. 首次拉取历史数据
 
 ```bash
@@ -646,6 +653,13 @@ sqlite3 data/jingzhe.db "SELECT COUNT(*) FROM daily_bar;"          # 应有数�
 sqlite3 data/jingzhe.db "SELECT COUNT(*) FROM trade_cal;"          # 交易日历
 sqlite3 data/jingzhe.db "SELECT MAX(trade_date) FROM daily_bar;"   # 最新日期
 ```
+
+> **积分档位决定能同步什么**（用当前 token 实测）：`news`（个股新闻）与 `research_report`（研报）
+> 回 40203 无权限，`anns` 接口名不被识别 —— 也就是拿不到任何个股级消息面；`fina_indicator` 不支持
+> 按报告期批量取全市场（50101「必填参数, ts_code」），所以只按投资决策集逐股拉；`major_news` 只给
+> "最新一页"（约 800 条 / 覆盖约 1.5 天，指定更早单日只剩 0~4 条），历史无法回填，只能每天跑一次累积。
+> 失败处理分两类：分钟级限流等满一个窗口再重试；无权限/参数非法/token 错/日配额这类永久错误不重试，
+> 直接进 `data_update` 的失败原因。总速率闸是 `tushare.rate_limit`（默认 150 次/分，按自己档位调）。
 
 #### 4. 安装 systemd 服务（开机自启 + 崩溃拉起）
 
@@ -742,12 +756,17 @@ curl -s http://127.0.0.1:11270/health
 
 ### macOS (launchd)
 
-非 NAS 场景可用 launchd：
+非 NAS 场景可用 launchd。**不要直接 cp 仓库里的 plist** —— 那两个文件是带 `__JZ_ROOT__`
+占位符的模板，路径由安装脚本按当前项目根渲染（写死绝对路径的话，目录搬家或换挂载点后
+launchd 会静默不启动，任务状态却一切正常）：
 
 ```bash
-cp scripts/com.jingzhe.trader.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.jingzhe.trader.plist
+scripts/install-launchd.sh          # 安装/更新并立即启动 (server + watchdog)
+scripts/install-launchd.sh stop     # 停止常驻 (卸载 launchd 装载)
 ```
+
+脚本会检查 `bin/` 是否已编译、把渲染结果写入 `~/Library/LaunchAgents/`、并打印每个任务是否拿到 PID。
+服务没起来时看：`logs/launchd-stderr.log`。改了代码记得先 `make build` 再重跑安装脚本。
 
 ## QMT 实盘（可选，Windows）
 

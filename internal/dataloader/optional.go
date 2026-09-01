@@ -23,7 +23,7 @@ func (l *Loader) syncOptional(opts Options, tradeCals []model.TradeCal) []string
 		}
 	}
 	if opts.SyncNews {
-		report("新闻快讯", l.syncNews(opts.StartDate, opts.EndDate))
+		report("新闻快讯", l.syncNews())
 	}
 	if opts.SyncMoneyFlow {
 		report("个股资金流向", l.syncMoneyFlow(tradeCals))
@@ -38,16 +38,22 @@ func (l *Loader) syncOptional(opts Options, tradeCals []model.TradeCal) []string
 }
 
 // syncNews 同步新闻快讯
-func (l *Loader) syncNews(startDate, endDate string) error {
+// 不传日期窗口: 本档位 major_news 只服务"最新一页"(实测约 800 条, 覆盖最近约 1.5 天),
+// 传更早的单日反而只返回 0~4 条。历史因此无法回填, 只能每天跑一次逐步累积;
+// 相邻两天的重叠由 news(datetime,title) 唯一索引 + INSERT OR IGNORE 吸收。
+func (l *Loader) syncNews() error {
 	logger.L().Info("=== 同步新闻快讯 ===")
-	newsList, err := l.ts.MajorNews(startDate, endDate, "")
+	newsList, err := l.ts.MajorNews("", "", "")
 	if err != nil {
 		return fmt.Errorf("获取失败: %w", err)
+	}
+	if len(newsList) == 0 {
+		return fmt.Errorf("返回 0 条 (接口未更新或不可用)")
 	}
 	if err := store.NewNewsRepo(l.db).BatchInsert(newsList); err != nil {
 		return fmt.Errorf("入库失败: %w", err)
 	}
-	logger.L().Infof("新闻快讯同步完成: %d 条", len(newsList))
+	logger.L().Infof("新闻快讯同步完成: 拉到 %d 条", len(newsList))
 	return nil
 }
 
@@ -130,17 +136,24 @@ func (l *Loader) syncTopList(tradeCals []model.TradeCal) error {
 }
 
 // syncFina 同步财务指标 (逐股票并行, 股票内各报告期串行)
-// Tushare 500元档 fina_indicator 必须传 ts_code, 不能按报告期批量获取
+//
+// 两处档位约束决定了这个形状: fina_indicator 必须逐股传 ts_code (按报告期批量取全市场会报
+// 「必填参数, ts_code」), 且低积分档按分钟/按天计次。因此范围只覆盖投资决策集
+// (股票池 + watchlist + 持仓 + 选股结果, 与 filter_mode 同一集合): 全市场 5551 只 × 每轮报告期
+// 一次同步就要几千次调用, 当天配额必然见底; 而消费方 (辩论分析师/信号适配/回测) 全部按代码查。
 func (l *Loader) syncFina(startDate, endDate string) error {
 	logger.L().Info("=== 同步财务指标 ===")
 	finaRepo := store.NewFinaRepo(l.db)
 
-	allStocks, err := l.stockRepo.GetAll()
-	if err != nil {
-		return fmt.Errorf("获取股票列表失败: %w", err)
+	codes := make([]string, 0, len(l.watchCodes()))
+	for _, code := range sortedKeys(l.watchCodes()) {
+		if IsIndexCode(code) {
+			continue // 指数没有财务指标, 查它只是白耗低档位的调用计次
+		}
+		codes = append(codes, code)
 	}
-	if len(allStocks) == 0 {
-		return fmt.Errorf("股票列表为空, 无法按股票拉取财务指标")
+	if len(codes) == 0 {
+		return fmt.Errorf("投资决策集为空, 跳过财务指标: 先跑选股或补充持仓/股票池")
 	}
 
 	periods := genReportPeriods(startDate, endDate)
@@ -150,36 +163,52 @@ func (l *Loader) syncFina(startDate, endDate string) error {
 		logger.L().Infof("区间 %s~%s 内无报告期, 跳过财务指标同步", startDate, endDate)
 		return nil
 	}
-	logger.L().Infof("待同步报告期: %v, 股票数: %d", periods, len(allStocks))
+	// 增量口径: 只补库内尚未有的报告期。genReportPeriods 按同步窗口给到 3 年 12 个季度,
+	// 每日 data_update 都全量重拉, 等于让同一批早已定稿的数据反复吃掉低档位的计次配额。
+	// 最新那一期始终保留: 财报会随更正/审计公告重发, 需要覆盖式刷新。
+	if last, err := finaRepo.GetMaxEndDate(); err == nil && last != "" {
+		newer := make([]string, 0, len(periods))
+		for _, p := range periods {
+			if p > last {
+				newer = append(newer, p)
+			}
+		}
+		if len(newer) == 0 || newer[0] != periods[0] {
+			newer = append([]string{periods[0]}, newer...) // periods 降序, periods[0] 即最新报告期
+		}
+		periods = newer
+	}
+	logger.L().Infof("待同步报告期: %v, 决策集股票数: %d", periods, len(codes))
 
 	var mu sync.Mutex
 	finaSynced := 0
 	failedCount := 0
 	processed := 0
-	total := len(allStocks)
+	total := len(codes)
 
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, dataloaderConcurrency)
-	for _, stock := range allStocks {
+	for _, code := range codes {
 		wg.Add(1)
-		go func(stock model.Stock) {
+		go func(code string) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
 			for _, period := range periods {
-				indicators, err := l.ts.FinaIndicator(stock.TsCode, period)
+				indicators, err := l.ts.FinaIndicator(code, period)
 				if err != nil {
 					mu.Lock()
 					failedCount++
 					mu.Unlock()
+					logger.L().Warnf("获取 %s %s 期财务指标失败: %v", code, period, err)
 					continue
 				}
 				if len(indicators) == 0 {
 					continue
 				}
 				if err := finaRepo.BatchInsert(indicators); err != nil {
-					logger.L().Errorf("存储 %s 财务指标失败: %v", stock.TsCode, err)
+					logger.L().Errorf("存储 %s 财务指标失败: %v", code, err)
 					continue
 				}
 				mu.Lock()
@@ -193,13 +222,18 @@ func (l *Loader) syncFina(startDate, endDate string) error {
 				logger.L().Infof("进度: %d/%d (已同步%d条)", processed, total, finaSynced)
 			}
 			mu.Unlock()
-		}(stock)
+		}(code)
 	}
 	wg.Wait()
 	logger.L().Infof("财务指标同步完成, 共 %d 条, 失败 %d 次", finaSynced, failedCount)
 
 	if finaSynced == 0 && failedCount > 0 {
-		return fmt.Errorf("%d 只股票 × %d 个报告期全部拉取失败 (接口不可用或权限不足)", len(allStocks), len(periods))
+		return fmt.Errorf("%d 只股票 × %d 个报告期全部拉取失败 (接口不可用或权限不足)", len(codes), len(periods))
+	}
+	if finaSynced == 0 {
+		// 请求全部成功却一条没有: 决策集里根本没有个股 (只剩 ETF/指数, 或选股结果为空)。
+		// 这不是故障, 但必须留痕 —— 否则基本面分析师长期吃空数据而任务始终显示成功
+		logger.L().Warnf("财务指标 0 条: 决策集 %v 内无可用的个股标的 (ETF/指数无财务指标, 或 screen_result 为空)", codes)
 	}
 	return nil
 }

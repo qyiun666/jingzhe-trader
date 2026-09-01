@@ -2,7 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- 惊蛰信号链路看门狗: 交易日 19:30/22:00 两轮检查 数据→信号→日报 是否全部成功,
      缺项走独立邮件告警 (与 server 进程无关, 进程死了也能报) -->
-<!-- 安装: cp scripts/com.jingzhe.watchdog.plist ~/Library/LaunchAgents/ && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.jingzhe.watchdog.plist -->
+<!-- 本文件是模板: 安装请跑 scripts/install-launchd.sh, 它会把 __JZ_ROOT__ 渲染成当前项目根
+     再写入 ~/Library/LaunchAgents/。目录搬家后重跑该脚本即可, 不要直接 cp 本文件。 -->
 <!-- 注意: 修改 server 代码后需 make build 重新生成 bin/watchdog -->
 <plist version="1.0">
 <dict>
@@ -11,10 +12,10 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/zsh</string>
-        <string>/Volumes/zt_hd/projects/jingzhe-trader/scripts/run-watchdog.sh</string>
+        <string>__JZ_ROOT__/scripts/run-watchdog.sh</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Volumes/zt_hd/projects/jingzhe-trader</string>
+    <string>__JZ_ROOT__</string>
     <key>StartCalendarInterval</key>
     <array>
         <dict>
@@ -69,8 +70,8 @@
         </dict>
     </array>
     <key>StandardOutPath</key>
-    <string>/Volumes/zt_hd/projects/jingzhe-trader/logs/launchd-watchdog-stdout.log</string>
+    <string>__JZ_ROOT__/logs/launchd-watchdog-stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/Volumes/zt_hd/projects/jingzhe-trader/logs/launchd-watchdog-stderr.log</string>
+    <string>__JZ_ROOT__/logs/launchd-watchdog-stderr.log</string>
 </dict>
 </plist>

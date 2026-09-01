@@ -12,5 +12,8 @@ else
   set +a
 fi
 
-cd /Volumes/zt_hd/projects/jingzhe-trader || exit 2
-exec ./bin/watchdog
+# 项目根由脚本自身位置推导: 目录搬家或换挂载点都不用再改这里
+# (看门狗同样要读 data/jingzhe.db, 该默认路径是相对路径)
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT" || exit 2
+exec "$ROOT/bin/watchdog"

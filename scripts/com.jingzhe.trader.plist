@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- 惊蛰交易系统常驻守护: 开机自启 + 崩溃自动拉起 (ThrottleInterval 限频防刷) -->
-<!-- 安装: cp scripts/com.jingzhe.trader.plist ~/Library/LaunchAgents/ && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.jingzhe.trader.plist -->
+<!-- 本文件是模板: 安装请跑 scripts/install-launchd.sh, 它会把 __JZ_ROOT__ 渲染成当前项目根
+     再写入 ~/Library/LaunchAgents/。目录搬家后重跑该脚本即可, 不要直接 cp 本文件。 -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -9,10 +10,10 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/zsh</string>
-        <string>/Volumes/zt_hd/projects/jingzhe-trader/scripts/start-server.sh</string>
+        <string>__JZ_ROOT__/scripts/start-server.sh</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Volumes/zt_hd/projects/jingzhe-trader</string>
+    <string>__JZ_ROOT__</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -20,8 +21,8 @@
     <key>ThrottleInterval</key>
     <integer>30</integer>
     <key>StandardOutPath</key>
-    <string>/Volumes/zt_hd/projects/jingzhe-trader/logs/launchd-stdout.log</string>
+    <string>__JZ_ROOT__/logs/launchd-stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/Volumes/zt_hd/projects/jingzhe-trader/logs/launchd-stderr.log</string>
+    <string>__JZ_ROOT__/logs/launchd-stderr.log</string>
 </dict>
 </plist>

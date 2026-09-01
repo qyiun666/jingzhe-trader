@@ -6,9 +6,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -43,6 +45,12 @@ func main() {
 	logger.Init(cfg.Log.Level, cfg.Log.Format, cfg.Log.Output, cfg.Log.FilePath, cfg.Retention.LogDays)
 	defer logger.Sync()
 
+	// 启动脚本会 source ~/.jingzhe.env, 里面任何非空凭据都优先于库内值。
+	// 不打印出来的话, "到底哪份 token 在生效" 只能靠猜 (曾因此把一个 mock 值当成"token 失效")
+	if overridden := config.EnvOverrideReport(); len(overridden) > 0 {
+		logger.L().Warnf("凭据被环境变量顶换, 库内同名值未生效: %s", strings.Join(overridden, "; "))
+	}
+
 	// 优先使用配置文件中的端口
 	serverPort := *port
 	if cfg.Server.Port > 0 {
@@ -66,6 +74,13 @@ func main() {
 		host = "127.0.0.1"
 	}
 	addr := host + ":" + serverPort
+
+	// 绑到非回环地址即整个局域网可调 MCP (含持仓/交易计划工具)。
+	// 无 token 时不启动而不是"先跑起来再说": 敞开跑等于把账户数据放在二层网络上裸奔
+	if !isLoopbackHost(host) && cfg.Server.APIToken == "" {
+		log.Fatalf("server.host=%s 暴露到局域网但未配置鉴权: 用 `bin/config set server.api_token <长随机串>` "+
+			"或设环境变量 JZ_API_TOKEN; 只想本机用则把 server.host 改回 127.0.0.1", host)
+	}
 
 	// 包装 MCP handler: 提供 /health 给 systemd/cron, 并对 /mcp 复用 Bearer 鉴权
 	handler = withHealthAndAuth(handler, svc, cfg.Server.APIToken)
@@ -127,6 +142,19 @@ func main() {
 		log.Printf("关闭数据库异常: %v", err)
 	}
 	log.Println("服务已停止")
+}
+
+// isLoopbackHost 该监听地址是否只接受本机连接
+// 判不准时一律按"非本机"处理: 宁可多要求一次 token, 也不能把敞开的端口误判成安全
+func isLoopbackHost(host string) bool {
+	switch host {
+	case "localhost", "::1", "[::1]":
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // withHealthAndAuth wraps the MCP handler with a lightweight /health endpoint

@@ -320,7 +320,10 @@ func newViper() *viper.Viper {
 
 	// 设置默认值
 	v.SetDefault("tushare.base_url", "http://api.tushare.pro")
-	v.SetDefault("tushare.rate_limit", 450)
+	// 每分钟请求数: Tushare 按积分档位限制每接口每分钟调用次数, 低档位远低于 450,
+	// 取 150 属保守值 (宁可慢, 也不触发限流重试)。
+	// 默认值只作用于首次播种的配置; 已存在的库取库内值, 调整用 `bin/config set tushare.rate_limit <n>`
+	v.SetDefault("tushare.rate_limit", 150)
 	v.SetDefault("tushare.max_retries", 3)
 	v.SetDefault("tushare.retry_interval", 2)
 	v.SetDefault("cost.commission_rate", 0.000085)
@@ -660,6 +663,30 @@ func applyEnvOverrides(cfg *Config) {
 	if p := os.Getenv("JZ_MAIL_PASSWORD"); p != "" {
 		cfg.Mail.Password = p
 	}
+}
+
+// envCredentialMap 环境变量 → 它顶换的配置项 (非空即顶换库内值)
+var envCredentialMap = [][2]string{
+	{"TUSHARE_TOKEN", "tushare.token"},
+	{"LLM_API_KEY", "llm.api_key"},
+	{"JZ_API_TOKEN", "server.api_token"},
+	{"JZ_MAIL_PASSWORD", "mail.password"},
+}
+
+// EnvOverrideReport 列出当前被环境变量顶换的凭据项 ("VAR 顶换 配置路径"), 只给名字不给值
+//
+// 存在的意义: 应急通道会盖掉库内凭据, 而"哪一份在生效"从任何日志里都看不出来。
+// 实测教训 —— ~/.jingzhe.env 里一份开发期 mock TUSHARE_TOKEN 盖住了库内真 token,
+// 服务端每次同步都报"您的token不对", 而命令行跑同一份库却完全正常, 排查方向被彻底带偏。
+// 单独成函数而不是在 applyEnvOverrides 里打日志: 日志器要到配置装载之后才初始化。
+func EnvOverrideReport() []string {
+	var report []string
+	for _, kv := range envCredentialMap {
+		if os.Getenv(kv[0]) != "" {
+			report = append(report, kv[0]+" 顶换 "+kv[1])
+		}
+	}
+	return report
 }
 
 // DefaultDBPath 返回默认数据库路径

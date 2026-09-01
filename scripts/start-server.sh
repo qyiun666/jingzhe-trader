@@ -13,5 +13,8 @@ else
   set +a
 fi
 
-cd /Volumes/zt_hd/projects/jingzhe-trader || exit 1
-exec /Volumes/zt_hd/projects/jingzhe-trader/bin/jingzhe-server
+# 项目根由脚本自身位置推导: 目录搬家或换挂载点都不用再改这里
+# (必须在正确目录下启动 —— 默认库路径 data/jingzhe.db 是相对路径)
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT" || exit 1
+exec "$ROOT/bin/jingzhe-server"

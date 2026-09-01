@@ -2,6 +2,7 @@ package dataloader
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -129,7 +130,7 @@ func (l *Loader) syncStockList() {
 }
 
 // syncDailyData 按交易日同步日线/涨跌停/基本面/ETF (交易日间并行拉取)
-// 除增量同步外, 每个交易日重拉最近 reSyncTradeDays 个交易日 (UPSERT覆盖),
+// 除增量同步外, 每个交易日重拉最近 StaleKeepRecentDays 自然日 (UPSERT覆盖),
 // 以吸收 tushare 对近期数据的更正 (分红/停复牌/行情修订)
 func (l *Loader) syncDailyData(tradeCals []model.TradeCal) {
 	logger.L().Info("=== 同步日线行情 ===")
@@ -137,7 +138,9 @@ func (l *Loader) syncDailyData(tradeCals []model.TradeCal) {
 	reSyncFrom := ""
 	if lastDate != "" {
 		if t, err := time.Parse("20060102", lastDate); err == nil {
-			reSyncFrom = t.AddDate(0, 0, -14).Format("20060102") // 自然日回退14天 ≈ 10个交易日
+			// 回退天数直接取全市场保留窗口: 重拉窗口一旦窄于它, 停机期间落在两者之间的那些日期
+			// 就永远补不回来 —— 它们承诺保留全市场却再没人重拉, 只会停在裁剪状态
+			reSyncFrom = t.AddDate(0, 0, -store.StaleKeepRecentDays).Format("20060102")
 		}
 	}
 
@@ -240,8 +243,7 @@ func (l *Loader) syncOneDayBars(calDate string) bool {
 	// filter_mode 只裁剪历史日期: 近 StaleKeepRecentDays 内必须留全市场日线,
 	// 否则选股器按日读本地收盘价算 MA5 时只剩股票池里那几个代码 (多为 ETF),
 	// 趋势过滤与 5 日动量对全部 A 股候选静默失效 (与 CleanStaleStocks 同一窗口口径)
-	keepAllMarketSince := time.Now().AddDate(0, 0, -store.StaleKeepRecentDays).Format("20060102")
-	if l.cfg.Dataloader.FilterMode && calDate < keepAllMarketSince {
+	if l.trimHistory(calDate) {
 		watchCodes := l.watchCodes()
 		filtered := make([]model.Bar, 0, len(bars))
 		for _, bar := range bars {
@@ -280,7 +282,9 @@ func (l *Loader) syncOneDayExtras(calDate string) {
 
 	if l.cfg.Dataloader.EnableBasic {
 		if basics, err := l.ts.DailyBasic(calDate); err == nil && len(basics) > 0 {
-			if l.cfg.Dataloader.FilterMode {
+			// 与日线同一裁剪口径: 选股器 (screener) 与信号适配 (data_adapter) 都按日取
+			// daily_basic 全市场, 把近窗口也裁成关注集等于让候选池只剩股票池自己
+			if l.trimHistory(calDate) {
 				watchCodes := l.watchCodes()
 				filtered := make([]model.DailyBasic, 0, len(basics))
 				for _, b := range basics {
@@ -309,20 +313,22 @@ func (l *Loader) syncOneDayExtras(calDate string) {
 	}
 
 	// 同步 watchlist 中的指数日线 (如 000300.SH 大盘过滤需要)
-	indexCodes := l.indexCodes()
-	if len(indexCodes) > 0 {
-		if idxBars, err := l.ts.IndexDaily(calDate); err == nil && len(idxBars) > 0 {
-			filtered := make([]model.Bar, 0, len(indexCodes))
-			for _, bar := range idxBars {
-				if indexCodes[bar.TsCode] {
-					filtered = append(filtered, bar)
-				}
-			}
-			if len(filtered) > 0 {
-				if err := l.barRepo.BatchInsert(filtered); err != nil {
-					logger.L().Errorf("存储 %s 指数日线失败: %v", calDate, err)
-				}
-			}
+	// 按代码逐个拉而非按交易日拉全市场: index_daily 按 trade_date 查是"全部指数"口径
+	// (实测单次返回 8000 行, 已到该接口分页上限), 只为筛出 watchlist 里那一两个代码,
+	// 既白耗低档位的调用计次, 目标指数也可能被截断掉直接漏数据。
+	for _, code := range sortedKeys(l.indexCodes()) {
+		bars, err := l.ts.IndexDailyByCode(code, calDate, calDate)
+		if err != nil {
+			logger.L().Errorf("获取 %s %s 指数日线失败: %v", code, calDate, err)
+			continue
+		}
+		if len(bars) == 0 {
+			// 空结果留痕: 大盘过滤器会继续沿用上一交易日收盘, 表现与"指数在跌"难以区分
+			logger.L().Warnf("获取 %s %s 指数日线为空 (数据源未更新)", code, calDate)
+			continue
+		}
+		if err := l.barRepo.BatchInsert(bars); err != nil {
+			logger.L().Errorf("存储 %s %s 指数日线失败: %v", code, calDate, err)
 		}
 	}
 }
@@ -355,19 +361,12 @@ func (l *Loader) syncIndexHistory(start, end string) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			bars, err := l.ts.DailyByCode(code, start, end)
+			// 直接走 index_daily: 这里的 code 全部来自 indexCodes() (即 watchlist 中的指数),
+			// 而 daily 接口对指数代码返回 0 行 —— 先按 daily 试一次只会每轮白耗一次请求
+			bars, err := l.ts.IndexDailyByCode(code, start, end)
 			if err != nil {
 				logger.L().Errorf("获取 %s 指数日线失败: %v", code, err)
 				return
-			}
-			// DailyByCode 用的是 daily 接口, 指数需要 index_daily
-			// 这里直接用 IndexDailyByCode
-			if len(bars) == 0 {
-				bars, err = l.ts.IndexDailyByCode(code, start, end)
-				if err != nil {
-					logger.L().Errorf("获取 %s 指数日线(index)失败: %v", code, err)
-					return
-				}
 			}
 			if err := l.barRepo.BatchInsert(bars); err != nil {
 				logger.L().Errorf("存储 %s 指数日线失败: %v", code, err)
@@ -377,6 +376,20 @@ func (l *Loader) syncIndexHistory(start, end string) {
 		}(code)
 	}
 	wg.Wait()
+}
+
+// trimHistory 该交易日的行情是否可按关注集裁剪存储
+//
+// FilterMode 的裁剪只能作用于"选股再也用不到"的历史日期: 日线与每日基本面都有按日取全市场的
+// 消费方 (screener 的市值/PE/换手筛选、data_adapter 的当日基本面、动量与趋势的近5日收盘),
+// 近窗口内裁成关注集就等于把候选池缩到股票池自己那几只, 筛选条件对全部 A 股静默失效。
+// 窗口与 CleanStaleStocks 共用 store.StaleKeepRecentDays, 避免两处口径分叉。
+// 只按代码取数的 (如 stk_limit, 自带 CalcUpLimit 兜底) 不受此约束, 仍按 FilterMode 全量裁剪。
+func (l *Loader) trimHistory(calDate string) bool {
+	if !l.cfg.Dataloader.FilterMode {
+		return false
+	}
+	return calDate < time.Now().AddDate(0, 0, -store.StaleKeepRecentDays).Format("20060102")
 }
 
 // watchCodes 获取关注股票代码集合(实例级缓存)
@@ -445,4 +458,14 @@ func (l *Loader) indexCodes() map[string]bool {
 		}
 	}
 	return codeSet
+}
+
+// sortedKeys 集合转升序切片: 让遍历顺序与日志进度可复现 (map 迭代顺序随机)
+func sortedKeys(set map[string]bool) []string {
+	keys := make([]string, 0, len(set))
+	for k := range set {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

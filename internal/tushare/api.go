@@ -170,11 +170,6 @@ func (c *Client) DailyByCode(tsCode, startDate, endDate string) ([]model.Bar, er
 	return fetchRows(c, "daily", barParams("", tsCode, startDate, endDate), dailyFields, parseBar)
 }
 
-// IndexDaily 按交易日获取指数日线 (如 000300.SH 沪深300, 000001.SH 上证综指)
-func (c *Client) IndexDaily(tradeDate string) ([]model.Bar, error) {
-	return fetchRows(c, "index_daily", barParams(tradeDate, "", "", ""), dailyFields, parseBar)
-}
-
 // IndexDailyByCode 按代码获取指数日线
 func (c *Client) IndexDailyByCode(tsCode, startDate, endDate string) ([]model.Bar, error) {
 	return fetchRows(c, "index_daily", barParams("", tsCode, startDate, endDate), dailyFields, parseBar)

@@ -14,15 +14,21 @@ import (
 	"jingzhe-trader/pkg/retry"
 )
 
+// rateLimitWindow Tushare 频次限制的时间窗: 触发限流后等满一个窗口再重试
+const rateLimitWindow = time.Minute
+
+// burstTokens 令牌桶容量: 允许略高于并发的瞬时突发, 不放开整分钟配额
+const burstTokens = 8
+
 // Client Tushare API 客户端
 // 封装了 HTTP 请求、令牌桶限流和指数退避重试逻辑
 type Client struct {
 	token         string
 	baseURL       string
 	httpClient    *http.Client
-	rateBucket    chan struct{} // 令牌桶: 缓冲大小为每分钟配额, 取走一个令牌才能发起请求
+	rateBucket    chan struct{} // 令牌桶: 容量为突发上限, 长期速率由 refillTicker 按配额速率补充
 	maxRetries    int           // 最大重试次数
-	retryInterval time.Duration // 基础重试间隔, 实际退避按指数增长
+	retryInterval time.Duration // 基础重试间隔, 实际退避按指数增长 (分钟级限流除外, 按整窗等待)
 	quit          chan struct{} // refillTicker 退出信号 (Close 关闭)
 	closeOnce     sync.Once
 }
@@ -41,14 +47,15 @@ func NewClient(cfg config.TushareConfig) *Client {
 	// 构造令牌桶限流器
 	if cfg.RateLimit > 0 {
 		c.quit = make(chan struct{})
-		capacity := cfg.RateLimit
-		c.rateBucket = make(chan struct{}, capacity)
-		// 预先填满令牌, 允许开始时的突发请求
-		for i := 0; i < capacity; i++ {
-			c.rateBucket <- struct{}{}
+		// 桶容量只容纳调度并发, 不等于每分钟配额:
+		// 容量取配额会让整分钟的请求在一次突发里全部打完, 分钟级限制形同不存在
+		capacity := burstTokens
+		if cfg.RateLimit < capacity {
+			capacity = cfg.RateLimit
 		}
-		// 每分钟均匀补充 RateLimit 个令牌
-		interval := time.Minute / time.Duration(capacity)
+		c.rateBucket = make(chan struct{}, capacity)
+		// 按配置速率匀速补充令牌, 由补充速度决定长期吞吐
+		interval := rateLimitWindow / time.Duration(cfg.RateLimit)
 		go c.refillTicker(interval)
 	}
 
@@ -91,6 +98,8 @@ func (c *Client) waitForToken() {
 
 // call 通用请求入口, 包含限流与指数退避重试
 // apiName: Tushare 接口名; params: 接口参数; fields: 需返回的字段(逗号分隔, 可空)
+//
+// 只有"重试可能成功"的错误才重试: 权限/参数/日配额类错误重试只是白烧请求数与当天计次。
 func (c *Client) call(apiName string, params map[string]interface{}, fields string) (*Response, error) {
 	retries := c.maxRetries
 	if retries < 0 {
@@ -98,13 +107,18 @@ func (c *Client) call(apiName string, params map[string]interface{}, fields stri
 	}
 
 	var lastErr error
+	var waitBeforeNext time.Duration // 0 = 用默认指数退避
 	for attempt := 0; attempt <= retries; attempt++ {
-		// 重试时进行指数退避等待
+		// 重试时进行退避等待
 		if attempt > 0 {
-			backoff := retry.Backoff(c.retryInterval, attempt)
-			logger.L().Warnf("tushare %s 第 %d 次重试, 等待 %s", apiName, attempt, backoff)
-			time.Sleep(backoff)
+			wait := waitBeforeNext
+			if wait == 0 {
+				wait = retry.Backoff(c.retryInterval, attempt)
+			}
+			logger.L().Warnf("tushare %s 第 %d 次重试, 等待 %s: %v", apiName, attempt, wait, lastErr)
+			time.Sleep(wait)
 		}
+		waitBeforeNext = 0
 
 		c.waitForToken()
 
@@ -114,10 +128,16 @@ func (c *Client) call(apiName string, params map[string]interface{}, fields stri
 			logger.L().Warnf("tushare %s 请求失败(第 %d 次): %v", apiName, attempt+1, err)
 			continue
 		}
-		// code != 0 视为业务错误, 进行重试
 		if resp.Code != 0 {
-			lastErr = fmt.Errorf("tushare API %s 返回错误: code=%d msg=%s", apiName, resp.Code, resp.Msg)
-			logger.L().Warnf("tushare %s 业务错误(第 %d 次): code=%d msg=%s", apiName, attempt+1, resp.Code, resp.Msg)
+			apiErr := classify(apiName, resp.Code, resp.Msg)
+			if apiErr.Permanent {
+				return nil, fmt.Errorf("%w (不重试: %s)", apiErr, apiErr.Reason)
+			}
+			lastErr = apiErr
+			if apiErr.RateLimited {
+				// 分钟级限制: 指数退避的那几秒跨不出时间窗, 等满一个窗口再试
+				waitBeforeNext = rateLimitWindow
+			}
 			continue
 		}
 		return resp, nil

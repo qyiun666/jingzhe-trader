@@ -303,6 +303,14 @@ func migrate(db *sqlx.DB) error {
 			PRIMARY KEY (ts_code, trade_date)
 		);
 		CREATE INDEX IF NOT EXISTS idx_screen_result_date ON screen_result(trade_date);`,
+
+		// 新闻去重: major_news 在低积分档位只提供"最新一页"(实测约 800 条, 覆盖最近约 1.5 天),
+		// 相邻两天的拉取必然大量重叠。news 表原先没有唯一约束, INSERT OR IGNORE 实际上永不忽略,
+		// 重叠部分会逐日重复堆积。先清掉历史重复, 再建唯一索引, 把去重交给约束本身。
+		`DELETE FROM news WHERE id NOT IN (
+			SELECT MIN(id) FROM news GROUP BY datetime, title
+		);`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_news_dedup ON news(datetime, title);`,
 	}
 
 	for _, s := range stmts {
