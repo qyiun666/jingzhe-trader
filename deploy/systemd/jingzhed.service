@@ -1,0 +1,26 @@
+[Unit]
+Description=Jingzhe Trader MCP Daemon (jingzhed)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 二进制与数据库路径按实际部署修改
+ExecStart=/opt/jingzhe/jingzhed -db /opt/jingzhe/data/jingzhe.db -addr :8080
+# 令牌来源：环境变量优先于配置表 server.api_token（令牌为空则拒绝启动）
+Environment=JZ_SERVER_API_TOKEN=CHANGE_ME
+Environment=JZ_TUSHARE_TOKEN=CHANGE_ME
+# 邮件告警（可选，watchdog 用）
+Environment=JZ_WATCHDOG_SMTP_HOST=smtp.qq.com
+Environment=JZ_WATCHDOG_SMTP_PORT=465
+Environment=JZ_WATCHDOG_SMTP_USER=CHANGE_ME
+Environment=JZ_WATCHDOG_SMTP_PASS=CHANGE_ME
+Environment=JZ_WATCHDOG_MAIL_TO=CHANGE_ME
+Restart=always
+RestartSec=5
+User=jingzhe
+# 防 OOM 误杀
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target

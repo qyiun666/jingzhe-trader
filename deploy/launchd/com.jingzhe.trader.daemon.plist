@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jingzhe.trader.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/jingzhe/jingzhed</string>
+        <string>-db</string>
+        <string>/opt/jingzhe/data/jingzhe.db</string>
+        <string>-addr</string>
+        <string>:8080</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>JZ_SERVER_API_TOKEN</key>
+        <string>CHANGE_ME</string>
+        <key>JZ_TUSHARE_TOKEN</key>
+        <string>CHANGE_ME</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/opt/jingzhe/log/jingzhed.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/opt/jingzhe/log/jingzhed.err.log</string>
+</dict>
+</plist>

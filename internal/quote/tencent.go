@@ -1,81 +1,62 @@
 package quote
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/transform"
+	"jingzhe-trader/internal/model"
 )
 
-// Source 实时行情源接口
-// 仅用于盘中止损监控与计划参考价, 不驱动策略
-type Source interface {
-	// GetRealtimePrices 批量获取最新价, 返回 ts_code -> price
-	GetRealtimePrices(codes []string) (map[string]float64, error)
+// TencentSource 腾讯 qt.gtimg.cn 行情（降级备用源）。GBK 解码。
+type TencentSource struct {
+	httpClient *http.Client
+	cacheMu    sync.Mutex
+	cache      map[string]Quote
 }
 
-// TencentQuote 腾讯免费行情源 (qt.gtimg.cn)
-// 无需密钥, 适合小资金零成本方案; 仅解析最新价字段
-type TencentQuote struct {
-	client  *http.Client
-	baseURL string
-}
-
-// NewTencentQuote 创建腾讯行情源
-func NewTencentQuote() *TencentQuote {
-	return &TencentQuote{
-		client: &http.Client{
-			Timeout: 10 * time.Second,
-		},
-		baseURL: "https://qt.gtimg.cn",
+// NewTencentSource 构造腾讯降级源。
+func NewTencentSource() *TencentSource {
+	return &TencentSource{
+		httpClient: &http.Client{Timeout: 10 * time.Second},
+		cache:      make(map[string]Quote),
 	}
 }
 
-// GetRealtimePrices 批量获取最新价
-func (t *TencentQuote) GetRealtimePrices(codes []string) (map[string]float64, error) {
-	if len(codes) == 0 {
-		return map[string]float64{}, nil
-	}
-
-	// ts_code 600519.SH -> sh600519
-	symbols := make([]string, 0, len(codes))
-	symbolToCode := make(map[string]string, len(codes))
-	for _, code := range codes {
-		sym := toTencentSymbol(code)
-		if sym == "" {
-			continue
-		}
-		symbols = append(symbols, sym)
-		symbolToCode[sym] = code
-	}
-	if len(symbols) == 0 {
-		return map[string]float64{}, nil
-	}
-
-	url := fmt.Sprintf("%s/q=%s", t.baseURL, strings.Join(symbols, ","))
-	resp, err := t.client.Get(url)
+// Fetch 拉取腾讯实时行情（GBK→UTF-8）。
+func (s *TencentSource) Fetch(ctx context.Context, tsCodes []string) (map[string]Quote, error) {
+	q := "http://qt.gtimg.cn/q=" + strings.Join(toTencentCodes(tsCodes), ",")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, q, nil)
 	if err != nil {
-		return nil, fmt.Errorf("请求腾讯行情失败: %w", err)
+		return nil, err
+	}
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return nil, err
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("腾讯行情响应异常: HTTP %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("读取腾讯行情响应失败: %w", err)
+		return nil, err
 	}
-
-	return parseTencentBody(string(body), symbolToCode), nil
+	// GBK → UTF-8
+	utf8, _, derr := transform.Bytes(simplifiedchinese.GBK.NewDecoder(), raw)
+	if derr != nil {
+		return nil, fmt.Errorf("GBK 解码失败: %w", derr)
+	}
+	return s.parse(string(utf8), tsCodes)
 }
 
-// parseTencentBody 解析响应体
-// 格式: v_sh600519="1~贵州茅台~600519~1405.00~..."; 最新价在第4个字段(下标3)
-func parseTencentBody(body string, symbolToCode map[string]string) map[string]float64 {
-	prices := make(map[string]float64)
+// parse 解析腾讯行情文本行：v_sh600519="1~名称~代码~当前价~昨收~今开~..."。
+func (s *TencentSource) parse(body string, tsCodes []string) (map[string]Quote, error) {
+	res := make(map[string]Quote, len(tsCodes))
 	for _, line := range strings.Split(body, ";") {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "v_") {
@@ -85,37 +66,116 @@ func parseTencentBody(body string, symbolToCode map[string]string) map[string]fl
 		if eq < 0 {
 			continue
 		}
-		sym := strings.TrimPrefix(line[:eq], "v_")
-		code, ok := symbolToCode[sym]
-		if !ok {
+		key := line[2:eq] // sh600519
+		val := strings.Trim(line[eq+1:], "\"")
+		if val == "" {
 			continue
 		}
-		content := strings.Trim(line[eq+1:], `"`)
-		fields := strings.Split(content, "~")
-		if len(fields) < 4 {
+		parts := strings.Split(val, "~")
+		if len(parts) < 6 {
 			continue
 		}
-		if price, err := strconv.ParseFloat(fields[3], 64); err == nil && price > 0 {
-			prices[code] = price
+		ts := toTsCode(key)
+		qq := Quote{
+			TsCode:   ts,
+			Price:    parseFen(parts[3]),
+			PreClose: parseFen(parts[4]),
+			Open:     parseFen(parts[5]),
+			High:     parseFen(at(parts, 33)),
+			Low:      parseFen(at(parts, 34)),
+			Source:   "tencent",
 		}
+		if qq.High.IsZero() {
+			qq.High = qq.Price
+		}
+		if qq.Low.IsZero() {
+			qq.Low = qq.Price
+		}
+		res[ts] = qq
+		s.cacheMu.Lock()
+		s.cache[ts] = qq
+		s.cacheMu.Unlock()
 	}
-	return prices
+	if len(res) == 0 {
+		return nil, fmt.Errorf("腾讯行情返回为空")
+	}
+	return res, nil
 }
 
-// toTencentSymbol ts_code 转腾讯代码: 600519.SH -> sh600519, 000001.SZ -> sz000001
-func toTencentSymbol(tsCode string) string {
-	parts := strings.Split(tsCode, ".")
-	if len(parts) != 2 {
-		return ""
+func parseFen(s string) model.Fen {
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0
 	}
-	switch strings.ToUpper(parts[1]) {
-	case "SH":
-		return "sh" + parts[0]
-	case "SZ":
-		return "sz" + parts[0]
-	case "BJ":
-		return "bj" + parts[0]
+	return model.FromFloat(f)
+}
+
+func at(parts []string, i int) string {
+	if i < len(parts) {
+		return parts[i]
+	}
+	return ""
+}
+
+func toTencentCodes(tsCodes []string) []string {
+	out := make([]string, 0, len(tsCodes))
+	for _, tc := range tsCodes {
+		out = append(out, toTencentCode(tc))
+	}
+	return out
+}
+
+func toTencentCode(tc string) string {
+	parts := strings.SplitN(tc, ".", 2)
+	code := parts[0]
+	suffix := ""
+	if len(parts) == 2 {
+		suffix = strings.ToLower(parts[1])
+	}
+	switch suffix {
+	case "sh":
+		return "sh" + code
+	case "sz":
+		return "sz" + code
+	case "bj":
+		return "bj" + code
 	default:
-		return ""
+		return toTencentCodeByPrefix(code)
 	}
+}
+
+func toTencentCodeByPrefix(code string) string {
+	if len(code) == 0 {
+		return code
+	}
+	switch code[0] {
+	case '6':
+		return "sh" + code
+	case '0', '3':
+		return "sz" + code
+	case '8', '9':
+		return "bj" + code
+	default:
+		return "sh" + code
+	}
+}
+
+func toTsCode(tencentKey string) string {
+	if len(tencentKey) < 2 {
+		return tencentKey
+	}
+	prefix := tencentKey[:2]
+	code := tencentKey[2:]
+	var suffix string
+	switch strings.ToLower(prefix) {
+	case "sh":
+		suffix = "SH"
+	case "sz":
+		suffix = "SZ"
+	case "bj":
+		suffix = "BJ"
+	default:
+		suffix = "SH"
+	}
+	return code + "." + suffix
 }

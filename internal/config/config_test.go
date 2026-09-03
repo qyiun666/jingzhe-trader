@@ -1,130 +1,161 @@
 package config
 
 import (
-	"encoding/json"
-	"reflect"
-	"strings"
+	"context"
+	"errors"
 	"testing"
+
+	"jingzhe-trader/internal/store"
 )
 
-// TestDefaultDocumentCoversEveryField 结构体里每个可配置字段都必须有代码默认值。
-//
-// 背景: 配置源从 YAML 换成 SQLite 后, 首次启动靠 DefaultJSON() 种子。此前 risk.* / strategy.* /
-// goal.* 等 49 个键只存在于配置文件、没有代码默认值, 空库种子出来全是 Go 零值 ——
-// 而 risk.max_position_pct=0 会让风控把每笔买入裁成 0 股, 属于静默的危险配置。
-// 新增字段却忘了 SetDefault 会直接命中这个用例。
-func TestDefaultDocumentCoversEveryField(t *testing.T) {
-	doc, err := DefaultJSON()
+// openTestStore 打开临时库（自动建全部表），供配置测试使用。
+func openTestStore(t *testing.T) *store.Store {
+	t.Helper()
+	s, err := store.Open(t.TempDir() + "/cfg.db")
 	if err != nil {
-		t.Fatalf("DefaultJSON 失败: %v", err)
+		t.Fatalf("store.Open 失败: %v", err)
 	}
-	var flat map[string]any
-	if err := json.Unmarshal(doc, &flat); err != nil {
-		t.Fatalf("默认文档不是合法 JSON: %v", err)
-	}
-	present := map[string]bool{}
-	flatten("", flat, present)
+	return s
+}
 
-	// 凭据不得有默认值: 源码里不能出现任何密钥字面量
-	noDefault := map[string]bool{
-		"tushare.token": true,
-		"llm.api_key":   true,
-		"mail.password": true,
+// TestRefuseZero 危险零值拒绝：risk.stop_loss_pct=0 应被拒绝并指明键名。
+func TestRefuseZero(t *testing.T) {
+	cfg := &Config{Values: map[string]ConfigValue{
+		"risk.stop_loss_pct": {Key: "risk.stop_loss_pct", Type: TypeFloat, Value: "0"},
+	}}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("期望拒绝零值，但 Validate 通过")
 	}
+	var ce *ConfigError
+	if !errors.As(err, &ce) {
+		t.Fatalf("期望 *ConfigError，实际 %T", err)
+	}
+	found := false
+	for _, k := range ce.ZeroValues {
+		if k == "risk.stop_loss_pct" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("零值清单应含 risk.stop_loss_pct，实际: %v", ce.ZeroValues)
+	}
+}
 
-	var missing []string
-	for _, path := range structLeafPaths(reflect.TypeOf(Config{}), "") {
-		if noDefault[path] {
-			if present[path] {
-				t.Errorf("凭据键 %s 不应有代码默认值", path)
+// TestRequiredMissing 必配项为空拒绝：tushare.token / server.api_token 缺失应列出。
+func TestRequiredMissing(t *testing.T) {
+	cfg := &Config{Values: map[string]ConfigValue{}}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("期望拒绝缺失必配项，但 Validate 通过")
+	}
+	var ce *ConfigError
+	if !errors.As(err, &ce) {
+		t.Fatalf("期望 *ConfigError，实际 %T", err)
+	}
+	has := func(list []string, k string) bool {
+		for _, x := range list {
+			if x == k {
+				return true
 			}
-			continue
 		}
-		if !present[path] {
-			missing = append(missing, path)
-		}
+		return false
 	}
-	if len(missing) > 0 {
-		t.Errorf("%d 个配置字段缺少代码默认值, 空库种子后会落到 Go 零值: %s",
-			len(missing), strings.Join(missing, ", "))
+	if !has(ce.Missing, "tushare.token") || !has(ce.Missing, "server.api_token") {
+		t.Fatalf("缺失清单应含 tushare.token 与 server.api_token，实际: %v", ce.Missing)
 	}
 }
 
-// TestCriticalDefaultsAreUsable 关键风控与策略默认值必须是可用值而非零值
-func TestCriticalDefaultsAreUsable(t *testing.T) {
-	doc, err := DefaultJSON()
+// TestEnvOverridePriority 环境变量 > 库值 > 默认值（仅非空顶换）。
+func TestEnvOverridePriority(t *testing.T) {
+	s := openTestStore(t)
+	defer s.Close()
+	ctx := context.Background()
+
+	// 库值：screen.top_n = 5（默认值 20）
+	repo := NewRepo(s)
+	if err := repo.Set(ctx, "screen.top_n", "5", "test"); err != nil {
+		t.Fatalf("Set 失败: %v", err)
+	}
+	// 环境变量顶换：JZ_SCREEN_TOP_N = 7
+	t.Setenv("JZ_SCREEN_TOP_N", "7")
+	// Load 校验必配项，提供凭据占位（envName: tushare.token→JZ_TUSHARE_TOKEN, server.api_token→JZ_SERVER_API_TOKEN）
+	t.Setenv("JZ_TUSHARE_TOKEN", "env_tushare")
+	t.Setenv("JZ_SERVER_API_TOKEN", "env_api")
+
+	cfg, err := Load(ctx, s)
 	if err != nil {
-		t.Fatalf("DefaultJSON: %v", err)
+		t.Fatalf("Load 失败: %v", err)
 	}
-	cfg, err := LoadFromJSON(doc)
+	if got := cfg.GetInt("screen.top_n"); got != 7 {
+		t.Fatalf("环境变量应顶换库值：期望 7，实际 %d", got)
+	}
+
+	// 默认值基线：未设置的 risk.stop_loss_pct 应取默认 0.08
+	if got := cfg.GetFloat("risk.stop_loss_pct"); got != 0.08 {
+		t.Fatalf("未设置键应取默认：期望 0.08，实际 %v", got)
+	}
+}
+
+// TestEnvSecretOverride 凭据环境变量覆盖生效（JZ_SERVER_API_TOKEN）。
+func TestEnvSecretOverride(t *testing.T) {
+	s := openTestStore(t)
+	defer s.Close()
+	ctx := context.Background()
+	t.Setenv("JZ_TUSHARE_TOKEN", "env_tushare")
+	t.Setenv("JZ_SERVER_API_TOKEN", "env_api")
+
+	cfg, err := Load(ctx, s)
 	if err != nil {
-		t.Fatalf("LoadFromJSON(默认文档) 失败: %v", err)
+		t.Fatalf("Load 失败（凭据由 env 提供）: %v", err)
 	}
-	if cfg.Risk.MaxPositionPct <= 0 || cfg.Risk.MaxPositionPct > 1 {
-		t.Errorf("risk.max_position_pct 默认值不可用: %v", cfg.Risk.MaxPositionPct)
+	if cfg.GetString("tushare.token") != "env_tushare" {
+		t.Fatalf("tushare.token 应取 env 值")
 	}
-	if cfg.Risk.StopLossPct <= 0 {
-		t.Errorf("risk.stop_loss_pct 默认值为 0, 止损会失效")
-	}
-	if cfg.Strategy.MACross.ShortPeriod <= 0 || cfg.Strategy.MACross.LongPeriod <= cfg.Strategy.MACross.ShortPeriod {
-		t.Errorf("ma_cross 均线周期默认值非法: short=%d long=%d",
-			cfg.Strategy.MACross.ShortPeriod, cfg.Strategy.MACross.LongPeriod)
-	}
-	if cfg.Broker.Type == "" {
-		t.Errorf("broker.type 默认值为空, 券商分支会走错")
+	if cfg.GetString("server.api_token") != "env_api" {
+		t.Fatalf("server.api_token 应取 env 值")
 	}
 }
 
-// TestLoadFromJSONEmptyDocFallsBackToDefaults 空文档(全新库尚未种子)必须回落默认值而非报错
-func TestLoadFromJSONEmptyDocFallsBackToDefaults(t *testing.T) {
-	cfg, err := LoadFromJSON(nil)
+// TestDBOverridesDefault 库值覆盖默认值。
+func TestDBOverridesDefault(t *testing.T) {
+	s := openTestStore(t)
+	defer s.Close()
+	ctx := context.Background()
+	repo := NewRepo(s)
+	if err := repo.Set(ctx, "screen.top_n", "5", "test"); err != nil {
+		t.Fatalf("Set 失败: %v", err)
+	}
+	// 不设业务 env；Load 校验必配项，提供凭据占位
+	t.Setenv("JZ_TUSHARE_TOKEN", "env_tushare")
+	t.Setenv("JZ_SERVER_API_TOKEN", "env_api")
+	cfg, err := Load(ctx, s)
 	if err != nil {
-		t.Fatalf("空文档不应报错: %v", err)
+		t.Fatalf("Load 失败: %v", err)
 	}
-	if cfg.Tushare.BaseURL != "http://api.tushare.pro" {
-		t.Errorf("应拿到默认值, 实际 %q", cfg.Tushare.BaseURL)
-	}
-	if _, err := EffectiveJSON(nil); err != nil {
-		t.Errorf("空文档 dump 不应报错: %v", err)
+	if got := cfg.GetInt("screen.top_n"); got != 5 {
+		t.Fatalf("库值应覆盖默认：期望 5，实际 %d", got)
 	}
 }
 
-func flatten(prefix string, m map[string]any, out map[string]bool) {
-	for k, v := range m {
-		path := k
-		if prefix != "" {
-			path = prefix + "." + k
-		}
-		if child, ok := v.(map[string]any); ok {
-			flatten(path, child, out)
-			continue
-		}
-		out[path] = true
+// TestMaskNotLeak 凭据掩码不泄露明文。
+func TestMaskNotLeak(t *testing.T) {
+	if Mask("abcdef") != maskLiteral {
+		t.Fatal("Mask 应返回掩码")
 	}
-}
-
-// structLeafPaths 按 mapstructure tag 递归收集 Config 的全部叶子路径
-func structLeafPaths(t reflect.Type, prefix string) []string {
-	var out []string
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
-		name := f.Tag.Get("mapstructure")
-		if name == "" || name == "-" {
-			continue
-		}
-		path := name
-		if prefix != "" {
-			path = prefix + "." + name
-		}
-		ft := f.Type
-		if ft.Kind() == reflect.Ptr {
-			ft = ft.Elem()
-		}
-		if ft.Kind() == reflect.Struct {
-			out = append(out, structLeafPaths(ft, path)...)
-			continue
-		}
-		out = append(out, path)
+	if Mask("") != "" {
+		t.Fatal("空值掩码应返回空")
 	}
-	return out
+	e := Entry{Key: "tushare.token", Value: "supersecret", IsSecret: true}
+	if DisplayValue(e, false) != maskLiteral {
+		t.Fatal("未显式 show-secrets 时凭据应掩码")
+	}
+	if DisplayValue(e, true) != "supersecret" {
+		t.Fatal("显式 show-secrets 应返回明文")
+	}
+	// 非凭据键不掩码
+	ne := Entry{Key: "risk.stop_loss_pct", Value: "0.08", IsSecret: false}
+	if DisplayValue(ne, false) != "0.08" {
+		t.Fatal("非凭据键不应掩码")
+	}
 }

@@ -1,296 +1,111 @@
+// Package llm DeepSeek 二次质证（P1 可选增强，默认关闭）。
+//
+// 原则（PRD / §5.1 15:40）：LLM 只做买入候选终审，不参与决策否决之外的环节；
+// 失败必须显式告警（LLM_FAILED）并标注"未质证"，绝不把失败标成"已分析"。
 package llm
 
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
-
-	"golang.org/x/time/rate"
-
-	"jingzhe-trader/pkg/retry"
 )
 
-const (
-	// maxAttempts 最大尝试次数(含首次请求), 即最多重试 2 次
-	maxAttempts = 3
-	// defaultMaxTokens 输出上限默认值, 过小容易导致 LLM 返回的 JSON 被截断
-	defaultMaxTokens = 2048
-	// defaultTemperature 分析类任务默认低温度, 保证输出稳定
-	defaultTemperature = 0.3
-	// defaultTimeoutSeconds HTTP 请求超时默认值
-	defaultTimeoutSeconds = 30
-)
-
-// retryBackoffBase 重试退避基数(指数退避: base, 2*base), 测试可调小以加速
-var retryBackoffBase = time.Second
-
-// Client LLM 客户端
-// 仅支持 DeepSeek API (OpenAI 兼容接口)
-// 全局并发/限流: 所有调用方 (辩论/新闻/日报) 共用同一实例, 在 Chat 入口统一受控
+// Client DeepSeek Chat Completions 客户端（http.Client 可注入，单测打桩）。
 type Client struct {
-	apiKey      string
-	baseURL     string
-	model       string
-	httpClient  *http.Client
-	enabled     bool
-	temperature float64
-	maxTokens   int
-	jsonMode    bool
-	cache       sync.Map      // 进程内缓存: key=date+symbol+role+输入hash, value=响应内容
-	sem         chan struct{} // 并发在飞请求上限 (nil=不限制)
-	limiter     *rate.Limiter // 每秒请求数限速 (nil=不限速)
+	apiKey  string
+	baseURL string
+	model   string
+	hc      *http.Client
 }
 
-// Config LLM 配置
-type Config struct {
-	APIKey         string  `mapstructure:"api_key"`
-	BaseURL        string  `mapstructure:"base_url"` // 默认 "https://api.deepseek.com/v1"
-	Model          string  `mapstructure:"model"`    // 默认 "deepseek-chat"
-	Enabled        bool    `mapstructure:"enabled"`
-	Temperature    float64 `mapstructure:"temperature"`     // 默认 0.3
-	MaxTokens      int     `mapstructure:"max_tokens"`      // 默认 2048
-	TimeoutSeconds int     `mapstructure:"timeout_seconds"` // 默认 30
-	JSONMode       *bool   `mapstructure:"json_mode"`       // nil 表示默认 false, 强制 JSON 输出 (仅 DeepSeek 支持)
-	MaxConcurrency int     `mapstructure:"max_concurrency"` // 并发在飞请求上限, 0=不限制
-	RPS            float64 `mapstructure:"rps"`             // 每秒请求数上限, 0=不限速
+// NewClient 构造客户端。hc 为 nil 时使用 30s 超时的默认客户端。
+func NewClient(apiKey, baseURL, model string, hc *http.Client) *Client {
+	if hc == nil {
+		hc = &http.Client{Timeout: 30 * time.Second}
+	}
+	return &Client{apiKey: apiKey, baseURL: strings.TrimRight(baseURL, "/"), model: model, hc: hc}
 }
 
-// NewClient 创建 LLM 客户端
-// 如果未启用或 API Key 为空，返回一个禁用状态的客户端，所有调用都会返回错误
-func NewClient(cfg Config) *Client {
-	if !cfg.Enabled || cfg.APIKey == "" {
-		return &Client{enabled: false}
-	}
-	baseURL := cfg.BaseURL
-	if baseURL == "" {
-		baseURL = "https://api.deepseek.com/v1"
-	}
-	model := cfg.Model
-	if model == "" {
-		model = "deepseek-chat"
-	}
-	temperature := cfg.Temperature
-	if temperature < 0 {
-		temperature = defaultTemperature
-	}
-	maxTokens := cfg.MaxTokens
-	if maxTokens <= 0 {
-		maxTokens = defaultMaxTokens
-	}
-	timeout := cfg.TimeoutSeconds
-	if timeout <= 0 {
-		timeout = defaultTimeoutSeconds
-	}
-	jsonMode := false // 默认关闭, 仅 DeepSeek 支持
-	if cfg.JSONMode != nil {
-		jsonMode = *cfg.JSONMode
-	}
-
-	// 并发/限流: 零值 (0) 表示不限制, 默认值由配置层 SetDefault 注入
-	// 测试直接构造 Config{} 时不受限速影响
-	var sem chan struct{}
-	if cfg.MaxConcurrency > 0 {
-		sem = make(chan struct{}, cfg.MaxConcurrency)
-	}
-	var limiter *rate.Limiter
-	if cfg.RPS > 0 {
-		burst := cfg.MaxConcurrency
-		if burst < 1 {
-			burst = 1
-		}
-		limiter = rate.NewLimiter(rate.Limit(cfg.RPS), burst)
-	}
-
-	return &Client{
-		apiKey:      cfg.APIKey,
-		baseURL:     baseURL,
-		model:       model,
-		temperature: temperature,
-		maxTokens:   maxTokens,
-		jsonMode:    jsonMode,
-		sem:         sem,
-		limiter:     limiter,
-		httpClient: &http.Client{
-			Timeout: time.Duration(timeout) * time.Second,
-		},
-		enabled: true,
-	}
+// Enabled 客户端是否可用（key/model 配置齐全）。
+func (c *Client) Enabled() bool {
+	return c != nil && c.apiKey != "" && c.model != ""
 }
 
-// IsEnabled 是否启用了 LLM
-func (c *Client) IsEnabled() bool {
-	return c.enabled
+// chatRequest / chatResponse OpenAI 兼容协议的最小子集。
+type chatRequest struct {
+	Model       string        `json:"model"`
+	Messages    []chatMessage `json:"messages"`
+	Temperature float64       `json:"temperature"`
 }
-
-// ChatMessage 聊天消息
-type ChatMessage struct {
-	Role    string `json:"role"` // system / user / assistant
+type chatMessage struct {
+	Role    string `json:"role"`
 	Content string `json:"content"`
 }
-
-// ChatCompletionRequest 请求体
-type ChatCompletionRequest struct {
-	Model          string          `json:"model"`
-	Messages       []ChatMessage   `json:"messages"`
-	Temperature    float64         `json:"temperature"`
-	MaxTokens      int             `json:"max_tokens"`
-	ResponseFormat *ResponseFormat `json:"response_format,omitempty"`
-}
-
-// ResponseFormat 响应格式约束 (OpenAI 兼容 json_object mode)
-type ResponseFormat struct {
-	Type string `json:"type"`
-}
-
-// ChatCompletionResponse 响应体
-type ChatCompletionResponse struct {
+type chatResponse struct {
 	Choices []struct {
-		Message ChatMessage `json:"message"`
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
 	} `json:"choices"`
 	Error *struct {
 		Message string `json:"message"`
-	} `json:"error,omitempty"`
+	} `json:"error"`
 }
 
-// Chat 发送聊天请求
-// systemPrompt: 系统提示词，定义角色和输出格式
-// userPrompt: 用户提示词，包含具体的任务内容
-// 仅对网络错误 / 5xx / 429 做指数退避重试(最多 maxAttempts 次), 4xx 等业务错误不重试
-func (c *Client) Chat(systemPrompt, userPrompt string) (string, error) {
-	if !c.enabled {
-		return "", fmt.Errorf("LLM 未启用")
+// Chat 发起一次对话补全，返回首个 choice 的文本内容。
+// 非 200、响应含 error、choices 为空均返回显式错误（绝不返回空内容 + nil error）。
+func (c *Client) Chat(ctx context.Context, system, user string) (string, error) {
+	if !c.Enabled() {
+		return "", fmt.Errorf("llm 客户端未配置（api_key/model 缺失）")
 	}
-
-	// 全局并发/限流: 信号量限制在飞请求数, 令牌桶平滑限速 (429 由重试层兜底)
-	if c.sem != nil {
-		c.sem <- struct{}{}
-		defer func() { <-c.sem }()
-	}
-	if c.limiter != nil {
-		if err := c.limiter.Wait(context.Background()); err != nil {
-			return "", fmt.Errorf("LLM 限流等待失败: %w", err)
-		}
-	}
-
-	reqBody := ChatCompletionRequest{
-		Model: c.model,
-		Messages: []ChatMessage{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: userPrompt},
-		},
-		Temperature: c.temperature,
-		MaxTokens:   c.maxTokens,
-	}
-	if c.jsonMode {
-		// 强制 JSON 输出, 避免分析结果被 markdown 代码块或散文包裹
-		// 前置条件: prompt 中需包含 "json" 字样 (所有内置 prompt 均已满足)
-		reqBody.ResponseFormat = &ResponseFormat{Type: "json_object"}
-	}
-
-	bodyBytes, err := json.Marshal(reqBody)
+	reqBody, err := json.Marshal(chatRequest{
+		Model:       c.model,
+		Messages:    []chatMessage{{Role: "system", Content: system}, {Role: "user", Content: user}},
+		Temperature: 0.2,
+	})
 	if err != nil {
-		return "", fmt.Errorf("序列化请求失败: %w", err)
+		return "", fmt.Errorf("序列化 LLM 请求失败: %w", err)
 	}
-
-	var lastErr error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if attempt > 0 {
-			// 指数退避: 第1次重试等 base, 第2次等 2*base
-			time.Sleep(retry.Backoff(retryBackoffBase, attempt))
-		}
-		content, retryable, err := c.doChatRequest(bodyBytes)
-		if err == nil {
-			return content, nil
-		}
-		lastErr = err
-		if !retryable {
-			// 4xx 等业务错误重试无意义, 直接返回
-			return "", err
-		}
-	}
-	return "", lastErr
-}
-
-// ChatWithCache 带进程内缓存的聊天请求
-// key = 日期 + 股票代码 + 角色 + 输入内容hash, 同日同股票同角色且输入相同时直接命中缓存, 不重复调用 LLM
-// 仅缓存成功响应; 进程内有效, 进程重启后自动失效
-func (c *Client) ChatWithCache(tradeDate, tsCode, role, systemPrompt, userPrompt string) (string, error) {
-	if !c.enabled {
-		return "", fmt.Errorf("LLM 未启用")
-	}
-	sum := sha256.Sum256([]byte(systemPrompt + "\x00" + userPrompt))
-	key := fmt.Sprintf("%s|%s|%s|%s", tradeDate, tsCode, role, hex.EncodeToString(sum[:]))
-	if v, ok := c.cache.Load(key); ok {
-		return v.(string), nil
-	}
-	resp, err := c.Chat(systemPrompt, userPrompt)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(reqBody))
 	if err != nil {
-		return "", err
-	}
-	actual, _ := c.cache.LoadOrStore(key, resp)
-	return actual.(string), nil
-}
-
-// doChatRequest 执行单次聊天请求
-// 返回 retryable=true 表示网络错误 / 5xx / 429, 可安全重试; 4xx 及响应解析错误不重试
-func (c *Client) doChatRequest(bodyBytes []byte) (string, bool, error) {
-	url := c.baseURL + "/chat/completions"
-	req, err := http.NewRequest("POST", url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return "", false, fmt.Errorf("创建请求失败: %w", err)
+		return "", fmt.Errorf("构建 LLM 请求失败: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.hc.Do(req)
 	if err != nil {
-		// 网络层错误(连接失败/超时等), 可重试
-		return "", true, fmt.Errorf("请求 LLM 接口失败: %w", err)
+		return "", fmt.Errorf("调用 LLM 失败: %w", err)
 	}
 	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", true, fmt.Errorf("读取响应失败: %w", err)
+		return "", fmt.Errorf("读取 LLM 响应失败: %w", err)
 	}
-
-	// 非 2xx 响应直接报错 (避免将 HTML 错误页误报为"解析失败")
-	// 429(限流) 与 5xx(服务端错误) 可重试, 其余 4xx 不重试
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
-		return "", retryable, fmt.Errorf("LLM HTTP %d: %s", resp.StatusCode, string(respBody))
+	var cr chatResponse
+	if err := json.Unmarshal(body, &cr); err != nil {
+		return "", fmt.Errorf("解析 LLM 响应失败（http %d）: %w", resp.StatusCode, err)
 	}
-
-	var result ChatCompletionResponse
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return "", false, fmt.Errorf("解析响应失败: %w, 原始内容: %s", err, string(respBody))
+	if cr.Error != nil && cr.Error.Message != "" {
+		return "", fmt.Errorf("LLM 返回错误: %s", cr.Error.Message)
 	}
-
-	if result.Error != nil {
-		return "", false, fmt.Errorf("LLM 错误: %s", result.Error.Message)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("LLM http 状态 %d: %s", resp.StatusCode, truncate(string(body), 300))
 	}
-
-	if len(result.Choices) == 0 {
-		return "", false, fmt.Errorf("无响应内容")
+	if len(cr.Choices) == 0 || cr.Choices[0].Message.Content == "" {
+		return "", fmt.Errorf("LLM 响应为空（choices=%d）", len(cr.Choices))
 	}
-
-	return result.Choices[0].Message.Content, false, nil
+	return cr.Choices[0].Message.Content, nil
 }
 
-// StripCodeFence 剥离 LLM 响应中的 markdown 代码块包裹 (```json ... ```)
-// 多个调用方(agent 分析师/研究员/新闻分析)共用同一解析预处理
-func StripCodeFence(s string) string {
-	s = strings.TrimSpace(s)
-	s = strings.TrimPrefix(s, "```json")
-	s = strings.TrimPrefix(s, "```")
-	s = strings.TrimSuffix(s, "```")
-	return strings.TrimSpace(s)
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }

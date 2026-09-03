@@ -1,265 +1,204 @@
-// Package mcp exposes the Jingzhe trading system capabilities through the
-// Model Context Protocol (MCP). It reuses the business logic from
-// internal/api by calling the exported Service methods.
 package mcp
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 
-	"github.com/mark3labs/mcp-go/mcp"
-	mcpserver "github.com/mark3labs/mcp-go/server"
-
-	"jingzhe-trader/internal/api"
 	"jingzhe-trader/internal/config"
+	"jingzhe-trader/internal/observability"
+	"jingzhe-trader/internal/store"
 )
 
-// Server wraps an MCP server on top of the existing api.Service.
+// Server MCP 对外服务：/healthz 免鉴权，/mcp 需 Bearer 令牌（§10.6-2/7）。
 type Server struct {
-	svc *api.Service
-	cfg *config.Config
-	mcp *mcpserver.MCPServer
+	deps     *Deps
+	apiToken string
+	tools    map[string]*Tool
+	mux      *http.ServeMux
 }
 
-// NewServer creates and configures the MCP server.
-func NewServer(svc *api.Service, cfg *config.Config) *Server {
-	s := &Server{svc: svc, cfg: cfg}
-	s.mcp = mcpserver.NewMCPServer(
-		"jingzhe-trader",
-		"1.0.0",
-		mcpserver.WithToolCapabilities(true),
-	)
+// New 构造 MCP 服务。apiToken 为空时直接返回错误（拒绝无令牌启动，验收 §10.6-7）。
+func New(st *store.Store, cfg *config.Config, apiToken string) (*Server, error) {
+	if apiToken == "" {
+		return nil, fmt.Errorf("MCP 服务拒绝启动：server.api_token 为空（外部 agent 无令牌不可接入）")
+	}
+	ctx := context.Background()
+	deps, err := BuildDeps(ctx, st, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("装配 MCP 依赖失败: %w", err)
+	}
+	s := &Server{deps: deps, apiToken: apiToken, tools: map[string]*Tool{}}
 	s.registerTools()
-	s.registerResources()
-	return s
+	s.mux = http.NewServeMux()
+	s.mux.HandleFunc("/healthz", s.handleHealthz)
+	s.mux.HandleFunc("/mcp", s.handleMCP)
+	return s, nil
 }
 
-// Handler returns an http.Handler that serves MCP over Streamable HTTP.
-// This keeps the server as a single resident background process while
-// exposing only the MCP interface externally.
-func (s *Server) Handler() http.Handler {
-	return mcpserver.NewStreamableHTTPServer(
-		s.mcp,
-		mcpserver.WithEndpointPath("/mcp"),
-		mcpserver.WithDisableLocalhostProtection(true),
-	)
+// Start 在 addr 上启动 HTTP 服务（阻塞）。
+func (s *Server) Start(addr string) error {
+	observability.S().Infow("MCP 服务启动", "addr", addr)
+	return http.ListenAndServe(addr, s.mux)
 }
 
-// ServeStdio runs the MCP server over stdio, useful for local CLI clients.
-func (s *Server) ServeStdio() error {
-	return mcpserver.ServeStdio(s.mcp)
-}
+// Handler 返回 HTTP 处理器（供测试使用 httptest）。
+func (s *Server) Handler() http.Handler { return s.mux }
 
-func (s *Server) registerTools() {
-	// ---------- read tools ----------
-
-	s.addTool("get_health",
-		"Get server health status (uptime, goroutines, db size, data freshness, job health).",
-		s.handleGetHealth)
-
-	s.addTool("get_agent_brief",
-		"Get the full agent context: plans, portfolio, market, debates, decision changes, task status, and goal.",
-		s.handleGetAgentBrief)
-
-	s.addTool("get_agent_dashboard",
-		"Get the agent dashboard summary: unread alerts, today's alerts, open plans, debates, decision changes, and task status.",
-		s.handleGetAgentDashboard)
-
-	s.addTool("get_agent_changes",
-		"Get decision changes, plan status changes, and task status for a date.",
-		s.handleGetAgentChanges,
-		mcp.WithString("date", mcp.Description("Date in YYYYMMDD format; defaults to latest trade date")))
-
-	s.addTool("get_agent_alerts",
-		"Get recent or unread agent alerts (notifications persisted to the alert store).",
-		s.handleGetAgentAlerts,
-		mcp.WithBoolean("unread_only", mcp.Description("Only return unread alerts"), mcp.DefaultBool(false)),
-		mcp.WithString("date", mcp.Description("Optional date filter in YYYYMMDD format")))
-
-	s.addTool("get_positions",
-		"Get the current portfolio diagnosis (positions, asset, health score, risk metrics).",
-		s.handleGetPositions,
-		mcp.WithString("date", mcp.Description("Date in YYYYMMDD format; defaults to today")))
-
-	s.addTool("get_portfolio",
-		"Get the raw portfolio holdings from the database.",
-		s.handleGetPortfolio)
-
-	s.addTool("get_market",
-		"Get the market snapshot for a date.",
-		s.handleGetMarket,
-		mcp.WithString("date", mcp.Description("Date in YYYYMMDD format; defaults to today")))
-
-	s.addTool("get_daily_report",
-		"Get the daily trading report for a date and strategy.",
-		s.handleGetDailyReport,
-		mcp.WithString("date", mcp.Description("Date in YYYYMMDD format; defaults to today")),
-		mcp.WithString("strategy", mcp.Description("Strategy name; defaults to dynamic strategy selection")))
-
-	s.addTool("get_plans",
-		"Get trade plan list for a date, or all open plans when date is omitted.",
-		s.handleGetPlans,
-		mcp.WithString("date", mcp.Description("Optional date in YYYYMMDD format")))
-
-	s.addTool("get_strategy_status",
-		"Get the dynamic strategy selector status (current strategy, market condition, confidence, recommendation).",
-		s.handleGetStrategyStatus)
-
-	s.addTool("get_goal_status",
-		"Get the quarterly goal tracking status (return, drawdown, budget consumed, risk mode).",
-		s.handleGetGoalStatus,
-		mcp.WithString("date", mcp.Description("Date in YYYYMMDD format; defaults to today")))
-
-	s.addTool("get_screener_results",
-		"Get the latest or historical automatic stock screening results.",
-		s.handleGetScreenerResults,
-		mcp.WithString("date", mcp.Description("Optional date in YYYYMMDD format")))
-
-	s.addTool("get_system_status",
-		"Get overall system status (data freshness, portfolio count, next market open, uptime).",
-		s.handleGetSystemStatus)
-
-	s.addTool("get_kline",
-		"Get K-line bars for a stock.",
-		s.handleGetKline,
-		mcp.WithString("code", mcp.Required(), mcp.Description("Stock code, e.g. 510050.SH")),
-		mcp.WithString("start", mcp.Description("Start date in YYYYMMDD format; defaults to 20200101")),
-		mcp.WithString("end", mcp.Description("End date in YYYYMMDD format; defaults to today")))
-
-	s.addTool("get_snapshots",
-		"Get historical account snapshots.",
-		s.handleGetSnapshots,
-		mcp.WithNumber("limit", mcp.Description("Maximum number of snapshots to return"), mcp.DefaultNumber(30)))
-
-	// ---------- write tools ----------
-
-	s.addTool("confirm_plan",
-		"Confirm a pending trade plan by ID. In QMT+auto_execute mode this places a real order.",
-		s.handleConfirmPlan,
-		mcp.WithNumber("id", mcp.Required(), mcp.Description("Trade plan ID")))
-
-	s.addTool("confirm_trade",
-		"Report a manual trade execution so the local portfolio stays in sync.",
-		s.handleConfirmTrade,
-		mcp.WithString("ts_code", mcp.Required(), mcp.Description("Stock code, e.g. 000001.SZ")),
-		mcp.WithString("side", mcp.Required(), mcp.Description("buy or sell")),
-		mcp.WithNumber("qty", mcp.Required(), mcp.Description("Trade quantity (must be a multiple of 100)")),
-		mcp.WithNumber("price", mcp.Required(), mcp.Description("Trade price")),
-		mcp.WithNumber("plan_id", mcp.Description("Optional trade plan ID to close after confirmation"),
-			mcp.DefaultNumber(0)))
-
-	s.addTool("sync_portfolio",
-		"Synchronize the local portfolio with real broker positions.",
-		s.handleSyncPortfolio,
-		mcp.WithNumber("cash", mcp.Description("Available cash; omit to keep current cash")),
-		mcp.WithBoolean("overwrite", mcp.Description("If true, replace all positions; if false, upsert incrementally"), mcp.DefaultBool(true)),
-		mcp.WithArray("positions", mcp.Required(), mcp.Description("Array of position objects {ts_code, total_qty, available_qty, cost_price}")))
-
-	s.addTool("update_data",
-		"Manually trigger an incremental data update (Tushare bars, calendar, basics).",
-		s.handleUpdateData)
-
-	s.addTool("switch_strategy",
-		"Manually switch the active strategy used for signal generation.",
-		s.handleSwitchStrategy,
-		mcp.WithString("strategy", mcp.Required(), mcp.Description("Strategy name, e.g. ma_cross, macd, multi_factor")))
-
-	s.addTool("run_screener",
-		"Manually trigger the full-market stock screener.",
-		s.handleRunScreener)
-
-	s.addTool("mark_alerts_read",
-		"Mark agent alerts as read.",
-		s.handleMarkAlertsRead,
-		mcp.WithNumber("id", mcp.Description("Alert ID to mark read; omit and set all=true to mark all as read")),
-		mcp.WithBoolean("all", mcp.Description("Mark all alerts as read"), mcp.DefaultBool(false)))
-}
-
-func (s *Server) registerResources() {
-	res := mcp.NewResource("jingzhe://health",
-		"Health Status",
-		mcp.WithMIMEType("application/json"),
-	)
-	s.mcp.AddResource(res, func(ctx context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-		return s.resourceJSON(s.svc.BuildHealthStatus())
-	})
-
-	res = mcp.NewResource("jingzhe://agent/brief",
-		"Agent Brief",
-		mcp.WithMIMEType("application/json"),
-	)
-	s.mcp.AddResource(res, func(ctx context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-		brief := s.svc.BuildAgentBrief()
-		return s.resourceJSON(brief)
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]interface{}{
+		"status": "ok",
+		"time":   time.Now().UTC().Format(time.RFC3339),
+		"service": "jingzhe-trader-mcp",
 	})
 }
 
-// addTool registers a tool with the MCP server.
-func (s *Server) addTool(name, description string, handler func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error), opts ...mcp.ToolOption) {
-	toolOpts := []mcp.ToolOption{mcp.WithDescription(description)}
-	toolOpts = append(toolOpts, opts...)
-	tool := mcp.NewTool(name, toolOpts...)
-	s.mcp.AddTool(tool, handler)
-}
-
-// resourceJSON converts any value to a single JSON text resource content.
-func (s *Server) resourceJSON(v interface{}) ([]mcp.ResourceContents, error) {
-	b, err := json.Marshal(v)
+func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// 鉴权：所有 /mcp 请求需 Bearer 令牌。
+	tok := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	if !constantTimeEqual(tok, s.apiToken) {
+		writeJSON(w, 401, map[string]interface{}{
+			"jsonrpc": "2.0",
+			"error":   map[string]interface{}{"code": 401, "message": "未授权：缺少或错误的 Bearer 令牌"},
+		})
+		return
+	}
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		return nil, err
+		writeJSON(w, 400, rpcError(0, -32700, "请求体读取失败: "+err.Error()))
+		return
 	}
-	return []mcp.ResourceContents{mcp.TextResourceContents{
-		URI:      "resource",
-		MIMEType: "application/json",
-		Text:     string(b),
-	}}, nil
+	var req JSONRPCRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeJSON(w, 400, rpcError(0, -32700, "JSON 解析失败: "+err.Error()))
+		return
+	}
+	s.dispatch(w, r.Context(), &req)
 }
 
-// errorResult builds a tool result that represents an error message.
-func (s *Server) errorResult(format string, args ...interface{}) *mcp.CallToolResult {
-	return mcp.NewToolResultError(fmt.Sprintf(format, args...))
+func (s *Server) dispatch(w http.ResponseWriter, ctx context.Context, req *JSONRPCRequest) {
+	switch req.Method {
+	case "initialize":
+		writeJSON(w, 200, JSONRPCResponse{
+			JSONRPC: "2.0", ID: req.ID,
+			Result: map[string]interface{}{
+				"protocolVersion": "2024-11-05",
+				"capabilities":    map[string]interface{}{"tools": map[string]interface{}{}},
+				"serverInfo":      map[string]interface{}{"name": "jingzhe-trader", "version": "0.1.0"},
+			},
+		})
+	case "tools/list":
+		tools := make([]map[string]interface{}, 0, len(s.tools))
+		for _, t := range s.tools {
+			tools = append(tools, map[string]interface{}{
+				"name":        t.Name,
+				"description": t.Description,
+				"inputSchema": t.InputSchema,
+			})
+		}
+		writeJSON(w, 200, JSONRPCResponse{
+			JSONRPC: "2.0", ID: req.ID,
+			Result: map[string]interface{}{"tools": tools},
+		})
+	case "tools/call":
+		var p struct {
+			Name      string                 `json:"name"`
+			Arguments map[string]interface{} `json:"arguments"`
+		}
+		if err := json.Unmarshal(req.RawParams, &p); err != nil {
+			writeJSON(w, 200, rpcError(req.ID, -32602, "参数解析失败: "+err.Error()))
+			return
+		}
+		t, ok := s.tools[p.Name]
+		if !ok {
+			writeJSON(w, 200, rpcError(req.ID, -32601, "未知工具: "+p.Name))
+			return
+		}
+		res, err := t.Handler(ctx, p.Arguments)
+		if err != nil {
+			writeJSON(w, 200, JSONRPCResponse{
+				JSONRPC: "2.0", ID: req.ID,
+				Result: map[string]interface{}{
+					"content": []map[string]interface{}{
+						{"type": "text", "text": "错误: " + err.Error()},
+					},
+					"isError": true,
+				},
+			})
+			return
+		}
+		text, _ := json.MarshalIndent(res, "", "  ")
+		writeJSON(w, 200, JSONRPCResponse{
+			JSONRPC: "2.0", ID: req.ID,
+			Result: map[string]interface{}{
+				"content": []map[string]interface{}{
+					{"type": "text", "text": string(text)},
+				},
+				"isError": false,
+			},
+		})
+	default:
+		writeJSON(w, 200, rpcError(req.ID, -32601, "不支持的方法: "+req.Method))
+	}
 }
 
-// jsonResult serializes v to JSON and wraps it in a tool result.
-func (s *Server) jsonResult(v interface{}) (*mcp.CallToolResult, error) {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return s.errorResult("json marshal error: %v", err), nil
-	}
-	return mcp.NewToolResultText(string(b)), nil
+// ---- JSON-RPC 基础结构 ----
+
+type JSONRPCRequest struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      interface{}     `json:"id"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params"`
+	RawParams json.RawMessage `json:"-"`
 }
 
-// getString returns a string argument with a default fallback.
-func (s *Server) getString(args map[string]interface{}, key, defaultVal string) string {
-	if v, ok := args[key].(string); ok {
-		return v
-	}
-	return defaultVal
+type JSONRPCResponse struct {
+	JSONRPC string      `json:"jsonrpc"`
+	ID      interface{} `json:"id"`
+	Result  interface{} `json:"result,omitempty"`
+	Error   interface{} `json:"error,omitempty"`
 }
 
-// getNumber returns a float64 argument with a default fallback.
-func (s *Server) getNumber(args map[string]interface{}, key string, defaultVal float64) float64 {
-	if v, ok := args[key].(float64); ok {
-		return v
+func (r *JSONRPCRequest) UnmarshalJSON(b []byte) error {
+	type alias JSONRPCRequest
+	aux := alias{}
+	if err := json.Unmarshal(b, &aux); err != nil {
+		return err
 	}
-	if v, ok := args[key].(int); ok {
-		return float64(v)
-	}
-	return defaultVal
+	*r = JSONRPCRequest(aux)
+	r.RawParams = aux.Params
+	return nil
 }
 
-// getBool returns a bool argument with a default fallback.
-func (s *Server) getBool(args map[string]interface{}, key string, defaultVal bool) bool {
-	if v, ok := args[key].(bool); ok {
-		return v
+func rpcError(id interface{}, code int, msg string) JSONRPCResponse {
+	return JSONRPCResponse{
+		JSONRPC: "2.0", ID: id,
+		Error: map[string]interface{}{"code": code, "message": msg},
 	}
-	return defaultVal
 }
 
-// today returns today's date in YYYYMMDD format.
-func (s *Server) today() string {
-	return time.Now().Format("20060102")
+func writeJSON(w http.ResponseWriter, status int, v interface{}) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// constantTimeEqual 防时序侧信道的字符串比较。
+func constantTimeEqual(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	var diff byte
+	for i := 0; i < len(a); i++ {
+		diff |= a[i] ^ b[i]
+	}
+	return diff == 0
 }

@@ -1,47 +1,194 @@
+// Package store SQLite 单一数据源：连接/建表/迁移/仓储/保留清理。
+//
+// 依赖方向（ARCHITECTURE §1.1）：store 只依赖 model，禁止 import 任何业务包。
+// 外部 IO 只在适配层，store 层禁止 net/http。
 package store
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"github.com/jmoiron/sqlx"
-	_ "modernc.org/sqlite" // 纯 Go SQLite 驱动, 无需 CGO
+	_ "modernc.org/sqlite" // 纯 Go SQLite 驱动，无 CGO（硬约束）
 )
 
-// NewDB 打开 SQLite 数据库并执行建表迁移
-// path 为数据库文件路径, 不存在时会自动创建
-func NewDB(path string) (*sqlx.DB, error) {
-	db, err := sqlx.Open("sqlite", path)
+// Store 封装单写者写池 + 独立读池（ARCHITECTURE §11.5）。
+type Store struct {
+	writeDB *sqlx.DB
+	readDB  *sqlx.DB
+	path    string
+}
+
+// syncMarkers 文件同步标记：命中则拒绝启动，防止库文件被 Syncthing/云盘同步破坏（D6）。
+var syncMarkers = []string{".stfolder", ".stversions", ".stignore", ".syncthing", "CloudStation"}
+
+// Open 打开（或创建）SQLite 数据库并完成全部启动自检：
+//  1. 解析路径并创建目录
+//  2. 检测目录是否存在文件同步标记（命中拒绝启动）
+//  3. 应用 PRAGMA（WAL / busy_timeout / auto_vacuum=INCREMENTAL / synchronous=NORMAL / foreign_keys）
+//  4. 校验 PRAGMA 实际生效
+//  5. 执行建表迁移
+func Open(path string) (*Store, error) {
+	abs, err := filepath.Abs(path)
 	if err != nil {
-		return nil, fmt.Errorf("打开数据库失败: %w", err)
+		return nil, fmt.Errorf("解析数据库路径失败: %w", err)
 	}
-
-	// 连接存活检查
-	if err := db.Ping(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("数据库连接失败: %w", err)
+	dir := filepath.Dir(abs)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("创建数据库目录 %s 失败: %w", dir, err)
 	}
-
-	// SQLite 性能与并发优化
-	pragmas := []string{
-		"PRAGMA journal_mode=WAL;",        // 写前日志, 提升并发读写
-		"PRAGMA synchronous=NORMAL;",      // WAL 模式下安全且更快
-		"PRAGMA busy_timeout=5000;",       // 锁等待 5 秒
-		"PRAGMA foreign_keys=ON;",         // 开启外键约束
-		"PRAGMA auto_vacuum=INCREMENTAL;", // 支持增量回收空间 (配合定期清理)
-	}
-	for _, p := range pragmas {
-		if _, err := db.Exec(p); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("执行 %s 失败: %w", p, err)
-		}
-	}
-
-	// modernc/sqlite 单写者模型: 限制单连接, 避免长期运行后偶发 SQLITE_BUSY
-	db.SetMaxOpenConns(1)
-
-	if err := migrate(db); err != nil {
-		db.Close()
+	if err := checkNoSyncMarkers(dir); err != nil {
 		return nil, err
 	}
-	return db, nil
+
+	dsn := buildDSN(abs)
+
+	wdb, err := sqlx.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("打开写库失败: %w", err)
+	}
+	wdb.SetMaxOpenConns(1) // 单写者（§3.0 / §11.5）
+	if err := wdb.Ping(); err != nil {
+		wdb.Close()
+		return nil, fmt.Errorf("写库连接失败: %w", err)
+	}
+
+	rdb, err := sqlx.Open("sqlite", dsn)
+	if err != nil {
+		wdb.Close()
+		return nil, fmt.Errorf("打开读库失败: %w", err)
+	}
+	rdb.SetMaxOpenConns(10) // 读池独立
+	if err := rdb.Ping(); err != nil {
+		wdb.Close()
+		rdb.Close()
+		return nil, fmt.Errorf("读库连接失败: %w", err)
+	}
+
+	st := &Store{writeDB: wdb, readDB: rdb, path: abs}
+
+	// 库文件权限收敛（§6.3）
+	if err := os.Chmod(abs, 0o600); err != nil {
+		// 权限收敛失败不致命，仅记录（由调用方日志）
+		_ = err
+	}
+
+	if err := st.VerifyPragmas(context.Background()); err != nil {
+		wdb.Close()
+		rdb.Close()
+		return nil, fmt.Errorf("数据库 PRAGMA 校验失败: %w", err)
+	}
+	if err := Migrate(st); err != nil {
+		wdb.Close()
+		rdb.Close()
+		return nil, fmt.Errorf("数据库迁移失败: %w", err)
+	}
+	return st, nil
 }
+
+// buildDSN 构造带 PRAGMA 的 DSN。modernc.org/sqlite 的 _pragma 参数对连接池内每个新连接生效。
+func buildDSN(path string) string {
+	return "file:" + path +
+		"?_pragma=busy_timeout(5000)" +
+		"&_pragma=journal_mode(WAL)" +
+		"&_pragma=synchronous(NORMAL)" +
+		"&_pragma=foreign_keys(ON)" +
+		"&_pragma=auto_vacuum(INCREMENTAL)"
+}
+
+// checkNoSyncMarkers 检测库目录是否存在文件同步标记（D6 / P0-15-6）。
+func checkNoSyncMarkers(dir string) error {
+	for _, m := range syncMarkers {
+		p := filepath.Join(dir, m)
+		if fi, err := os.Stat(p); err == nil && fi != nil {
+			return fmt.Errorf("数据库目录 %s 存在文件同步标记 %s，拒绝启动以防数据被同步破坏（如需使用请将库移出同步目录）", dir, m)
+		}
+	}
+	return nil
+}
+
+// WriteDB 返回单写者写连接池。
+func (s *Store) WriteDB() *sqlx.DB { return s.writeDB }
+
+// ReadDB 返回独立读连接池。
+func (s *Store) ReadDB() *sqlx.DB { return s.readDB }
+
+// Path 返回数据库绝对路径。
+func (s *Store) Path() string { return s.path }
+
+// Close 关闭读写连接池。
+func (s *Store) Close() error {
+	var firstErr error
+	if err := s.readDB.Close(); err != nil {
+		firstErr = err
+	}
+	if err := s.writeDB.Close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
+}
+
+// PragmaInfo 返回当前 PRAGMA 实际值，用于启动自检报告（验收 #5）。
+type PragmaInfo struct {
+	JournalMode string
+	AutoVacuum  int
+	BusyTimeout int
+}
+
+// VerifyPragmas 校验 PRAGMA 实际生效：journal_mode=wal、auto_vacuum=2、busy_timeout≥5000。
+func (s *Store) VerifyPragmas(ctx context.Context) error {
+	var jm string
+	if err := s.writeDB.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&jm); err != nil {
+		return fmt.Errorf("读取 journal_mode 失败: %w", err)
+	}
+	if jm != "wal" {
+		return fmt.Errorf("journal_mode=%s, 期望 wal", jm)
+	}
+	var av int
+	if err := s.writeDB.QueryRowContext(ctx, "PRAGMA auto_vacuum").Scan(&av); err != nil {
+		return fmt.Errorf("读取 auto_vacuum 失败: %w", err)
+	}
+	if av != 2 {
+		return fmt.Errorf("auto_vacuum=%d, 期望 2(INCREMENTAL)；旧库需离线 VACUUM 重建", av)
+	}
+	var bt int
+	if err := s.writeDB.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&bt); err != nil {
+		return fmt.Errorf("读取 busy_timeout 失败: %w", err)
+	}
+	if bt < 5000 {
+		return fmt.Errorf("busy_timeout=%d, 期望 ≥5000", bt)
+	}
+	return nil
+}
+
+// PragmaInfo 返回当前 PRAGMA 实际值。
+func (s *Store) PragmaInfo(ctx context.Context) (PragmaInfo, error) {
+	var info PragmaInfo
+	if err := s.writeDB.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&info.JournalMode); err != nil {
+		return info, fmt.Errorf("读取 journal_mode 失败: %w", err)
+	}
+	if err := s.writeDB.QueryRowContext(ctx, "PRAGMA auto_vacuum").Scan(&info.AutoVacuum); err != nil {
+		return info, fmt.Errorf("读取 auto_vacuum 失败: %w", err)
+	}
+	if err := s.writeDB.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&info.BusyTimeout); err != nil {
+		return info, fmt.Errorf("读取 busy_timeout 失败: %w", err)
+	}
+	return info, nil
+}
+
+// DBSizeBytes 返回主库文件大小（含 -wal/-shm 之和）。
+func (s *Store) DBSizeBytes() (int64, error) {
+	var total int64
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if fi, err := os.Stat(s.path + suffix); err == nil {
+			total += fi.Size()
+		}
+	}
+	return total, nil
+}
+
+// ensure sql import used (kept for potential future raw access).
+var _ = sql.ErrNoRows

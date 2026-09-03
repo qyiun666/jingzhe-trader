@@ -1,85 +1,61 @@
 package market
 
 import (
-	"jingzhe-trader/internal/config"
+	"math"
+
 	"jingzhe-trader/internal/model"
 )
 
-// CostModel 交易费用模型
-//
-// A 股交易费用构成:
-//   - 佣金:   双向收取, 按成交金额 × 佣金费率计算, 不低于单笔最低佣金
-//   - 印花税: 仅卖出收取, 按成交金额 × 印花税率计算
-//   - 过户费: 双向收取, 按成交金额 × 过户费率计算
-type CostModel struct {
-	CommissionRate  float64 // 佣金费率
-	MinCommission   float64 // 单笔最低佣金
-	StampTaxRate    float64 // 印花税率 (仅卖出)
-	TransferFeeRate float64 // 过户费率 (双向)
+// TradeCost 单笔交易费用明细（全部为分）。
+type TradeCost struct {
+	Commission  model.Fen // 佣金
+	StampTax    model.Fen // 印花税（仅卖出）
+	TransferFee model.Fen // 过户费
+	TotalFee    model.Fen // 费用合计
+	TotalCost   model.Fen // 买入=金额+费用；卖出=金额−费用（到账）
 }
 
-// NewCostModel 从配置创建交易费用模型
-func NewCostModel(cfg config.CostConfig) *CostModel {
-	return &CostModel{
-		CommissionRate:  cfg.CommissionRate,
-		MinCommission:   cfg.MinCommission,
-		StampTaxRate:    cfg.StampTaxRate,
-		TransferFeeRate: cfg.TransferFeeRate,
-	}
+// CostParams 交易成本参数集（来自 config cost.* 键，由调用方装配）。
+type CostParams struct {
+	CommissionRate  float64   // 佣金费率（如 0.00025）
+	MinCommission   model.Fen // 最低佣金（分）
+	StampTaxRate    float64   // 印花税率（仅卖出，如 0.001）
+	TransferFeeRate float64   // 过户费率（如 0.00001）
 }
 
-// Calculate 计算交易费用
-//   - 佣金:   max(amount × CommissionRate, MinCommission)
-//   - 印花税: 仅卖出, amount × StampTaxRate
-//   - 过户费: 双向, amount × TransferFeeRate
-//
-// amount = price × qty
-func (cm *CostModel) Calculate(side model.Side, price float64, qty int) model.Cost {
-	if qty <= 0 || price <= 0 {
-		return model.Cost{}
+// CalcCommission 佣金 = max(金额 × 费率, 最低佣金)。金额单位为分，费率为比例（如 0.00025）。
+func CalcCommission(amount model.Fen, rate float64, minCommission model.Fen) model.Fen {
+	c := model.Fen(math.Round(float64(amount) * rate))
+	if c < minCommission {
+		c = minCommission
 	}
-	amount := price * float64(qty)
-
-	// 佣金: 双向, 不低于最低佣金
-	commission := amount * cm.CommissionRate
-	if commission < cm.MinCommission {
-		commission = cm.MinCommission
-	}
-
-	// 印花税: 仅卖出
-	stampTax := 0.0
-	if side == model.SideSell {
-		stampTax = amount * cm.StampTaxRate
-	}
-
-	// 过户费: 双向
-	transferFee := amount * cm.TransferFeeRate
-
-	return model.Cost{
-		Commission:  commission,
-		StampTax:    stampTax,
-		TransferFee: transferFee,
-	}
+	return c
 }
 
-// BuyCost 计算买入总花费 (含费用)
-// 买入花费 = 成交金额 + 佣金 + 过户费 (买入无印花税)
-func (cm *CostModel) BuyCost(price float64, qty int) float64 {
-	if qty <= 0 || price <= 0 {
-		return 0
-	}
-	amount := price * float64(qty)
-	cost := cm.Calculate(model.SideBuy, price, qty)
-	return amount + cost.Commission + cost.TransferFee
+// CalcStampTax 印花税 = 金额 × 印花税率（仅卖出，如 0.001）。
+func CalcStampTax(amount model.Fen, rate float64) model.Fen {
+	return model.Fen(math.Round(float64(amount) * rate))
 }
 
-// SellIncome 计算卖出净收入 (扣费用)
-// 卖出收入 = 成交金额 - 佣金 - 印花税 - 过户费
-func (cm *CostModel) SellIncome(price float64, qty int) float64 {
-	if qty <= 0 || price <= 0 {
-		return 0
+// CalcTransferFee 过户费 = 金额 × 过户费率（如 0.00001）。
+func CalcTransferFee(amount model.Fen, rate float64) model.Fen {
+	return model.Fen(math.Round(float64(amount) * rate))
+}
+
+// CalcTradeCost 计算单笔交易费用（买入含佣金+过户费；卖出另加印花税）。
+// 费率（commissionRate/stampTaxRate/transferFeeRate）为比例浮点；最低佣金 minCommission 为金额（分，model.Fen）。
+func CalcTradeCost(amount model.Fen, isBuy bool, commissionRate, stampTaxRate, transferFeeRate float64, minCommission model.Fen) TradeCost {
+	var tc TradeCost
+	tc.Commission = CalcCommission(amount, commissionRate, minCommission)
+	tc.TransferFee = CalcTransferFee(amount, transferFeeRate)
+	if !isBuy {
+		tc.StampTax = CalcStampTax(amount, stampTaxRate)
 	}
-	amount := price * float64(qty)
-	cost := cm.Calculate(model.SideSell, price, qty)
-	return amount - cost.Total()
+	tc.TotalFee = tc.Commission + tc.StampTax + tc.TransferFee
+	if isBuy {
+		tc.TotalCost = amount + tc.TotalFee
+	} else {
+		tc.TotalCost = amount - tc.TotalFee
+	}
+	return tc
 }

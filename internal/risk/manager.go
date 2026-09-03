@@ -3,274 +3,154 @@ package risk
 import (
 	"fmt"
 
-	"jingzhe-trader/internal/config"
-	"jingzhe-trader/internal/market"
 	"jingzhe-trader/internal/model"
 )
 
-// RejectReason 拒绝原因
-type RejectReason struct {
-	TsCode string       // 股票代码
-	Signal model.Signal // 原始信号
-	Reason string       // 拒绝原因描述
-	Rule   string       // 触发的规则名
+// 否决规则名（落 signal.reject_rule，验收 #7/#8 的取值契约）。
+const (
+	RuleAllowNewPosition = "allow_new_position"
+	RuleMinConfidence    = "min_confidence"
+	RuleScoreThreshold   = "score_threshold"
+	RuleMaxPositions     = "max_positions"
+	RuleAlreadyHolding   = "already_holding"
+	RuleMaxPosition      = "max_position"
+	RuleMinAmount        = "min_amount"
+	RuleCashInsufficient = "cash_insufficient"
+	RuleMaxTotalPosition = "max_total_position"
+	RuleIllegalPrice     = "illegal_price"
+)
+
+// AccountState 风控核算的账户状态快照（金额一律分）。
+type AccountState struct {
+	TotalAsset    model.Fen      // 总资产
+	Cash          model.Fen      // 可用现金
+	PositionsMV   model.Fen      // 持仓市值（成本或最新价口径，由调用方决定）
+	PositionCount int            // 当前持仓只数
+	HeldCodes     map[string]bool // 已持有代码集合
 }
 
-// reject 构造拒绝原因 (统一 13 处构造样板)
-func reject(sig model.Signal, rule, reason string) *RejectReason {
-	return &RejectReason{TsCode: sig.TsCode, Signal: sig, Reason: reason, Rule: rule}
+// BuyIntent 单笔买入意向（来自通过规则筛选的买入信号）。
+type BuyIntent struct {
+	TsCode     string
+	Name       string
+	RefPrice   model.Fen // 参考价（分）
+	Confidence float64   // 信号置信度 0~1
+	Score      float64   // 因子综合分 0~100
 }
 
-// RiskManager 风控管理器
-// 所有信号进入执行前都必须经过风控检查
-// 检查顺序: 黑名单 -> 仓位限制(含板块敞口) -> 止损止盈 -> 小资金 -> T+1
-type RiskManager struct {
-	cfg             config.RiskConfig
-	positionLimiter *PositionLimiter
-	stopLossManager *StopLossManager
-	blacklist       *Blacklist
-	sizeLimits      SizeLimits // 小资金资金管理 (最小单笔金额/最大持仓数)
+// Decision 批次风控裁决结果。
+type Decision struct {
+	TsCode     string
+	Approved   bool
+	RejectRule string // 否决时非空（100% 留痕，禁静默丢弃）
+	RejectMsg  string
+	Qty        model.Qty   // 通过时给出的建议股数（整手）
+	Amount     model.Fen   // 通过时的计划金额（分）
+	PlannedPct float64     // 计划金额占总资产比例
 }
 
-// NewRiskManager 创建风控管理器
-func NewRiskManager(cfg config.RiskConfig) *RiskManager {
-	sl := NewStopLossManager(cfg.StopLossPct, cfg.TakeProfitPct)
-	if cfg.TrailingStopPct > 0 {
-		sl.SetTrailingStop(cfg.TrailingStopPct)
-	}
-	return &RiskManager{
-		cfg:             cfg,
-		positionLimiter: NewPositionLimiter(cfg.MaxPositionPct, cfg.MaxTotalPositionPct, cfg.MaxSectorPct),
-		stopLossManager: sl,
-		blacklist:       NewBlacklist(cfg.ExcludeST, cfg.MinListDays),
-	}
+// Manager 批次累计风控管理器：同一批多笔买入按序核算，
+// 已通过的在途金额即时累计，合计超总仓位上限必须拒绝后续笔（历史 P0 bug 回归点）。
+type Manager struct {
+	P RiskParams
 }
 
-// PositionLimiter 获取仓位限制器
-func (rm *RiskManager) PositionLimiter() *PositionLimiter {
-	return rm.positionLimiter
-}
+// NewManager 构造管理器。
+func NewManager(p RiskParams) *Manager { return &Manager{P: p} }
 
-// StopLossManager 获取止损止盈管理器
-func (rm *RiskManager) StopLossManager() *StopLossManager {
-	return rm.stopLossManager
-}
-
-// Blacklist 获取黑名单
-func (rm *RiskManager) Blacklist() *Blacklist {
-	return rm.blacklist
-}
-
-// SetSizeLimits 配置小资金资金管理限制
-func (rm *RiskManager) SetSizeLimits(limits SizeLimits) {
-	rm.sizeLimits = limits
-}
-
-// checkSizeLimits 小资金资金管理检查 (仅针对买入信号)
-//  1. 单笔金额低于最小交易额时, 先尝试逐手上调数量达标 (整手取整误差补偿),
-//     上调后仍超单票仓位上限则拒绝 (避免最低佣金侵蚀)
-//  2. 新开仓超过最大持仓数时拒绝
-func (rm *RiskManager) checkSizeLimits(sig model.Signal, currentPrice, totalAsset float64,
-	positions map[string]*model.Position, newCodes map[string]bool) (model.Signal, *RejectReason) {
-
-	if minAmount := rm.sizeLimits.ResolveMinAmount(); minAmount > 0 && currentPrice > 0 {
-		amount := currentPrice * float64(sig.TargetQty)
-		if amount < minAmount {
-			// 整手取整导致的小额缺口: 逐手上调, 不突破单票仓位上限
-			maxAmount := totalAsset * rm.cfg.MaxPositionPct
-			qty := sig.TargetQty
-			for currentPrice*float64(qty) < minAmount &&
-				currentPrice*float64(qty+100) <= maxAmount {
-				qty += 100
-			}
-			if currentPrice*float64(qty) < minAmount {
-				return sig, reject(sig, "min_trade_amount", fmt.Sprintf("单笔金额 %.0f 低于最小交易额 %.0f (最低佣金侵蚀)", amount, minAmount))
-			}
-			sig.TargetQty = qty
-		}
-	}
-
-	if maxPos := rm.sizeLimits.ResolveMaxPositions(totalAsset); maxPos > 0 {
-		pos := positions[sig.TsCode]
-		isNew := (pos == nil || pos.TotalQty <= 0) && !newCodes[sig.TsCode]
-		if isNew {
-			held := len(newCodes)
-			for _, p := range positions {
-				if p != nil && p.TotalQty > 0 {
-					held++
-				}
-			}
-			if held >= maxPos {
-				return sig, reject(sig, "max_positions", fmt.Sprintf("持仓数已达上限 %d (小资金集中持仓)", maxPos))
-			}
-		}
-	}
-	return sig, nil
-}
-
-// Check 检查信号，返回通过的信号和被拒绝的原因
-// 检查顺序: 黑名单 -> 仓位限制 -> 止损止盈 -> 敞口控制 -> T+1 -> 涨跌停
+// CheckBatch 按序裁决一批买入意向。
 //
-// 参数:
-//   - signals: 待检查的交易信号列表
-//   - positions: 当前持仓映射
-//   - totalAsset: 总资产
-//   - stocks: 股票基本信息映射
-//   - tradeDate: 当前交易日期 YYYYMMDD
-//   - bars: 当日K线数据（用于获取当前价格、涨跌停价等）
-//
-// 返回:
-//   - 通过风控检查的信号列表（买入信号可能已调整数量）
-//   - 被拒绝的原因列表
-func (rm *RiskManager) Check(signals []model.Signal, positions map[string]*model.Position,
-	totalAsset float64, stocks map[string]*model.Stock, tradeDate string,
-	bars map[string]*model.Bar) ([]model.Signal, []RejectReason) {
-
-	var passed []model.Signal
-	var rejected []RejectReason
-	// 本批次已通过的新开仓代码 (用于最大持仓数检查)
-	newCodes := make(map[string]bool)
-	// 本批次在途买入市值累计 (防同批次多笔买入叠加绕过总仓位/板块敞口约束)
-	batch := newBatchPending()
-
-	// 第一步：黑名单过滤
-	survived, blRejected := rm.blacklist.FilterSignals(signals, stocks, tradeDate)
-	rejected = append(rejected, blRejected...)
-
-	// 第二步：逐个检查剩余信号
-	for _, sig := range survived {
-		// 获取当前价格
-		currentPrice := 0.0
-		bar := bars[sig.TsCode]
-		if bar != nil {
-			currentPrice = bar.Close
-		}
-		// 如果K线没有价格，尝试用持仓的市价或成本价
-		if currentPrice <= 0 {
-			if pos := positions[sig.TsCode]; pos != nil {
-				if pos.MarketPrice > 0 {
-					currentPrice = pos.MarketPrice
-				} else if pos.CostPrice > 0 {
-					currentPrice = pos.CostPrice
-				}
-			}
-		}
-
-		// 获取涨跌停价
-		upLimit := 0.0
-		downLimit := 0.0
-		if bar != nil && bar.PreClose > 0 {
-			stock := stocks[sig.TsCode]
-			isST := false
-			if stock != nil {
-				isST = stock.IsST
-			}
-			// 使用市场规则计算涨跌停价
-			// 这里简单估算，实际应使用 StkLimit 数据
-			upLimit = market.CalcUpLimit(bar.PreClose, sig.TsCode, isST, bar.Date())
-			downLimit = market.CalcDownLimit(bar.PreClose, sig.TsCode, isST, bar.Date())
-		}
-
-		// 根据方向分别检查
-		if sig.Direction == model.DirBuy {
-			// 买入信号检查
-
-			// 1. 涨跌停检查：涨停不能买入
-			if currentPrice > 0 && upLimit > 0 {
-				if err := market.CheckLimit(model.SideBuy, currentPrice, upLimit, downLimit); err != nil {
-					rejected = append(rejected, *reject(sig, "limit_up_buy", err.Error()))
-					continue
-				}
-			}
-
-			// 2. 仓位限制检查（可能调整买入数量, 含本批次在途买入）
-			adjusted, err := rm.positionLimiter.checkPosition(sig, positions, totalAsset, stocks, currentPrice, batch)
-			if err != nil {
-				// 如果调整后数量为 0，完全拒绝
-				if adjusted.TargetQty <= 0 {
-					rejected = append(rejected, *reject(sig, "position_limit", err.Error()))
-					continue
-				}
-				// 部分调整，继续后续检查
-				sig = adjusted
-			}
-
-			// 3. 小资金资金管理检查 (最小单笔金额/最大持仓数); 可能上调数量补偿取整误差
-			sized, rej := rm.checkSizeLimits(sig, currentPrice, totalAsset, positions, newCodes)
-			if rej != nil {
-				rejected = append(rejected, *rej)
-				continue
-			}
-			sig = sized
-
-			// 4. 板块敞口控制检查（板块限制, 含本批次在途买入）
-			if err := rm.positionLimiter.checkSectorLimit(sig, positions, stocks, totalAsset, currentPrice, sig.TargetQty, batch); err != nil {
-				rejected = append(rejected, *reject(sig, "sector_exposure", err.Error()))
-				continue
-			}
-
-			if pos := positions[sig.TsCode]; pos == nil || pos.TotalQty <= 0 {
-				newCodes[sig.TsCode] = true
-			}
-			// 记录本批次在途买入市值, 供后续信号的同批次累计约束
-			batch.add(sig.TsCode, sectorOf(stocks[sig.TsCode], sig.TsCode), float64(sig.TargetQty)*currentPrice)
-			passed = append(passed, sig)
-
-		} else if sig.Direction == model.DirSell {
-			// 卖出信号检查
-
-			pos := positions[sig.TsCode]
-
-			// 1. 检查是否有持仓
-			if pos == nil || pos.TotalQty <= 0 {
-				rejected = append(rejected, *reject(sig, "no_position", "无持仓可卖"))
-				continue
-			}
-
-			// 2. T+1 可卖检查
-			if !market.CanSell(pos, sig.TargetQty) {
-				// 如果可卖量不足，调整为可卖数量
-				if pos.AvailableQty > 0 {
-					adjusted := sig
-					adjusted.TargetQty = pos.AvailableQty
-					adjusted.Reason = sig.Reason + fmt.Sprintf(" (T+1调整: 可卖%d股)", pos.AvailableQty)
-					sig = adjusted
-				} else {
-					rejected = append(rejected, *reject(sig, "t1_restriction", fmt.Sprintf("T+1限制: 可卖量不足(可卖%d, 需卖%d)", pos.AvailableQty, sig.TargetQty)))
-					continue
-				}
-			}
-
-			// 3. 涨跌停检查：跌停不能卖出
-			if currentPrice > 0 && downLimit > 0 {
-				if err := market.CheckLimit(model.SideSell, currentPrice, upLimit, downLimit); err != nil {
-					rejected = append(rejected, *reject(sig, "limit_down_sell", err.Error()))
-					continue
-				}
-			}
-
-			// 4. 卖出数量不能超过持仓数量
-			if sig.TargetQty > pos.TotalQty {
-				sig.TargetQty = pos.TotalQty
-			}
-
-			passed = append(passed, sig)
-		}
-		// DirHold 信号直接忽略
+// 累计语义：committed = 现有持仓市值 + 本批已通过金额；每笔通过后立即累加，
+// 因此第 N 笔即使单笔未超单票上限，只要使合计突破总仓位上限就会被拒，
+// reject_rule 固定为 max_total_position（验收 #7）。
+func (m *Manager) CheckBatch(intents []BuyIntent, st AccountState) []Decision {
+	out := make([]Decision, 0, len(intents))
+	committed := st.PositionsMV
+	posCount := st.PositionCount
+	totalCap := pctOf(st.TotalAsset, m.P.MaxTotalPositionPct)
+	singleCap := pctOf(st.TotalAsset, m.P.MaxPositionPct)
+	if cap2 := pctOf(st.TotalAsset, m.P.MaxSingleAmountPct); cap2 < singleCap {
+		singleCap = cap2
 	}
+	minAmount := m.P.MinSingleAmountFen
 
-	return passed, rejected
-}
+	for _, in := range intents {
+		dec := Decision{TsCode: in.TsCode}
+		reject := func(rule, msg string) {
+			dec.Approved = false
+			dec.RejectRule = rule
+			dec.RejectMsg = msg
+		}
 
-// CheckStopLoss 检查所有持仓的止损止盈
-// 返回需要卖出的止损止盈信号
-func (rm *RiskManager) CheckStopLoss(positions map[string]*model.Position,
-	bars map[string]*model.Bar) []model.Signal {
-	return rm.stopLossManager.CheckStopLoss(positions, bars)
-}
+		// 1) 档位开关
+		if !m.P.AllowNewPosition || m.P.Bias == BiasExitOnly {
+			reject(RuleAllowNewPosition, fmt.Sprintf("当前档位 %s 禁止开新仓", m.P.Bias))
+			out = append(out, dec)
+			continue
+		}
+		// 2) 置信度与评分门槛
+		if in.Confidence < m.P.MinConfidence {
+			reject(RuleMinConfidence, fmt.Sprintf("置信度 %.2f 低于下限 %.2f", in.Confidence, m.P.MinConfidence))
+			out = append(out, dec)
+			continue
+		}
+		if in.Score < 60*m.P.ScoreThresholdMul {
+			reject(RuleScoreThreshold, fmt.Sprintf("综合分 %.1f 低于门槛 %.1f（60×%.2f）",
+				in.Score, 60*m.P.ScoreThresholdMul, m.P.ScoreThresholdMul))
+			out = append(out, dec)
+			continue
+		}
+		// 3) 持仓数与重复持仓
+		if st.HeldCodes[in.TsCode] {
+			reject(RuleAlreadyHolding, "已持有该标的，不重复建仓")
+			out = append(out, dec)
+			continue
+		}
+		if posCount >= m.P.MaxPositions {
+			reject(RuleMaxPositions, fmt.Sprintf("持仓数 %d（含本批在途）达到上限 %d", posCount, m.P.MaxPositions))
+			out = append(out, dec)
+			continue
+		}
+		// 4) 价格合法性与单笔金额核算
+		if in.RefPrice <= 0 {
+			reject(RuleIllegalPrice, fmt.Sprintf("参考价非法: %d 分", int64(in.RefPrice)))
+			out = append(out, dec)
+			continue
+		}
+		intent := singleCap
+		if st.Cash < intent {
+			intent = st.Cash
+		}
+		qty := TargetQty(intent, in.RefPrice)
+		amount := in.RefPrice.Mul(qty)
+		if qty <= 0 || amount < minAmount {
+			reject(RuleMinAmount, fmt.Sprintf("单笔金额 %d 分（价格 %d 分）低于下限 %d 分",
+				int64(amount), int64(in.RefPrice), int64(minAmount)))
+			out = append(out, dec)
+			continue
+		}
+		if amount > st.Cash {
+			reject(RuleCashInsufficient, fmt.Sprintf("计划金额 %d 分超过可用现金 %d 分", int64(amount), int64(st.Cash)))
+			out = append(out, dec)
+			continue
+		}
+		// 5) 批次累计总仓位（先斩后奏的历史 P0 bug 在此拦截）
+		if committed+amount > totalCap {
+			reject(RuleMaxTotalPosition, fmt.Sprintf("批次累计仓位 %d 分 + 本笔 %d 分 超过总仓位上限 %d 分（%.0f%%×总资产）",
+				int64(committed), int64(amount), int64(totalCap), m.P.MaxTotalPositionPct*100))
+			out = append(out, dec)
+			continue
+		}
 
-// SectorExposure 获取各板块敞口
-func (rm *RiskManager) SectorExposure(positions map[string]*model.Position,
-	stocks map[string]*model.Stock, totalAsset float64) map[string]float64 {
-	return rm.positionLimiter.SectorExposure(positions, stocks, totalAsset)
+		// 通过：累计在途，供后续笔核算
+		dec.Approved = true
+		dec.Qty = qty
+		dec.Amount = amount
+		dec.PlannedPct = float64(amount) / float64(st.TotalAsset)
+		committed += amount
+		st.Cash -= amount
+		posCount++
+		out = append(out, dec)
+	}
+	return out
 }

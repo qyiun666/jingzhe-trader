@@ -1,397 +1,379 @@
 package screener
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
 	"time"
 
-	"jingzhe-trader/internal/config"
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/store"
-	"jingzhe-trader/internal/tushare"
-	"jingzhe-trader/pkg/logger"
 )
 
-// ScreenResult 选股结果 (定义在 store 包, 此处别名, 避免循环依赖)
-type ScreenResult = store.ScreenResult
+// AlertCodeScreenEmpty 候选为 0 的 urgent 告警码（附录 B）。
+const AlertCodeScreenEmpty = "SCREEN_EMPTY"
 
-// Screener 自动选股器
-// 每日收盘后从全市场筛选候选股票, 补充到策略股票池
+// momentumBars 动量/低波因子所需最少日线根数（约一个月）。
+const momentumBars = 20
+
+// Screener 选股器：粗筛 → 五因子打分 → TopN → 落库（含漏斗与降级观察名单）。
 type Screener struct {
-	ts         *tushare.Client
-	stockRepo  *store.StockRepo
-	barRepo    *store.BarRepo
-	basicRepo  *store.BasicRepo
-	screenRepo *store.ScreenRepo
-	cfg        config.ScreenerConfig
-	capital    CapitalSource
+	st  *store.Store
+	cfg FilterConfig
+	w   FactorWeights
 }
 
-// Deps 选股器依赖, 由组合根一次性装配
-type Deps struct {
-	TS         *tushare.Client
-	StockRepo  *store.StockRepo
-	BarRepo    *store.BarRepo
-	BasicRepo  *store.BasicRepo
-	ScreenRepo *store.ScreenRepo
-	Cfg        config.ScreenerConfig
-	Capital    CapitalSource // 可 nil: 无资金视图时退回配置里的静态价格区间
-}
-
-// New 创建选股器
-func New(d Deps) *Screener {
-	return &Screener{
-		ts:         d.TS,
-		stockRepo:  d.StockRepo,
-		barRepo:    d.BarRepo,
-		basicRepo:  d.BasicRepo,
-		screenRepo: d.ScreenRepo,
-		cfg:        d.Cfg,
-		capital:    d.Capital,
+// New 构造选股器。cfg 为零值时使用默认参数。
+func New(st *store.Store, cfg FilterConfig) *Screener {
+	if cfg.TopN <= 0 {
+		cfg = DefaultFilterConfig()
 	}
+	return &Screener{st: st, cfg: cfg, w: DefaultWeights()}
 }
 
-// Screen 执行全市场选股
-// 1. 拉取全市场 daily_basic + daily (不经过 filter_mode)
-// 2. 计算近5日收盘均线与动量 (本地 daily_bar 优先, 缺失走 API)
-// 3. 逐只过滤: 配置区间 ∩ 资金反推价格带 + 方向门槛 (站上MA5 且 5日动量非负, 数据不足即淘汰)
-// 4. 评分排序取 TopN, 同行业最多3只 (行业分散)
-// 5. 同步候选股票历史K线与当日基本面 (策略均线/辩论基本面计算需要)
-// 6. 结果落库
-func (s *Screener) Screen(date string) ([]ScreenResult, error) {
-	if !s.cfg.Enabled {
-		logger.L().Info("选股器未启用, 跳过")
-		return nil, nil
-	}
+// Report 一次选股运行的产出（供 CLI 打印与任务记录）。
+type Report struct {
+	TradeDate   string
+	Candidates  []model.ScreenResult // TopN 候选（已落库）
+	FunnelRows  []store.FunnelRow    // 漏斗快照（已落库）
+	WatchRows   []store.WatchRow     // 降级观察名单（仅候选为 0 时非空，已落库）
+	ScoredTotal int                  // 进入因子打分的股票数
+	Empty       bool                 // 候选是否为 0
+}
 
-	logger.L().Infow("开始全市场选股", "date", date, "max_candidates", s.cfg.MaxCandidates)
+// Run 执行选股并落库（screen_result / screen_funnel / 必要时 screen_watchlist + SCREEN_EMPTY 告警）。
+// 数据全部读自 SQLite（Tushare 已由 data 任务入库），本函数不触网。
+func (s *Screener) Run(ctx context.Context, tradeDate string) (*Report, error) {
+	rep := &Report{TradeDate: tradeDate}
 
-	// 1. 拉取全市场基本面
-	basics, err := s.ts.DailyBasic(date)
+	// ---------- 数据装载 ----------
+	bars, err := s.st.ScreenRepo().RecentTradeDates(ctx, tradeDate, momentumBars)
 	if err != nil {
-		return nil, fmt.Errorf("拉取全市场基本面失败: %w", err)
+		return nil, err
 	}
-	logger.L().Infow("全市场基本面拉取完成", "count", len(basics))
-
-	// 2. 拉取全市场日线 (用于涨跌幅)
-	bars, err := s.ts.Daily(date)
+	if len(bars) == 0 {
+		return nil, fmt.Errorf("选股失败: daily_bar 无 %s 及之前的任何数据（请先运行 data 任务）", tradeDate)
+	}
+	fromDate := bars[len(bars)-1]
+	series, err := s.st.ScreenRepo().BarCloseSeries(ctx, fromDate)
 	if err != nil {
-		return nil, fmt.Errorf("拉取全市场日线失败: %w", err)
+		return nil, err
 	}
-	barMap := make(map[string]model.Bar, len(bars))
-	for _, b := range bars {
-		barMap[b.TsCode] = b
-	}
-
-	// 2.5 拉取近5个交易日收盘价 (用于趋势和动量计算)
-	recentCloses := s.fetchRecentCloses(date)
-	logger.L().Infow("近5日收盘价获取完成", "stocks", len(recentCloses))
-
-	// 3. 获取股票基本信息 (ST/上市日期)
-	stocks, err := s.stockRepo.GetAll()
+	closesByCode := groupCloses(series)
+	basics, err := s.st.ScreenRepo().BasicAt(ctx, tradeDate)
 	if err != nil {
-		return nil, fmt.Errorf("获取股票列表失败: %w", err)
+		return nil, err
 	}
-	stockMap := make(map[string]model.Stock, len(stocks))
-	for _, st := range stocks {
-		stockMap[st.TsCode] = st
-	}
-
-	// 4. 构建配置池排除集合 (已在配置池中的不需要重复选)
-	excludeCodes := make(map[string]bool)
-	for _, code := range s.cfg.ExcludeCodes {
-		excludeCodes[code] = true
-	}
-
-	// 4.5 价格区间与资金反推的价格带取交集
-	// 资金决定可选域: 买不起 1 手的高价股、凑不满最小单笔金额的低价股都必然被风控裁掉,
-	// 选进候选池只会挤掉真正可执行的标的
-	money := s.capitalSnapshot()
-	minPrice, maxPrice := priceBandOf(s.cfg, money)
-	logger.L().Infow("选股价格区间", "min_price", minPrice, "max_price", maxPrice,
-		"total_asset", money.TotalAsset, "cash", money.Cash)
-
-	// 5. 多维度筛选 (逐只过滤 + 按原因计数, 空候选日必须能说清是被哪条规则清空)
-	env := filterEnv{
-		date:     date,
-		exclude:  excludeCodes,
-		stocks:   stockMap,
-		bars:     barMap,
-		recent:   recentCloses,
-		minPrice: minPrice,
-		maxPrice: maxPrice,
-	}
-	candidates, dropped := s.filterCandidates(basics, env)
-	logger.L().Infow("初筛完成", "count", len(candidates), "dropped", dropped)
-
-	// 6. 按评分排序取 TopN, 同行业最多3只 (避免集中)
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].Score > candidates[j].Score
-	})
-	industries := make(map[string]string, len(stockMap))
-	for code, st := range stockMap {
-		industries[code] = st.Industry
-	}
-	candidates = diversifyByIndustry(candidates, industries, s.cfg.MaxCandidates, 3)
-
-	// 7. 同步候选股票历史K线 (策略需要均线数据, 约半年)
-	if len(candidates) > 0 {
-		s.syncHistoryBars(candidates, date)
-		s.saveCandidateBasics(candidates, basics)
-	}
-
-	// 8. 结果落库
-	if err := s.screenRepo.SaveResults(date, candidates); err != nil {
-		logger.L().Warnw("选股结果落库失败", "err", err)
-	}
-
-	// 9. 同步当日日线到 daily_bar (策略 OnBar 需要当日行情)
-	s.syncTodayBars(candidates, barMap)
-
-	logger.L().Infow("选股完成", "date", date, "candidates", len(candidates))
-	for i, c := range candidates {
-		logger.L().Infof("  #%d %s %s  收盘%.2f 涨跌%.2f%% 换手%.2f%% PE_TTM=%.1f PB=%.2f 评分%.2f",
-			i+1, c.TsCode, c.Name, c.Close, c.PctChg, c.TurnoverRate, c.PE_TTM, c.PB, c.Score)
-	}
-
-	return candidates, nil
-}
-
-// filterEnv 初筛一次运行内共享的只读上下文
-type filterEnv struct {
-	date     string                 // 选股日期 YYYYMMDD
-	exclude  map[string]bool        // 配置池已有代码
-	stocks   map[string]model.Stock // ts_code → 基本信息
-	bars     map[string]model.Bar   // ts_code → 当日日线
-	recent   map[string][]float64   // ts_code → 近 N 日收盘 (由近及远)
-	minPrice float64                // 价格带下限 (含资金反推)
-	maxPrice float64                // 价格带上限 (含资金反推)
-}
-
-// filterCandidates 对全市场基本面逐只跑过滤条件, 返回候选与按规则计数的淘汰数
-func (s *Screener) filterCandidates(basics []model.DailyBasic, e filterEnv) ([]ScreenResult, map[string]int) {
-	dropped := make(map[string]int)
-	candidates := make([]ScreenResult, 0, len(basics))
-	for _, basic := range basics {
-		res, rule := s.filterOne(basic, e)
-		if rule != "" {
-			dropped[rule]++
-			continue
-		}
-		candidates = append(candidates, res)
-	}
-	return candidates, dropped
-}
-
-// filterOne 单只股票的过滤 + 评分
-// 通过时 rule 为空串; 被淘汰时 rule 为淘汰原因标签 (供计数)
-func (s *Screener) filterOne(basic model.DailyBasic, e filterEnv) (ScreenResult, string) {
-	stock := e.stocks[basic.TsCode]
-	switch {
-	case e.exclude[basic.TsCode]:
-		return ScreenResult{}, "已在配置池"
-	case s.cfg.ExcludeST && stock.IsST:
-		return ScreenResult{}, "ST股"
-	case stock.ListStatus != "" && stock.ListStatus != "L":
-		return ScreenResult{}, "非上市状态"
-	case !s.listedLongEnough(stock):
-		return ScreenResult{}, "上市不足"
-	case model.IsLimitUp(basic.LimitStatus) || model.IsLimitDown(basic.LimitStatus):
-		return ScreenResult{}, "当日涨跌停"
-	case e.minPrice > 0 && basic.Close < e.minPrice:
-		return ScreenResult{}, "低于资金可买价格带下限"
-	case e.maxPrice > 0 && basic.Close > e.maxPrice:
-		return ScreenResult{}, "高于资金可买价格带上限"
-	case s.cfg.MinTurnoverRate > 0 && basic.TurnoverRate < s.cfg.MinTurnoverRate:
-		return ScreenResult{}, "换手率不足"
-	case s.cfg.MaxPE > 0 && (basic.PE_TTM <= 0 || basic.PE_TTM > s.cfg.MaxPE):
-		return ScreenResult{}, "PE区间外"
-	case s.cfg.MaxPB > 0 && (basic.PB <= 0 || basic.PB > s.cfg.MaxPB):
-		return ScreenResult{}, "PB区间外"
-	case s.cfg.MinCircMV > 0 && basic.CircMV < s.cfg.MinCircMV:
-		return ScreenResult{}, "流通市值过小"
-	case s.cfg.MaxCircMV > 0 && basic.CircMV > s.cfg.MaxCircMV:
-		return ScreenResult{}, "流通市值过大"
-	}
-
-	// 方向门槛: 买入候选必须处于上行方向
-	// 样本不足时按"方向未知"淘汰 —— 原实现用 `ma5 > 0 &&` 短路, 缺数据等于放行,
-	// 会把趋势过滤变成只在有数据的日子生效的摆设
-	t := calcTrend(e.recent[basic.TsCode], basic.Close)
-	if t.MA5 <= 0 {
-		return ScreenResult{}, "趋势数据不足"
-	}
-	if basic.Close < t.MA5 {
-		return ScreenResult{}, "收盘低于MA5"
-	}
-	if t.Momentum < 0 {
-		return ScreenResult{}, "5日动量为负"
-	}
-
-	pctChg := 0.0
-	if bar, ok := e.bars[basic.TsCode]; ok {
-		pctChg = bar.PctChg
-	}
-	name := stock.Name
-	if name == "" {
-		name = basic.TsCode
-	}
-	return ScreenResult{
-		TsCode:       basic.TsCode,
-		Name:         name,
-		TradeDate:    e.date,
-		Close:        basic.Close,
-		PctChg:       pctChg,
-		TurnoverRate: basic.TurnoverRate,
-		VolumeRatio:  basic.VolumeRatio,
-		PE:           basic.PE,
-		PE_TTM:       basic.PE_TTM,
-		PB:           basic.PB,
-		CircMV:       basic.CircMV,
-		Score:        s.calcScore(basic, pctChg, t),
-		Reason:       s.buildReason(basic, pctChg, t),
-	}, ""
-}
-
-// listedLongEnough 上市是否满 min_list_days (无上市日期信息时不因此淘汰)
-func (s *Screener) listedLongEnough(stock model.Stock) bool {
-	if s.cfg.MinListDays <= 0 || stock.ListDate == "" {
-		return true
-	}
-	listTime, err := time.Parse("20060102", stock.ListDate)
-	if err != nil {
-		return true
-	}
-	return int(time.Since(listTime).Hours()/24) >= s.cfg.MinListDays
-}
-
-// capitalSnapshot 取当前资金快照 (未注入资金源时返回零值)
-func (s *Screener) capitalSnapshot() Capital {
-	if s.capital == nil {
-		return Capital{}
-	}
-	return s.capital.Capital()
-}
-
-// priceBandOf 配置价格区间与资金反推价格带取交集 (0 表示该侧不设限)
-func priceBandOf(cfg config.ScreenerConfig, money Capital) (minPrice, maxPrice float64) {
-	lo, hi := money.PriceBand()
-	pick := func(a, b float64, widest bool) float64 {
-		if a <= 0 {
-			return b
-		}
-		if b <= 0 {
-			return a
-		}
-		if widest {
-			return math.Max(a, b) // 下限取更严的一侧
-		}
-		return math.Min(a, b)
-	}
-	return pick(cfg.MinPrice, lo, true), pick(cfg.MaxPrice, hi, false)
-}
-
-// saveCandidateBasics 把候选股票当日基本面写回 daily_basic
-// dataloader 的 filter_mode 会把 daily_basic 裁到配置股票池, 新选出的候选因此常年无基本面行;
-// 辩论的基本面分析师拿到全 0 的 PE/PB 不会报错, 只会据此判定"估值异常"并给出偏空结论
-func (s *Screener) saveCandidateBasics(candidates []ScreenResult, basics []model.DailyBasic) {
-	if s.basicRepo == nil || len(candidates) == 0 {
-		return
-	}
-	want := make(map[string]bool, len(candidates))
-	for _, c := range candidates {
-		want[c.TsCode] = true
-	}
-	var rows []model.DailyBasic
+	basicByCode := make(map[string]model.DailyBasic, len(basics))
 	for _, b := range basics {
-		if want[b.TsCode] {
-			rows = append(rows, b)
-		}
+		basicByCode[b.TsCode] = b
 	}
-	if err := s.basicRepo.BatchInsert(rows); err != nil {
-		logger.L().Warnw("候选股票基本面落库失败", "err", err, "rows", len(rows))
-	}
-}
-
-// syncHistoryBars 同步候选股票历史K线 (约6个月, 策略均线计算需要)
-func (s *Screener) syncHistoryBars(candidates []ScreenResult, date string) {
-	if s.ts == nil {
-		return
-	}
-	// 计算6个月前的日期
-	endDate := date
-	t, err := time.Parse("20060102", date)
+	stocks, err := s.st.ScreenRepo().LiveStocks(ctx)
 	if err != nil {
-		return
+		return nil, err
 	}
-	startDate := t.AddDate(0, -6, 0).Format("20060102")
+	suspended, err := s.st.ScreenRepo().SuspendedMap(ctx, tradeDate)
+	if err != nil {
+		return nil, err
+	}
+	finas, err := s.st.ScreenRepo().FinaLatestAsOf(ctx, tradeDate)
+	if err != nil {
+		return nil, err
+	}
 
-	synced := 0
-	for _, c := range candidates {
-		// 检查是否已有足够历史数据
-		existing, err := s.barRepo.GetBars(c.TsCode, startDate, endDate)
-		if err == nil && len(existing) >= 60 {
-			continue // 已有足够数据, 跳过
-		}
+	// ---------- 漏斗逐级筛选 ----------
+	type dropStats map[string]int
+	newDrops := func() dropStats { return dropStats{} }
+	stages := make([]store.FunnelRow, 0, 4)
 
-		// 拉取历史日线
-		bars, err := s.ts.DailyByCode(c.TsCode, startDate, endDate)
-		if err != nil {
-			logger.L().Warnw("同步历史K线失败", "ts_code", c.TsCode, "err", err)
-			continue
+	survivors := make([]model.StockBasic, 0, len(stocks))
+	drops := newDrops()
+	passedIn := len(stocks)
+	for _, stk := range stocks {
+		ok, why := basicEligible(stk, listDaysBetween(stk.ListDate, tradeDate), s.cfg.MinListDays, suspended[stk.TsCode])
+		if ok {
+			survivors = append(survivors, stk)
+		} else {
+			drops[why]++
 		}
-		if len(bars) == 0 {
-			continue
-		}
-		if err := s.barRepo.BatchInsert(bars); err != nil {
-			logger.L().Warnw("写入历史K线失败", "ts_code", c.TsCode, "err", err)
-			continue
-		}
-		synced++
 	}
-	if synced > 0 {
-		logger.L().Infow("候选股票历史K线同步完成", "synced", synced, "total", len(candidates))
+	stages = append(stages, sages(passedIn, len(survivors), drops, "基础资格(ST/新股/停牌)")...)
+	stage1 := append([]model.StockBasic(nil), survivors...) // 一级存量快照（降级观察名单回退用）
+
+	// 流动性
+	passedIn = len(survivors)
+	liqOK := make([]model.StockBasic, 0, len(survivors))
+	drops = newDrops()
+	for _, stk := range survivors {
+		b, ok := basicByCode[stk.TsCode]
+		if !ok {
+			drops[reasonNoBasic]++
+			continue
+		}
+		if ok, why := liquidityStage(b, s.cfg); ok {
+			liqOK = append(liqOK, stk)
+		} else {
+			drops[why]++
+		}
 	}
+	survivors = liqOK
+	stages = append(stages, sages(passedIn, len(survivors), drops, "流动性(市值/换手)")...)
+
+	// 估值与价格
+	passedIn = len(survivors)
+	valOK := make([]model.StockBasic, 0, len(survivors))
+	drops = newDrops()
+	for _, stk := range survivors {
+		b := basicByCode[stk.TsCode]
+		if ok, why := valuationStage(b, s.cfg); ok {
+			valOK = append(valOK, stk)
+		} else {
+			drops[why]++
+		}
+	}
+	survivors = valOK
+	stages = append(stages, sages(passedIn, len(survivors), drops, "估值价格(PE/PB/区间)")...)
+
+	rep.ScoredTotal = len(survivors)
+
+	// 逐级存量快照：候选为 0 时观察名单回退到最后一级仍有存量的集合
+	poolStage1 := append([]model.StockBasic(nil), stage1...)
+	poolStage2 := append([]model.StockBasic(nil), liqOK...)
+	poolStage3 := append([]model.StockBasic(nil), valOK...)
+
+	// ---------- 因子打分 ----------
+	allScored, raw := s.scorePool(survivors, closesByCode, basicByCode, finas)
+	sort.SliceStable(allScored, func(i, j int) bool {
+		if allScored[i].Score != allScored[j].Score {
+			return allScored[i].Score > allScored[j].Score
+		}
+		return allScored[i].Code < allScored[j].Code
+	})
+
+	// ---------- TopN ----------
+	topN := s.cfg.TopN
+	if topN > len(allScored) {
+		topN = len(allScored)
+	}
+	thJSON, _ := json.Marshal(s.cfg) // 序列化失败时 thresholds 留空，不阻断
+
+	passedIn = len(allScored)
+	drops = newDrops()
+	if rest := len(allScored) - topN; rest > 0 {
+		drops[reasonRankOut] = rest
+	}
+	stages = append(stages, sages(passedIn, len(allScored), drops, "因子排名TopN")...)
+	for i := range stages {
+		stages[i].TradeDate = tradeDate
+		stages[i].Stage = i + 1 // 漏斗级序号从 1 开始
+		stages[i].Thresholds = string(thJSON)
+	}
+
+	rep.FunnelRows = stages
+
+	// ---------- 组装结果 ----------
+	nameMap, err := s.st.ScreenRepo().StockNameMap(ctx)
+	if err != nil {
+		nameMap = map[string]string{} // 名称缺失不阻断选股，reason 中省略名称
+	}
+
+	if topN == 0 {
+		rep.Empty = true
+		// 降级观察名单：最后一级（因子打分）无存量时，回退到最后一级仍有存量的漏斗级，
+		// 保证 SCREEN_EMPTY 时人工介入始终有 Top20 可看（验收 #3）。
+		watchScored, watchStage := allScored, ""
+		if len(watchScored) == 0 {
+			fallback := []struct {
+				pool []model.StockBasic
+				name string
+			}{{poolStage3, "估值价格(PE/PB/区间)"}, {poolStage2, "流动性(市值/换手)"}, {poolStage1, "基础资格(ST/新股/停牌)"}}
+			for _, fb := range fallback {
+				if len(fb.pool) > 0 {
+					watchScored, _ = s.scorePool(fb.pool, closesByCode, basicByCode, finas)
+					watchStage = fb.name
+					break
+				}
+			}
+		}
+		sort.SliceStable(watchScored, func(i, j int) bool {
+			if watchScored[i].Score != watchScored[j].Score {
+				return watchScored[i].Score > watchScored[j].Score
+			}
+			return watchScored[i].Code < watchScored[j].Code
+		})
+		rep.WatchRows = s.buildWatchlist(tradeDate, watchScored, watchStage, watchBudget)
+		if err := s.st.ScreenRepo().ReplaceScreenResults(ctx, tradeDate, nil); err != nil {
+			return nil, err
+		}
+		if err := s.st.ScreenRepo().ReplaceWatchlist(ctx, tradeDate, rep.WatchRows); err != nil {
+			return nil, err
+		}
+		if err := s.st.ScreenRepo().ReplaceFunnel(ctx, tradeDate, stages); err != nil {
+			return nil, err
+		}
+		if err := s.raiseEmptyAlert(ctx, tradeDate, rep); err != nil {
+			return nil, err
+		}
+		return rep, nil
+	}
+
+	results := make([]model.ScreenResult, 0, topN)
+	for rank, sc := range allScored[:topN] {
+		b := basicByCode[sc.Code]
+		rm := raw[sc.Code]
+		reason := BuildReason(sc.Factors, sc.Score, b, rm.Quality, rm.HasQual)
+		if nm, ok := nameMap[sc.Code]; ok && nm != "" {
+			reason = nm + "：" + reason
+		}
+		results = append(results, model.ScreenResult{
+			TradeDate:    tradeDate,
+			TsCode:       sc.Code,
+			Rank:         rank + 1,
+			Score:        sc.Score,
+			Factors:      sc.Factors,
+			F_Momentum:   sc.Factors.Momentum,
+			F_Quality:    sc.Factors.Quality,
+			F_Value:      sc.Factors.Value,
+			F_LowVol:     sc.Factors.LowVol,
+			F_Liquidity:  sc.Factors.Liquidity,
+			Close:        b.Close,
+			CircMvW:      b.CircMvW,
+			PETtm:        b.PETtm,
+			PB:           b.PB,
+			TurnoverRate: b.TurnoverRate,
+			Reason:       reason,
+		})
+	}
+	rep.Candidates = results
+
+	if err := s.st.ScreenRepo().ReplaceScreenResults(ctx, tradeDate, results); err != nil {
+		return nil, err
+	}
+	if err := s.st.ScreenRepo().ReplaceFunnel(ctx, tradeDate, stages); err != nil {
+		return nil, err
+	}
+	return rep, nil
 }
 
-// syncTodayBars 同步候选股票当日日线到 daily_bar (策略 OnBar 需要)
-func (s *Screener) syncTodayBars(candidates []ScreenResult, barMap map[string]model.Bar) {
-	var barsToInsert []model.Bar
-	for _, c := range candidates {
-		if bar, ok := barMap[c.TsCode]; ok {
-			barsToInsert = append(barsToInsert, bar)
+// watchBudget 候选为 0 时写入观察名单的容量。
+const watchBudget = 20
+
+// scorePool 对给定股票集合做五因子打分（不排序），供 TopN 与降级观察名单共用。
+func (s *Screener) scorePool(pool []model.StockBasic, closesByCode map[string][]float64,
+	basicByCode map[string]model.DailyBasic, finas map[string]model.FinaIndicator) ([]Scored, map[string]RawMetrics) {
+	codes := make([]string, 0, len(pool))
+	raw := make(map[string]RawMetrics, len(pool))
+	pePB := make(map[string][2]float64, len(pool))
+	for _, stk := range pool {
+		codes = append(codes, stk.TsCode)
+		b := basicByCode[stk.TsCode]
+		cs := closesByCode[stk.TsCode]
+		rm := ComputeRaw(cs, b.TurnoverRate, 0, false, momentumBars)
+		if fi, ok := finas[stk.TsCode]; ok {
+			rm.Quality = fi.ROE
+			rm.HasQual = fi.ROE != 0
 		}
+		pePB[stk.TsCode] = [2]float64{b.PETtm, b.PB}
+		raw[stk.TsCode] = rm
 	}
-	if len(barsToInsert) > 0 {
-		if err := s.barRepo.BatchInsert(barsToInsert); err != nil {
-			logger.L().Warnw("写入候选股票当日行情失败", "err", err)
-		}
+	factorByCode := buildFactorScores(codes, raw, pePB)
+	scored := make([]Scored, 0, len(codes))
+	for _, c := range codes {
+		fs := factorByCode[c]
+		scored = append(scored, Scored{Code: c, Factors: fs, Score: Composite(fs, s.w)})
 	}
+	return scored, raw
 }
 
-// diversifyByIndustry 按行业分散选股: 同行业最多 maxPerIndustry 只
-// industries 为 ts_code → 行业名称映射 (来自 stock_basic), 缺失回退 "unknown"
-// 候选不足或行业高度集中时允许少于 maxN, 不撤销分散约束
-func diversifyByIndustry(candidates []ScreenResult, industries map[string]string, maxN, maxPerIndustry int) []ScreenResult {
-	industryCount := make(map[string]int)
-	result := make([]ScreenResult, 0, maxN)
-	for _, c := range candidates {
-		if len(result) >= maxN {
-			break
-		}
-		industry := industries[c.TsCode]
-		if industry == "" {
-			industry = "unknown"
-		}
-		if industryCount[industry] >= maxPerIndustry {
-			continue
-		}
-		industryCount[industry]++
-		result = append(result, c)
+// buildWatchlist 降级观察名单：取给定打分集合的 TopN，并注明未过原因，便于人工介入。
+// watchStage 非空时表示回退到的漏斗级（该级之后被阈值拦下）。
+func (s *Screener) buildWatchlist(tradeDate string, scored []Scored, watchStage string, budget int) []store.WatchRow {
+	if len(scored) == 0 {
+		return nil
 	}
-	if len(result) < maxN {
-		logger.L().Infow("行业分散后未凑满候选数", "selected", len(result), "max", maxN, "total", len(candidates))
+	if budget > len(scored) {
+		budget = len(scored)
 	}
-	return result
+	rows := make([]store.WatchRow, 0, budget)
+	for i := 0; i < budget; i++ {
+		sc := scored[i]
+		why := "因子分不足未进TopN"
+		if watchStage != "" {
+			why = "被[" + watchStage + "]级阈值拦截"
+		} else if sc.Score <= 0 {
+			why = "因子分过低"
+		}
+		rows = append(rows, store.WatchRow{
+			TradeDate: tradeDate,
+			TsCode:    sc.Code,
+			Rank:      i + 1,
+			Score:     sc.Score,
+			Reason:    fmt.Sprintf("候选为0降级观察（未过原因：%s，得分 %.1f）", why, sc.Score),
+		})
+	}
+	return rows
+}
+
+// raiseEmptyAlert 候选为 0 时落 SCREEN_EMPTY urgent 告警（含漏斗摘要，诊断不黑盒）。
+func (s *Screener) raiseEmptyAlert(ctx context.Context, tradeDate string, rep *Report) error {
+	content := fmt.Sprintf("%s 选股候选 0 条（打分样本 %d 只）。漏斗：%s。观察名单已降级写入 %d 只，请人工介入。",
+		tradeDate, rep.ScoredTotal, funnelSummary(rep.FunnelRows), len(rep.WatchRows))
+	alert := model.AgentAlert{
+		TradeDate: tradeDate,
+		Source:    "screener",
+		Level:     model.AlertUrgent,
+		Code:      AlertCodeScreenEmpty,
+		Title:     "选股候选为空",
+		Content:   content,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	if err := s.st.OpsRepo().RaiseAlert(ctx, alert); err != nil {
+		return fmt.Errorf("落 SCREEN_EMPTY 告警失败: %w", err)
+	}
+	return nil
+}
+
+// funnelSummary 生成漏斗一行的可读摘要（"基础资格 5554→4300；流动性 …"）。
+func funnelSummary(rows []store.FunnelRow) string {
+	out := ""
+	for i, r := range rows {
+		if i > 0 {
+			out += "；"
+		}
+		out += fmt.Sprintf("%s %d→%d", r.StageName, r.PassedIn, r.PassedOut)
+	}
+	return out
+}
+
+// sages 组装单级漏斗行（stage 序号由切片长度推导，调用方按序追加）。
+func sages(passedIn, passedOut int, drops map[string]int, name string) []store.FunnelRow {
+	total := 0
+	keys := make([]string, 0, len(drops))
+	for k, v := range drops {
+		keys = append(keys, k)
+		total += v
+	}
+	sort.Strings(keys) // 稳定输出
+	dj, _ := json.Marshal(drops)
+	return []store.FunnelRow{{
+		Stage:       0, // 由调用方追加后统一编号
+		StageName:   name,
+		PassedIn:    passedIn,
+		PassedOut:   passedOut,
+		Dropped:     passedIn - passedOut,
+		DropReasons: string(dj),
+	}}
+}
+
+// groupCloses 将日线序列点按代码分组为升序前复权收盘切片。
+func groupCloses(series []store.ClosePoint) map[string][]float64 {
+	m := make(map[string][]float64)
+	for _, p := range series {
+		if p.Close > 0 && !math.IsNaN(p.Close) {
+			m[p.TsCode] = append(m[p.TsCode], p.Close)
+		}
+	}
+	return m
 }

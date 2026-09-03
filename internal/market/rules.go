@@ -1,124 +1,55 @@
 package market
 
-import (
-	"math"
-	"time"
-)
+import "jingzhe-trader/internal/model"
 
-// A股交易时段规则 (以下时间均以北京时间 Asia/Shanghai UTC+8 为准):
-//   - 开盘集合竞价: 9:15 - 9:25
-//   - 上午连续竞价: 9:30 - 11:30
-//   - 下午连续竞价: 13:00 - 15:00
-//   - 收盘集合竞价: 14:57 - 15:00
-//
-// 入参 t 可能携带任意时区, 函数内部统一转换为北京时间后再判断。
+// ===================== 涨跌停 / 停牌 / 整手 / T+1 规则 =====================
+// 涨跌停判定用 stk_limit 价格字段，绝不依赖状态编码猜测（D1）。
 
-// beijingLocation 北京时区 (Asia/Shanghai)
-var beijingLocation = func() *time.Location {
-	loc, err := time.LoadLocation("Asia/Shanghai")
-	if err != nil {
-		// 兜底: 直接构造 UTC+8 固定时区
-		loc = time.FixedZone("CST", 8*3600)
-	}
-	return loc
-}()
-
-// toBeijing 将任意时区的时间转换为北京时间
-func toBeijing(t time.Time) time.Time {
-	return t.In(beijingLocation)
+// IsLimitUp 是否涨停（价格 ≥ 涨停价）。
+func IsLimitUp(price, upLimit model.Fen) bool {
+	return price >= upLimit
 }
 
-// beijingDateStr 返回北京时间下的日期字符串 (格式 YYYYMMDD)
-// 用于按日期版本化规则 (如 ST 涨跌幅变更), 字符串字典序与日期先后一致
-func beijingDateStr(t time.Time) string {
-	return t.In(beijingLocation).Format("20060102")
+// IsLimitDown 是否跌停（价格 ≤ 跌停价）。
+func IsLimitDown(price, downLimit model.Fen) bool {
+	return price <= downLimit
 }
 
-// isWeekendBeijing 判断北京时间是否为周末
-func isWeekendBeijing(bt time.Time) bool {
-	switch bt.Weekday() {
-	case time.Saturday, time.Sunday:
-		return true
-	}
-	return false
+// IsSuspended 是否停牌（suspend 标记）。
+func IsSuspended(suspended bool) bool {
+	return suspended
 }
 
-// IsTradingTime 判断是否在 A股交易时段内 (9:30-11:30, 13:00-15:00, 北京时间)
-// 注: 该时段包含收盘集合竞价时段 (14:57-15:00)
-func IsTradingTime(t time.Time) bool {
-	bt := toBeijing(t)
-	if isWeekendBeijing(bt) {
-		return false
-	}
-	minutes := bt.Hour()*60 + bt.Minute()
-
-	// 上午连续竞价: 9:30 - 11:30
-	if minutes >= 9*60+30 && minutes <= 11*60+30 {
-		return true
-	}
-	// 下午连续竞价: 13:00 - 15:00
-	if minutes >= 13*60 && minutes <= 15*60 {
-		return true
-	}
-	return false
+// CanBuy 涨停禁买：涨停时不可买入。
+func CanBuy(price, upLimit model.Fen) bool {
+	return !IsLimitUp(price, upLimit)
 }
 
-// IsCallAuction 判断是否在开盘集合竞价时段 (9:15-9:25, 北京时间)
-func IsCallAuction(t time.Time) bool {
-	bt := toBeijing(t)
-	if isWeekendBeijing(bt) {
-		return false
-	}
-	minutes := bt.Hour()*60 + bt.Minute()
-	return minutes >= 9*60+15 && minutes <= 9*60+25
+// CanSell 跌停禁卖：跌停时不可卖出。
+func CanSell(price, downLimit model.Fen) bool {
+	return !IsLimitDown(price, downLimit)
 }
 
-// IsCloseAuction 判断是否在收盘集合竞价时段 (14:57-15:00, 北京时间)
-func IsCloseAuction(t time.Time) bool {
-	bt := toBeijing(t)
-	if isWeekendBeijing(bt) {
-		return false
-	}
-	minutes := bt.Hour()*60 + bt.Minute()
-	return minutes >= 14*60+57 && minutes <= 15*60
+// RoundLotDown 向下取整到 100 股。
+func RoundLotDown(q model.Qty) model.Qty {
+	return q.RoundLotDown()
 }
 
-// LotSize A股 1 手 = 100 股, 买入申报数量须为其整数倍
-const LotSize = 100
-
-// RoundLot 买入手数向下取整到 100 股 (A 股 1 手 = 100 股)
-// 买入申报数量须为 100 股的整数倍, 不足 100 股部分舍去
-func RoundLot(qty int) int {
-	if qty <= 0 {
-		return 0
-	}
-	return (qty / LotSize) * LotSize
+// RoundLotUp 向上取整到 100 股。
+func RoundLotUp(q model.Qty) model.Qty {
+	return q.RoundLotUp()
 }
 
-// IsvalidLot 判断申报数量是否为有效手数
-//   - 买入: 必须为 100 的整数倍
-//   - 卖出: 允许零股 (清仓时可卖出不满 100 股的零头)
-func IsvalidLot(qty int, isSell bool) bool {
-	if qty <= 0 {
-		return false
+// T1Available T+1 可卖量 = 总持仓 − 当日买入。
+func T1Available(total, todayBought model.Qty) model.Qty {
+	avail := total - todayBought
+	if avail < 0 {
+		avail = 0
 	}
-	if isSell {
-		// 卖出允许零股 (清仓)
-		return true
-	}
-	// 买入必须为 100 的倍数
-	return qty%100 == 0
+	return avail
 }
 
-// minPriceTick A 股最小变动价位 (元)
-const minPriceTick = 0.01
-
-// RoundPrice 将价格按 A 股最小变动价位 (0.01 元) 四舍五入取整
-// A 股最小变动价位为 0.01 元, 涨跌停价计算采用四舍五入规则
-func RoundPrice(price float64) float64 {
-	if price <= 0 {
-		return 0
-	}
-	// 先放大 100 倍, 四舍五入后再缩小 100 倍
-	return math.Round(price/minPriceTick) * minPriceTick
+// MinTradeAmountOK 是否满足最小交易金额门槛（amount 为金额分）。
+func MinTradeAmountOK(amount model.Fen, minAmount model.Fen) bool {
+	return amount >= minAmount
 }

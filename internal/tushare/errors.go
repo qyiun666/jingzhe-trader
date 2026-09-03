@@ -1,60 +1,80 @@
+// Package tushare Tushare HTTP 适配层（L2）。
+//
+// 职责：限流 + 错误分类 + 指数退避重试 + 将返回值解码为 model 类型。
+// 外部 IO 只在适配层；store/业务层禁止 net/http（ARCHITECTURE §1.2）。
+// money/price 一律 model.Fen；float→Fen 边界集中在 decode.go（§11.4）。
 package tushare
 
 import (
+	"errors"
 	"fmt"
-	"strings"
 )
 
-// APIError Tushare 业务错误 (HTTP 200 但响应 code != 0)
+// Kind 错误分类（ARCHITECTURE §11.1）。
+type Kind int
+
+const (
+	// KindTransient 瞬时错误：指数退避重试。
+	KindTransient Kind = iota
+	// KindRateLimited 频率限制：整窗等待后重试。
+	KindRateLimited
+	// KindPermanent 永久错误：不重试，直接落告警。
+	KindPermanent
+)
+
+func (k Kind) String() string {
+	switch k {
+	case KindTransient:
+		return "transient"
+	case KindRateLimited:
+		return "rate_limited"
+	case KindPermanent:
+		return "permanent"
+	default:
+		return "unknown"
+	}
+}
+
+// APIError Tushare 接口返回的结构化错误。
 type APIError struct {
-	API         string
-	Code        int
-	Msg         string
-	Reason      string // 判定依据, 便于日志定位为什么没重试
-	Permanent   bool   // 重试不会改变结果 (无权限/token 错/参数非法/日配额用尽)
-	RateLimited bool   // 分钟级限流: 退避到下一个时间窗后重试有意义
+	API  string // 接口名（用于告警定位）
+	Code int    // Tushare 错误码
+	Msg  string // 错误描述
+	Kind Kind   // 分类
+	Err  error  // 底层错误（网络/JSON 等）
 }
 
 func (e *APIError) Error() string {
-	return fmt.Sprintf("tushare API %s 返回错误: code=%d msg=%s", e.API, e.Code, e.Msg)
+	if e.Err != nil {
+		return fmt.Sprintf("tushare %s 失败 code=%d(%s) msg=%q: %v", e.API, e.Code, e.Kind, e.Msg, e.Err)
+	}
+	return fmt.Sprintf("tushare %s 失败 code=%d(%s) msg=%q", e.API, e.Code, e.Kind, e.Msg)
 }
 
-// classify 判定业务错误可否重试
+func (e *APIError) Unwrap() error { return e.Err }
+
+// 哨兵错误（跨包判等用 errors.Is）。
+var (
+	// ErrPermanentAPI 永久错误（无权限/接口名错/积分不足），不重试。
+	ErrPermanentAPI = errors.New("tushare permanent api error")
+	// ErrRateLimited 频率限制，整窗等待后重试。
+	ErrRateLimited = errors.New("tushare rate limited")
+	// ErrTransient 瞬时错误，指数退避重试。
+	ErrTransient = errors.New("tushare transient error")
+)
+
+// Classify 根据 Tushare 错误码分类（实测结论见 docs/tech-constraints.md §2.3）。
 //
-// Tushare 的错误码粒度很粗 (40101 同时覆盖"token 不对"与"接口名错误"), 只能以报文关键词为主、
-// 错误码为辅。判错的代价不对称: 把永久错误当可重试, 一次调用白烧 4 个请求和 16s 退避等待
-// (实测 token 配置错误就是这样把整轮同步拖长), 在按分钟/按天计次的档位上还会顺带挤掉当天正常配额。
-func classify(api string, code int, msg string) *APIError {
-	err := &APIError{API: api, Code: code, Msg: msg}
-	switch {
-	case containsAny(msg, "每天", "每日", "当天", "每月"):
-		// 日配额已用尽: 当天再重试只会重复失败。必须排在分钟判断之前——
-		// Tushare 的日配额与分钟限流都写作"最多访问…次", 只靠该词区分不出窗口
-		err.Permanent = true
-		err.Reason = "日配额已用尽"
-	case containsAny(msg, "每分钟", "每小时") || strings.Contains(msg, "最多访问"):
-		err.RateLimited = true
-		err.Reason = "分钟级限流"
-	case code == 40203 || code == 40209 || strings.Contains(msg, "没有接口"):
-		err.Permanent = true
-		err.Reason = "当前档位无该接口权限"
-	case strings.Contains(msg, "token"):
-		err.Permanent = true
-		err.Reason = "token 无效"
-	case code == 50101 || containsAny(msg, "必填参数", "参数错误", "参数不合法") || strings.Contains(msg, "接口名"):
-		err.Permanent = true
-		err.Reason = "请求参数或接口名非法"
+//	永久（不重试）：40101 接口名错 / 40203 无权限 / 403xx 权限积分 / 426xx 无权限申请
+//	频率（整窗等待）：42901 每分钟访问次数超限
+//	其余（50000 系统异常、网络错等）归为瞬时（指数退避）
+func Classify(code int) Kind {
+	switch code {
+	case 40101, 40203, 40301, 40302, 40303, 42601, 42602, 42603:
+		return KindPermanent
+	case 42901:
+		return KindRateLimited
 	default:
-		err.Reason = "未知错误码, 按可重试处理"
+		return KindTransient
 	}
-	return err
-}
-
-func containsAny(s string, subs ...string) bool {
-	for _, sub := range subs {
-		if strings.Contains(s, sub) {
-			return true
-		}
-	}
-	return false
 }

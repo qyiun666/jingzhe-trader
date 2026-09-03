@@ -1,169 +1,138 @@
 package store
 
 import (
-	"path/filepath"
+	"context"
 	"testing"
 	"time"
 )
 
-// TestTradePlanStatusFlow trade_plan 状态流转: pending → confirmed → executed / expired
-func TestTradePlanStatusFlow(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "test.db"))
+// openStoreForTest 打开临时库（自动建全部表），供 store 包测试使用。
+func openStoreForTest(t *testing.T) *Store {
+	t.Helper()
+	s, err := Open(t.TempDir() + "/ret.db")
 	if err != nil {
-		t.Fatalf("初始化测试库失败: %v", err)
+		t.Fatalf("store.Open 失败: %v", err)
 	}
-	defer db.Close()
+	return s
+}
 
-	repo := NewPlanRepo(db)
-	id, err := repo.InsertPlan(&TradePlan{
-		TradeDate: "20260102", TsCode: "600519.SH", Direction: "buy",
-		Qty: 100, RefPrice: 1400, Reason: "测试",
-	})
-	if err != nil {
-		t.Fatalf("插入计划失败: %v", err)
-	}
+// TestDeleteBatched100k 对应验收 #11：10 万行、批上限 5000，应恰好 20 批删完。
+func TestDeleteBatched100k(t *testing.T) {
+	s := openStoreForTest(t)
+	defer s.Close()
+	ctx := context.Background()
 
-	plan, err := repo.GetPlanByID(id)
-	if err != nil {
-		t.Fatalf("查询计划失败: %v", err)
+	const n = 100_000
+	cols := []string{"job_name", "trade_date", "status", "started_at"}
+	rows := make([][]interface{}, 0, n)
+	for i := 0; i < n; i++ {
+		rows = append(rows, []interface{}{
+			"job_" + itoa(i),
+			"20000101",
+			"ok",
+			"2000-01-01T00:00:00Z",
+		})
 	}
-	if plan.Status != PlanStatusPending {
-		t.Errorf("新计划状态应为 pending, 实际 %s", plan.Status)
+	if _, err := BatchInsert(ctx, s.WriteDB(), "job_run", cols, rows, 2000); err != nil {
+		t.Fatalf("批量插入 100k 行失败: %v", err)
 	}
-
-	// pending → confirmed → executed
-	if err := repo.UpdatePlanStatus(id, PlanStatusConfirmed); err != nil {
-		t.Fatalf("确认计划失败: %v", err)
+	var cnt int
+	if err := s.WriteDB().Get(&cnt, "SELECT COUNT(*) FROM job_run"); err != nil {
+		t.Fatalf("统计失败: %v", err)
 	}
-	if err := repo.UpdatePlanStatus(id, PlanStatusExecuted); err != nil {
-		t.Fatalf("执行计划失败: %v", err)
-	}
-	plan, _ = repo.GetPlanByID(id)
-	if plan.Status != PlanStatusExecuted {
-		t.Errorf("计划状态应为 executed, 实际 %s", plan.Status)
-	}
-
-	// 旧日期 pending 计划过期; 已 executed 的不受影响
-	oldID, _ := repo.InsertPlan(&TradePlan{
-		TradeDate: "20251230", TsCode: "000001.SZ", Direction: "sell", Qty: 200,
-	})
-	n, err := repo.ExpireOldPlans("20260102")
-	if err != nil {
-		t.Fatalf("过期旧计划失败: %v", err)
-	}
-	if n != 1 {
-		t.Errorf("应过期 1 条计划, 实际 %d", n)
-	}
-	oldPlan, _ := repo.GetPlanByID(oldID)
-	if oldPlan.Status != PlanStatusExpired {
-		t.Errorf("旧计划应为 expired, 实际 %s", oldPlan.Status)
+	if cnt != n {
+		t.Fatalf("期望插入 %d 行，实际 %d", n, cnt)
 	}
 
-	// GetOpenPlans 只返回 pending/confirmed
-	openID, _ := repo.InsertPlan(&TradePlan{
-		TradeDate: "20260102", TsCode: "000002.SZ", Direction: "buy", Qty: 300,
-	})
-	open, err := repo.GetOpenPlans()
+	deleted, batches, err := DeleteBatched(ctx, s.WriteDB(), "job_run", "trade_date < ?", []interface{}{"20990101"}, 5000)
 	if err != nil {
-		t.Fatalf("查询待处理计划失败: %v", err)
+		t.Fatalf("DeleteBatched 失败: %v", err)
 	}
-	if len(open) != 1 || open[0].ID != openID {
-		t.Errorf("待处理计划应只有 1 条(id=%d), 实际 %d 条", openID, len(open))
+	if deleted != n {
+		t.Fatalf("期望删除 %d 行，实际 %d", n, deleted)
+	}
+	if batches != n/5000 {
+		t.Fatalf("期望 %d 批，实际 %d", n/5000, batches)
+	}
+	if err := s.WriteDB().Get(&cnt, "SELECT COUNT(*) FROM job_run"); err != nil {
+		t.Fatalf("统计失败: %v", err)
+	}
+	if cnt != 0 {
+		t.Fatalf("删除后应清空，剩余 %d", cnt)
 	}
 }
 
-// TestReplaceDayPlans EOD重跑覆盖: 只清 pending+normal, urgent 与已确认计划保留
-func TestReplaceDayPlans(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatalf("初始化测试库失败: %v", err)
+// TestDeleteBatchedTimeout 对应验收 #11：context 已过期时 DeleteBatched 应立即以
+// DeadlineExceeded 提前退出（保留剩余，不阻塞）。
+func TestDeleteBatchedTimeout(t *testing.T) {
+	s := openStoreForTest(t)
+	defer s.Close()
+
+	cols := []string{"job_name", "trade_date", "status", "started_at"}
+	const n = 5000
+	rows := make([][]interface{}, 0, n)
+	for i := 0; i < n; i++ {
+		rows = append(rows, []interface{}{"t_" + itoa(i), "20000101", "ok", "2000-01-01T00:00:00Z"})
 	}
-	defer db.Close()
-
-	repo := NewPlanRepo(db)
-	date := "20260102"
-	repo.InsertPlan(&TradePlan{TradeDate: date, TsCode: "A.SZ", Direction: "buy", Qty: 100})
-	urgentID, _ := repo.InsertPlan(&TradePlan{
-		TradeDate: date, TsCode: "B.SZ", Direction: "sell", Qty: 100, Urgency: PlanUrgencyUrgent,
-	})
-	confirmedID, _ := repo.InsertPlan(&TradePlan{TradeDate: date, TsCode: "C.SZ", Direction: "buy", Qty: 100})
-	repo.UpdatePlanStatus(confirmedID, PlanStatusConfirmed)
-
-	if err := repo.ReplaceDayPlans(date, []*TradePlan{
-		{TradeDate: date, TsCode: "D.SZ", Direction: "buy", Qty: 200},
-	}); err != nil {
-		t.Fatalf("覆盖当日计划失败: %v", err)
+	if _, err := BatchInsert(context.Background(), s.WriteDB(), "job_run", cols, rows, 2000); err != nil {
+		t.Fatalf("批量插入失败: %v", err)
 	}
 
-	plans, _ := repo.GetPlansByDate(date)
-	if len(plans) != 3 {
-		t.Fatalf("覆盖后应有 3 条计划(urgent+confirmed+新计划), 实际 %d", len(plans))
+	// 已过期 context
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Nanosecond)
+	defer cancel()
+	// 确保已过期
+	time.Sleep(2 * time.Millisecond)
+
+	deleted, _, err := DeleteBatched(ctx, s.WriteDB(), "job_run", "trade_date < ?", []interface{}{"20990101"}, 5000)
+	if err == nil {
+		t.Fatal("期望返回 DeadlineExceeded，但无错误")
 	}
-	codes := map[string]bool{}
-	for _, p := range plans {
-		codes[p.TsCode] = true
+	if err != context.DeadlineExceeded {
+		t.Fatalf("期望 context.DeadlineExceeded，实际 %v", err)
 	}
-	if codes["A.SZ"] || !codes["B.SZ"] || !codes["C.SZ"] || !codes["D.SZ"] {
-		t.Errorf("覆盖结果错误: %v (A应被清理, B/C/D应保留)", codes)
+	if deleted != 0 {
+		t.Fatalf("已过期 context 应提前退出且删除 0 行，实际 %d", deleted)
 	}
-	_ = urgentID
 }
 
-// TestRunRetention 数据清理: 只删过期数据, live_ 前缀回测run永久保留
-func TestRunRetention(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "test.db"))
+// TestApplyRetentionSmoke ApplyRetention 在空库上遍历全部策略表不应 panic/报错。
+func TestApplyRetentionSmoke(t *testing.T) {
+	s := openStoreForTest(t)
+	defer s.Close()
+
+	now := time.Date(2026, 3, 31, 0, 0, 0, 0, time.UTC)
+	results, err := ApplyRetention(context.Background(), s, now, nil)
 	if err != nil {
-		t.Fatalf("初始化测试库失败: %v", err)
+		t.Fatalf("ApplyRetention 失败: %v", err)
 	}
-	defer db.Close()
-
-	oldDate := time.Now().AddDate(-4, 0, 0).Format("20060102")    // 4年前, 超出3年保留期
-	recentDate := time.Now().AddDate(0, 0, -1).Format("20060102") // 昨天
-
-	// 行情: 一条过期 + 一条新鲜
-	db.MustExec(`INSERT INTO daily_bar (ts_code, trade_date, close) VALUES (?, ?, 10)`, "600519.SH", oldDate)
-	db.MustExec(`INSERT INTO daily_bar (ts_code, trade_date, close) VALUES (?, ?, 11)`, "600519.SH", recentDate)
-
-	// 新闻: 过期 + 新鲜
-	oldNews := time.Now().AddDate(0, 0, -60).Format("2006-01-02 15:04:05")
-	newNews := time.Now().Format("2006-01-02 15:04:05")
-	db.MustExec(`INSERT INTO news (datetime, content, title, channels) VALUES (?, 'x', 'old', '')`, oldNews)
-	db.MustExec(`INSERT INTO news (datetime, content, title, channels) VALUES (?, 'x', 'new', '')`, newNews)
-
-	// 回测run: 3个bt run + 1个live run, 保留最近2个bt
-	for _, runID := range []string{"bt_1", "bt_2", "bt_3", "live_main"} {
-		db.MustExec(`INSERT INTO trades (run_id, ts_code, side, price, qty, trade_date) VALUES (?, 'A.SZ', 1, 10, 100, ?)`,
-			runID, recentDate)
-		db.MustExec(`INSERT INTO account_snapshot (run_id, trade_date, total_asset) VALUES (?, ?, 10000)`,
-			runID, recentDate)
-	}
-
-	// 交易计划: 过期 + 新鲜
-	oldPlanDate := time.Now().AddDate(0, 0, -120).Format("20060102")
-	db.MustExec(`INSERT INTO trade_plan (trade_date, ts_code, name, direction, qty, ref_price, reason, strategy, urgency, status, created_at, updated_at)
-		VALUES (?, 'A.SZ', '', 'buy', 100, 10, '', '', 'normal', 'expired', '', '')`, oldPlanDate)
-	db.MustExec(`INSERT INTO trade_plan (trade_date, ts_code, name, direction, qty, ref_price, reason, strategy, urgency, status, created_at, updated_at)
-		VALUES (?, 'B.SZ', '', 'buy', 100, 10, '', '', 'normal', 'pending', '', '')`, recentDate)
-
-	policy := RetentionPolicy{BarYears: 3, NewsDays: 30, PlanDays: 90, BacktestRuns: 2}
-	if err := RunRetention(db, policy, true); err != nil {
-		t.Fatalf("执行数据清理失败: %v", err)
-	}
-
-	assertCount := func(query, desc string, want int) {
-		t.Helper()
-		var n int
-		if err := db.Get(&n, query); err != nil {
-			t.Fatalf("查询 %s 失败: %v", desc, err)
-		}
-		if n != want {
-			t.Errorf("%s: 期望 %d 行, 实际 %d 行", desc, want, n)
+	// 空库各表删除数应为 0
+	for tbl, del := range results {
+		if del != 0 {
+			t.Fatalf("空库 %s 不应有删除，实际 %d", tbl, del)
 		}
 	}
-	assertCount(`SELECT COUNT(1) FROM daily_bar`, "daily_bar", 1)
-	assertCount(`SELECT COUNT(1) FROM news`, "news", 1)
-	assertCount(`SELECT COUNT(1) FROM trades WHERE run_id = 'live_main'`, "live run trades", 1)
-	assertCount(`SELECT COUNT(1) FROM trades WHERE run_id = 'bt_1'`, "最旧bt run应被清理", 0)
-	assertCount(`SELECT COUNT(1) FROM trades WHERE run_id LIKE 'bt_%'`, "保留的bt run trades", 2)
-	assertCount(`SELECT COUNT(1) FROM trade_plan`, "trade_plan", 1)
+}
+
+// itoa 简单整型转字符串（测试内用，避免额外依赖）。
+func itoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	neg := i < 0
+	if neg {
+		i = -i
+	}
+	var buf [20]byte
+	pos := len(buf)
+	for i > 0 {
+		pos--
+		buf[pos] = byte('0' + i%10)
+		i /= 10
+	}
+	if neg {
+		pos--
+		buf[pos] = '-'
+	}
+	return string(buf[pos:])
 }

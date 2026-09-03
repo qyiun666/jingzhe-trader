@@ -1,184 +1,187 @@
+// Package tushare Tushare HTTP 适配层（L2）。
+//
+// 职责边界（ARCHITECTURE §1.2/§11.1）：仅此层触达外部网络；
+// 所有调用统一经过令牌桶限流 + 错误分类 + 指数退避重试。
 package tushare
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"sync"
+	"strings"
 	"time"
 
-	"jingzhe-trader/internal/config"
-	"jingzhe-trader/pkg/logger"
-	"jingzhe-trader/pkg/retry"
+	"golang.org/x/time/rate"
 )
 
-// rateLimitWindow Tushare 频次限制的时间窗: 触发限流后等满一个窗口再重试
-const rateLimitWindow = time.Minute
-
-// burstTokens 令牌桶容量: 允许略高于并发的瞬时突发, 不放开整分钟配额
-const burstTokens = 8
-
-// Client Tushare API 客户端
-// 封装了 HTTP 请求、令牌桶限流和指数退避重试逻辑
+// Client Tushare HTTP 适配客户端。
 type Client struct {
-	token         string
-	baseURL       string
-	httpClient    *http.Client
-	rateBucket    chan struct{} // 令牌桶: 容量为突发上限, 长期速率由 refillTicker 按配额速率补充
-	maxRetries    int           // 最大重试次数
-	retryInterval time.Duration // 基础重试间隔, 实际退避按指数增长 (分钟级限流除外, 按整窗等待)
-	quit          chan struct{} // refillTicker 退出信号 (Close 关闭)
-	closeOnce     sync.Once
+	token       string
+	baseURL     string
+	httpClient  *http.Client
+	limiter     *rate.Limiter // 令牌桶：控制每分钟调用次数（慢路径 fina 的限流核心）
+	maxRetries  int
+	baseBackoff time.Duration
+	rateWindow  time.Duration
 }
 
-// NewClient 根据 TushareConfig 构造一个客户端
-// 当 RateLimit > 0 时启用令牌桶限流, 每分钟最多 RateLimit 次请求
-func NewClient(cfg config.TushareConfig) *Client {
-	c := &Client{
-		token:         cfg.Token,
-		baseURL:       cfg.BaseURL,
-		httpClient:    &http.Client{Timeout: 60 * time.Second},
-		maxRetries:    cfg.MaxRetries,
-		retryInterval: time.Duration(cfg.RetryInterval) * time.Second,
-	}
+// Option 可选配置项。
+type Option func(*Client)
 
-	// 构造令牌桶限流器
-	if cfg.RateLimit > 0 {
-		c.quit = make(chan struct{})
-		// 桶容量只容纳调度并发, 不等于每分钟配额:
-		// 容量取配额会让整分钟的请求在一次突发里全部打完, 分钟级限制形同不存在
-		capacity := burstTokens
-		if cfg.RateLimit < capacity {
-			capacity = cfg.RateLimit
+// WithHTTPClient 注入自定义 *http.Client（单测用）。
+func WithHTTPClient(h *http.Client) Option { return func(c *Client) { c.httpClient = h } }
+
+// WithRetryPolicy 设置重试次数与基础退避。
+func WithRetryPolicy(maxRetries int, baseBackoff time.Duration) Option {
+	return func(c *Client) {
+		if maxRetries >= 0 {
+			c.maxRetries = maxRetries
 		}
-		c.rateBucket = make(chan struct{}, capacity)
-		// 按配置速率匀速补充令牌, 由补充速度决定长期吞吐
-		interval := rateLimitWindow / time.Duration(cfg.RateLimit)
-		go c.refillTicker(interval)
+		if baseBackoff > 0 {
+			c.baseBackoff = baseBackoff
+		}
 	}
+}
 
+// NewClient 构造 Tushare 客户端。
+//   - token: tushare.token（必填）
+//   - baseURL: tushare.base_url（缺省 http://api.tushare.pro）
+//   - ratePerMin: tushare.rate_per_min（令牌桶速率，缺省 200）
+func NewClient(token, baseURL string, ratePerMin int, opts ...Option) *Client {
+	if baseURL == "" {
+		baseURL = "http://api.tushare.pro"
+	}
+	if ratePerMin <= 0 {
+		ratePerMin = 200
+	}
+	c := &Client{
+		token:       token,
+		baseURL:     baseURL,
+		httpClient:  &http.Client{Timeout: 30 * time.Second},
+		limiter:     rate.NewLimiter(rate.Limit(float64(ratePerMin)/60.0), ratePerMin),
+		maxRetries:  5,
+		baseBackoff: time.Second,
+		rateWindow:  60 * time.Second,
+	}
+	for _, o := range opts {
+		o(c)
+	}
 	return c
 }
 
-// Close 停止限流令牌补充 goroutine
-// 进程内短生命周期 Client (如每次手动触发数据更新) 用完必须调用, 否则每次 NewClient 泄漏一个 goroutine
-func (c *Client) Close() {
-	if c.quit != nil {
-		c.closeOnce.Do(func() { close(c.quit) })
-	}
+type tushareRequest struct {
+	API    string                 `json:"api_name"`
+	Token  string                 `json:"token"`
+	Params map[string]interface{} `json:"params"`
+	Fields string                 `json:"fields,omitempty"`
 }
 
-// refillTicker 启动一个定时器, 按固定间隔向令牌桶补充令牌
-func (c *Client) refillTicker(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-c.quit:
-			return
-		case <-ticker.C:
-			select {
-			case c.rateBucket <- struct{}{}:
-				// 成功放入一个令牌
-			default:
-				// 桶已满, 丢弃本次令牌
-			}
-		}
-	}
+type tushareResponse struct {
+	Code int          `json:"code"`
+	Msg  string       `json:"msg"`
+	Data *tushareData `json:"data"`
 }
 
-// waitForToken 阻塞等待获取一个令牌(若启用了限流)
-func (c *Client) waitForToken() {
-	if c.rateBucket != nil {
-		<-c.rateBucket
-	}
+type tushareData struct {
+	Fields  []string        `json:"fields"`
+	Items   [][]interface{} `json:"items"`
+	HasMore bool            `json:"has_more"`
+	Count   int             `json:"count"`
 }
 
-// call 通用请求入口, 包含限流与指数退避重试
-// apiName: Tushare 接口名; params: 接口参数; fields: 需返回的字段(逗号分隔, 可空)
+// Call 发起一次 Tushare 接口调用，内置：
+//  1. 令牌桶限流（limiter.Wait）
+//  2. 错误分类（Classify）：永久错误不重试直接返回；频率/瞬时错误按策略退避重试
 //
-// 只有"重试可能成功"的错误才重试: 权限/参数/日配额类错误重试只是白烧请求数与当天计次。
-func (c *Client) call(apiName string, params map[string]interface{}, fields string) (*Response, error) {
-	retries := c.maxRetries
-	if retries < 0 {
-		retries = 0
-	}
-
+// 成功返回 (fields, items)。失败返回 *APIError（含 Kind）。
+func (c *Client) Call(ctx context.Context, apiName string, params map[string]interface{}, fields ...string) ([]string, [][]interface{}, error) {
 	var lastErr error
-	var waitBeforeNext time.Duration // 0 = 用默认指数退避
-	for attempt := 0; attempt <= retries; attempt++ {
-		// 重试时进行退避等待
-		if attempt > 0 {
-			wait := waitBeforeNext
-			if wait == 0 {
-				wait = retry.Backoff(c.retryInterval, attempt)
-			}
-			logger.L().Warnf("tushare %s 第 %d 次重试, 等待 %s: %v", apiName, attempt, wait, lastErr)
-			time.Sleep(wait)
+	for attempt := 0; attempt <= c.maxRetries; attempt++ {
+		if err := c.limiter.Wait(ctx); err != nil {
+			return nil, nil, fmt.Errorf("tushare 限流等待被取消: %w", err)
 		}
-		waitBeforeNext = 0
+		fieldsOut, items, callErr := c.do(ctx, apiName, params, fields...)
+		if callErr == nil {
+			return fieldsOut, items, nil
+		}
 
-		c.waitForToken()
+		apiErr, ok := callErr.(*APIError)
+		if !ok {
+			apiErr = &APIError{API: apiName, Code: 0, Msg: callErr.Error(), Kind: KindTransient, Err: callErr}
+		}
+		lastErr = apiErr
 
-		resp, err := c.doRequest(apiName, params, fields)
-		if err != nil {
-			lastErr = err
-			logger.L().Warnf("tushare %s 请求失败(第 %d 次): %v", apiName, attempt+1, err)
-			continue
-		}
-		if resp.Code != 0 {
-			apiErr := classify(apiName, resp.Code, resp.Msg)
-			if apiErr.Permanent {
-				return nil, fmt.Errorf("%w (不重试: %s)", apiErr, apiErr.Reason)
+		switch apiErr.Kind {
+		case KindPermanent:
+			// 无权限/接口名错/积分不足：不重试，直接由上层告警
+			return nil, nil, apiErr
+		case KindRateLimited:
+			if werr := sleepCtx(ctx, c.rateWindow); werr != nil {
+				return nil, nil, werr
 			}
-			lastErr = apiErr
-			if apiErr.RateLimited {
-				// 分钟级限制: 指数退避的那几秒跨不出时间窗, 等满一个窗口再试
-				waitBeforeNext = rateLimitWindow
+		case KindTransient:
+			backoff := c.baseBackoff * time.Duration(1<<uint(attempt))
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
 			}
-			continue
+			if werr := sleepCtx(ctx, backoff); werr != nil {
+				return nil, nil, werr
+			}
 		}
-		return resp, nil
 	}
-
-	return nil, fmt.Errorf("tushare 请求 %s 重试 %d 次后仍失败: %w", apiName, retries, lastErr)
+	return nil, nil, lastErr
 }
 
-// doRequest 执行一次 HTTP POST 请求并解析响应
-func (c *Client) doRequest(apiName string, params map[string]interface{}, fields string) (*Response, error) {
-	reqBody := Request{
-		APIName: apiName,
-		Token:   c.token,
-		Params:  params,
-		Fields:  fields,
+// do 执行单次 HTTP 请求并解析 Tushare 响应（不重试）。
+func (c *Client) do(ctx context.Context, apiName string, params map[string]interface{}, fields ...string) ([]string, [][]interface{}, error) {
+	reqBody := tushareRequest{API: apiName, Token: c.token, Params: params}
+	if len(fields) > 0 {
+		reqBody.Fields = strings.Join(fields, ",")
 	}
-	bodyBytes, err := json.Marshal(reqBody)
+	payload, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("序列化请求失败: %w", err)
+		return nil, nil, &APIError{API: apiName, Kind: KindTransient, Msg: "请求序列化失败", Err: err}
 	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL, bytes.NewReader(payload))
+	if err != nil {
+		return nil, nil, &APIError{API: apiName, Kind: KindTransient, Msg: "构造请求失败", Err: err}
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
 
-	req, err := http.NewRequest(http.MethodPost, c.baseURL, bytes.NewReader(bodyBytes))
+	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("创建请求失败: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("HTTP 请求失败: %w", err)
+		return nil, nil, &APIError{API: apiName, Code: 0, Msg: "网络错误", Kind: KindTransient, Err: err}
 	}
 	defer resp.Body.Close()
-
-	raw, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("读取响应失败: %w", err)
+		return nil, nil, &APIError{API: apiName, Kind: KindTransient, Msg: "读取响应失败", Err: err}
 	}
+	var tr tushareResponse
+	if err := json.Unmarshal(body, &tr); err != nil {
+		return nil, nil, &APIError{API: apiName, Kind: KindTransient, Msg: "响应 JSON 解析失败", Err: err}
+	}
+	if tr.Code != 0 {
+		kind := Classify(tr.Code)
+		return nil, nil, &APIError{API: apiName, Code: tr.Code, Msg: tr.Msg, Kind: kind}
+	}
+	if tr.Data == nil {
+		return []string{}, [][]interface{}{}, nil
+	}
+	return tr.Data.Fields, tr.Data.Items, nil
+}
 
-	var tushareResp Response
-	if err := json.Unmarshal(raw, &tushareResp); err != nil {
-		return nil, fmt.Errorf("解析响应失败: %w, body=%s", err, string(raw))
+// sleepCtx 可被 ctx 取消的 sleep。
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
 	}
-	return &tushareResp, nil
 }
