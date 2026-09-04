@@ -2,85 +2,86 @@ package signal
 
 import (
 	"context"
-	"fmt"
-	"math"
 
 	"jingzhe-trader/internal/model"
-	"jingzhe-trader/internal/risk"
 )
 
-// BuyRuleName 买入规则名（signal.rule 取值）。
-const BuyRuleName = "buy_trend"
-
-// BuyConfirmer 买入候选终审接口（用户决策：LLM 只做买入候选终审）。
-// Batch 3 只提供直接放行的默认实现；Batch 4 接入 DeepSeek 实现（不触网约束由实现方保证）。
-type BuyConfirmer interface {
-	// Confirm 对单个买入候选做终审。返回 false 表示否决该候选（不产生信号）。
-	Confirm(ctx context.Context, candidate BuyCandidate) (bool, error)
+// BuyDecider 买入决策接口 —— 由 llm.Reviewer 实现。
+//
+// 用户拍板（2026-09-03 决策 1）：买什么、买多少由 LLM 定，风控只做硬截断。
+// 因此本接口是买入链上唯一的"要不要买"，规则证据只是它的输入。
+//
+// 批量而非逐只（用户拍板 2026-09-03 第四轮）：筛选后的候选一次性交给模型。
+// 逐只问会把 5 条 prompt 变成 5N 次调用，联网那一条还要把上下文重烧 N 遍。
+type BuyDecider interface {
+	// DecideBatch 对整批候选出一次裁决，返回按 ts_code 索引的结论。
+	// 某个标的在 map 里缺失 = 没问出结果（按失败处理，不是"模型说不要买"）。
+	DecideBatch(ctx context.Context, req BatchRequest) (map[string]BuyDecision, error)
+	// Enabled 是否真的有决策者在跑。false 意味着当日不可能有买单，必须显式可见。
+	Enabled() bool
 }
 
-// BuyCandidate 终审输入：选股结果 + 股票名称。
-type BuyCandidate struct {
-	Result model.ScreenResult
-	Name   string
-}
-
-// PassThroughConfirmer 默认终审：直接放行（不触网，Batch 4 替换为 LLM 实现）。
-type PassThroughConfirmer struct{}
-
-// Confirm 直接放行。
-func (PassThroughConfirmer) Confirm(context.Context, BuyCandidate) (bool, error) {
-	return true, nil
-}
-
-// BarSeries 单只股票的指标输入（升序）：前复权收盘与成交量（手）。
+// BarSeries 单只股票的指标输入（按日期升序）：Closes 前复权收盘（元）、
+// Vols 成交量（手）、Raws 未复权收盘（分）。
+// Raws 单独留着是为了算真实成交额（复权价乘出来的成交额在除权日会失真）。
 type BarSeries struct {
 	Closes []float64
 	Vols   []float64
+	Raws   []float64
 }
 
-// 买入触发阈值（趋势确认，ARCHITECTURE §2.8 buy.go）。
-const (
-	volRatioMin = 1.2 // 量能 ≥ 5 日均量 ×1.2
-	minBars     = 20  // MA20 所需最少根数
-)
-
-// EvalBuy 单候选买入规则评估：
-// 趋势确认（MA5 > MA20 且 量比 ≥ 1.2）且置信度 ≥ 档位下限 → 生成买入信号。
-// 未触发或数据不足返回 nil。
-func EvalBuy(c BuyCandidate, bs BarSeries, p risk.RiskParams) *model.Signal {
-	if len(bs.Closes) < minBars || len(bs.Vols) < minBars {
-		return nil // 数据不足：不产生信号（由调用方记降级，不静默丢弃候选本身）
-	}
-	ma5, ma20 := MA5MA20(bs.Closes)
-	if math.IsNaN(ma20) || ma5 <= ma20 {
-		return nil
-	}
-	vr := VolumeRatio(bs.Vols)
-	if vr < volRatioMin {
-		return nil
-	}
-	confidence := c.Result.Score / 100
-	if confidence < p.MinConfidence {
-		return nil // 置信度不足：规则未触发（批次风控侧还有同名校验，双保险）
-	}
-	ref := c.Result.Close
-	if ref <= 0 {
-		return nil
-	}
-	sig := &model.Signal{
-		TradeDate:  c.Result.TradeDate,
-		TsCode:     c.Result.TsCode,
-		Name:       c.Name,
-		Direction:  model.DirBuy,
-		Rule:       BuyRuleName,
-		Confidence: confidence,
-		RefPrice:   ref,
-		Reason: fmt.Sprintf("综合分 %.1f；MA5 %.2f > MA20 %.2f，量比 %.2f（≥%.1f）",
-			c.Result.Score, ma5, ma20, vr, volRatioMin),
-		Status: "new",
-	}
-	sig.Payload = fmt.Sprintf(`{"rank":%d,"score":%.2f,"ma5":%.4f,"ma20":%.4f,"vol_ratio":%.4f}`,
-		c.Result.Rank, c.Result.Score, ma5, ma20, vr)
-	return sig
+// BatchRequest 一批买入评审的输入：当日全部候选（同一天只问一次）。
+type BatchRequest struct {
+	TradeDate string
+	Items     []BuyRequest
 }
+
+// BuyRequest 单只候选的评审输入。
+type BuyRequest struct {
+	TradeDate string
+	Candidate model.Candidate
+	Bars      BarSeries
+	Rules     RuleEvidence
+	RulesOK   bool      // false = 窗口不足以算证据，必须把这句话原样告诉模型
+	Budget    BuyBudget // 风控口径的钱与额度：模型给的权重会被它截断
+}
+
+// BuyBudget 本次决策可用的钱（分）。模型只在给定额度内表达意愿，越界由风控斩掉。
+type BuyBudget struct {
+	CashFen    model.Fen // 可用现金
+	SlotFen    model.Fen // 单票上限（含单笔金额上限取严后的较小值）
+	LotCostFen model.Fen // 一手成本
+	Positions  int       // 当前持仓只数
+	MaxPos     int       // 档位允许的最大持仓只数
+}
+
+// BuyDecision 模型的裁决。
+//
+// WeightPct 是"拟投入占总资产比例"（0~1），不是股数 —— 换成整手股数、扣现金、
+// 卡单票上限是风控的活。置信度低于档位下限会被风控拒（见 risk.Manager）。
+// 止损价不由模型给：日内扫描与指令单止损价一律按档位参数算，
+// 模型放宽止损就等于让硬风控失效。
+type BuyDecision struct {
+	Approve    bool
+	WeightPct  float64
+	Confidence float64
+	Reason     string
+	Failed     bool // true = 评审没问出结果（调用/解析失败），不是"评审认为不该买"
+}
+
+// NoDecider 模型未启用时的决策器：一律不买。
+//
+// 存在的意义是把"没有决策者"变成显式事实，而不是偷偷退回规则信号那条老路。
+type NoDecider struct{}
+
+// DecideBatch 永远整批不批。
+func (NoDecider) DecideBatch(_ context.Context, req BatchRequest) (map[string]BuyDecision, error) {
+	out := make(map[string]BuyDecision, len(req.Items))
+	for _, it := range req.Items {
+		out[it.Candidate.TsCode] = BuyDecision{Reason: "llm.enabled=false，无决策者，当日不开新仓"}
+	}
+	return out, nil
+}
+
+// Enabled 恒为 false：这个实现的存在本身就是"没有决策者"的表达。
+func (NoDecider) Enabled() bool { return false }

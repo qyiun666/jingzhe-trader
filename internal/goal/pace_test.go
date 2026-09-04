@@ -13,11 +13,11 @@ func TestAggressiveDenied(t *testing.T) {
 	s := PaceSettings{Policy: PolicyAggressive, MaxBoostPct: 0.10, BudgetBelow: 0.30}
 
 	cases := []struct {
-		name    string
-		m       GoalMetrics
-		confirm string
-		today   string
-		wantOK  bool
+		name     string
+		m        GoalMetrics
+		confirm  string
+		today    string
+		wantOK   bool
 		wantCode string
 	}{
 		{"allowed_when_confirmed_and_budget_ok", GoalMetrics{PaceGap: 0.20, BudgetConsumed: 0.10}, "20260102", "20260102", false, ""},
@@ -49,9 +49,9 @@ func TestAggressivePaceApply(t *testing.T) {
 	base := risk.RiskParams{MaxTotalPositionPct: 0.90}
 
 	cases := []struct {
-		name  string
-		pace  AggressivePace
-		want  float64
+		name string
+		pace AggressivePace
+		want float64
 	}{
 		{"boost_5pct", AggressivePace{PaceGap: 0.20, BudgetConsumed: 0.10, MaxBoostPct: 0.05, BudgetBelow: 0.30, Confirmed: true}, 0.90 * 1.05},
 		{"boost_capped_to_10pct", AggressivePace{PaceGap: 0.20, BudgetConsumed: 0.10, MaxBoostPct: 0.20, BudgetBelow: 0.30, Confirmed: true}, 0.90 * 1.10},

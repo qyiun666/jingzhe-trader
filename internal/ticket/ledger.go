@@ -3,6 +3,8 @@ package ticket
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -10,15 +12,16 @@ import (
 	"jingzhe-trader/internal/config"
 	"jingzhe-trader/internal/market"
 	"jingzhe-trader/internal/model"
+	"jingzhe-trader/internal/observability"
 	"jingzhe-trader/internal/store"
 )
 
 // Ledger 成交回执记账：加权成本、可卖量（T+1）、现金推算、组合同步、本金 write-once。
 //
 // 核心契约（验收 #10/#11/#12/#14）：
-//   - fill.ticket_id 唯一约束 → 同一单据重复回执天然幂等（第二次零写入）；
-//   - fill + position + ticket 状态在同一事务内，任一失败整体回滚并上抛；
-//   - 现金不单独落库，由本金与成交历史推算（cash = 本金 − Σ买入总成本 + Σ卖出净到账）。
+//   - 一单最多一回执（成交列就在指令单行上）→ 以 reported_at 非空判重，重复回执天然幂等；
+//   - 成交列写回 + 持仓更新在同一事务内，任一失败整体回滚并上抛；
+//   - 现金不单独落库，由本金/现金锚点与成交历史推算（cash = 锚点 − Σ买入总成本 + Σ卖出净到账）。
 type Ledger struct {
 	st             *store.Store
 	cost           market.CostParams
@@ -60,12 +63,8 @@ func (l *Ledger) ReportFill(ctx context.Context, req FillRequest) (FillResult, e
 		return FillResult{}, fmt.Errorf("%w: ticket_id=%d: %v", ErrTicketNotFound, req.TicketID, err)
 	}
 	// 幂等先行：该单据已有回执 → 直接返回既有成交，账本零改动（验收 #10）
-	existing, found, err := l.st.TradeRepo().FillByTicket(ctx, req.TicketID)
-	if err != nil {
-		return FillResult{}, err
-	}
-	if found {
-		return FillResult{Fill: existing, Duplicate: true}, nil
+	if t.HasFill() {
+		return FillResult{Fill: t.FillView(), Duplicate: true}, nil
 	}
 	if t.Status.IsTerminal() {
 		return FillResult{}, fmt.Errorf("回执失败: 指令单 %d 已处于终态 %s", t.ID, t.Status)
@@ -82,76 +81,36 @@ func (l *Ledger) ReportFill(ctx context.Context, req FillRequest) (FillResult, e
 		actor = "manual"
 	}
 
-	fill := model.Fill{
-		TicketID:    t.ID,
-		TsCode:      t.TsCode,
-		Direction:   t.Direction,
-		Qty:         req.Qty,
-		Price:       req.Price,
-		Amount:      amount,
-		Commission:  tc.Commission,
-		StampTax:    tc.StampTax,
-		TransferFee: tc.TransferFee,
-		TotalCost:   tc.TotalCost,
-		TradeDate:   t.TradeDate,
-		ReportedBy:  actor,
-		ReportedAt:  now,
-		Note:        req.Note,
-	}
+	// 成交回执就是指令单这一行的成交列（一单最多一回执），在其副本上填好后整体写回
+	f := t
+	f.FillQty = req.Qty
+	f.FillPrice = req.Price
+	f.TotalCost = tc.TotalCost // 含费合计；金额与三项费用由使用处现算，不落列
+	f.ReportedBy = actor
+	f.ReportedAt = now
+	f.Note = req.Note
 
 	var result FillResult
 	err = store.WithTx(ctx, l.st.WriteDB(), func(tx *sqlx.Tx) error {
-		// 1) 写 fill（ticket_id 唯一，冲突即重复回执 → 幂等命中零写入）
-		res, err := tx.NamedExecContext(ctx,
-			`INSERT INTO fill (ticket_id, ts_code, direction, qty, price, amount, commission, stamp_tax, transfer_fee, total_cost, trade_date, reported_by, reported_at, note)
-			 VALUES (:ticket_id, :ts_code, :direction, :qty, :price, :amount, :commission, :stamp_tax, :transfer_fee, :total_cost, :trade_date, :reported_by, :reported_at, :note)`,
-			fill)
-		if err != nil {
-			return fmt.Errorf("写入成交回执 %d 失败: %w", t.ID, err)
+		// 1) 成交列 + 终态状态一次写回指令单行
+		if err := store.RecordFillTx(ctx, tx, f, model.TicketFilled); err != nil {
+			return err
 		}
-		if n, _ := res.RowsAffected(); n == 0 {
-			// 重复回执：幂等命中。读取既有成交返回，账本零改动。
-			var existing model.Fill
-			if err := tx.GetContext(ctx, &existing, "SELECT * FROM fill WHERE ticket_id = ?", t.ID); err != nil {
-				return fmt.Errorf("读取既有回执 %d 失败: %w", t.ID, err)
-			}
-			result.Fill = existing
-			result.Duplicate = true
-			return nil
-		}
-		if id, err := res.LastInsertId(); err == nil {
-			fill.ID = id
-		}
-
 		// 2) 更新持仓（加权成本 / T+1 可卖量）
 		if err := l.applyPosition(ctx, tx, t, req, tc); err != nil {
 			return err
 		}
-
-		// 3) 指令单状态 → filled
-		now := time.Now().UTC().Format(time.RFC3339)
-		if _, err := tx.ExecContext(ctx,
-			"UPDATE order_ticket SET status=?, updated_at=?, closed_at=? WHERE id=?",
-			string(model.TicketFilled), now, now, t.ID); err != nil {
-			return fmt.Errorf("更新指令单 %d 为 filled 失败: %w", t.ID, err)
-		}
-
-		// 4) 审计
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO action_log (trade_date, actor, object_type, object_id, action, before_value, after_value, reason, created_at)
-			 VALUES (?, ?, 'order_ticket', ?, 'fill', ?, ?, ?, ?)`,
-			t.TradeDate, actor, fmt.Sprintf("%d", t.ID),
-			string(model.TicketIssued), string(model.TicketFilled),
-			fmt.Sprintf("回执 %d 股 @ %s 分", int64(req.Qty), req.Price), now); err != nil {
-			return fmt.Errorf("写入回执审计日志失败: %w", err)
-		}
-
-		result.Fill = fill
+		result.Fill = f.FillView()
 		return nil
 	})
 	if err != nil {
 		return FillResult{}, err // 账本失败上抛，禁止降级继续（§11.1）
 	}
+	// 成交事实已在指令单行上（reported_* 与 fill_* 列），此处只留一行日志，不再另入库。
+	observability.S().Infow("成交回执已登记",
+		"ticket_id", t.ID, "date", t.TradeDate, "ts_code", t.TsCode,
+		"direction", string(t.Direction), "qty", int64(req.Qty), "price", int64(req.Price),
+		"total_cost", int64(tc.TotalCost), "reported_by", actor)
 	return result, nil
 }
 
@@ -159,11 +118,10 @@ func (l *Ledger) ReportFill(ctx context.Context, req FillRequest) (FillResult, e
 func (l *Ledger) applyPosition(ctx context.Context, tx *sqlx.Tx, t model.OrderTicket, req FillRequest, tc market.TradeCost) error {
 	var pos model.Position
 	err := tx.GetContext(ctx, &pos,
-		"SELECT ts_code, total_qty, available_qty, today_bought, cost_price, high_price, first_open_date, updated_at FROM position WHERE ts_code=?",
+		"SELECT ts_code, total_qty, today_bought, cost_price, high_price, COALESCE(first_open_date,'') AS first_open_date FROM position WHERE ts_code=?",
 		t.TsCode)
-	now := time.Now().UTC().Format(time.RFC3339)
-	if err != nil {
-		pos = model.Position{TsCode: t.TsCode} // 新建仓
+	if err != nil || pos.TotalQty <= 0 {
+		pos = model.Position{TsCode: t.TsCode} // 新建仓（读不到行或残留的清仓行）
 	}
 	switch t.Direction {
 	case model.DirBuy:
@@ -171,7 +129,7 @@ func (l *Ledger) applyPosition(ctx context.Context, tx *sqlx.Tx, t model.OrderTi
 		newTotal := pos.TotalQty.Add(req.Qty)
 		pos.CostPrice = oldCost.Add(tc.TotalCost).DivQty(newTotal) // (旧成本×旧量 + 成交额 + 费用) / 新量
 		pos.TotalQty = newTotal
-		pos.TodayBought = pos.TodayBought.Add(req.Qty) // T+1：available_qty 不增
+		pos.TodayBought = pos.TodayBought.Add(req.Qty) // T+1：今日买入不可卖
 		if req.Price > pos.HighPrice {
 			pos.HighPrice = req.Price
 		}
@@ -182,59 +140,94 @@ func (l *Ledger) applyPosition(ctx context.Context, tx *sqlx.Tx, t model.OrderTi
 		if pos.TotalQty < req.Qty {
 			return fmt.Errorf("回执失败: 卖出 %d 股超过持仓 %d 股 (%s)", int64(req.Qty), int64(pos.TotalQty), t.TsCode)
 		}
+		// 只减总量：可卖量恒等于 total_qty − today_bought，卖出天然先消耗可卖部分。
 		pos.TotalQty = pos.TotalQty.Sub(req.Qty)
-		pos.AvailableQty = pos.AvailableQty.Sub(req.Qty)
-		if pos.AvailableQty < 0 {
-			pos.AvailableQty = 0
-		}
 	}
-	pos.UpdatedAt = now
-	const q = `INSERT INTO position (ts_code, total_qty, available_qty, today_bought, cost_price, high_price, first_open_date, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(ts_code) DO UPDATE SET
-			total_qty=excluded.total_qty, available_qty=excluded.available_qty, today_bought=excluded.today_bought,
-			cost_price=excluded.cost_price, high_price=excluded.high_price, first_open_date=excluded.first_open_date, updated_at=excluded.updated_at`
-	if _, err := tx.ExecContext(ctx, q,
-		pos.TsCode, int64(pos.TotalQty), int64(pos.AvailableQty), int64(pos.TodayBought),
-		int64(pos.CostPrice), int64(pos.HighPrice), pos.FirstOpenDate, pos.UpdatedAt); err != nil {
+	if err := store.UpsertPositionTx(ctx, tx, pos); err != nil {
 		return fmt.Errorf("更新持仓 %s 失败: %w", pos.TsCode, err)
 	}
 	return nil
 }
 
-// SettleT1 T+1 结转（每日 09:25）：available_qty += today_bought，today_bought 归零（验收 #12）。
-// 返回结转的持仓行数。
+// SettleT1 T+1 结转（每日 09:00）：把"昨天买的"从 today_bought 里清掉，可卖量随之变成全部持仓。
+// 只写这一列：available 不落库，结转就是"昨天买的今天不算是今天买的了"。
+//
+// 判据是成交日而不是"有没有 today_bought"：当天补跑一次 morning_plan，
+// 或按历史日期补跑，都会把当天刚买的股票解锁成可卖 —— 那是直接绕过 T+1。
 func (l *Ledger) SettleT1(ctx context.Context, date string) (int, error) {
 	positions, err := l.st.TradeRepo().ListPositions(ctx)
 	if err != nil {
 		return 0, err
 	}
+	lastBuy, err := l.st.TradeRepo().LastBuyDates(ctx)
+	if err != nil {
+		return 0, err
+	}
 	n := 0
-	now := time.Now().UTC().Format(time.RFC3339)
 	for _, pos := range positions {
 		if pos.TodayBought <= 0 {
 			continue
 		}
-		// 结转后今日买入成为可卖：available = T1Available(total, 0) = total
-		avail := market.T1Available(pos.TotalQty, 0)
-		const q = `UPDATE position SET available_qty=?, today_bought=0, updated_at=? WHERE ts_code=?`
-		if _, err := l.st.WriteDB().ExecContext(ctx, q, int64(avail), now, pos.TsCode); err != nil {
+		if d := lastBuy[pos.TsCode]; d != "" && d >= date {
+			continue // 这批就是结转日当天（或之后补记）买的，仍然不可卖
+		}
+		const q = `UPDATE position SET today_bought=0 WHERE ts_code=?`
+		if _, err := l.st.WriteDB().ExecContext(ctx, q, pos.TsCode); err != nil {
+			observability.S().Errorw("T+1 结转失败", "ts_code", pos.TsCode, "date", date, "err", err.Error())
 			return n, fmt.Errorf("T+1 结转 %s 失败: %w", pos.TsCode, err)
 		}
+		observability.S().Infow("T+1 结转", "ts_code", pos.TsCode, "date", date,
+			"settled_qty", int64(pos.TodayBought))
 		n++
 	}
 	return n, nil
 }
 
-// Cash 推算可用现金：本金 − Σ买入总成本 + Σ卖出净到账。
-// 现金不单独落库（单一数据源原则：成交历史是唯一事实）。不做截断，
-// 负值即真实透支信号（正常情况下风控的现金核算会先于透支拦截）。
+// 现金锚点两个 config 键：组合同步（券商口径校准）写入，Cash() 读取。
+// 存 config_kv 而不是建新表 —— 它就是一个事实："某天券商说我还剩这么多现金"。
+const (
+	keyCashAnchor     = "account.cash_anchor"      // 锚点时刻的可用现金（分）
+	keyCashAnchorDate = "account.cash_anchor_date" // 锚点所属交易日 YYYYMMDD
+)
+
+// Cash 推算可用现金，两种口径按有没有锚点自动切换：
+//   - 有锚点（做过组合同步）：锚点现金 + 锚点之后成交的净变动。校准进来的持仓没有成交单支撑，
+//     它的成本已经扣在锚点现金里，不能再从本金里减一遍；
+//   - 无锚点（纯成交历史驱动，正常跑起来的账户）：本金 − Σ买入总成本 + Σ卖出净到账。
+//
+// 不做截断，负值即真实透支信号（正常情况下风控的现金核算会先于透支拦截）。
 func (l *Ledger) Cash(ctx context.Context) (model.Fen, error) {
-	buyCost, sellProceeds, err := l.st.TradeRepo().FillTotals(ctx)
+	raw, err := config.NewRepo(l.st).RawAll(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("读取现金锚点失败: %w", err)
+	}
+	anchor, anchorDate, err := cashAnchor(raw)
 	if err != nil {
 		return 0, err
 	}
+	buyCost, sellProceeds, err := l.st.TradeRepo().FillTotals(ctx, anchorDate)
+	if err != nil {
+		return 0, err
+	}
+	if anchorDate != "" {
+		return anchor - buyCost + sellProceeds, nil
+	}
 	return l.initialCapital - buyCost + sellProceeds, nil
+}
+
+// cashAnchor 读现金锚点。没有锚点日期＝从未做过组合同步，返回 ("") 让调用方走纯成交口径；
+// 但日期在位而金额解析不了＝这个键被写坏了，必须报错——静默换口径等于现金口径被悄悄改掉。
+func cashAnchor(raw map[string]string) (model.Fen, string, error) {
+	date := strings.TrimSpace(raw[keyCashAnchorDate])
+	if date == "" {
+		return 0, "", nil
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(raw[keyCashAnchor]), 10, 64)
+	if err != nil {
+		return 0, "", fmt.Errorf("%s=%q 不是整数（锚点日期 %s 已在位，不能当没有锚点）: %w",
+			keyCashAnchor, raw[keyCashAnchor], date, err)
+	}
+	return model.Fen(n), date, nil
 }
 
 // PortfolioInput 组合同步输入（MCP sync_portfolio：以券商实际持仓为准校准账本）。
@@ -247,69 +240,112 @@ type PortfolioInput struct {
 	HighPrice    model.Fen
 }
 
-// SyncPortfolio 以券商实际持仓校准账本，并做本金 write-once：
-//   - initial_capital 已非零 → 拒绝覆盖本金，落 action_log 拒绝记录（验收 #14），持仓照常同步；
-//   - initial_capital 为零 → 写入本金（首次）。
+// PortfolioSync 一次组合同步的全部输入（口径以券商为准）。
+type PortfolioSync struct {
+	Date    string    // 锚点所属交易日 YYYYMMDD
+	Capital model.Fen // 本金 = 期初总资产（含持仓成本）；write-once
+	Cash    model.Fen // 券商口径的可用现金：必填，缺了持仓成本会被双算
+	Items   []PortfolioInput
+	Actor   string
+}
+
+// SyncPortfolio 以券商实际持仓校准账本：写持仓 + 写现金锚点 + 本金 write-once。
+//
+//   - Cash 必须 >0：校准进来的持仓没有成交单支撑，只有同时给出当时的可用现金，
+//     现金推算才不会把这笔持仓成本再算成可用资金（原缺陷：同步持仓后总资产虚增一份成本）；
+//   - 本金已非零 → 拒绝覆盖，返回 rejected=true（验收 #14），持仓与现金照常同步；
+//   - Items 为空 = 只校准资金口径（本金 + 现金锚点），不动任何持仓行。
 //
 // 返回同步的持仓行数与"本金是否被拒绝覆盖"。
-func (l *Ledger) SyncPortfolio(ctx context.Context, tradeDate string, capital model.Fen, items []PortfolioInput, actor string) (int, bool, error) {
-	now := time.Now().UTC().Format(time.RFC3339)
+func (l *Ledger) SyncPortfolio(ctx context.Context, in PortfolioSync) (int, bool, error) {
+	if in.Cash <= 0 {
+		return 0, false, fmt.Errorf("组合同步失败: 必须给出券商口径的可用现金，" +
+			"否则校准进来的持仓成本会被双算成可用资金")
+	}
+	actor := in.Actor
 	if actor == "" {
 		actor = "manual"
 	}
-	// 本金 write-once（config account.initial_capital）
-	rejected := false
-	repo := config.NewRepo(l.st)
-	raw, err := repo.RawAll(ctx)
+	rejected, err := l.applyCapital(ctx, in.Date, in.Capital, actor)
 	if err != nil {
-		return 0, false, fmt.Errorf("读取配置失败: %w", err)
+		return 0, rejected, err
 	}
-	if row, ok := raw["account.initial_capital"]; ok && row.Value != "" && row.Value != "0" {
-		capitalRaw := fmt.Sprintf("%d", int64(capital))
-		if row.Value != capitalRaw {
-			rejected = true
-			if err := l.st.OpsRepo().InsertActionLog(ctx, model.ActionLog{
-				TradeDate:   tradeDate,
-				Actor:       actor,
-				ObjectType:  "account",
-				ObjectID:    "initial_capital",
-				Action:      "rejected_overwrite",
-				BeforeValue: row.Value,
-				AfterValue:  capitalRaw,
-				Reason:      "initial_capital 为 write-once 配置，拒绝覆盖（如需修正请走人工复核流程）",
-				CreatedAt:   now,
-			}); err != nil {
-				return 0, false, fmt.Errorf("写入本金拒绝审计日志失败: %w", err)
-			}
-		}
-	} else if capital > 0 {
-		if err := repo.Set(ctx, "account.initial_capital", fmt.Sprintf("%d", int64(capital)), actor); err != nil {
-			return 0, false, fmt.Errorf("写入初始本金失败: %w", err)
-		}
-		l.initialCapital = capital
+	if err := l.applyCashAnchor(ctx, in.Date, in.Cash, actor); err != nil {
+		return 0, rejected, err
 	}
-	// 持仓校准
 	n := 0
-	for _, it := range items {
+	for _, it := range in.Items {
 		if it.TsCode == "" {
 			return n, rejected, fmt.Errorf("组合同步失败: 第 %d 项缺少 ts_code", n+1)
 		}
 		pos := model.Position{
-			TsCode:       it.TsCode,
-			TotalQty:     it.TotalQty,
-			AvailableQty: it.AvailableQty,
-			TodayBought:  it.TodayBought,
-			CostPrice:    it.CostPrice,
-			HighPrice:    it.HighPrice,
-			UpdatedAt:    now,
+			TsCode:      it.TsCode,
+			TotalQty:    it.TotalQty,
+			TodayBought: it.TodayBought,
+			CostPrice:   it.CostPrice,
+			HighPrice:   it.HighPrice,
 		}
-		if pos.AvailableQty == 0 && pos.TodayBought > 0 {
-			pos.AvailableQty = market.T1Available(pos.TotalQty, pos.TodayBought)
+		// 库里只有 total 与 today 两个量：券商只给了可卖量时按差额反推今日买入量，
+		// 两个都给时以今日买入量为准（可卖量此后一律由 total − today 现算）。
+		if pos.TodayBought <= 0 && it.AvailableQty > 0 && it.TotalQty > it.AvailableQty {
+			pos.TodayBought = it.TotalQty.Sub(it.AvailableQty)
+		}
+		if pos.HighPrice <= 0 {
+			pos.HighPrice = it.CostPrice // 校准进来的票没有历史高点，用成本起算回撤基准
 		}
 		if err := l.st.TradeRepo().UpsertPosition(ctx, pos); err != nil {
 			return n, rejected, err
 		}
 		n++
 	}
+	observability.S().Infow("组合同步完成", "date", in.Date, "actor", actor,
+		"positions", n, "cash_anchor_yuan", in.Cash.Float(),
+		"capital_rejected", rejected)
 	return n, rejected, nil
+}
+
+// applyCapital 本金 write-once（config account.initial_capital）。
+//
+// 量纲是"元"：app.InitialCapitalOf 按元读这个键，原先把分直接写进去会让本金放大 100 倍。
+// 返回"是否因已配置而拒绝覆盖"。
+func (l *Ledger) applyCapital(ctx context.Context, date string, capital model.Fen, actor string) (bool, error) {
+	repo := config.NewRepo(l.st)
+	raw, err := repo.RawAll(ctx)
+	if err != nil {
+		return false, fmt.Errorf("读取配置失败: %w", err)
+	}
+	yuan := strconv.FormatInt(int64(capital)/100, 10)
+	existing, set := raw["account.initial_capital"]
+	if set && existing != "" && existing != "0" {
+		if existing == yuan {
+			return false, nil
+		}
+		// 拒绝覆盖已随返回值 rejected 显式告知调用方（MCP 响应字段 capital_rejected），
+		// 旧值原样留在 config_kv，不再另入轨迹表。
+		observability.S().Warnw("本金 write-once 拒绝覆盖",
+			"date", date, "actor", actor,
+			"existing_yuan", existing, "requested_yuan", yuan,
+			"reason", "initial_capital 为 write-once 配置，如需修正请走人工复核流程")
+		return true, nil
+	}
+	if capital <= 0 {
+		return false, nil // 没给本金就不动这个键（只首次写入）
+	}
+	if err := repo.Set(ctx, "account.initial_capital", yuan); err != nil {
+		return false, fmt.Errorf("写入初始本金失败: %w", err)
+	}
+	l.initialCapital = capital
+	return false, nil
+}
+
+// applyCashAnchor 写现金锚点（分）与它所属的交易日：锚点之前的成交视为已含在这笔现金里。
+func (l *Ledger) applyCashAnchor(ctx context.Context, date string, cash model.Fen, actor string) error {
+	repo := config.NewRepo(l.st)
+	if err := repo.Set(ctx, keyCashAnchor, strconv.FormatInt(int64(cash), 10)); err != nil {
+		return fmt.Errorf("写入现金锚点失败: %w", err)
+	}
+	if err := repo.Set(ctx, keyCashAnchorDate, date); err != nil {
+		return fmt.Errorf("写入现金锚点日期失败: %w", err)
+	}
+	return nil
 }

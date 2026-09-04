@@ -4,50 +4,44 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 
 	"github.com/bensema/gotdx"
 	"github.com/bensema/gotdx/types"
 	"jingzhe-trader/internal/model"
+	"jingzhe-trader/internal/observability"
 )
 
-// GotdxSource gotdx 实时行情主源。
+// GotdxSource gotdx 实时行情源（全系统唯一实现，不再有 Source 接口：
+// 备用源已删，也没有任何测试需要 mock 它 —— 行情只能通过真接口验证）。
 type GotdxSource struct {
-	client   *gotdx.Client
-	fallback Source // 降级备用源（腾讯）
-	cacheMu  sync.Mutex
-	cache    map[string]Quote
-	onStale  func(code, reason string) // 行情过时（兜底缓存）告警回调
+	client *gotdx.Client
 }
 
-// NewGotdxSource 构造 gotdx 主源；fallback 为可选降级源（通常为腾讯）。
-func NewGotdxSource(fallback Source) *GotdxSource {
-	return &GotdxSource{
-		client:   gotdx.New(),
-		fallback: fallback,
-		cache:    make(map[string]Quote),
-	}
+// NewGotdxSource 构造 gotdx 行情源。
+func NewGotdxSource() *GotdxSource {
+	return &GotdxSource{client: gotdx.New()}
 }
 
-// SetStaleHook 设置行情过时（兜底缓存）告警回调。
-func (s *GotdxSource) SetStaleHook(hook func(code, reason string)) {
-	s.onStale = hook
-}
-
-// Fetch 拉取实时报价：主节点不可达自动切最快节点；失败降级腾讯；再失败返回缓存价（不触发止损）。
+// Fetch 拉取实时报价：任一标的没取到价即整体失败。
+//
+// 没有备用源、没有缓存兜底：盘中拿不到当前价就只能报"取不到价"，
+// 拿旧价继续跑等于用昨天的价格判断今天的止损，宁可不判断。
 func (s *GotdxSource) Fetch(ctx context.Context, tsCodes []string) (map[string]Quote, error) {
-	if err := s.connect(ctx); err != nil {
-		return s.degrade(ctx, tsCodes, fmt.Sprintf("gotdx 连接失败: %v", err))
+	if len(tsCodes) == 0 {
+		return map[string]Quote{}, nil
+	}
+	if err := s.connect(); err != nil {
+		return nil, fmt.Errorf("gotdx 连接失败: %w", err)
 	}
 	markets, codes := splitMarkets(tsCodes)
 	reply, err := s.client.GetSecurityQuotes(markets, codes)
 	if err != nil {
-		return s.degrade(ctx, tsCodes, fmt.Sprintf("gotdx 行情失败: %v", err))
+		return nil, fmt.Errorf("gotdx 行情失败: %w", err)
 	}
 	res := make(map[string]Quote, len(tsCodes))
 	for _, q := range reply.List {
 		ts := normalizeCode(q.Code, q.Market)
-		qq := Quote{
+		res[ts] = Quote{
 			TsCode:     ts,
 			Price:      model.FromFloat(q.Close),
 			PreClose:   model.FromFloat(q.PreClose),
@@ -57,92 +51,58 @@ func (s *GotdxSource) Fetch(ctx context.Context, tsCodes []string) (map[string]Q
 			ServerTime: q.ServerTime,
 			Source:     "gotdx",
 		}
-		res[ts] = qq
-		s.cacheMu.Lock()
-		s.cache[ts] = qq
-		s.cacheMu.Unlock()
 	}
-	// 未返回的标的用缓存兜底
-	s.fillFromCache(res, tsCodes)
-	if len(res) == 0 {
-		return s.degrade(ctx, tsCodes, "gotdx 返回空行情")
+	if missing := missingCodes(tsCodes, res); len(missing) > 0 {
+		return nil, fmt.Errorf("gotdx 未返回 %d/%d 个标的的报价: %s",
+			len(missing), len(tsCodes), strings.Join(missing, ","))
+	}
+	// 0 价同样算没拿到价：停牌、退市整理、代码写错都会以 0 出现，
+	// 放过去等于这只持仓今天不判止损。
+	var zero []string
+	for _, c := range tsCodes {
+		if res[c].Price <= 0 {
+			zero = append(zero, c)
+		}
+	}
+	if len(zero) > 0 {
+		return nil, fmt.Errorf("gotdx 返回 %d 个 0 价标的（停牌或代码无效）: %s",
+			len(zero), strings.Join(firstN(zero, 5), ","))
 	}
 	return res, nil
 }
 
-// connect 连接并在主节点不可达时自动探测切换最快节点。
-func (s *GotdxSource) connect(ctx context.Context) error {
-	if _, err := s.client.Connect(); err != nil {
-		if _, ferr := s.client.FastestHost(); ferr == nil {
-			// 重新连接会使用连接顺序中最快可达节点
-			if _, cerr := s.client.Connect(); cerr == nil {
-				return nil
-			}
+// missingCodes 返回请求了但没拿到报价的标的（按请求顺序）。
+func missingCodes(requested []string, got map[string]Quote) []string {
+	var out []string
+	for _, c := range requested {
+		if _, ok := got[c]; !ok {
+			out = append(out, c)
 		}
-		return err
 	}
+	return out
+}
+
+// firstN 错误信息只列前 n 个代码，避免整仓停牌时把轨迹 detail 撑爆。
+func firstN(items []string, n int) []string {
+	if len(items) <= n {
+		return items
+	}
+	return items[:n]
+}
+
+// connect 连接；默认节点不可达时探测并切到最快可达节点（同一个源，不是备用源）。
+func (s *GotdxSource) connect() error {
+	if _, err := s.client.Connect(); err == nil {
+		return nil
+	}
+	if _, ferr := s.client.FastestHost(); ferr != nil {
+		return fmt.Errorf("主节点不可达且最快节点探测失败: %w", ferr)
+	}
+	if _, cerr := s.client.Connect(); cerr != nil {
+		return fmt.Errorf("切换最快节点后仍连接失败: %w", cerr)
+	}
+	observability.S().Warnw("gotdx 已切换到最快节点", "reason", "默认节点连接失败")
 	return nil
-}
-
-// degrade 降级路径：先尝试备用源，再尝试缓存兜底。
-func (s *GotdxSource) degrade(ctx context.Context, tsCodes []string, reason string) (map[string]Quote, error) {
-	if s.fallback != nil {
-		if r, ferr := s.fallback.Fetch(ctx, tsCodes); ferr == nil || len(r) > 0 {
-			s.mergeCache(r)
-			if s.onStale != nil {
-				s.onStale("QUOTE_DEGRADED", reason)
-			}
-			return r, nil
-		}
-	}
-	res := s.snapshotCache(tsCodes)
-	if len(res) > 0 {
-		if s.onStale != nil {
-			s.onStale("QUOTE_STALE", reason)
-		}
-		return res, nil
-	}
-	return nil, fmt.Errorf("行情全部失败: %s", reason)
-}
-
-// fillFromCache 用缓存兜底补齐 gotdx 未返回的标的。
-func (s *GotdxSource) fillFromCache(res map[string]Quote, tsCodes []string) {
-	s.cacheMu.Lock()
-	defer s.cacheMu.Unlock()
-	for _, code := range tsCodes {
-		if _, ok := res[code]; !ok {
-			if c, ok2 := s.cache[code]; ok2 {
-				c2 := c
-				c2.Source = "cache"
-				res[code] = c2
-				if s.onStale != nil {
-					s.onStale("QUOTE_STALE", fmt.Sprintf("标的 %s 使用缓存价", code))
-				}
-			}
-		}
-	}
-}
-
-func (s *GotdxSource) mergeCache(r map[string]Quote) {
-	s.cacheMu.Lock()
-	defer s.cacheMu.Unlock()
-	for k, v := range r {
-		s.cache[k] = v
-	}
-}
-
-func (s *GotdxSource) snapshotCache(tsCodes []string) map[string]Quote {
-	s.cacheMu.Lock()
-	defer s.cacheMu.Unlock()
-	res := make(map[string]Quote, len(tsCodes))
-	for _, code := range tsCodes {
-		if c, ok := s.cache[code]; ok {
-			c2 := c
-			c2.Source = "cache"
-			res[code] = c2
-		}
-	}
-	return res
 }
 
 // splitMarkets 将 ts_code 拆分为 gotdx 的 market(uint8) 与 code(6位)。

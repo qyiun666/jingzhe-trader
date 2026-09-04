@@ -15,9 +15,11 @@ type PaceSettings struct {
 }
 
 // AggressivePace 激进落后策略（goal.pace_policy = aggressive，§8.3 三重保护）：
-//  ① 放大幅度 +10% 封顶（MaxBoostPct 超过 0.10 一律截断到 0.10）；
-//  ② 仅在 BudgetConsumed < BudgetBelow 时允许加成；
-//  ③ 每日人工确认续期（Confirmed = pace_confirm_date == today），过期自动回落档位原值。
+//
+//	① 放大幅度 +10% 封顶（MaxBoostPct 超过 0.10 一律截断到 0.10）；
+//	② 仅在 BudgetConsumed < BudgetBelow 时允许加成；
+//	③ 每日人工确认续期（Confirmed = pace_confirm_date == today），过期自动回落档位原值。
+//
 // 未落后（PaceGap < 0.15）不加码；被拒时回落档位原值（等于无 pace 加成）。
 type AggressivePace struct {
 	PaceGap        float64
@@ -80,13 +82,13 @@ func AggressiveDenied(s PaceSettings, m GoalMetrics, paceConfirmDate, today stri
 
 // 策略名常量（与 config goal.pace_policy 取值一致）。
 const (
-	PolicyUnrestricted  = "unrestricted"
-	PolicyConservative  = "conservative"
-	PolicyAggressive    = "aggressive"
+	PolicyUnrestricted = "unrestricted"
+	PolicyConservative = "conservative"
+	PolicyAggressive   = "aggressive"
 )
 
 // NewPaceAdjust 装配落后策略为 risk.PaceAdjust（Resolve 链路的最后一个参数变换器）。
-// paceConfirmDate 为 goal_state.pace_confirm_date；today 为本次评估交易日。
+// paceConfirmDate 为 goal.state 的 pace_confirm_date；today 为本次评估交易日。
 func NewPaceAdjust(s PaceSettings, m GoalMetrics, paceConfirmDate, today string) risk.PaceAdjust {
 	switch strings.TrimSpace(s.Policy) {
 	case PolicyConservative:

@@ -45,21 +45,21 @@ var KeySpecs = []KeySpec{
 	{Key: "mail.smtp_port", Type: TypeInt, Default: "465", RefuseZero: true},
 
 	// ---------- 服务 / 鉴权 ----------
-	{Key: "server.host", Type: TypeString, Default: "127.0.0.1"},
-	{Key: "server.port", Type: TypeInt, Default: "8787"},
+	// 监听地址由 serve 子命令的 -addr 决定，不设配置键（避免两处入口互相误导）。
 	{Key: "server.api_token", Type: TypeSecret, Secret: true, Required: true},
 
 	// ---------- 账户 ----------
 	{Key: "account.initial_capital", Type: TypeInt, Default: "0", WriteOnce: true},
-	{Key: "account.cash", Type: TypeInt, Default: "0"},
+	// 现金锚点：持仓是按券商口径校准进来的（没有成交单支撑），只按"本金 − 成交"推现金
+	// 会把这笔持仓成本双算成可用资金。组合同步时把当时的可用现金落成锚点，
+	// 此后只把锚点交易日之后成交的净变动加回去。两键都由 sync_portfolio / init 写入。
+	{Key: "account.cash_anchor", Type: TypeInt, Default: "0"},
+	{Key: "account.cash_anchor_date", Type: TypeString, Default: ""},
 
 	// ---------- 风控 ----------
-	{Key: "risk.max_total_position_pct", Type: TypeFloat, Default: "0.90", RefuseZero: true},
-	{Key: "risk.max_position_pct", Type: TypeFloat, Default: "0.40", RefuseZero: true},
+	// 仓位上限 / 持仓数 / 止损只由 risk.GearTable 按档位给出（Resolve 无条件覆盖），
+	// 不作为配置键暴露；这里只留档位无关、确实生效的两个旋钮。
 	{Key: "risk.max_sector_pct", Type: TypeFloat, Default: "0.50", RefuseZero: true},
-	{Key: "risk.max_positions", Type: TypeInt, Default: "0"},
-	{Key: "risk.stop_loss_pct", Type: TypeFloat, Default: "0.08", RefuseZero: true},
-	{Key: "risk.trailing_stop_pct", Type: TypeFloat, Default: "0.05", RefuseZero: true},
 	{Key: "risk.take_profit_pct", Type: TypeFloat, Default: "0.15", RefuseZero: true},
 
 	// ---------- 交易成本 ----------
@@ -68,19 +68,18 @@ var KeySpecs = []KeySpec{
 	{Key: "cost.stamp_tax_rate", Type: TypeFloat, Default: "0.001"},
 	{Key: "cost.transfer_fee_rate", Type: TypeFloat, Default: "0.00001"},
 
-	// ---------- 交易 ----------
-	{Key: "trading.min_trade_amount", Type: TypeInt, Default: "3000"},
-
 	// ---------- 选股 ----------
-	{Key: "screen.enabled", Type: TypeBool, Default: "true"},
+	// 单笔最小金额门槛见 risk.DefaultMinSingleAmountFen（由风控参数生效），此处不设重复键；
+	// 候选每日重算，无跨日保留期概念。
 	{Key: "screen.top_n", Type: TypeInt, Default: "20", RefuseZero: true},
-	{Key: "screen.candidate_keep_days", Type: TypeInt, Default: "10", RefuseZero: true},
 	{Key: "screen.min_circ_mv_w", Type: TypeFloat, Default: "500000", RefuseZero: true},
 	{Key: "screen.min_turnover_rate", Type: TypeFloat, Default: "1.0", RefuseZero: true},
 	{Key: "screen.price_low", Type: TypeFloat, Default: "2.0", RefuseZero: true},
-	{Key: "screen.price_high", Type: TypeFloat, Default: "100.0", RefuseZero: true},
 	{Key: "screen.pe_ttm_max", Type: TypeFloat, Default: "80.0", RefuseZero: true},
 	{Key: "screen.pb_max", Type: TypeFloat, Default: "10.0", RefuseZero: true},
+	{Key: "screen.min_list_days", Type: TypeInt, Default: "60"},
+	{Key: "screen.sector_top_k", Type: TypeInt, Default: "8", RefuseZero: true},
+	{Key: "screen.min_sector_members", Type: TypeInt, Default: "30", RefuseZero: true},
 	{Key: "screen.min_bar_rows", Type: TypeInt, Default: "5000"},
 
 	// ---------- 季度目标 ----------
@@ -96,38 +95,33 @@ var KeySpecs = []KeySpec{
 	{Key: "goal.lock_at_progress", Type: TypeFloat, Default: "1.00", RefuseZero: true},
 	{Key: "goal.lock_budget_below", Type: TypeFloat, Default: "0.70", RefuseZero: true},
 
-	// ---------- LLM ----------
-	{Key: "llm.enabled", Type: TypeBool, Default: "false"},
+	// ---------- LLM（买入决策者，不是可选增强）----------
+	// 默认开：关掉它当日不会有任何买单 —— 买什么、买多少由它定，风控只做硬截断。
+	{Key: "llm.enabled", Type: TypeBool, Default: "true"},
 	{Key: "llm.api_key", Type: TypeSecret, Secret: true},
 	{Key: "llm.base_url", Type: TypeString, Default: "https://api.deepseek.com/v1"},
-	{Key: "llm.model", Type: TypeString, Default: "deepseek-chat"},
+	{Key: "llm.model", Type: TypeString, Default: "deepseek-v4-flash"},
+	// 只对挂了 web_search 的消息面维度有意义。以前"问不出结果就降档重试"是误诊：
+	// 真因是请求没传 max_output_tokens（见 llm.maxOutputTokens），预算修好后一档到底。
+	{Key: "llm.search_context_size", Type: TypeString, Default: "high"},
 
-	// ---------- 调度（PRD §5.2 时间线）----------
-	{Key: "scheduler.daily_check", Type: TypeString, Default: "07:00"},
-	{Key: "scheduler.premarket", Type: TypeString, Default: "08:30"},
-	{Key: "scheduler.t1_settle", Type: TypeString, Default: "09:25"},
-	{Key: "scheduler.data_sync", Type: TypeString, Default: "15:05"},
-	{Key: "scheduler.data_retry", Type: TypeString, Default: "15:25,15:50,16:30"},
-	{Key: "scheduler.snapshot", Type: TypeString, Default: "15:20"},
-	{Key: "scheduler.screener", Type: TypeString, Default: "15:30"},
-	{Key: "scheduler.signal", Type: TypeString, Default: "15:50"},
-	{Key: "scheduler.ticket_mail", Type: TypeString, Default: "16:10"},
-	{Key: "scheduler.cleanup", Type: TypeString, Default: "16:40"},
-	{Key: "scheduler.daily_report", Type: TypeString, Default: "20:00"},
+	// ---------- 调度（scheduler.BuildJobs 逐键读取）----------
+	// 五个触发点：09:00 计划 / 盘中扫描 / 16:30 流水线 / 17:00 待买卖邮件 / 18:00 日报。
+	// 盘中扫描窗口（09:30-11:30、13:00-15:00）与保留清理（并入 18:00 日报之后）都不设键。
+	{Key: "scheduler.morning", Type: TypeString, Default: "09:00"},
+	{Key: "scheduler.pipeline", Type: TypeString, Default: "16:30"},
+	{Key: "scheduler.mail_pending", Type: TypeString, Default: "17:00"},
+	{Key: "scheduler.report", Type: TypeString, Default: "18:00"},
 
 	// ---------- 保留策略（§3.9）----------
-	{Key: "retention.bar_years", Type: TypeInt, Default: "3"},
-	{Key: "retention.fina_quarters", Type: TypeInt, Default: "8"},
-	{Key: "retention.mf_days", Type: TypeInt, Default: "60"},
-	{Key: "retention.screen_days", Type: TypeInt, Default: "90"},
-	{Key: "retention.signal_days", Type: TypeInt, Default: "365"},
-	{Key: "retention.alert_days", Type: TypeInt, Default: "180"},
-	{Key: "retention.job_days", Type: TypeInt, Default: "90"},
-	{Key: "retention.mail_days", Type: TypeInt, Default: "30"},
-	{Key: "retention.llm_days", Type: TypeInt, Default: "90"},
-	{Key: "retention.log_days", Type: TypeInt, Default: "30"},
+	{Key: "retention.bar_days", Type: TypeInt, Default: "45"},
+	// 停牌集合（config_kv 的 suspend:<日期> 一行）只在选股当日读一次，无回测/复算路径，
+	// 留 3 天只是给跨天重跑留余量。
+	{Key: "retention.suspend_days", Type: TypeInt, Default: "3"},
+	// 任务、告警、发信已并成一张 run_trace，共用一个窗口。
+	{Key: "retention.trace_days", Type: TypeInt, Default: "90"},
 
-	// ---------- 看门狗 ----------
+	// ---------- 通知收件人（逗号分隔；M1~M5 与告警邮件共用）----------
 	{Key: "watch.mail_to", Type: TypeString},
 }
 

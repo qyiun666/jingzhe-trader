@@ -1,33 +1,24 @@
 package market
 
-import "jingzhe-trader/internal/model"
+import (
+	"strings"
 
-// ===================== 涨跌停 / 停牌 / 整手 / T+1 规则 =====================
-// 涨跌停判定用 stk_limit 价格字段，绝不依赖状态编码猜测（D1）。
+	"jingzhe-trader/internal/model"
+)
 
-// IsLimitUp 是否涨停（价格 ≥ 涨停价）。
-func IsLimitUp(price, upLimit model.Fen) bool {
-	return price >= upLimit
-}
+// ===================== 停牌 / 整手 / T+1 规则 =====================
 
-// IsLimitDown 是否跌停（价格 ≤ 跌停价）。
-func IsLimitDown(price, downLimit model.Fen) bool {
-	return price <= downLimit
-}
-
-// IsSuspended 是否停牌（suspend 标记）。
-func IsSuspended(suspended bool) bool {
-	return suspended
-}
-
-// CanBuy 涨停禁买：涨停时不可买入。
-func CanBuy(price, upLimit model.Fen) bool {
-	return !IsLimitUp(price, upLimit)
-}
-
-// CanSell 跌停禁卖：跌停时不可卖出。
-func CanSell(price, downLimit model.Fen) bool {
-	return !IsLimitDown(price, downLimit)
+// IsSTName 是否 ST / *ST / 退市整理：只看名称前缀。
+//
+// 不落 is_st 列的原因是名称就是唯一真相源 —— 戴帽摘帽先反映在名称上，Tushare 的
+// stock_basic 接口又带 name 字段，另存一个布尔只会出现"名称已摘帽、标记还是 ST"。
+func IsSTName(name string) bool {
+	n := strings.ToUpper(strings.Join(strings.Fields(name), "")) // 去掉全部空白
+	n = strings.TrimPrefix(n, "*")                               // *ST
+	for strings.HasPrefix(n, "S") && !strings.HasPrefix(n, "ST") {
+		n = strings.TrimPrefix(strings.TrimPrefix(n, "S"), "*") // SST / S*ST
+	}
+	return strings.HasPrefix(n, "ST") || strings.Contains(n, "退")
 }
 
 // RoundLotDown 向下取整到 100 股。
@@ -38,18 +29,4 @@ func RoundLotDown(q model.Qty) model.Qty {
 // RoundLotUp 向上取整到 100 股。
 func RoundLotUp(q model.Qty) model.Qty {
 	return q.RoundLotUp()
-}
-
-// T1Available T+1 可卖量 = 总持仓 − 当日买入。
-func T1Available(total, todayBought model.Qty) model.Qty {
-	avail := total - todayBought
-	if avail < 0 {
-		avail = 0
-	}
-	return avail
-}
-
-// MinTradeAmountOK 是否满足最小交易金额门槛（amount 为金额分）。
-func MinTradeAmountOK(amount model.Fen, minAmount model.Fen) bool {
-	return amount >= minAmount
 }

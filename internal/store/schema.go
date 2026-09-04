@@ -6,419 +6,154 @@ import (
 	"github.com/jmoiron/sqlx"
 )
 
-// schemaDDL 全部建表 DDL（幂等 IF NOT EXISTS），严格对应 ARCHITECTURE §3 定义。
-// 共 28 张表：配置(1) + 市场(9) + 财务(3) + 选股信号(4) + 交易(4) + 目标(2)
-// + 运维(4) + LLM(1)。字段与 §3 逐字段一致，禁止自行增删。
+// schemaDDL 全部建表 DDL（幂等 IF NOT EXISTS）。共 7 张表，本文件即结构的唯一真相源
+// （迁移体系已删除：库不跨版本升级，就没有第二份结构需要调和）。
+//
+//	状态 1  config_kv    key→value：配置键 + 单行状态 + 当日集合
+//	市场 3  trade_cal    stock_basic    daily_bar
+//	交易 2  order_ticket position
+//	轨迹 1  run_trace    任务 / 邮件 / 告警 / LLM 调用，一天一件事一行
+//
+// 建表的判据有两条，缺一律不建：
+//  1. 有点名的读者（哪个函数按什么条件读它）；
+//  2. 粒度或保留窗口与已有表不同 —— 字段长得像不算理由，能从别的表或本表别的列算出来的
+//     数就不落库（"一个数据只存一处"）。
+//
+// 按这两条折叠掉的三张表（不是删信息，是换存放位置）：
+//   - llm_call → run_trace：唯一键 (trade_date, ts_code, prompt_key) 就是 run_trace 的
+//     UNIQUE(trade_date, subject)，status 就是 outcome，窗口同为 90 天。见 repo_llm.go：
+//     subject = llm:<标的>:<prompt_key>，结论与理由序列化进 detail。
+//   - suspend_d → config_kv：两个读者都只要"当日停牌代码集合"，一天一行
+//     suspend:<YYYYMMDD> 存逗号分隔代码。见 MarketRepo.SaveSuspended。
+//   - goal_state → config_kv：只有一行、且每次写都整行覆盖（没有按列更新、没有按列查询）。
+//     见 repo_goal.go 的 goal.state 键。
+//   - daily_basic → stock_basic：估值截面每票每日一份，但全项目只有"选股当日"这一个读者，
+//     没有任何历史复算路径读旧日期；它与 stock_basic 同为"按 ts_code 的当前快照"，合并后
+//     省一张表、两个索引、一条保留规则。代价：补跑旧一日选股时估值是更新的，故 screener
+//     显式核对 val_date，不匹配就报数据不符而不是拿新估值凑。
+//
+// 明确不入库的数据：
+//   - 选股过程产物（候选、信号、漏斗计数）：选股是一条顺序流水线，中间结果在内存里交给
+//     决策环节，每级进出数写日志。落库的结果只有指令单。
+//   - 过程状态（任务尝试次数、耗时、产出物明细、降级清单、告警已读标记）：并入 run_trace
+//     的 outcome + detail 两列，一次写覆盖一行。
+//   - 邮件发件队列：发信同步一次，结果写一行 run_trace。不再跨进程补发 —— 那是为
+//     "SMTP 半夜挂了"设计的机制，而 SMTP 挂掉会在当日轨迹里显式失败。
+//   - 成交表：一单最多一回执（原 fill.ticket_id 的 UNIQUE 约束即为此），成交字段直接落在
+//     order_ticket 行上，避免 ts_code/direction/trade_date 三列从单据抄写。
+//   - 派生值一律不落列（存了就会出现两处不一致）：可用数量 = total_qty − today_bought；
+//     成交金额 = fill_qty × fill_price；三项费用 = 金额 × 费率配置；前后交易日 = 日历行序；
+//     是否 ST = 股票名称前缀；现金余额 = 本金/锚点 − Σ含费成交合计。
+//   - 日线开高低走、涨跌幅、成交额、复权因子：全链路零消费者。量比由 vol_lot 现算，
+//     均线由 index 收盘现算。
+//   - 指数独立表：与 daily_bar 同形同窗口、代码不重叠，直接共用 daily_bar。
+//   - 停牌并入 daily_bar：实测 190 行停牌记录里 145 行当日没有对应日线（停牌股不出线），
+//     而这 145 行正是覆盖缺口闸门豁免"该有却没行情"的依据，并列会把它丢掉。
+//   - 涨跌停价、个股资金流、财务快照、账户日终快照、档位变更历史、资产净值曲线、新闻公告：
+//     见 ARCHITECTURE §3 各条删表理由。
 var schemaDDL = []string{
-	// ===================== 3.1 配置域 =====================
+	// ===================== 配置与状态 =====================
+	// 只有两列：类型/凭据标记/改动人与时间都不存 —— 类型的唯一真相源是代码里的键目录
+	// （config.KeySpecs），库里那份镜像零读者；谁改了配置走服务日志。
+	// 除配置键外还承载三类机器写入的状态：goal.state、suspend:<YYYYMMDD>、
+	// account.cash_anchor*。它们不进键目录，config set 拒绝写、config dump 不显示。
 	`CREATE TABLE IF NOT EXISTS config_kv (
-		key         TEXT PRIMARY KEY,
-		value       TEXT NOT NULL,
-		value_type  TEXT NOT NULL DEFAULT 'string',
-		is_secret   INTEGER NOT NULL DEFAULT 0,
-		updated_at  TEXT NOT NULL,
-		updated_by  TEXT NOT NULL DEFAULT 'system'
+		key   TEXT PRIMARY KEY,
+		value TEXT NOT NULL
 	)`,
-	`CREATE INDEX IF NOT EXISTS idx_config_secret ON config_kv(is_secret)`,
 
-	// ===================== 3.2 市场域 =====================
+	// ===================== 市场 =====================
+	// 只存"这天开不开市"。前后交易日按 cal_date 行序现算（market.PrevTradeDay/NextTradeDay），
+	// 原 pretrade_date/nexttrade_date 是从 Tushare 抄回来却没人读的镜像。
+	// synthetic 唯一的读者是"真实日历续上以后整批清掉补齐行重建"。
 	`CREATE TABLE IF NOT EXISTS trade_cal (
-		cal_date        TEXT PRIMARY KEY,
-		is_open         INTEGER NOT NULL,
-		pretrade_date   TEXT,
-		nexttrade_date  TEXT,
-		exchange        TEXT NOT NULL DEFAULT 'SSE'
+		cal_date  TEXT PRIMARY KEY,
+		is_open   INTEGER NOT NULL,
+		synthetic INTEGER NOT NULL DEFAULT 0
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_cal_open_date ON trade_cal(is_open, cal_date)`,
 
+	// 每只票一行的当前快照：静态属性 + 最近一个交易日的估值截面（val_date 标注是哪天）。
+	// 指数不在本表（指数没有估值口径），只在 daily_bar 里有线。
+	// 是否 ST 不落列：ST 判定看名称前缀（market.IsSTName），名称就是唯一真相源。
 	`CREATE TABLE IF NOT EXISTS stock_basic (
-		ts_code      TEXT PRIMARY KEY,
-		symbol       TEXT NOT NULL,
-		name         TEXT NOT NULL,
-		market       TEXT,
-		exchange     TEXT,
-		industry     TEXT,
-		list_date    TEXT,
-		delist_date  TEXT,
-		is_st        INTEGER NOT NULL DEFAULT 0,
-		list_status  TEXT,
-		updated_at   TEXT NOT NULL
+		ts_code       TEXT PRIMARY KEY,
+		name          TEXT NOT NULL,
+		industry      TEXT,
+		list_date     TEXT,
+		list_status   TEXT,
+		val_date      TEXT,
+		turnover_rate REAL,
+		pe_ttm        REAL,
+		pb            REAL,
+		circ_mv_w     REAL
 	)`,
-	`CREATE INDEX IF NOT EXISTS idx_stock_industry ON stock_basic(industry)`,
 
+	// 个股与指数共用：指数代码（000001.SH 等）不与个股重叠，指数的 vol_lot/raw_close 为 0。
+	// 主键 (ts_code, trade_date) 已覆盖所有以 ts_code 打头的查询，不再另建 ts_code 索引。
 	`CREATE TABLE IF NOT EXISTS daily_bar (
 		ts_code     TEXT NOT NULL,
 		trade_date  TEXT NOT NULL,
-		open        INTEGER NOT NULL,
-		high        INTEGER NOT NULL,
-		low         INTEGER NOT NULL,
 		close       INTEGER NOT NULL,
-		pre_close   INTEGER NOT NULL,
-		pct_chg     REAL,
 		vol_lot     REAL,
-		amount_k    REAL,
-		adj_factor  REAL,
 		raw_close   INTEGER NOT NULL DEFAULT 0,
 		PRIMARY KEY (ts_code, trade_date)
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_bar_date ON daily_bar(trade_date)`,
-	`CREATE INDEX IF NOT EXISTS idx_bar_code ON daily_bar(ts_code)`,
 
-	`CREATE TABLE IF NOT EXISTS daily_basic (
-		ts_code        TEXT NOT NULL,
-		trade_date     TEXT NOT NULL,
-		close          INTEGER,
-		turnover_rate  REAL,
-		volume_ratio   REAL,
-		pe             REAL,
-		pe_ttm         REAL,
-		pb             REAL,
-		ps_ttm         REAL,
-		dv_ratio       REAL,
-		total_mv_w     REAL,
-		circ_mv_w      REAL,
-		PRIMARY KEY (ts_code, trade_date)
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_basic_date ON daily_basic(trade_date)`,
-
-	`CREATE TABLE IF NOT EXISTS stk_limit (
-		ts_code     TEXT NOT NULL,
-		trade_date  TEXT NOT NULL,
-		up_limit    INTEGER NOT NULL,
-		down_limit  INTEGER NOT NULL,
-		PRIMARY KEY (ts_code, trade_date)
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_limit_date ON stk_limit(trade_date)`,
-
-	`CREATE TABLE IF NOT EXISTS suspend_d (
-		ts_code        TEXT NOT NULL,
-		trade_date     TEXT NOT NULL,
-		suspend_type   TEXT,
-		suspend_timing TEXT,
-		PRIMARY KEY (ts_code, trade_date)
-	)`,
-
-	`CREATE TABLE IF NOT EXISTS adj_factor (
-		ts_code    TEXT NOT NULL,
-		trade_date TEXT NOT NULL,
-		adj_factor REAL NOT NULL,
-		PRIMARY KEY (ts_code, trade_date)
-	)`,
-
-	`CREATE TABLE IF NOT EXISTS index_daily (
-		ts_code    TEXT NOT NULL,
-		trade_date TEXT NOT NULL,
-		close      INTEGER NOT NULL,
-		ma20       REAL,
-		PRIMARY KEY (ts_code, trade_date)
-	)`,
-
-	`CREATE TABLE IF NOT EXISTS moneyflow (
-		ts_code         TEXT NOT NULL,
-		trade_date      TEXT NOT NULL,
-		buy_elg_amount  REAL,
-		sell_elg_amount REAL,
-		net_mf_amount   REAL,
-		PRIMARY KEY (ts_code, trade_date)
-	)`,
-
-	// ===================== 3.3 财务域（慢路径）=====================
-	`CREATE TABLE IF NOT EXISTS fina_indicator (
-		ts_code            TEXT NOT NULL,
-		end_date           TEXT NOT NULL,
-		ann_date           TEXT NOT NULL,
-		eps                REAL,
-		roe                REAL,
-		roe_dt             REAL,
-		grossprofit_margin REAL,
-		netprofit_margin   REAL,
-		debt_to_assets     REAL,
-		netprofit_yoy      REAL,
-		or_yoy             REAL,
-		bps                REAL,
-		PRIMARY KEY (ts_code, end_date)
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_fina_ann ON fina_indicator(ann_date)`,
-	`CREATE INDEX IF NOT EXISTS idx_fina_code ON fina_indicator(ts_code)`,
-
-	`CREATE TABLE IF NOT EXISTS fina_sync_state (
-		id              INTEGER PRIMARY KEY CHECK (id = 1),
-		status          TEXT NOT NULL,
-		cursor_ts_code  TEXT,
-		total           INTEGER NOT NULL DEFAULT 0,
-		done            INTEGER NOT NULL DEFAULT 0,
-		failed          INTEGER NOT NULL DEFAULT 0,
-		started_at      TEXT,
-		finished_at     TEXT
-	)`,
-
-	`CREATE TABLE IF NOT EXISTS fina_sync_item (
-		ts_code           TEXT PRIMARY KEY,
-		last_sync_end_date TEXT,
-		status            TEXT NOT NULL,
-		attempts          INTEGER NOT NULL DEFAULT 0,
-		last_error        TEXT,
-		updated_at        TEXT NOT NULL
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_fina_item_status ON fina_sync_item(status)`,
-
-	// ===================== 3.4 选股与信号域 =====================
-	`CREATE TABLE IF NOT EXISTS screen_result (
-		trade_date     TEXT NOT NULL,
-		ts_code        TEXT NOT NULL,
-		rank           INTEGER NOT NULL,
-		score          REAL NOT NULL,
-		f_momentum     REAL NOT NULL DEFAULT 0,
-		f_quality      REAL NOT NULL DEFAULT 0,
-		f_value        REAL NOT NULL DEFAULT 0,
-		f_lowvol       REAL NOT NULL DEFAULT 0,
-		f_liquidity    REAL NOT NULL DEFAULT 0,
-		close          INTEGER NOT NULL,
-		circ_mv_w      REAL,
-		pe_ttm         REAL,
-		pb             REAL,
-		turnover_rate  REAL,
-		reason         TEXT,
-		PRIMARY KEY (trade_date, ts_code)
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_screen_date_rank ON screen_result(trade_date, rank)`,
-
-	`CREATE TABLE IF NOT EXISTS signal (
-		id          INTEGER PRIMARY KEY AUTOINCREMENT,
-		trade_date  TEXT NOT NULL,
-		ts_code     TEXT NOT NULL,
-		name        TEXT NOT NULL,
-		direction   TEXT NOT NULL,
-		rule        TEXT NOT NULL,
-		confidence  REAL,
-		ref_price   INTEGER NOT NULL,
-		reason      TEXT NOT NULL,
-		payload     TEXT,
-		status      TEXT NOT NULL DEFAULT 'new',
-		reject_rule TEXT,
-		reject_msg  TEXT,
-		created_at  TEXT NOT NULL,
-		UNIQUE (trade_date, ts_code, direction, rule)
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_signal_date ON signal(trade_date, status)`,
-
-	`CREATE TABLE IF NOT EXISTS screen_funnel (
-		trade_date      TEXT NOT NULL,
-		stage           INTEGER NOT NULL,
-		stage_name      TEXT NOT NULL,
-		passed_in       INTEGER NOT NULL,
-		passed_out      INTEGER NOT NULL,
-		dropped         INTEGER NOT NULL,
-		drop_reasons    TEXT,
-		thresholds      TEXT,
-		PRIMARY KEY (trade_date, stage)
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_funnel_date ON screen_funnel(trade_date, stage)`,
-
-	`CREATE TABLE IF NOT EXISTS screen_watchlist (
-		trade_date      TEXT NOT NULL,
-		ts_code         TEXT NOT NULL,
-		rank            INTEGER NOT NULL,
-		score           REAL NOT NULL,
-		reason          TEXT,
-		PRIMARY KEY (trade_date, ts_code)
-	)`,
-
-	// ===================== 3.5 交易域 =====================
+	// ===================== 交易 =====================
+	// 成交回执直接落在本行（一单最多一回执）。不落 stop_price / 仓位比例 / 来源 / 时间戳：
+	// 止损与占比由风控参数按当时档位随时可重算，"哪条规则提的"进日志，流转时刻进日志。
+	// 费用明细同理不落列：只有含费合计 total_cost 是"这笔实际占用/到账多少现金"的结果。
+	// note 是唯一的人工备注列：作废原因与成交备注都写它（两个写者，查单时读）。
 	`CREATE TABLE IF NOT EXISTS order_ticket (
-		id             INTEGER PRIMARY KEY AUTOINCREMENT,
-		trade_date     TEXT NOT NULL,
-		ts_code        TEXT NOT NULL,
-		name           TEXT NOT NULL,
-		direction      TEXT NOT NULL,
-		qty            INTEGER NOT NULL,
-		ref_price_low  INTEGER NOT NULL,
-		ref_price_high INTEGER NOT NULL,
-		stop_price     INTEGER,
-		reason         TEXT NOT NULL,
-		position_pct   REAL,
-		urgency        TEXT NOT NULL DEFAULT 'normal',
-		source         TEXT NOT NULL,
-		status         TEXT NOT NULL DEFAULT 'drafted',
-		valid_until    TEXT NOT NULL,
-		gear           TEXT NOT NULL,
-		profit_lock    INTEGER NOT NULL DEFAULT 0,
-		goal_snapshot  TEXT,
-		signal_id      INTEGER,
-		skip_reason    TEXT,
-		created_at     TEXT NOT NULL,
-		updated_at     TEXT NOT NULL,
-		issued_at      TEXT,
-		closed_at      TEXT
+		id           INTEGER PRIMARY KEY AUTOINCREMENT,
+		trade_date   TEXT NOT NULL,
+		ts_code      TEXT NOT NULL,
+		name         TEXT NOT NULL,
+		direction    TEXT NOT NULL,
+		qty          INTEGER NOT NULL,
+		ref_price    INTEGER NOT NULL,
+		reason       TEXT NOT NULL,
+		status       TEXT NOT NULL DEFAULT 'drafted',
+		valid_until  TEXT NOT NULL,
+		gear         TEXT NOT NULL,
+		fill_qty     INTEGER NOT NULL DEFAULT 0,
+		fill_price   INTEGER NOT NULL DEFAULT 0,
+		total_cost   INTEGER NOT NULL DEFAULT 0,
+		reported_by  TEXT,
+		reported_at  TEXT,
+		note         TEXT
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_ticket_date_status ON order_ticket(trade_date, status)`,
-	`CREATE INDEX IF NOT EXISTS idx_ticket_status_until ON order_ticket(status, valid_until)`,
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_ticket_active
 		ON order_ticket(trade_date, ts_code, direction)
 		WHERE status IN ('drafted','issued')`,
 
-	`CREATE TABLE IF NOT EXISTS fill (
-		id           INTEGER PRIMARY KEY AUTOINCREMENT,
-		ticket_id    INTEGER NOT NULL UNIQUE,
-		ts_code      TEXT NOT NULL,
-		direction    TEXT NOT NULL,
-		qty          INTEGER NOT NULL,
-		price        INTEGER NOT NULL,
-		amount       INTEGER NOT NULL,
-		commission   INTEGER NOT NULL,
-		stamp_tax    INTEGER NOT NULL,
-		transfer_fee INTEGER NOT NULL,
-		total_cost   INTEGER NOT NULL,
-		trade_date   TEXT NOT NULL,
-		reported_by  TEXT NOT NULL,
-		reported_at  TEXT NOT NULL,
-		note         TEXT,
-		FOREIGN KEY (ticket_id) REFERENCES order_ticket(id)
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_fill_date ON fill(trade_date)`,
-
+	// 可用数量不落列：恒等于 total_qty − today_bought（T+1），见 Position.Available()。
+	// high_price 不落日线是因为持仓可以比日线保留窗口（45 天）更久，超出后无法回算。
 	`CREATE TABLE IF NOT EXISTS position (
-		ts_code       TEXT PRIMARY KEY,
-		total_qty     INTEGER NOT NULL DEFAULT 0,
-		available_qty INTEGER NOT NULL DEFAULT 0,
-		today_bought  INTEGER NOT NULL DEFAULT 0,
-		cost_price    INTEGER NOT NULL DEFAULT 0,
-		high_price    INTEGER NOT NULL DEFAULT 0,
-		first_open_date TEXT,
-		updated_at    TEXT NOT NULL
+		ts_code         TEXT PRIMARY KEY,
+		total_qty       INTEGER NOT NULL DEFAULT 0,
+		today_bought    INTEGER NOT NULL DEFAULT 0,
+		cost_price      INTEGER NOT NULL DEFAULT 0,
+		high_price      INTEGER NOT NULL DEFAULT 0,
+		first_open_date TEXT
 	)`,
 
-	`CREATE TABLE IF NOT EXISTS account_snapshot (
-		trade_date     TEXT PRIMARY KEY,
-		cash           INTEGER NOT NULL,
-		market_value   INTEGER NOT NULL,
-		total_asset    INTEGER NOT NULL,
-		position_count INTEGER NOT NULL,
-		gear           TEXT NOT NULL,
-		profit_lock    INTEGER NOT NULL DEFAULT 0,
-		created_at     TEXT NOT NULL
-	)`,
-
-	// ===================== 3.6 目标域 =====================
-	`CREATE TABLE IF NOT EXISTS goal_state (
-		id                INTEGER PRIMARY KEY CHECK (id = 1),
-		quarter           TEXT NOT NULL,
-		quarter_start     TEXT NOT NULL,
-		quarter_end       TEXT NOT NULL,
-		baseline_asset    INTEGER NOT NULL DEFAULT 0,
-		peak_asset        INTEGER NOT NULL DEFAULT 0,
-		current_gear      TEXT NOT NULL DEFAULT 'G1',
-		profit_lock       INTEGER NOT NULL DEFAULT 0,
-		upgrade_streak    INTEGER NOT NULL DEFAULT 0,
-		last_eval_date    TEXT,
-		override_gear     TEXT,
-		override_reason   TEXT,
-		override_until    TEXT,
-		pace_policy       TEXT NOT NULL DEFAULT 'unrestricted',
-		pace_confirm_date TEXT,
-		updated_at        TEXT NOT NULL
-	)`,
-
-	`CREATE TABLE IF NOT EXISTS goal_gear_log (
-		id              INTEGER PRIMARY KEY AUTOINCREMENT,
-		trade_date      TEXT NOT NULL,
-		quarter         TEXT NOT NULL,
-		from_gear       TEXT NOT NULL,
-		to_gear         TEXT NOT NULL,
-		from_lock       INTEGER NOT NULL DEFAULT 0,
-		to_lock         INTEGER NOT NULL DEFAULT 0,
-		trigger_rule    TEXT NOT NULL,
-		progress        REAL,
-		budget_consumed REAL,
-		pace_gap        REAL,
-		is_manual       INTEGER NOT NULL DEFAULT 0,
-		reason          TEXT,
-		params_snapshot TEXT,
-		created_at      TEXT NOT NULL
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_gearlog_date ON goal_gear_log(trade_date, created_at)`,
-
-	// ===================== 3.7 运维域 =====================
-	`CREATE TABLE IF NOT EXISTS job_run (
-		id          INTEGER PRIMARY KEY AUTOINCREMENT,
-		job_name    TEXT NOT NULL,
-		trade_date  TEXT NOT NULL,
-		attempt     INTEGER NOT NULL DEFAULT 1,
-		status      TEXT NOT NULL,
-		duration_ms INTEGER,
-		error       TEXT,
-		artifacts   TEXT,
-		degradations TEXT,
-		started_at  TEXT NOT NULL,
-		finished_at TEXT,
-		UNIQUE (job_name, trade_date, attempt)
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_jobrun_name_date ON job_run(job_name, trade_date, started_at)`,
-
-	`CREATE TABLE IF NOT EXISTS agent_alert (
+	// ===================== 轨迹 =====================
+	// 一件事一天一行、重跑覆盖：留下的就是"今天这件做成没有"。
+	// subject 命名空间：job:<任务> / mail:<类型> / alert:<码> / llm:<标的>:<prompt_key>。
+	`CREATE TABLE IF NOT EXISTS run_trace (
 		id         INTEGER PRIMARY KEY AUTOINCREMENT,
 		trade_date TEXT NOT NULL,
-		source     TEXT NOT NULL,
-		level      TEXT NOT NULL,
-		code       TEXT NOT NULL,
-		title      TEXT NOT NULL,
-		content    TEXT NOT NULL,
-		status     TEXT NOT NULL DEFAULT 'unread',
-		created_at TEXT NOT NULL,
-		read_at    TEXT
+		subject    TEXT NOT NULL,
+		outcome    TEXT NOT NULL,
+		detail     TEXT NOT NULL DEFAULT '',
+		at         TEXT NOT NULL,
+		UNIQUE (trade_date, subject)
 	)`,
-	`CREATE INDEX IF NOT EXISTS idx_alert_date_level ON agent_alert(trade_date, level)`,
-	`CREATE INDEX IF NOT EXISTS idx_alert_status ON agent_alert(status)`,
-	`CREATE INDEX IF NOT EXISTS idx_alert_dedup ON agent_alert(code, created_at)`,
-
-	`CREATE TABLE IF NOT EXISTS action_log (
-		id           INTEGER PRIMARY KEY AUTOINCREMENT,
-		trade_date   TEXT NOT NULL,
-		actor        TEXT NOT NULL,
-		object_type  TEXT NOT NULL,
-		object_id    TEXT,
-		action       TEXT NOT NULL,
-		before_value TEXT,
-		after_value  TEXT,
-		reason       TEXT,
-		created_at   TEXT NOT NULL
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_actionlog_date ON action_log(trade_date)`,
-	`CREATE INDEX IF NOT EXISTS idx_actionlog_object ON action_log(object_type, object_id)`,
-
-	`CREATE TABLE IF NOT EXISTS mail_outbox (
-		id           INTEGER PRIMARY KEY AUTOINCREMENT,
-		trade_date   TEXT NOT NULL,
-		mail_type    TEXT NOT NULL,
-		subject      TEXT NOT NULL,
-		body         TEXT NOT NULL,
-		status       TEXT NOT NULL DEFAULT 'pending',
-		attempts     INTEGER NOT NULL DEFAULT 0,
-		last_error   TEXT,
-		next_retry_at TEXT,
-		created_at   TEXT NOT NULL,
-		sent_at      TEXT
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_mail_status_retry ON mail_outbox(status, next_retry_at)`,
-	`CREATE INDEX IF NOT EXISTS idx_mail_date_type ON mail_outbox(trade_date, mail_type)`,
-
-	// ===================== 3.8 LLM 域（P1，表结构预留）=====================
-	`CREATE TABLE IF NOT EXISTS llm_call (
-		id             INTEGER PRIMARY KEY AUTOINCREMENT,
-		trade_date     TEXT NOT NULL,
-		signal_id      INTEGER,
-		ts_code        TEXT NOT NULL,
-		verdict        TEXT,
-		confidence     REAL,
-		rationale      TEXT,
-		status         TEXT NOT NULL,
-		error          TEXT,
-		review_date    TEXT,
-		review_ret_pct REAL,
-		review_correct INTEGER,
-		created_at     TEXT NOT NULL
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_llmcall_date ON llm_call(trade_date)`,
+	`CREATE INDEX IF NOT EXISTS idx_trace_subject ON run_trace(subject, at)`,
 }
 
 // CreateTables 执行全部建表 DDL（幂等）。
@@ -429,14 +164,4 @@ func CreateTables(db *sqlx.DB) error {
 		}
 	}
 	return nil
-}
-
-// TableCount 返回当前库中用户表数量（验收 #6）。
-func TableCount(db *sqlx.DB) (int, error) {
-	var n int
-	err := db.Get(&n, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'schema_version'")
-	if err != nil {
-		return 0, fmt.Errorf("统计表数量失败: %w", err)
-	}
-	return n, nil
 }

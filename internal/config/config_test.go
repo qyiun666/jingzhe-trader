@@ -18,10 +18,10 @@ func openTestStore(t *testing.T) *store.Store {
 	return s
 }
 
-// TestRefuseZero 危险零值拒绝：risk.stop_loss_pct=0 应被拒绝并指明键名。
+// TestRefuseZero 危险零值拒绝：risk.take_profit_pct=0 应被拒绝并指明键名。
 func TestRefuseZero(t *testing.T) {
 	cfg := &Config{Values: map[string]ConfigValue{
-		"risk.stop_loss_pct": {Key: "risk.stop_loss_pct", Type: TypeFloat, Value: "0"},
+		"risk.take_profit_pct": {Key: "risk.take_profit_pct", Type: TypeFloat, Value: "0"},
 	}}
 	err := cfg.Validate()
 	if err == nil {
@@ -33,12 +33,12 @@ func TestRefuseZero(t *testing.T) {
 	}
 	found := false
 	for _, k := range ce.ZeroValues {
-		if k == "risk.stop_loss_pct" {
+		if k == "risk.take_profit_pct" {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("零值清单应含 risk.stop_loss_pct，实际: %v", ce.ZeroValues)
+		t.Fatalf("零值清单应含 risk.take_profit_pct，实际: %v", ce.ZeroValues)
 	}
 }
 
@@ -74,7 +74,7 @@ func TestEnvOverridePriority(t *testing.T) {
 
 	// 库值：screen.top_n = 5（默认值 20）
 	repo := NewRepo(s)
-	if err := repo.Set(ctx, "screen.top_n", "5", "test"); err != nil {
+	if err := repo.Set(ctx, "screen.top_n", "5"); err != nil {
 		t.Fatalf("Set 失败: %v", err)
 	}
 	// 环境变量顶换：JZ_SCREEN_TOP_N = 7
@@ -91,9 +91,41 @@ func TestEnvOverridePriority(t *testing.T) {
 		t.Fatalf("环境变量应顶换库值：期望 7，实际 %d", got)
 	}
 
-	// 默认值基线：未设置的 risk.stop_loss_pct 应取默认 0.08
-	if got := cfg.GetFloat("risk.stop_loss_pct"); got != 0.08 {
-		t.Fatalf("未设置键应取默认：期望 0.08，实际 %v", got)
+	// 默认值基线：未设置的 risk.take_profit_pct 应取默认 0.15
+	if got := cfg.GetFloat("risk.take_profit_pct"); got != 0.15 {
+		t.Fatalf("未设置键应取默认：期望 0.15，实际 %v", got)
+	}
+}
+
+// TestWriteOnceIgnoresEnvOverride 本金这类 write-once 基准落库后，环境变量通道不得再顶换：
+// 季度收益与回撤全以它为基准（历史事故："同步把本金刷小"）。
+func TestWriteOnceIgnoresEnvOverride(t *testing.T) {
+	s := openTestStore(t)
+	defer s.Close()
+	ctx := context.Background()
+	t.Setenv("JZ_TUSHARE_TOKEN", "env_tushare")
+	t.Setenv("JZ_SERVER_API_TOKEN", "env_api")
+
+	// 空库时环境变量允许播种
+	t.Setenv("JZ_ACCOUNT_INITIAL_CAPITAL", "8888")
+	cfg, err := Load(ctx, s)
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if got := cfg.GetFloat("account.initial_capital"); got != 8888 {
+		t.Fatalf("库内无值时环境变量应能播种本金，实际 %v", got)
+	}
+
+	// 落库后以库值为准，环境变量覆盖被忽略
+	if err := NewRepo(s).Set(ctx, "account.initial_capital", "10000"); err != nil {
+		t.Fatalf("Set 失败: %v", err)
+	}
+	cfg, err = Load(ctx, s)
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if got := cfg.GetFloat("account.initial_capital"); got != 10000 {
+		t.Fatalf("write-once 本金应锁在库值 10000，实际 %v", got)
 	}
 }
 
@@ -123,7 +155,7 @@ func TestDBOverridesDefault(t *testing.T) {
 	defer s.Close()
 	ctx := context.Background()
 	repo := NewRepo(s)
-	if err := repo.Set(ctx, "screen.top_n", "5", "test"); err != nil {
+	if err := repo.Set(ctx, "screen.top_n", "5"); err != nil {
 		t.Fatalf("Set 失败: %v", err)
 	}
 	// 不设业务 env；Load 校验必配项，提供凭据占位
@@ -154,8 +186,8 @@ func TestMaskNotLeak(t *testing.T) {
 		t.Fatal("显式 show-secrets 应返回明文")
 	}
 	// 非凭据键不掩码
-	ne := Entry{Key: "risk.stop_loss_pct", Value: "0.08", IsSecret: false}
-	if DisplayValue(ne, false) != "0.08" {
+	ne := Entry{Key: "risk.take_profit_pct", Value: "0.15", IsSecret: false}
+	if DisplayValue(ne, false) != "0.15" {
 		t.Fatal("非凭据键不应掩码")
 	}
 }

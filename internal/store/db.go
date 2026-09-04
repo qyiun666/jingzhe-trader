@@ -6,7 +6,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -70,10 +69,12 @@ func Open(path string) (*Store, error) {
 
 	st := &Store{writeDB: wdb, readDB: rdb, path: abs}
 
-	// 库文件权限收敛（§6.3）
+	// 库文件权限收敛（§6.3）：库里存着 Tushare / LLM / 邮箱授权码，锁不住就不开。
+	// store 层禁止 import 业务包（含 observability），所以这里只能上抛而不是记日志。
 	if err := os.Chmod(abs, 0o600); err != nil {
-		// 权限收敛失败不致命，仅记录（由调用方日志）
-		_ = err
+		wdb.Close()
+		rdb.Close()
+		return nil, fmt.Errorf("库文件 %s 权限收敛为 0600 失败（内含凭据，拒绝打开）: %w", abs, err)
 	}
 
 	if err := st.VerifyPragmas(context.Background()); err != nil {
@@ -81,10 +82,10 @@ func Open(path string) (*Store, error) {
 		rdb.Close()
 		return nil, fmt.Errorf("数据库 PRAGMA 校验失败: %w", err)
 	}
-	if err := Migrate(st); err != nil {
+	if err := CreateTables(st.writeDB); err != nil {
 		wdb.Close()
 		rdb.Close()
-		return nil, fmt.Errorf("数据库迁移失败: %w", err)
+		return nil, fmt.Errorf("数据库建表失败: %w", err)
 	}
 	return st, nil
 }
@@ -178,17 +179,3 @@ func (s *Store) PragmaInfo(ctx context.Context) (PragmaInfo, error) {
 	}
 	return info, nil
 }
-
-// DBSizeBytes 返回主库文件大小（含 -wal/-shm 之和）。
-func (s *Store) DBSizeBytes() (int64, error) {
-	var total int64
-	for _, suffix := range []string{"", "-wal", "-shm"} {
-		if fi, err := os.Stat(s.path + suffix); err == nil {
-			total += fi.Size()
-		}
-	}
-	return total, nil
-}
-
-// ensure sql import used (kept for potential future raw access).
-var _ = sql.ErrNoRows

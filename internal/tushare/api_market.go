@@ -40,11 +40,11 @@ func (c *Client) TradeCal(ctx context.Context, exchange, start, end string) ([]T
 	return rows, nil
 }
 
-// StockBasic 拉取全部上市股票基础信息（慢路径 fina 同步的股票列表来源）。
+// StockBasic 拉取全部上市股票基础信息（1 次调用返回全市场清单）。
 func (c *Client) StockBasic(ctx context.Context) ([]model.StockBasic, error) {
 	fields, items, err := c.Call(ctx, "stock_basic",
 		map[string]interface{}{"exchange": "", "list_status": "L"},
-		"ts_code", "symbol", "name", "market", "exchange", "industry", "list_date", "delist_date", "list_status")
+		"ts_code", "name", "industry", "list_date", "list_status")
 	if err != nil {
 		return nil, err
 	}
@@ -60,7 +60,7 @@ func (c *Client) StockBasic(ctx context.Context) ([]model.StockBasic, error) {
 func (c *Client) Daily(ctx context.Context, tradeDate string) ([]model.Bar, error) {
 	fields, items, err := c.Call(ctx, "daily",
 		map[string]interface{}{"trade_date": tradeDate},
-		"ts_code", "trade_date", "open", "high", "low", "close", "pre_close", "vol", "amount", "pct_chg")
+		"ts_code", "trade_date", "close", "vol")
 	if err != nil {
 		return nil, err
 	}
@@ -75,21 +75,23 @@ func (c *Client) Daily(ctx context.Context, tradeDate string) ([]model.Bar, erro
 	return out, nil
 }
 
-// DailyBasic 按交易日全市场拉取每日指标。total_mv/circ_mv 千元在转换中折算为万元。
-func (c *Client) DailyBasic(ctx context.Context, tradeDate string) ([]model.DailyBasic, error) {
+// DailyBasic 按交易日全市场拉取估值截面。circ_mv 千元在转换中折算为万元。
+//
+// 不取 close：一手价用 daily_bar.raw_close（同一天的真实价），两处各存一份必然漂。
+func (c *Client) DailyBasic(ctx context.Context, tradeDate string) ([]model.Valuation, error) {
 	fields, items, err := c.Call(ctx, "daily_basic",
 		map[string]interface{}{"trade_date": tradeDate},
-		"ts_code", "trade_date", "close", "turnover_rate", "volume_ratio", "pe", "pe_ttm", "pb", "ps_ttm", "dv_ratio", "total_mv", "circ_mv")
+		"ts_code", "turnover_rate", "pe_ttm", "pb", "circ_mv")
 	if err != nil {
 		return nil, err
 	}
-	var raw []RawDailyBasic
+	var raw []RawValuation
 	if err := DecodeItems(fields, items, &raw); err != nil {
 		return nil, err
 	}
-	out := make([]model.DailyBasic, 0, len(raw))
+	out := make([]model.Valuation, 0, len(raw))
 	for _, r := range raw {
-		out = append(out, ToModelDailyBasic(r))
+		out = append(out, ToModelValuation(r))
 	}
 	return out, nil
 }
@@ -109,69 +111,49 @@ func (c *Client) AdjFactor(ctx context.Context, tradeDate string) ([]AdjFactorRo
 	return rows, nil
 }
 
-// StkLimit 按交易日全市场拉取涨跌停价（涨停禁买/跌停禁卖唯一判定依据，不依赖状态编码猜测）。
-func (c *Client) StkLimit(ctx context.Context, tradeDate string) ([]model.PriceLimit, error) {
-	fields, items, err := c.Call(ctx, "stk_limit",
-		map[string]interface{}{"trade_date": tradeDate},
-		"ts_code", "trade_date", "up_limit", "down_limit")
-	if err != nil {
-		return nil, err
-	}
-	var rows []model.PriceLimit
-	if err := DecodeItems(fields, items, &rows); err != nil {
-		return nil, err
-	}
-	return rows, nil
+// SuspendRow 停牌接口原始解码结构：只取代码一列，日期由入参限定。
+type SuspendRow struct {
+	TsCode string `db:"ts_code"`
 }
 
-// Suspend 按交易日全市场拉取停牌信息。
-func (c *Client) Suspend(ctx context.Context, tradeDate string) ([]model.Suspend, error) {
+// Suspend 按交易日全市场拉取停牌代码。返回代码切片：停牌已经不是一个"行"，
+// 只是当日的一个代码集合（见 store.MarketRepo.SaveSuspended）。
+func (c *Client) Suspend(ctx context.Context, tradeDate string) ([]string, error) {
 	fields, items, err := c.Call(ctx, "suspend_d",
 		map[string]interface{}{"trade_date": tradeDate},
-		"ts_code", "trade_date", "suspend_type", "suspend_timing")
+		"ts_code")
 	if err != nil {
 		return nil, err
 	}
-	var rows []model.Suspend
+	var rows []SuspendRow
 	if err := DecodeItems(fields, items, &rows); err != nil {
 		return nil, err
 	}
-	return rows, nil
+	codes := make([]string, 0, len(rows))
+	for _, r := range rows {
+		codes = append(codes, r.TsCode)
+	}
+	return codes, nil
 }
 
-// IndexDaily 按交易日 + 指数列表拉取大盘日线（ts_code 逗号拼接，单调用）。
-func (c *Client) IndexDaily(ctx context.Context, tradeDate string, indexCodes []string) ([]model.IndexDaily, error) {
-	tsParam := ""
-	for i, c0 := range indexCodes {
-		if i > 0 {
-			tsParam += ","
+// IndexDaily 按交易日拉取大盘指数日线（每个指数一次调用），与个股共用 daily_bar 结构。
+//
+// 实测：ts_code 传逗号拼接的多指数会得到 code=0 + 0 行（不报错、静默为空），
+// 因此只能逐指数调用（6 个指数 = 6 次调用/天，配额占比可忽略）。
+func (c *Client) IndexDaily(ctx context.Context, tradeDate string, indexCodes []string) ([]model.Bar, error) {
+	var out []model.Bar
+	for _, code := range indexCodes {
+		fields, items, err := c.Call(ctx, "index_daily",
+			map[string]interface{}{"ts_code": code, "trade_date": tradeDate},
+			"ts_code", "trade_date", "close")
+		if err != nil {
+			return nil, err
 		}
-		tsParam += c0
+		var rows []model.Bar
+		if err := DecodeItems(fields, items, &rows); err != nil {
+			return nil, err
+		}
+		out = append(out, rows...)
 	}
-	fields, items, err := c.Call(ctx, "index_daily",
-		map[string]interface{}{"ts_code": tsParam, "trade_date": tradeDate},
-		"ts_code", "trade_date", "close", "open", "high", "low", "pre_close", "pct_chg")
-	if err != nil {
-		return nil, err
-	}
-	var rows []model.IndexDaily
-	if err := DecodeItems(fields, items, &rows); err != nil {
-		return nil, err
-	}
-	return rows, nil
-}
-
-// MoneyFlow 按交易日全市场拉取个股资金流。
-func (c *Client) MoneyFlow(ctx context.Context, tradeDate string) ([]model.MoneyFlow, error) {
-	fields, items, err := c.Call(ctx, "moneyflow",
-		map[string]interface{}{"trade_date": tradeDate},
-		"ts_code", "trade_date", "buy_elg_amount", "sell_elg_amount", "net_mf_amount")
-	if err != nil {
-		return nil, err
-	}
-	var rows []model.MoneyFlow
-	if err := DecodeItems(fields, items, &rows); err != nil {
-		return nil, err
-	}
-	return rows, nil
+	return out, nil
 }

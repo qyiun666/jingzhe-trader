@@ -8,7 +8,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	"jingzhe-trader/internal/market"
 	"jingzhe-trader/internal/store"
@@ -16,21 +15,18 @@ import (
 
 // 新鲜度门禁失败码（每项独立分支，均有单测，验收 #9）。
 const (
-	CodeCalMissing   = "CAL_MISSING"   // 交易日历缺失目标日
-	CodeNotTradeDay  = "NOT_TRADE_DAY" // 非交易日（非阻断，跳过）
-	CodeBarStale     = "BAR_STALE"     // 目标日日线缺失（过时）
-	CodeBarRowsLow   = "BAR_ROWS_LOW"  // 日线行数低于阈值
+	CodeCalMissing   = "CAL_MISSING"    // 交易日历缺失目标日
+	CodeNotTradeDay  = "NOT_TRADE_DAY"  // 非交易日（非阻断，跳过）
+	CodeBarStale     = "BAR_STALE"      // 目标日日线缺失（过时）
+	CodeBarRowsLow   = "BAR_ROWS_LOW"   // 日线行数低于阈值
 	CodeBasicRowsLow = "BASIC_ROWS_LOW" // 每日指标行数低于阈值
-	CodeLimitRowsLow = "LIMIT_ROWS_LOW" // 涨跌停行数低于阈值
-	CodeCoverageGap  = "COVERAGE_GAP"  // 候选/持仓覆盖缺口
-	CodeIndexStale   = "INDEX_STALE"   // 沪深300指数日线缺失（权限不足时降级，不阻断）
+	CodeCoverageGap  = "COVERAGE_GAP"   // 候选/持仓覆盖缺口
+	CodeIndexStale   = "INDEX_STALE"    // 沪深300指数日线缺失（阻断：买入闸门与大盘卖出规则都读它）
+	CodeWindowShort  = "WINDOW_SHORT"   // 因子窗口内有交易日无日线（动量/MA20 会算错）
 )
 
-// defaultMinBarRows 日线/指标/涨跌停最低行数默认阈值（与 screen.min_bar_rows 一致）。
-const defaultMinBarRows = 5000
-
-// freshnessIndex 新鲜度门禁锚定的大盘指数（沪深300）。
-const freshnessIndex = "000300.SH"
+// freshnessIndex 新鲜度门禁锚定的大盘指数：与买入闸门用的是同一根常量。
+const freshnessIndex = store.MarketIndex
 
 // FreshnessGate 数据新鲜度门禁（八检查，每项独立失败码）。
 //
@@ -39,23 +35,22 @@ const freshnessIndex = "000300.SH"
 //  2. IsTradeDay  目标日为交易日（非交易日→NOT_TRADE_DAY，非阻断，跳过）
 //  3. BarDate     目标日日线存在（缺失→BAR_STALE，阻断）
 //  4. BarRows     日线行数≥阈值（不足→BAR_ROWS_LOW，阻断）
-//  5. BasicRows   每日指标行数≥阈值（不足→BASIC_ROWS_LOW，阻断）
-//  6. LimitRows   涨跌停行数≥阈值（不足→LIMIT_ROWS_LOW，阻断）
-//  7. MissingCodes 候选∪持仓覆盖完整（缺口→COVERAGE_GAP，阻断）
-//  8. IndexRows   沪深300指数日线存在（缺失→INDEX_STALE，非阻断：index_daily 权限可选，降级不阻断门禁）
+//  5. BasicRows   当日估值截面行数≥阈值（不足→BASIC_ROWS_LOW，阻断）
+//  6. MissingCodes 候选∪持仓覆盖完整（缺口→COVERAGE_GAP，阻断）
+//  7. WindowOK    因子窗口内每个交易日都有日线（缺口→WINDOW_SHORT，阻断）
+//  8. IndexRows   大盘指数日线存在（缺失→INDEX_STALE，阻断：没有它买入闸门与大盘卖出规则都跑不了）
 //
-// Fresh = IsTradeDay && #1 && #3–#8（#2/#8 为非阻断项，缺失时仅告警/跳过，不使门禁失败）。
+// Fresh = IsTradeDay && #1 && #3–#8（只有 #2 非阻断：非交易日直接跳过当日）。
 type FreshnessGate struct {
 	store      *store.Store
-	minBarRows int // 日线/指标/涨跌停最低行数（默认 5000，来自 screen.min_bar_rows）
+	minBarRows int // 日线/每日指标最低行数（来自 config screen.min_bar_rows）
+	windowDays int // 因子窗口交易日数（选股是最深消费者）
 }
 
-// NewFreshnessGate 构造门禁。minBarRows<=0 时默认 5000。
-func NewFreshnessGate(s *store.Store, minBarRows int) *FreshnessGate {
-	if minBarRows <= 0 {
-		minBarRows = defaultMinBarRows
-	}
-	return &FreshnessGate{store: s, minBarRows: minBarRows}
+// NewFreshnessGate 构造门禁。阈值由组合根从 config screen.min_bar_rows 给出（默认值只有
+// KeySpec 一份），这里不再自带第二份默认；windowDays<=0 表示跳过窗口完整性检查。
+func NewFreshnessGate(s *store.Store, minBarRows, windowDays int) *FreshnessGate {
+	return &FreshnessGate{store: s, minBarRows: minBarRows, windowDays: windowDays}
 }
 
 // CheckItem 单项检查结果。
@@ -63,7 +58,7 @@ type CheckItem struct {
 	Name     string // 检查名（如 CalendarOK）
 	Code     string // 失败码；通过或跳过时为空
 	OK       bool   // 是否通过
-	Blocking bool   // 失败时是否阻断新鲜度（NOT_TRADE_DAY / INDEX_STALE 为 false）
+	Blocking bool   // 失败时是否阻断新鲜度（只有 IsTradeDay 非阻断：非交易日直接跳过当日）
 	Detail   string
 }
 
@@ -121,12 +116,13 @@ func (g *FreshnessGate) Check(ctx context.Context, tradeDate string) (*Freshness
 		return rep, nil
 	}
 
-	// 3-8. 数据新鲜度检查（除 IndexRows 外均阻断）
+	// 3-7. 数据新鲜度检查（除 IndexRows 外均阻断）
 	rep.Checks = append(rep.Checks, g.checkBarDate(ctx, tradeDate))
-	rep.Checks = append(rep.Checks, g.checkTableRows(ctx, tradeDate, "daily_bar", "BarRows", CodeBarRowsLow))
-	rep.Checks = append(rep.Checks, g.checkTableRows(ctx, tradeDate, "daily_basic", "BasicRows", CodeBasicRowsLow))
-	rep.Checks = append(rep.Checks, g.checkTableRows(ctx, tradeDate, "stk_limit", "LimitRows", CodeLimitRowsLow))
+	rep.Checks = append(rep.Checks, g.checkRows(ctx, tradeDate, "daily_bar", "trade_date", "BarRows", CodeBarRowsLow))
+	// 估值截面在 stock_basic 的 val_date 上（不再有 daily_basic 表）：日期不符的行算"没有今日截面"。
+	rep.Checks = append(rep.Checks, g.checkRows(ctx, tradeDate, "stock_basic", "val_date", "BasicRows", CodeBasicRowsLow))
 	rep.Checks = append(rep.Checks, g.checkCoverage(ctx, tradeDate))
+	rep.Checks = append(rep.Checks, g.checkWindow(ctx, tradeDate))
 	rep.Checks = append(rep.Checks, g.checkIndex(ctx, tradeDate))
 
 	// Fresh = 所有阻断性检查通过
@@ -182,10 +178,12 @@ func (g *FreshnessGate) checkBarDate(ctx context.Context, tradeDate string) Chec
 	return okItem("BarDate", fmt.Sprintf("日线覆盖 %d 只", n))
 }
 
-// checkTableRows 通用行数检查：指定表在 tradeDate 的行数是否≥阈值。
-func (g *FreshnessGate) checkTableRows(ctx context.Context, tradeDate, table, name, code string) CheckItem {
+// checkRows 通用行数检查：某表按 dateCol 落在 tradeDate 上的行数是否≥阈值。
+//
+// table 与 dateCol 都只接受本文件内的常量，不接外部输入。
+func (g *FreshnessGate) checkRows(ctx context.Context, tradeDate, table, dateCol, name, code string) CheckItem {
 	var n int
-	q := "SELECT COUNT(*) FROM " + table + " WHERE trade_date = ?"
+	q := "SELECT COUNT(*) FROM " + table + " WHERE " + dateCol + " = ?"
 	if err := g.store.ReadDB().GetContext(ctx, &n, q, tradeDate); err != nil {
 		return failItem(name, code, fmt.Sprintf("统计%s失败: %v", table, err))
 	}
@@ -253,22 +251,43 @@ func coverageTolerance(candidateCount int) int {
 	return t
 }
 
-// checkIndex 检查沪深300指数日线是否存在。
-// index_daily 接口权限可选（40101/40203），权限不足时同步阶段已降级（WARN），
-// 此处缺失仅告警、不阻断门禁（Blocking=false）。
-func (g *FreshnessGate) checkIndex(ctx context.Context, tradeDate string) CheckItem {
-	n, err := g.store.MarketRepo().CountIndexDaily(ctx, freshnessIndex, tradeDate)
+// checkWindow 因子窗口完整性：最近 windowDays 个交易日历日都要有日线。
+//
+// 必须有这一项：单日行数达标不代表窗口完整。缺几天时因子窗口会算错（动量取首末、
+// MA20 取近 20 根），而"当日数据出全"的其它检查全都会绿。
+func (g *FreshnessGate) checkWindow(ctx context.Context, tradeDate string) CheckItem {
+	if g.windowDays <= 0 {
+		return CheckItem{Name: "WindowOK", OK: true, Detail: "未配置窗口天数，跳过"}
+	}
+	dates, err := g.store.ScreenRepo().WindowDates(ctx, tradeDate, g.windowDays)
 	if err != nil {
-		return warnItem("IndexRows", CodeIndexStale, fmt.Sprintf("统计指数日线失败: %v", err))
+		return failItem("WindowOK", CodeWindowShort, fmt.Sprintf("读取窗口交易日失败: %v", err))
 	}
-	if n == 0 {
-		return warnItem("IndexRows", CodeIndexStale,
-			fmt.Sprintf("%s 指数日线缺失（降级：不阻断门禁）", freshnessIndex))
+	if len(dates) < g.windowDays {
+		return failItem("WindowOK", CodeWindowShort,
+			fmt.Sprintf("交易日历只有 %d 个交易日 < 窗口 %d", len(dates), g.windowDays))
 	}
-	return CheckItem{Name: "IndexRows", OK: true, Blocking: false, Detail: fmt.Sprintf("%s 指数日线存在", freshnessIndex)}
+	gaps, err := g.store.ScreenRepo().WindowBarGaps(ctx, dates)
+	if err != nil {
+		return failItem("WindowOK", CodeWindowShort, fmt.Sprintf("统计窗口覆盖失败: %v", err))
+	}
+	if len(gaps) > 0 {
+		return failItem("WindowOK", CodeWindowShort,
+			fmt.Sprintf("窗口 %d 日中缺 %d 天日线（%s 起），请补跑 daily", g.windowDays, len(gaps), gaps[0]))
+	}
+	return okItem("WindowOK", fmt.Sprintf("因子窗口 %d 个交易日齐全", g.windowDays))
 }
 
-// nowCST 返回 Asia/Shanghai 时区的当前时间（门禁日志用）。
-func nowCST() time.Time {
-	return time.Now().In(market.Loc)
+// checkIndex 检查大盘指数日线是否存在。缺失即阻断：买入闸门（跌破 MA20 关漏斗）
+// 与卖出规则（大盘恶化）都以这根指数为输入，没有它当日既不能买也不能判"大盘正常"。
+func (g *FreshnessGate) checkIndex(ctx context.Context, tradeDate string) CheckItem {
+	n, err := g.store.MarketRepo().CountIndexBar(ctx, freshnessIndex, tradeDate)
+	if err != nil {
+		return failItem("IndexRows", CodeIndexStale, fmt.Sprintf("统计指数日线失败: %v", err))
+	}
+	if n == 0 {
+		return failItem("IndexRows", CodeIndexStale,
+			fmt.Sprintf("%s 指数日线缺失（当日不开买入漏斗）", freshnessIndex))
+	}
+	return okItem("IndexRows", fmt.Sprintf("%s 指数日线存在", freshnessIndex))
 }

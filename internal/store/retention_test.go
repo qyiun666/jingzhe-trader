@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"jingzhe-trader/internal/model"
 	"testing"
 	"time"
 )
@@ -23,7 +24,7 @@ func TestDeleteBatched100k(t *testing.T) {
 	ctx := context.Background()
 
 	const n = 100_000
-	cols := []string{"job_name", "trade_date", "status", "started_at"}
+	cols := []string{"subject", "trade_date", "outcome", "at"}
 	rows := make([][]interface{}, 0, n)
 	for i := 0; i < n; i++ {
 		rows = append(rows, []interface{}{
@@ -33,18 +34,18 @@ func TestDeleteBatched100k(t *testing.T) {
 			"2000-01-01T00:00:00Z",
 		})
 	}
-	if _, err := BatchInsert(ctx, s.WriteDB(), "job_run", cols, rows, 2000); err != nil {
+	if _, err := BatchInsert(ctx, s.WriteDB(), "run_trace", cols, rows, 2000); err != nil {
 		t.Fatalf("批量插入 100k 行失败: %v", err)
 	}
 	var cnt int
-	if err := s.WriteDB().Get(&cnt, "SELECT COUNT(*) FROM job_run"); err != nil {
+	if err := s.WriteDB().Get(&cnt, "SELECT COUNT(*) FROM run_trace"); err != nil {
 		t.Fatalf("统计失败: %v", err)
 	}
 	if cnt != n {
 		t.Fatalf("期望插入 %d 行，实际 %d", n, cnt)
 	}
 
-	deleted, batches, err := DeleteBatched(ctx, s.WriteDB(), "job_run", "trade_date < ?", []interface{}{"20990101"}, 5000)
+	deleted, batches, err := DeleteBatched(ctx, s.WriteDB(), "run_trace", "trade_date < ?", []interface{}{"20990101"}, 5000)
 	if err != nil {
 		t.Fatalf("DeleteBatched 失败: %v", err)
 	}
@@ -54,7 +55,7 @@ func TestDeleteBatched100k(t *testing.T) {
 	if batches != n/5000 {
 		t.Fatalf("期望 %d 批，实际 %d", n/5000, batches)
 	}
-	if err := s.WriteDB().Get(&cnt, "SELECT COUNT(*) FROM job_run"); err != nil {
+	if err := s.WriteDB().Get(&cnt, "SELECT COUNT(*) FROM run_trace"); err != nil {
 		t.Fatalf("统计失败: %v", err)
 	}
 	if cnt != 0 {
@@ -68,13 +69,13 @@ func TestDeleteBatchedTimeout(t *testing.T) {
 	s := openStoreForTest(t)
 	defer s.Close()
 
-	cols := []string{"job_name", "trade_date", "status", "started_at"}
+	cols := []string{"subject", "trade_date", "outcome", "at"}
 	const n = 5000
 	rows := make([][]interface{}, 0, n)
 	for i := 0; i < n; i++ {
 		rows = append(rows, []interface{}{"t_" + itoa(i), "20000101", "ok", "2000-01-01T00:00:00Z"})
 	}
-	if _, err := BatchInsert(context.Background(), s.WriteDB(), "job_run", cols, rows, 2000); err != nil {
+	if _, err := BatchInsert(context.Background(), s.WriteDB(), "run_trace", cols, rows, 2000); err != nil {
 		t.Fatalf("批量插入失败: %v", err)
 	}
 
@@ -84,7 +85,7 @@ func TestDeleteBatchedTimeout(t *testing.T) {
 	// 确保已过期
 	time.Sleep(2 * time.Millisecond)
 
-	deleted, _, err := DeleteBatched(ctx, s.WriteDB(), "job_run", "trade_date < ?", []interface{}{"20990101"}, 5000)
+	deleted, _, err := DeleteBatched(ctx, s.WriteDB(), "run_trace", "trade_date < ?", []interface{}{"20990101"}, 5000)
 	if err == nil {
 		t.Fatal("期望返回 DeadlineExceeded，但无错误")
 	}
@@ -110,6 +111,80 @@ func TestApplyRetentionSmoke(t *testing.T) {
 	for tbl, del := range results {
 		if del != 0 {
 			t.Fatalf("空库 %s 不应有删除，实际 %d", tbl, del)
+		}
+	}
+}
+
+// TestApplyRetentionHonorsOverrides retention.* 覆盖必须真正改变清理边界：
+// 此前组合根恒传 nil，这些键改了什么都不发生。
+func TestApplyRetentionHonorsOverrides(t *testing.T) {
+	s := openStoreForTest(t)
+	defer s.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 3, 31, 0, 0, 0, 0, time.UTC)
+	day120 := now.AddDate(0, 0, -120).Format("20060102")
+
+	seedBar := func() {
+		if err := s.MarketRepo().UpsertBar(ctx, model.Bar{
+			TsCode: "600519.SH", TradeDate: day120, Close: 10000, RawClose: 10000}); err != nil {
+			t.Fatalf("插入日线失败: %v", err)
+		}
+	}
+
+	seedBar()
+	res, err := ApplyRetention(ctx, s, now, nil)
+	if err != nil {
+		t.Fatalf("ApplyRetention 失败: %v", err)
+	}
+	if res["daily_bar"] != 1 {
+		t.Fatalf("默认 45 天窗口应删掉 120 天前的行，实际删 %d", res["daily_bar"])
+	}
+
+	seedBar()
+	res, err = ApplyRetention(ctx, s, now, map[string]int{"retention.bar_days": 400})
+	if err != nil {
+		t.Fatalf("带覆盖 ApplyRetention 失败: %v", err)
+	}
+	if res["daily_bar"] != 0 {
+		t.Fatalf("覆盖为 400 天后不应删除，实际删 %d", res["daily_bar"])
+	}
+}
+
+// TestRetentionPrunesSuspendKeys 停牌集合挤进 config_kv 以后，清理必须只按
+// suspend:<日期> 键区间走 —— 配置键与 goal.state 这些永久状态一键都不能被碰。
+func TestRetentionPrunesSuspendKeys(t *testing.T) {
+	s := openStoreForTest(t)
+	defer s.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 3, 31, 0, 0, 0, 0, time.UTC)
+	cr := s.ConfigRepo()
+
+	for _, k := range []string{"suspend:20260101", "suspend:20260329", "tushare.token", "account.cash_anchor"} {
+		if err := cr.Set(ctx, k, "v"); err != nil {
+			t.Fatalf("写入 %s 失败: %v", k, err)
+		}
+	}
+	if err := s.GoalRepo().UpsertGoalState(ctx, model.GoalState{Quarter: "2026Q1", CurrentGear: model.GearG1}); err != nil {
+		t.Fatalf("写入档位状态失败: %v", err)
+	}
+
+	res, err := ApplyRetention(ctx, s, now, nil)
+	if err != nil {
+		t.Fatalf("ApplyRetention 失败: %v", err)
+	}
+	if res["config_kv"] != 1 {
+		t.Fatalf("3 天窗口应只删掉 suspend:20260101 一行，实际删 %d", res["config_kv"])
+	}
+	all, err := cr.GetAll(ctx)
+	if err != nil {
+		t.Fatalf("读取配置失败: %v", err)
+	}
+	if _, ok := all["suspend:20260101"]; ok {
+		t.Error("过期停牌集合未被清理")
+	}
+	for _, k := range []string{"suspend:20260329", "tushare.token", "account.cash_anchor", goalStateKey} {
+		if _, ok := all[k]; !ok {
+			t.Errorf("%s 不该被保留策略删掉", k)
 		}
 	}
 }

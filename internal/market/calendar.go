@@ -4,6 +4,7 @@
 package market
 
 import (
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,6 +18,17 @@ var Loc = time.FixedZone("CST", 8*3600)
 // parseDate 以 Loc 解析 YYYYMMDD。
 func parseDate(date string) (time.Time, error) {
 	return time.ParseInLocation("20060102", date, Loc)
+}
+
+// CheckDate 外部入口的日期格式闸门：必须正好是 YYYYMMDD 且能落到真实日历日。
+//
+// 本包的纯函数（QuarterOf / PrevTradeDay 等）按 date[:4] 定长切片，短一个字符就在任务里 panic；
+// MCP 的 date/until 与 CLI 的 --date 都必须在进业务前过这一关。
+func CheckDate(date string) error {
+	if _, err := parseDate(date); err != nil {
+		return fmt.Errorf("日期 %q 不是 YYYYMMDD（例：20260904）: %w", date, err)
+	}
+	return nil
 }
 
 // IsTradeDay 交易日判定。日历缺失 → 返回 true（宁可空跑不可整天不动，PRD P0-2）。
@@ -54,7 +66,7 @@ func NextTradeDay(days []string, date string) (string, bool) {
 
 // quarterBounds 返回指定年月的季度边界（start/end 为 YYYY-MM-DD）。
 func quarterBounds(year int, quarter int) (start, end string) {
-	startMonth := (quarter - 1) * 3 + 1
+	startMonth := (quarter-1)*3 + 1
 	endMonth := quarter * 3
 	start = fmtDate(year, startMonth, 1)
 	// end = 季末月最后一天
@@ -100,27 +112,23 @@ func QuarterTradeDays(days []string, date string) (elapsed, total int) {
 	return
 }
 
-// EODValidUntil EOD 指令有效期 = 下一交易日 15:00（nexttrade_date 取自日历）。
-func EODValidUntil(days []string, genDate string) time.Time {
+// EODValidUntil EOD 指令有效期 = 下一交易日 15:00。
+//
+// 算不出下一交易日就是错误，不再退化成"自然日 +1"：那会把有效期落在周六/休市日上，
+// 而一张永远执行不了的指令单看起来和正常单没有区别。
+func EODValidUntil(days []string, genDate string) (time.Time, error) {
 	next, ok := NextTradeDay(days, genDate)
 	if !ok {
-		// 兜底：日历无后续，取自然日 +1
-		if t, err := parseDate(genDate); err == nil {
-			next = t.AddDate(0, 0, 1).Format("20060102")
-		}
+		return time.Time{}, fmt.Errorf("日历里 %s 之后没有交易日，算不出指令有效期（日历需续拉）", genDate)
 	}
-	t, err := parseDate(next)
-	if err != nil {
-		return time.Date(1970, 1, 1, 15, 0, 0, 0, Loc)
-	}
-	return time.Date(t.Year(), t.Month(), t.Day(), 15, 0, 0, 0, Loc)
+	return fifteenOn(next)
 }
 
-// IntradayValidUntil 盘中紧急指令有效期 = 当日 15:00。
-func IntradayValidUntil(date string) time.Time {
+// fifteenOn 把 YYYYMMDD 拼成当日 15:00（Loc）。
+func fifteenOn(date string) (time.Time, error) {
 	t, err := parseDate(date)
 	if err != nil {
-		return time.Date(1970, 1, 1, 15, 0, 0, 0, Loc)
+		return time.Time{}, fmt.Errorf("非法交易日期 %q: %w", date, err)
 	}
-	return time.Date(t.Year(), t.Month(), t.Day(), 15, 0, 0, 0, Loc)
+	return time.Date(t.Year(), t.Month(), t.Day(), 15, 0, 0, 0, Loc), nil
 }

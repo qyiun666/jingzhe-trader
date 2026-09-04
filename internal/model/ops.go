@@ -1,118 +1,83 @@
 package model
 
-// ===================== 运维域模型 =====================
+// ===================== 轨迹模型 =====================
 
-// JobRun 任务执行记录：四态（running/success/degraded/failed）+ 产出物契约。
-type JobRun struct {
-	ID          int64    `db:"id"`
-	JobName     string   `db:"job_name"`
-	TradeDate   string   `db:"trade_date"`
-	Attempt     int      `db:"attempt"`
-	Status      string   `db:"status"`
-	DurationMs  int64    `db:"duration_ms"`
-	Error       string   `db:"error"`
-	Artifacts   string   `db:"artifacts"`   // JSON：产出物声明与实测值
-	Degradations string  `db:"degradations"` // JSON：降级/跳过记录
-	StartedAt   string   `db:"started_at"`
-	FinishedAt  string   `db:"finished_at"`
+// 轨迹结果三态。partial = 做成了但有已知缺失（原 degraded 语义）。
+const (
+	TraceOK      = "ok"
+	TracePartial = "partial"
+	TraceFail    = "fail"
+)
+
+// RunTrace 轨迹：一件事在一个交易日只留一行最终结果。
+//
+// Subject 是"这件事"的稳定标识，前缀区分来源，同一 subject 当日重复写入即覆盖：
+//
+//	job:<任务名> / mail:<邮件类型> / alert:<告警码>
+//
+// 每个字段的读者：TradeDate=当日轨迹查询与保留窗口；Subject=完成判定与去重判定；
+// Outcome=调度器 shouldSkip 与 MCP/selfcheck 的唯一判据；Detail=失败时给人看的那一句；
+// At=排序与冷却判定。不存尝试次数、耗时、产出物明细 —— 那些是过程，不是结果。
+type RunTrace struct {
+	ID        int64  `db:"id"`
+	TradeDate string `db:"trade_date"`
+	Subject   string `db:"subject"`
+	Outcome   string `db:"outcome"`
+	Detail    string `db:"detail"`
+	At        string `db:"at"`
 }
 
-// AgentAlert 告警：四级 + 已读标记 + 告警码（聚合去重与单测断言用）。
-type AgentAlert struct {
-	ID        int64      `db:"id"`
-	TradeDate string     `db:"trade_date"`
-	Source    string     `db:"source"`
-	Level     AlertLevel `db:"level"`
-	Code      string     `db:"code"`
-	Title     string     `db:"title"`
-	Content   string     `db:"content"`
-	Status    string     `db:"status"`
-	CreatedAt string     `db:"created_at"`
-	ReadAt    string     `db:"read_at"`
-}
+// Subject 构造函数：subject 是 run_trace 的查找键（完成判定、冷却、去重、回答缓存都按它查），
+// 集中在这里拼，避免各调用方手拼前缀拼错后静默写出查不到的行。
+func TraceJob(name string) string              { return "job:" + name }
+func TraceMail(typ MailType) string            { return "mail:" + string(typ) }
+func TraceAlert(code string) string            { return "alert:" + code }
+func TraceLLM(tsCode, promptKey string) string { return "llm:" + tsCode + ":" + promptKey }
 
-// ActionLog 审计日志：谁/何时/改了什么/前后值。
-type ActionLog struct {
-	ID         int64  `db:"id"`
-	TradeDate  string `db:"trade_date"`
-	Actor      string `db:"actor"`
-	ObjectType string `db:"object_type"`
-	ObjectID   string `db:"object_id"`
-	Action     string `db:"action"`
-	BeforeValue string `db:"before_value"`
-	AfterValue  string `db:"after_value"`
-	Reason     string `db:"reason"`
-	CreatedAt  string `db:"created_at"`
-}
-
-// MailOutbox 邮件发件箱：破解"任务全绿但零邮件"的关键表（D1）。
-type MailOutbox struct {
-	ID          int64    `db:"id"`
-	TradeDate   string   `db:"trade_date"`
-	MailType    MailType `db:"mail_type"`
-	Subject     string   `db:"subject"`
-	Body        string   `db:"body"`
-	Status      string   `db:"status"`
-	Attempts    int      `db:"attempts"`
-	LastError   string   `db:"last_error"`
-	NextRetryAt string   `db:"next_retry_at"`
-	CreatedAt   string   `db:"created_at"`
-	SentAt      string   `db:"sent_at"`
-}
-
-// LLMCall LLM 终审调用记录（P1，失败显式落库，绝不把失败标成"已分析"）。
+// LLMCall 一条 prompt 对一只票的回答，存成一整行 run_trace（见 store.LLMRepo）：
+// Subject=TraceLLM(标的,prompt_key)、Outcome=Status、Detail=其余字段序列化。
+//
+// 读者是决策链自己 —— 重跑当日先查这一行，ok 就直接复用，不再花第二次钱；
+// Status 只有 TraceOK / TraceFail：失败行不算缓存命中，当天重跑会重试它，
+// 否则一次网络抖动就把这只票当天锁死。
+// Verdict 按 prompt 取值：证据行 positive / neutral / negative / unknown，
+// 决策行（prompt_key='decision'）buy / skip。
 type LLMCall struct {
-	ID           int64   `db:"id"`
-	TradeDate    string  `db:"trade_date"`
-	SignalID     int64   `db:"signal_id"`
-	TsCode       string  `db:"ts_code"`
-	Verdict      string  `db:"verdict"`
-	Confidence   float64 `db:"confidence"`
-	Rationale    string  `db:"rationale"`
-	Status       string  `db:"status"`
-	Error        string  `db:"error"`
-	ReviewDate   string  `db:"review_date"`
-	ReviewRetPct float64 `db:"review_ret_pct"`
-	ReviewCorrect int    `db:"review_correct"`
-	CreatedAt    string  `db:"created_at"`
+	TradeDate  string
+	TsCode     string
+	PromptKey  string
+	Verdict    string
+	Confidence float64
+	WeightPct  float64 // 仅决策行：模型批的仓位比例（占总资产）
+	Rationale  string
+	Status     string // = run_trace.outcome
+	Error      string
+	CreatedAt  string // = run_trace.at
 }
 
 // ===================== 目标域模型 =====================
 
-// GoalState 档位状态机持久化（单行 id=1）。
+// GoalState 档位状态机的当前状态。
+//
+// 存法：整个结构序列化成 JSON，落在 config_kv 的 goal.state 一个键上（见 store.GoalRepo）。
+// 它不配独立一张表的理由是"只有一行、且每次写都整行覆盖"——没有任何调用方按列更新它，
+// 字段只是 Go 结构体的成员名，从来不是查询条件。
+//
+// json tag 沿用原列名：改字段名会让已落库的 JSON 键一起漂，所以只加 tag 不改名。
 type GoalState struct {
-	Quarter          string `db:"quarter"`
-	QuarterStart     string `db:"quarter_start"`
-	QuarterEnd       string `db:"quarter_end"`
-	BaselineAsset    Fen    `db:"baseline_asset"`
-	PeakAsset        Fen    `db:"peak_asset"`
-	CurrentGear      Gear   `db:"current_gear"`
-	ProfitLock       bool   `db:"profit_lock"`
-	UpgradeStreak    int    `db:"upgrade_streak"`
-	LastEvalDate     string `db:"last_eval_date"`
-	OverrideGear     string `db:"override_gear"`
-	OverrideReason   string `db:"override_reason"`
-	OverrideUntil    string `db:"override_until"`
-	PacePolicy       string `db:"pace_policy"`
-	PaceConfirmDate  string `db:"pace_confirm_date"`
-	UpdatedAt        string `db:"updated_at"`
-}
-
-// GoalGearLog 档位变更日志（可回放）。
-type GoalGearLog struct {
-	ID             int64   `db:"id"`
-	TradeDate      string  `db:"trade_date"`
-	Quarter        string  `db:"quarter"`
-	FromGear       Gear    `db:"from_gear"`
-	ToGear         Gear    `db:"to_gear"`
-	FromLock       bool    `db:"from_lock"`
-	ToLock         bool    `db:"to_lock"`
-	TriggerRule    string  `db:"trigger_rule"`
-	Progress       float64 `db:"progress"`
-	BudgetConsumed float64 `db:"budget_consumed"`
-	PaceGap        float64 `db:"pace_gap"`
-	IsManual       bool    `db:"is_manual"`
-	Reason         string  `db:"reason"`
-	ParamsSnapshot string  `db:"params_snapshot"`
-	CreatedAt      string  `db:"created_at"`
+	Quarter         string `json:"quarter"`
+	QuarterStart    string `json:"quarter_start"`
+	QuarterEnd      string `json:"quarter_end"`
+	BaselineAsset   Fen    `json:"baseline_asset"`
+	PeakAsset       Fen    `json:"peak_asset"`
+	CurrentGear     Gear   `json:"current_gear"`
+	ProfitLock      bool   `json:"profit_lock"`
+	UpgradeStreak   int    `json:"upgrade_streak"`
+	LastEvalDate    string `json:"last_eval_date"`
+	OverrideGear    string `json:"override_gear"`
+	OverrideReason  string `json:"override_reason"`
+	OverrideUntil   string `json:"override_until"`
+	PacePolicy      string `json:"pace_policy"`
+	PaceConfirmDate string `json:"pace_confirm_date"`
+	UpdatedAt       string `json:"updated_at"`
 }

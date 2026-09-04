@@ -8,10 +8,10 @@ import (
 // TestQuarterOf 季度边界正确（验收 #8）。
 func TestQuarterOf(t *testing.T) {
 	cases := []struct {
-		date         string
-		wantLabel    string
-		wantStart    string
-		wantEnd      string
+		date      string
+		wantLabel string
+		wantStart string
+		wantEnd   string
 	}{
 		{"20260101", "2026Q1", "2026-01-01", "2026-03-31"},
 		{"20260331", "2026Q1", "2026-01-01", "2026-03-31"},
@@ -71,20 +71,25 @@ func TestNextPrevTradeDay(t *testing.T) {
 	}
 }
 
-// TestValidUntil EOD 有效期 = 下一交易日 15:00；盘中 = 当日 15:00。
+// TestValidUntil EOD 有效期 = 下一交易日 15:00；算不出下一交易日必须报错而不是退回自然日 +1。
 func TestValidUntil(t *testing.T) {
 	days := []string{"20260104", "20260105", "20260106", "20260107", "20260108"}
 	// EOD 生成日 0106（周二）→ 下一交易日 0107 15:00
-	eu := EODValidUntil(days, "20260106")
+	eu, err := EODValidUntil(days, "20260106")
+	if err != nil {
+		t.Fatalf("EODValidUntil(0106) 报错: %v", err)
+	}
 	want := time.Date(2026, 1, 7, 15, 0, 0, 0, Loc)
 	if !eu.Equal(want) {
 		t.Errorf("EODValidUntil(0106) = %v, 期望 %v", eu, want)
 	}
-	// 盘中 0106 → 当日 15:00
-	iu := IntradayValidUntil("20260106")
-	want2 := time.Date(2026, 1, 6, 15, 0, 0, 0, Loc)
-	if !iu.Equal(want2) {
-		t.Errorf("IntradayValidUntil(0106) = %v, 期望 %v", iu, want2)
+	// 日历里最后一个交易日之后没有下一交易日：报错，不给"自然日 +1"的周六有效期
+	if _, err := EODValidUntil(days, "20260108"); err == nil {
+		t.Error("日历无后续时应报错，实际静默给出了有效期")
+	}
+	// 非法日期
+	if _, err := EODValidUntil([]string{"2026年1月7日"}, "20260106"); err == nil {
+		t.Error("下一交易日日期非法时应报错")
 	}
 }
 

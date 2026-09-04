@@ -22,9 +22,26 @@ func batchState(totalAssetYuan, cashYuan, positionsMVYuan float64, posCount int,
 	}
 }
 
-// g1Params 总资产 10 万元的 G1 生效参数（单票 4 万 / 总仓 9 万 / 最大持仓自适应 6）。
+// g1Params 按总资产解析出的 G1 生效参数。10 万元：单票 4 万 / 总仓 9 万 / 最大持仓 6 / 置信度 0.55。
 func g1Params(totalAssetYuan float64) RiskParams {
-	return Resolve(DefaultBase(model.Fen(int64(totalAssetYuan*100))), model.GearG1, false, NoPace{})
+	return mustResolve(DefaultBase(model.Fen(int64(totalAssetYuan*100))), model.GearG1, false, NoPace{})
+}
+
+// mustResolve Resolve 的测试包装：用例传的都是表内合法档位，返回错误说明测试代码本身写错。
+func mustResolve(base RiskParams, gear model.Gear, lock bool, pace PaceAdjust) RiskParams {
+	p, err := Resolve(base, gear, lock, pace)
+	if err != nil {
+		panic(err)
+	}
+	return p
+}
+
+// intent 构造一笔"决策要求投入 wantYuan 元"的买入意向（缺省要满）。
+func intent(code string, priceYuan, wantYuan, conf float64) BuyIntent {
+	return BuyIntent{
+		TsCode: code, Name: code, RefPrice: model.FromFloat(priceYuan),
+		Confidence: conf, WantFen: model.FromFloat(wantYuan),
+	}
 }
 
 // TestNoBatchOverTotalPositionLimit 对应验收 #7（历史 P0 bug 回归）：
@@ -33,9 +50,9 @@ func g1Params(totalAssetYuan float64) RiskParams {
 func TestNoBatchOverTotalPositionLimit(t *testing.T) {
 	m := NewManager(g1Params(100000))
 	intents := []BuyIntent{
-		{TsCode: "sh600001", Name: "甲", RefPrice: model.FromFloat(10.0), Confidence: 0.9, Score: 80},
-		{TsCode: "sh600002", Name: "乙", RefPrice: model.FromFloat(10.0), Confidence: 0.9, Score: 80},
-		{TsCode: "sh600003", Name: "丙", RefPrice: model.FromFloat(10.0), Confidence: 0.9, Score: 80},
+		intent("sh600001", 10, 40000, 0.9),
+		intent("sh600002", 10, 40000, 0.9),
+		intent("sh600003", 10, 40000, 0.9),
 	}
 	got := m.CheckBatch(intents, batchState(100000, 100000, 0, 0))
 	if len(got) != 3 {
@@ -53,21 +70,19 @@ func TestNoBatchOverTotalPositionLimit(t *testing.T) {
 	if !strings.Contains(got[2].RejectMsg, "总仓位上限") {
 		t.Errorf("reject_msg 未写明原因: %q", got[2].RejectMsg)
 	}
-	// 前两笔金额均为单票上限 4 万（总仓 9 万未破）
 	if got[0].Amount != model.FromFloat(40000) {
 		t.Errorf("首笔金额=%s, 期望 40000.00", got[0].Amount)
 	}
 }
 
-// TestBatchRejectionWithExistingPositions 已有持仓市值计入累计基数：2 万持仓 + 3×4 万同样在第 3 笔被拒。
+// TestBatchRejectionWithExistingPositions 已有持仓市值计入累计基数：1 万持仓 + 3×4 万在第 3 笔被拒。
 func TestBatchRejectionWithExistingPositions(t *testing.T) {
 	m := NewManager(g1Params(100000)) // 总仓上限 9 万
 	intents := []BuyIntent{
-		{TsCode: "sh600001", RefPrice: model.FromFloat(10.0), Confidence: 0.9, Score: 80},
-		{TsCode: "sh600002", RefPrice: model.FromFloat(10.0), Confidence: 0.9, Score: 80},
-		{TsCode: "sh600003", RefPrice: model.FromFloat(10.0), Confidence: 0.9, Score: 80},
+		intent("sh600001", 10, 40000, 0.9),
+		intent("sh600002", 10, 40000, 0.9),
+		intent("sh600003", 10, 40000, 0.9),
 	}
-	// 现有持仓 1 万（现金 9 万）：1 万+4 万=5 万、+4 万=9 万恰好触顶，第 3 笔爆掉
 	got := m.CheckBatch(intents, batchState(100000, 90000, 10000, 1, "sz000009"))
 	if !got[0].Approved || !got[1].Approved {
 		t.Errorf("前两笔应通过: %+v %+v", got[0], got[1])
@@ -79,7 +94,7 @@ func TestBatchRejectionWithExistingPositions(t *testing.T) {
 
 // TestCheckBatchAllRules 每条否决规则逐一验证（100% 留痕的字段取值契约）。
 func TestCheckBatchAllRules(t *testing.T) {
-	p := g1Params(100000) // 单票 4 万 / 总仓 9 万 / 持仓上限 6 / 置信度 0.55 / 最小 5000 元
+	p := g1Params(100000)
 	cases := []struct {
 		name      string
 		params    RiskParams
@@ -90,49 +105,43 @@ func TestCheckBatchAllRules(t *testing.T) {
 	}{
 		{
 			name: "禁开新仓", params: withBias(p, BiasExitOnly, false),
-			intents:  []BuyIntent{{TsCode: "a", RefPrice: model.FromFloat(10), Confidence: 0.9, Score: 80}},
+			intents:  []BuyIntent{intent("a", 10, 40000, 0.9)},
 			state:    batchState(100000, 100000, 0, 0),
 			wantRule: RuleAllowNewPosition, wantIndex: 0,
 		},
 		{
 			name: "置信度不足", params: p,
-			intents:  []BuyIntent{{TsCode: "a", RefPrice: model.FromFloat(10), Confidence: 0.50, Score: 80}},
+			intents:  []BuyIntent{intent("a", 10, 40000, 0.50)},
 			state:    batchState(100000, 100000, 0, 0),
 			wantRule: RuleMinConfidence, wantIndex: 0,
 		},
 		{
-			name: "评分低于门槛", params: withMul(p, 1.5),
-			intents:  []BuyIntent{{TsCode: "a", RefPrice: model.FromFloat(10), Confidence: 0.9, Score: 80}},
-			state:    batchState(100000, 100000, 0, 0),
-			wantRule: RuleScoreThreshold, wantIndex: 0,
-		},
-		{
 			name: "重复持仓", params: p,
-			intents:  []BuyIntent{{TsCode: "a", RefPrice: model.FromFloat(10), Confidence: 0.9, Score: 80}},
+			intents:  []BuyIntent{intent("a", 10, 40000, 0.9)},
 			state:    batchState(100000, 100000, 0, 1, "a"),
 			wantRule: RuleAlreadyHolding, wantIndex: 0,
 		},
 		{
 			name: "持仓数达上限", params: withMaxPos(p, 1),
-			intents:  []BuyIntent{{TsCode: "b", RefPrice: model.FromFloat(10), Confidence: 0.9, Score: 80}},
+			intents:  []BuyIntent{intent("b", 10, 40000, 0.9)},
 			state:    batchState(100000, 100000, 0, 1, "a"),
 			wantRule: RuleMaxPositions, wantIndex: 0,
 		},
 		{
+			name: "一手买不起", params: p,
+			intents:  []BuyIntent{intent("a", 900, 40000, 0.9)}, // 一手 9 万 > 单票上限 4 万
+			state:    batchState(100000, 100000, 0, 0),
+			wantRule: RuleLotUnaffordable, wantIndex: 0,
+		},
+		{
 			name: "单笔金额低于下限", params: withMinAmount(p, model.FromFloat(60000)),
-			intents:  []BuyIntent{{TsCode: "a", RefPrice: model.FromFloat(100), Confidence: 0.9, Score: 80}},
+			intents:  []BuyIntent{intent("a", 10, 6000, 0.9)},
 			state:    batchState(100000, 100000, 0, 0),
 			wantRule: RuleMinAmount, wantIndex: 0,
 		},
 		{
-			name: "现金不足", params: p,
-			intents:  []BuyIntent{{TsCode: "a", RefPrice: model.FromFloat(10), Confidence: 0.9, Score: 80}},
-			state:    batchState(100000, 1000, 0, 0),
-			wantRule: RuleMinAmount, wantIndex: 0, // 1000 元现金折算后不足 5000 元下限
-		},
-		{
 			name: "参考价非法", params: p,
-			intents:  []BuyIntent{{TsCode: "a", RefPrice: 0, Confidence: 0.9, Score: 80}},
+			intents:  []BuyIntent{intent("a", 0, 40000, 0.9)},
 			state:    batchState(100000, 100000, 0, 0),
 			wantRule: RuleIllegalPrice, wantIndex: 0,
 		},
@@ -159,9 +168,9 @@ func TestCheckBatchBatchMaxPositionsInFlight(t *testing.T) {
 	p := withMaxPos(g1Params(100000), 2)
 	m := NewManager(p)
 	intents := []BuyIntent{
-		{TsCode: "a", RefPrice: model.FromFloat(10), Confidence: 0.9, Score: 80},
-		{TsCode: "b", RefPrice: model.FromFloat(10), Confidence: 0.9, Score: 80},
-		{TsCode: "c", RefPrice: model.FromFloat(10), Confidence: 0.9, Score: 80},
+		intent("a", 10, 40000, 0.9),
+		intent("b", 10, 40000, 0.9),
+		intent("c", 10, 40000, 0.9),
 	}
 	got := m.CheckBatch(intents, batchState(100000, 100000, 0, 0))
 	if !got[0].Approved || !got[1].Approved {
@@ -172,30 +181,54 @@ func TestCheckBatchBatchMaxPositionsInFlight(t *testing.T) {
 	}
 }
 
-// TestPlanBuy 金额→股数核算：整手向下取整 + 最小金额校验。
-func TestPlanBuy(t *testing.T) {
-	p := g1Params(100000) // 单票上限 4 万，最小 5000 元
-	qty, amount, err := PlanBuy(p, model.FromFloat(100000), model.FromFloat(37.8))
-	if err != nil {
-		t.Fatalf("PlanBuy 失败: %v", err)
+// TestWantFenTruncatedByCaps 决策要的钱必须被硬截断：这是"LLM 决定数量、风控只做截断"的接缝。
+func TestWantFenTruncatedByCaps(t *testing.T) {
+	p := g1Params(100000) // 单票上限 4 万
+	cases := []struct {
+		name       string
+		wantYuan   float64
+		cashYuan   float64
+		wantAmount model.Fen
+	}{
+		{"要满则给到单票上限", 999999, 100000, model.FromFloat(40000)},
+		{"要得少就按要的给", 12000, 100000, model.FromFloat(12000)},
+		{"现金不足则按现金截断", 40000, 15000, model.FromFloat(15000)},
 	}
-	if qty != 1000 {
-		t.Errorf("qty=%d, 期望 1000（37800/37.8≈1000 手取整）", qty)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := NewManager(p).CheckBatch(
+				[]BuyIntent{intent("a", 10, tc.wantYuan, 0.9)},
+				batchState(100000, tc.cashYuan, 0, 0))
+			if !got[0].Approved {
+				t.Fatalf("应通过: %+v", got[0])
+			}
+			if got[0].Amount != tc.wantAmount {
+				t.Errorf("金额=%s, 期望 %s", got[0].Amount, tc.wantAmount)
+			}
+			if got[0].Qty%model.LotShares != 0 {
+				t.Errorf("股数 %d 不是整手", got[0].Qty)
+			}
+		})
 	}
-	if amount != model.FromFloat(37800) {
-		t.Errorf("amount=%s, 期望 37800.00", amount)
+}
+
+// TestMinAmountFloorScalesWithCapital 单笔金额下限必须随资金缩放：
+// 5000 元的绝对下限是为压佣金设的，两万元账户的单票上限本身不到一万元，
+// 按绝对值卡会让每一个候选都判"金额过小"，当日一张单都出不来。
+func TestMinAmountFloorScalesWithCapital(t *testing.T) {
+	cases := []struct {
+		totalYuan float64
+		wantFen   model.Fen
+	}{
+		{20000, model.FromFloat(4000)},  // 单票上限 8000 → 下限收口到一半
+		{50000, model.FromFloat(5000)},  // 单票上限 2 万，绝对下限 5000 仍生效
+		{200000, model.FromFloat(5000)}, // 大账户保持 5000 元
 	}
-	// 低价股不超过单票上限
-	qty2, _, err2 := PlanBuy(p, model.FromFloat(100000), model.FromFloat(2.5))
-	if err2 != nil {
-		t.Fatalf("PlanBuy(低价股) 失败: %v", err2)
-	}
-	if qty2 != 16000 {
-		t.Errorf("低价股 qty=%d, 期望 16000（40000/2.5 整手）", qty2)
-	}
-	// 高价股低于最小交易额 → 报错
-	if _, _, err3 := PlanBuy(p, model.FromFloat(100000), model.FromFloat(800)); err3 == nil {
-		t.Errorf("800 元/股 × 整手远超现金，应返回错误")
+	for _, tc := range cases {
+		p := g1Params(tc.totalYuan)
+		if got := p.MinAmountFloor(); got != tc.wantFen {
+			t.Errorf("总资产 %.0f 元时生效下限=%s, 期望 %s", tc.totalYuan, got, tc.wantFen)
+		}
 	}
 }
 
@@ -206,9 +239,9 @@ func TestTargetQty(t *testing.T) {
 		want          model.Qty
 	}{
 		{model.FromFloat(10000), model.FromFloat(10), 1000},
-		{model.FromFloat(10050), model.FromFloat(10), 1000},   // 向下取整
-		{model.FromFloat(99), model.FromFloat(10), 0},         // 不足一手
-		{model.FromFloat(10000), 0, 0},                        // 非法价格
+		{model.FromFloat(10050), model.FromFloat(10), 1000}, // 向下取整
+		{model.FromFloat(99), model.FromFloat(10), 0},       // 不足一手
+		{model.FromFloat(10000), 0, 0},                      // 非法价格
 	}
 	for _, tc := range cases {
 		if got := TargetQty(tc.amount, tc.price); got != tc.want {
@@ -222,11 +255,6 @@ func TestTargetQty(t *testing.T) {
 func withBias(p RiskParams, b StrategyBias, allow bool) RiskParams {
 	p.Bias = b
 	p.AllowNewPosition = allow
-	return p
-}
-
-func withMul(p RiskParams, mul float64) RiskParams {
-	p.ScoreThresholdMul = mul
 	return p
 }
 

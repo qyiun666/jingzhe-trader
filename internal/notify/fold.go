@@ -1,7 +1,7 @@
 // Package notify 邮件构建/折行/发送/重试、告警落库与分级（D1 破解"任务全绿但零邮件"）。
 //
 // 核心原则：
-//   - 邮件未启用不是 no-op：Enqueue 显式落 mail_outbox failed 行并返回 ErrNotConfigured；
+//   - 邮件未启用不是 no-op：Send 显式落一条 mail:* 失败轨迹并返回 ErrNotConfigured；
 //   - 折行按字节（≤990）且不切断 UTF-8 多字节字符（§6-D8 / 附录 A）；
 //   - urgent 告警立即发信，普通告警同 code 1 小时去重。
 package notify

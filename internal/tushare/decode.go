@@ -151,67 +151,42 @@ func setField(fv reflect.Value, val interface{}) error {
 // total_mv_w/circ_mv_w）不一致，故先解码到原始 DTO（float64 元/手/千元），再经下方
 // 转换函数归一为 model（分/万元）。转换函数位于适配层，是本包两处 float→Fen 边界之一（§11.4）。
 
-// RawBar 日线原始解码结构（Tushare 字段名，float64 元/手/千元）。
+// RawBar 日线原始解码结构（Tushare 字段名，float64 元/手）。
+// 只取实际入库的三列：close 是未复权收盘（转成 RawClose），vol 是成交量（手）。
 type RawBar struct {
 	TsCode    string  `db:"ts_code"`
 	TradeDate string  `db:"trade_date"`
-	Open      float64 `db:"open"`
-	High      float64 `db:"high"`
-	Low       float64 `db:"low"`
 	Close     float64 `db:"close"`
-	PreClose  float64 `db:"pre_close"`
 	Vol       float64 `db:"vol"`
-	Amount    float64 `db:"amount"`
-	PctChg    float64 `db:"pct_chg"`
 }
 
-// ToModelBar 将原始日线转为 model.Bar（价格→分；vol_lot 手、amount_k 千元原样）。
+// ToModelBar 将原始日线转为 model.Bar（价格→分；Close 暂存未复权值，由同步侧就地复权）。
 func ToModelBar(r RawBar) model.Bar {
 	return model.Bar{
 		TsCode:    r.TsCode,
 		TradeDate: r.TradeDate,
-		Open:      model.FromFloat(r.Open),
-		High:      model.FromFloat(r.High),
-		Low:       model.FromFloat(r.Low),
 		Close:     model.FromFloat(r.Close),
-		PreClose:  model.FromFloat(r.PreClose),
-		PctChg:    r.PctChg,
 		VolLot:    r.Vol,
-		AmountK:   r.Amount,
 	}
 }
 
-// RawDailyBasic 每日指标原始解码结构（Tushare 字段名）。
-// total_mv/circ_mv 单位为千元，ToModelDailyBasic 换算为万元（模型口径）。
-type RawDailyBasic struct {
+// RawValuation 每日指标原始解码结构（Tushare 字段名）。
+// circ_mv 单位为千元，ToModelValuation 换算为万元（模型口径）。
+type RawValuation struct {
 	TsCode       string  `db:"ts_code"`
-	TradeDate    string  `db:"trade_date"`
-	Close        float64 `db:"close"`
 	TurnoverRate float64 `db:"turnover_rate"`
-	VolumeRatio  float64 `db:"volume_ratio"`
-	PE           float64 `db:"pe"`
 	PETtm        float64 `db:"pe_ttm"`
 	PB           float64 `db:"pb"`
-	PsTtm        float64 `db:"ps_ttm"`
-	DvRatio      float64 `db:"dv_ratio"`
-	TotalMv      float64 `db:"total_mv"` // 千元
 	CircMv       float64 `db:"circ_mv"` // 千元
 }
 
-// ToModelDailyBasic 将原始每日指标转为 model.DailyBasic（价格→分；市值千元→万元）。
-func ToModelDailyBasic(r RawDailyBasic) model.DailyBasic {
-	return model.DailyBasic{
+// ToModelValuation 将原始每日指标转为 model.Valuation（流通市值千元→万元）。
+func ToModelValuation(r RawValuation) model.Valuation {
+	return model.Valuation{
 		TsCode:       r.TsCode,
-		TradeDate:    r.TradeDate,
-		Close:        model.FromFloat(r.Close),
 		TurnoverRate: r.TurnoverRate,
-		VolumeRatio:  r.VolumeRatio,
-		PE:           r.PE,
 		PETtm:        r.PETtm,
 		PB:           r.PB,
-		PsTtm:        r.PsTtm,
-		DvRatio:      r.DvRatio,
-		TotalMvW:     r.TotalMv / 10.0,
 		CircMvW:      r.CircMv / 10.0,
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"jingzhe-trader/internal/observability"
 	"jingzhe-trader/internal/store"
 )
 
@@ -32,15 +33,24 @@ type Entry struct {
 }
 
 // effectiveValue 计算生效值：默认 < 库值 < 环境变量（非空才顶换）。
-func effectiveValue(spec KeySpec, row store.ConfigRow, dbHas bool) string {
+// write-once 键例外：库里已有非零值时环境变量不得顶换。
+func effectiveValue(spec KeySpec, dbValue string, dbHas bool) string {
 	v := spec.Default
 	if dbHas {
-		v = row.Value
+		v = dbValue
 	}
-	if env := os.Getenv(envName(spec.Key)); env != "" {
-		v = env // 应急覆盖通道：非空才顶换库内值（§6.3）
+	env := os.Getenv(envName(spec.Key))
+	if env == "" {
+		return v
 	}
-	return v
+	// 本金这类 write-once 基准一旦被一份 .env 悄悄改写，季度收益与回撤全错
+	// （历史事故："同步把本金刷小"）。此时以库值为准并显式告警，不静默丢弃。
+	if spec.WriteOnce && v != "" && v != "0" {
+		observability.S().Warnw("忽略 write-once 配置键的环境变量覆盖，以库内值为准",
+			"key", spec.Key, "db_value", v)
+		return v
+	}
+	return env
 }
 
 // Load 从 config_kv 读取配置，叠加默认值与环境变量，并拒绝危险零值/缺失必配项（启动自检 D6）。
@@ -49,14 +59,10 @@ func Load(ctx context.Context, s *store.Store) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("读取配置失败: %w", err)
 	}
-	db := make(map[string]store.ConfigRow, len(rows))
-	for _, r := range rows {
-		db[r.Key] = r
-	}
 	vals := make(map[string]ConfigValue, len(KeySpecs))
 	for _, spec := range KeySpecs {
-		row, ok := db[spec.Key]
-		v := effectiveValue(spec, row, ok)
+		dbValue, ok := rows[spec.Key]
+		v := effectiveValue(spec, dbValue, ok)
 		vals[spec.Key] = ConfigValue{Key: spec.Key, Type: spec.Type, Value: v, IsSecret: spec.Secret}
 	}
 	cfg := &Config{Values: vals}
@@ -66,9 +72,13 @@ func Load(ctx context.Context, s *store.Store) (*Config, error) {
 	return cfg, nil
 }
 
-// Validate 校验：必配项为空 → 列出缺失；拒绝零值键为 0 → 列出零值（D6）。
+// Validate 校验三类：必配项为空、拒绝零值键为 0、数值/布尔键解析不了（启动自检 D6）。
+//
+// 第三类必须有：GetInt/GetFloat/GetBool 解析失败一律返回零值。
+// 一个写坏的数值键（手工 SQL 改的、或老版本写进去的）在业务层静默变成 0，
+// 比键干脆缺失更隐蔽 —— 门禁阈值类配置尤其如此（阈值为 0 等于门禁不生效）。
 func (c *Config) Validate() error {
-	var missing, zeros []string
+	var missing, zeros, malformed []string
 	for _, spec := range KeySpecs {
 		v := c.val(spec.Key)
 		if spec.Required && strings.TrimSpace(v) == "" {
@@ -87,17 +97,23 @@ func (c *Config) Validate() error {
 				}
 			}
 		}
+		if v = strings.TrimSpace(v); v != "" {
+			if err := coerce(spec, v); err != nil {
+				malformed = append(malformed, fmt.Sprintf("%s=%s（%s）", spec.Key, v, err))
+			}
+		}
 	}
-	if len(missing) == 0 && len(zeros) == 0 {
+	if len(missing) == 0 && len(zeros) == 0 && len(malformed) == 0 {
 		return nil
 	}
-	return &ConfigError{Missing: missing, ZeroValues: zeros}
+	return &ConfigError{Missing: missing, ZeroValues: zeros, Malformed: malformed}
 }
 
-// ConfigError 配置自检失败（含缺失项与零值项清单）。
+// ConfigError 配置自检失败（含缺失项、零值项与类型不符项清单）。
 type ConfigError struct {
 	Missing    []string
 	ZeroValues []string
+	Malformed  []string
 }
 
 func (e *ConfigError) Error() string {
@@ -108,6 +124,9 @@ func (e *ConfigError) Error() string {
 	}
 	for _, k := range e.ZeroValues {
 		b.WriteString(fmt.Sprintf("\n  - %s 为零值（危险配置，必须显式设置非零值）", k))
+	}
+	for _, k := range e.Malformed {
+		b.WriteString(fmt.Sprintf("\n  - 配置值与声明类型不符: %s（读取时会静默变成零值）", k))
 	}
 	return b.String()
 }
@@ -150,15 +169,11 @@ func Dump(ctx context.Context, s *store.Store) ([]Entry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("读取配置失败: %w", err)
 	}
-	db := make(map[string]store.ConfigRow, len(rows))
-	for _, r := range rows {
-		db[r.Key] = r
-	}
 	entries := make([]Entry, 0, len(KeySpecs))
 	for _, key := range SortedKeys() {
 		spec := specIndex[key]
-		row, ok := db[key]
-		v := effectiveValue(spec, row, ok)
+		stored, ok := rows[key]
+		v := effectiveValue(spec, stored, ok)
 		entries = append(entries, Entry{Key: key, Value: v, Type: spec.Type, IsSecret: spec.Secret})
 	}
 	return entries, nil
@@ -170,14 +185,12 @@ func Get(ctx context.Context, s *store.Store, key string) (Entry, error) {
 	if !ok {
 		return Entry{}, fmt.Errorf("未知配置键: %s", key)
 	}
-	db := make(map[string]store.ConfigRow)
-	if rows, err := s.ConfigRepo().GetAll(ctx); err == nil {
-		for _, r := range rows {
-			db[r.Key] = r
-		}
+	rows, err := s.ConfigRepo().GetAll(ctx)
+	if err != nil {
+		return Entry{}, fmt.Errorf("读取配置失败: %w", err)
 	}
-	row, ok := db[key]
-	v := effectiveValue(spec, row, ok)
+	stored, ok := rows[key]
+	v := effectiveValue(spec, stored, ok)
 	return Entry{Key: key, Value: v, Type: spec.Type, IsSecret: spec.Secret}, nil
 }
 

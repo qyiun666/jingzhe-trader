@@ -8,28 +8,17 @@ import (
 	"jingzhe-trader/internal/model"
 )
 
-// FactorWeights 五因子权重（各档位可覆盖；G1 均衡，G2 质量与低波加权）。
+// FactorWeights 四因子权重（各档位可覆盖；均衡档偏动量，防御档偏低波与价值）。
 type FactorWeights struct {
 	Momentum  float64
-	Quality   float64
 	Value     float64
 	LowVol    float64
 	Liquidity float64
 }
 
-// DefaultWeights G1 均衡权重（合计 1.0）。
+// DefaultWeights 均衡权重（合计 1.0）。
 func DefaultWeights() FactorWeights {
-	return FactorWeights{Momentum: 0.25, Quality: 0.20, Value: 0.20, LowVol: 0.15, Liquidity: 0.20}
-}
-
-// DefensiveWeights G2 收紧档权重：质量与低波加权（合计 1.0）。
-func DefensiveWeights() FactorWeights {
-	return FactorWeights{Momentum: 0.15, Quality: 0.30, Value: 0.20, LowVol: 0.25, Liquidity: 0.10}
-}
-
-// NeutralWeights 缺失因子兜底（等权）。
-func NeutralWeights() FactorWeights {
-	return FactorWeights{Momentum: 0.20, Quality: 0.20, Value: 0.20, LowVol: 0.20, Liquidity: 0.20}
+	return FactorWeights{Momentum: 0.30, Value: 0.25, LowVol: 0.20, Liquidity: 0.25}
 }
 
 // neutralScore 缺失数据的因子中性分。
@@ -38,18 +27,16 @@ const neutralScore = 50.0
 // RawMetrics 单只股票的原始因子输入（截面百分位转换前）。
 type RawMetrics struct {
 	Momentum float64 // 区间收益率（小数，如 0.12）
-	Quality  float64 // ROE（%），缺失为 NaN
-	HasQual  bool
 	Value    float64 // 估值原始值：-1 表示越便宜越好（由调用方直接给"越低越好"的合成值）
 	LowVol   float64 // 区间日收益率标准差
 	Turnover float64 // 换手率（%）
 	OK       bool    // 行情序列是否足够（不足以计算动量/低波）
 }
 
-// ComputeRaw 计算单只股票的原始因子值。closes 为升序前复权收盘，roe 为最新一期 ROE（%）。
+// ComputeRaw 计算单只股票的原始因子值。closes 为升序前复权收盘。
 // bars 不足 minBars 时 OK=false（动量/低波取中性分）。
-func ComputeRaw(closes []float64, turnover float64, roe float64, hasRoe bool, minBars int) RawMetrics {
-	rm := RawMetrics{Turnover: turnover, Quality: roe, HasQual: hasRoe}
+func ComputeRaw(closes []float64, turnover float64, minBars int) RawMetrics {
+	rm := RawMetrics{Turnover: turnover}
 	if len(closes) < minBars {
 		return rm
 	}
@@ -61,7 +48,7 @@ func ComputeRaw(closes []float64, turnover float64, roe float64, hasRoe bool, mi
 	rets := dailyReturns(closes)
 	rm.LowVol = stdDev(rets)
 	// 价值：用 PE_TTM 与 PB 的倒数合成（越低越好的原始值交由截面百分位反转），
-	// 由调用方在 screener.Run 中直接填 rm.Value = -(合成便宜的度量)。
+	// 由调用方在 scorePool 中直接填 rm.Value = -(合成便宜的度量)。
 	return rm
 }
 
@@ -152,16 +139,15 @@ type Scored struct {
 
 // Composite 加权综合分（0~100）。
 func Composite(fs model.FactorScore, w FactorWeights) float64 {
-	return fs.Momentum*w.Momentum + fs.Quality*w.Quality + fs.Value*w.Value +
+	return fs.Momentum*w.Momentum + fs.Value*w.Value +
 		fs.LowVol*w.LowVol + fs.Liquidity*w.Liquidity
 }
 
-// buildFactorScores 将原始指标截面转换为五因子百分位分（0~100）。
-// valueRaw 传"原始 PE/PB 合成值（越低越好）"，函数内部做反转。
+// buildFactorScores 将原始指标截面转换为因子百分位分（0~100）。
+// pePB 传 {PE_TTM, PB}，价值分由二者倒数合成（越大越便宜）。
 func buildFactorScores(codes []string, raw map[string]RawMetrics, pePB map[string][2]float64) map[string]model.FactorScore {
 	n := len(codes)
 	mom := make([]float64, n)
-	qua := make([]float64, n)
 	val := make([]float64, n)
 	low := make([]float64, n)
 	liq := make([]float64, n)
@@ -173,11 +159,6 @@ func buildFactorScores(codes []string, raw map[string]RawMetrics, pePB map[strin
 			low[i] = math.NaN()
 		} else {
 			low[i] = rm.LowVol
-		}
-		if rm.HasQual {
-			qua[i] = rm.Quality
-		} else {
-			qua[i] = math.NaN()
 		}
 		// 价值合成：PE 与 PB 各自倒数平均（越大越便宜），缺失用另一项
 		if pp, ok := pePB[c]; ok {
@@ -205,7 +186,6 @@ func buildFactorScores(codes []string, raw map[string]RawMetrics, pePB map[strin
 		}
 	}
 	pMom := PercentileRank(mom)
-	pQua := PercentileRank(qua)
 	pVal := PercentileRank(val) // 越大越便宜 → 直接为"价值分"
 	pLow := PercentileRank(low)
 	pLiq := PercentileRank(liq)
@@ -214,7 +194,6 @@ func buildFactorScores(codes []string, raw map[string]RawMetrics, pePB map[strin
 	for i, c := range codes {
 		out[c] = model.FactorScore{
 			Momentum:  pMom[i],
-			Quality:   pQua[i],
 			Value:     pVal[i],
 			LowVol:    pLow[i],
 			Liquidity: pLiq[i],
@@ -223,25 +202,20 @@ func buildFactorScores(codes []string, raw map[string]RawMetrics, pePB map[strin
 	return out
 }
 
-// BuildReason 生成可解释理由文本（验收 #2：screen_result.reason 必须可读）。
-func BuildReason(fs model.FactorScore, score float64, b model.DailyBasic, roe float64, hasRoe bool) string {
-	top2 := topFactorNames(fs)
-	s := fmt.Sprintf("综合%.1f分；%s；PE_TTM %.1f/PB %.1f/换手 %.2f%%/流通市值 %.0f万",
-		score, top2, b.PETtm, b.PB, b.TurnoverRate, b.CircMvW)
-	if hasRoe {
-		s += fmt.Sprintf("/ROE %.1f%%", roe)
-	}
-	return s
+// BuildReason 生成可解释理由文本（指令单 reason 的唯一来源，必须人可读）。
+func BuildReason(fs model.FactorScore, score float64, s model.StockBasic) string {
+	return fmt.Sprintf("综合%.1f分；%s；PE_TTM %.1f/PB %.1f/换手 %.2f%%/流通市值 %.0f万",
+		score, topFactorNames(fs), s.PETtm, s.PB, s.TurnoverRate, s.CircMvW)
 }
 
-// topFactorNames 取得分最高的两个因子名（"动量85/质量72"样式）。
+// topFactorNames 取得分最高的两个因子名（"动量85/低波72"样式）。
 func topFactorNames(fs model.FactorScore) string {
 	type kv struct {
 		name string
 		v    float64
 	}
 	all := []kv{
-		{"动量", fs.Momentum}, {"质量", fs.Quality}, {"价值", fs.Value},
+		{"动量", fs.Momentum}, {"价值", fs.Value},
 		{"低波", fs.LowVol}, {"流动性", fs.Liquidity},
 	}
 	sort.SliceStable(all, func(i, j int) bool { return all[i].v > all[j].v })

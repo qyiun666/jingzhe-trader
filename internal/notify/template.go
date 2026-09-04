@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
-	"jingzhe-trader/internal/model"
 )
 
 // GoalBrief 邮件顶部三行的"目标还差多少"数据源（渲染层转元，金额不进模板层计算）。
@@ -27,14 +25,21 @@ type TicketLine struct {
 	Direction  string // buy/sell
 	DirLabel   string // 买入/卖出
 	Qty        int64
-	PriceLow   float64
-	PriceHigh  float64
+	Price      float64 // 参考价（元）
 	ValidUntil string
 	Reason     string
 }
 
 // briefLines 顶部三行：做什么 / 多少钱 / 目标还差多少（验收 §10.5-6）。
+// 返回 nil 表示没有概要可写（紧急/告警邮件），此时整段不渲染。
+func (b GoalBrief) empty() bool {
+	return b.Gear == "" && b.TotalYuan == 0 && b.CashYuan == 0 && b.TargetPct == 0
+}
+
 func briefLines(b GoalBrief) []string {
+	if b.empty() {
+		return nil
+	}
 	lock := ""
 	if b.ProfitLock {
 		lock = "（已锁利）"
@@ -77,8 +82,8 @@ func RenderM1(lines []TicketLine, b GoalBrief, noTicketReason string) (string, s
 		var sb strings.Builder
 		sb.WriteString("== 明日指令（请人工在券商 App 执行，有效期见下）==\n")
 		for i, l := range lines {
-			fmt.Fprintf(&sb, "%d. %s %s（%s）%d 股，参考价 %.2f~%.2f 元，有效期至 %s\n   回执话术：「%s %s %d 股，指令单已回执」\n   理由：%s",
-				i+1, l.TsCode, l.Name, l.DirLabel, l.Qty, l.PriceLow, l.PriceHigh, l.ValidUntil,
+			fmt.Fprintf(&sb, "%d. %s %s（%s）%d 股，参考价 %.2f 元，有效期至 %s\n   回执话术：「%s %s %d 股，指令单已回执」\n   理由：%s",
+				i+1, l.TsCode, l.Name, l.DirLabel, l.Qty, l.Price, l.ValidUntil,
 				l.TsCode, l.DirLabel, l.Qty, l.Reason)
 			sb.WriteString("\n")
 		}
@@ -100,17 +105,10 @@ func RenderM3(lines []TicketLine, reason string) (string, string) {
 	var sb strings.Builder
 	sb.WriteString("== 盘中紧急 ==\n" + reason + "\n")
 	for _, l := range lines {
-		fmt.Fprintf(&sb, "%s %s（%s）%d 股，参考价 %.2f~%.2f，有效期至 %s\n", l.TsCode, l.Name, l.DirLabel, l.Qty, l.PriceLow, l.PriceHigh, l.ValidUntil)
+		fmt.Fprintf(&sb, "%s %s（%s）%d 股，参考价 %.2f，有效期至 %s\n", l.TsCode, l.Name, l.DirLabel, l.Qty, l.Price, l.ValidUntil)
 	}
 	subject := fmt.Sprintf("[惊蛰][紧急] 盘中触发 %d 笔卖出", len(lines))
 	return render(subject, b, []string{sb.String()})
-}
-
-// RenderM4 M4 档位变更（含前后对照与恢复条件，立即发）。
-func RenderM4(fromGear, toGear, reason, recoverHint string, b GoalBrief) (string, string) {
-	subject := fmt.Sprintf("[惊蛰][档位] %s → %s", fromGear, toGear)
-	sections := []string{fmt.Sprintf("== 档位变更 ==\n%s → %s\n原因：%s\n恢复条件：%s", fromGear, toGear, reason, recoverHint)}
-	return render(subject, b, sections)
 }
 
 // RenderM5 M5 每日报告（心跳必发；degraded 与 success 分列）。
@@ -135,24 +133,4 @@ func RenderM6(level, code, title, content string) (string, string) {
 	subject := fmt.Sprintf("[惊蛰][%s] %s：%s", level, code, title)
 	b := GoalBrief{}
 	return render(subject, b, []string{fmt.Sprintf("== 告警 %s（%s）==\n%s", code, level, content)})
-}
-
-// MailTypeName 类型中文名（主题/日报用）。
-func MailTypeName(t model.MailType) string {
-	switch t {
-	case model.MailM1:
-		return "次日指令"
-	case model.MailM2:
-		return "盘前提醒"
-	case model.MailM3:
-		return "盘中紧急"
-	case model.MailM4:
-		return "档位变更"
-	case model.MailM5:
-		return "每日报告"
-	case model.MailM6:
-		return "异常告警"
-	default:
-		return string(t)
-	}
 }

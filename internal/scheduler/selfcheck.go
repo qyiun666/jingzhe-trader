@@ -13,12 +13,13 @@ import (
 type CheckResult struct {
 	Name   string
 	OK     bool
-	Code   string // 失败时的告警码（如 MAIL_NOT_SENT / SNAPSHOT_MISSING）
+	Code   string // 失败时的告警码（如 MAIL_NOT_SENT / ARTIFACT_MISSING）
 	Detail string
 }
 
-// BuildDailyChecks 八类产出物自检（§5.1 20:00 / D1）：
-// 日历覆盖 / 日线行数 / 每日指标行数 / 选股结果 / 信号 / 账户快照 / M5 邮件 / 任务状态。
+// BuildDailyChecks 六类产出物自检（日报的"当天失败汇报"）：
+// 日历覆盖 / 日线行数 / 每日指标行数 / 待买卖表 / 日报邮件 / 任务状态。
+// 只看结果表与当日轨迹 —— 选股条数、漏斗诊断、信号明细属过程产物，只写日志，不入库也不在此复算。
 // 纯读库，无副作用。
 func BuildDailyChecks(ctx context.Context, st *store.Store, date string, minBarRows int) []CheckResult {
 	var rs []CheckResult
@@ -42,79 +43,68 @@ func BuildDailyChecks(ctx context.Context, st *store.Store, date string, minBarR
 	} else {
 		rs = append(rs, CheckResult{Name: "日线行情", OK: true, Detail: fmt.Sprintf("%d 行", barRows)})
 	}
-	basicRows, err := st.MarketRepo().CountDailyBasic(ctx, date)
+	basicRows, err := st.MarketRepo().CountValuation(ctx, date)
 	if err != nil || basicRows == 0 {
-		rs = append(rs, CheckResult{Name: "每日指标", OK: false, Code: "DATA_STALE", Detail: fmt.Sprintf("daily_basic 0 行 err=%v", err)})
+		rs = append(rs, CheckResult{Name: "估值截面", OK: false, Code: "DATA_STALE",
+			Detail: fmt.Sprintf("stock_basic 当日估值 0 行 err=%v", err)})
 	} else {
 		rs = append(rs, CheckResult{Name: "每日指标", OK: true, Detail: fmt.Sprintf("%d 行", basicRows)})
 	}
 
-	// 4. 选股结果（0 条本身不判失败——SCREEN_EMPTY 已有独立告警，此处只报告）
-	cands, err := st.ScreenRepo().ListScreenResults(ctx, date)
+	// 4. 待买卖表（0 条不判失败：无信号是合法结果，17:00 会自行跳过发信；
+	//    选股条数与漏斗诊断只写日志，不在结果表里）
+	tks, err := st.TradeRepo().ListTickets(ctx, date, "")
 	if err != nil {
-		rs = append(rs, CheckResult{Name: "选股结果", OK: false, Code: "ARTIFACT_MISSING", Detail: err.Error()})
+		rs = append(rs, CheckResult{Name: "待买卖表", OK: false, Code: "ARTIFACT_MISSING", Detail: err.Error()})
 	} else {
-		rs = append(rs, CheckResult{Name: "选股结果", OK: true, Detail: fmt.Sprintf("%d 条", len(cands))})
+		rs = append(rs, CheckResult{Name: "待买卖表", OK: true, Detail: fmt.Sprintf("%d 张指令单", len(tks))})
 	}
 
-	// 5. 信号
-	sigN, err := st.DecisionRepo().CountSignals(ctx, date)
-	if err != nil {
-		rs = append(rs, CheckResult{Name: "信号", OK: false, Code: "ARTIFACT_MISSING", Detail: err.Error()})
-	} else {
-		rs = append(rs, CheckResult{Name: "信号", OK: true, Detail: fmt.Sprintf("%d 条", sigN)})
+	// 5/6. 一次读当日轨迹，供「日报邮件」与「任务状态」两项判定
+	traces, terr := st.TraceRepo().List(ctx, date)
+	if terr != nil {
+		rs = append(rs, CheckResult{Name: "日报邮件", OK: false, Code: "MAIL_NOT_SENT", Detail: terr.Error()})
+		rs = append(rs, CheckResult{Name: "任务记录", OK: false, Code: "JOB_FAILED", Detail: terr.Error()})
+		return rs
 	}
 
-	// 6. 账户快照
-	hasSn, err := st.TradeRepo().HasSnapshot(ctx, date)
-	if err != nil || !hasSn {
-		rs = append(rs, CheckResult{Name: "账户快照", OK: false, Code: "SNAPSHOT_MISSING", Detail: fmt.Sprintf("当日无快照 err=%v", err)})
-	} else {
-		rs = append(rs, CheckResult{Name: "账户快照", OK: true, Detail: "已写入"})
-	}
-
-	// 7. M5 日报邮件（当日应有邮件无 sent 记录 → MAIL_NOT_SENT，验收 §10.5-11）
+	// 5. M5 日报邮件（缺行或 fail → MAIL_NOT_SENT，验收 §10.5-11）
 	MAIL_NOT_SENT := "MAIL_NOT_SENT"
-	mails, err := st.OpsRepo().ListMailByDate(ctx, date)
-	if err != nil {
-		rs = append(rs, CheckResult{Name: "日报邮件", OK: false, Code: MAIL_NOT_SENT, Detail: err.Error()})
-	} else {
-		m5 := findMail(mails, model.MailM5)
-		switch {
-		case m5 == nil:
-			rs = append(rs, CheckResult{Name: "日报邮件", OK: false, Code: MAIL_NOT_SENT,
-				Detail: "当日 mail_outbox 无 M5 记录（日报未入队或被删除）"})
-		case m5.Status == "failed":
-			rs = append(rs, CheckResult{Name: "日报邮件", OK: false, Code: MAIL_NOT_SENT,
-				Detail: "M5 终态 failed：" + m5.LastError})
-		default:
-			rs = append(rs, CheckResult{Name: "日报邮件", OK: true, Detail: "M5 状态 " + m5.Status})
-		}
+	m5 := findTrace(traces, model.TraceMail(model.MailM5))
+	switch {
+	case m5 == nil:
+		rs = append(rs, CheckResult{Name: "日报邮件", OK: false, Code: MAIL_NOT_SENT,
+			Detail: "当日轨迹无 mail:M5 行（日报未执行或进程中途退出）"})
+	case m5.Outcome == model.TraceFail:
+		rs = append(rs, CheckResult{Name: "日报邮件", OK: false, Code: MAIL_NOT_SENT,
+			Detail: "M5 发送失败：" + m5.Detail})
+	default:
+		rs = append(rs, CheckResult{Name: "日报邮件", OK: true, Detail: m5.Detail})
 	}
 
-	// 8. 任务状态（failed/degraded 列名，供日报分列）
-	runs, err := st.OpsRepo().ListJobRuns(ctx, date)
-	if err != nil {
-		rs = append(rs, CheckResult{Name: "任务记录", OK: false, Code: "JOB_FAILED", Detail: err.Error()})
-	} else {
-		var failed, degraded []string
-		for _, j := range runs {
-			switch model.JobStatus(j.Status) {
-			case model.JobFailed:
-				failed = append(failed, j.JobName)
-			case model.JobDegraded:
-				degraded = append(degraded, j.JobName)
-			}
+	// 6. 任务轨迹（fail/partial 列名，供日报分列）
+	var failed, partial []string
+	for _, t := range traces {
+		if !strings.HasPrefix(t.Subject, "job:") {
+			continue
 		}
-		if len(failed) > 0 {
-			rs = append(rs, CheckResult{Name: "任务记录", OK: false, Code: "JOB_FAILED",
-				Detail: fmt.Sprintf("失败任务：%s", strings.Join(failed, ","))})
-		} else if len(degraded) > 0 {
-			rs = append(rs, CheckResult{Name: "任务记录", OK: true,
-				Detail: fmt.Sprintf("降级任务：%s", strings.Join(degraded, ","))})
-		} else {
-			rs = append(rs, CheckResult{Name: "任务记录", OK: true, Detail: "全部成功"})
+		name := strings.TrimPrefix(t.Subject, "job:")
+		switch t.Outcome {
+		case model.TraceFail:
+			failed = append(failed, name)
+		case model.TracePartial:
+			partial = append(partial, name)
 		}
+	}
+	switch {
+	case len(failed) > 0:
+		rs = append(rs, CheckResult{Name: "任务记录", OK: false, Code: "JOB_FAILED",
+			Detail: fmt.Sprintf("失败任务：%s", strings.Join(failed, ","))})
+	case len(partial) > 0:
+		rs = append(rs, CheckResult{Name: "任务记录", OK: true,
+			Detail: fmt.Sprintf("降级任务：%s", strings.Join(partial, ","))})
+	default:
+		rs = append(rs, CheckResult{Name: "任务记录", OK: true, Detail: "全部成功"})
 	}
 	return rs
 }
@@ -123,7 +113,7 @@ func BuildDailyChecks(ctx context.Context, st *store.Store, date string, minBarR
 func BuildDailyBlock(ctx context.Context, st *store.Store, date string, minBarRows int) string {
 	rs := BuildDailyChecks(ctx, st, date, minBarRows)
 	var b strings.Builder
-	b.WriteString("== 静默失败自检（8 项）==\n")
+	b.WriteString("== 静默失败自检（6 项）==\n")
 	for _, r := range rs {
 		mark := "✓"
 		if !r.OK {
@@ -138,11 +128,11 @@ func BuildDailyBlock(ctx context.Context, st *store.Store, date string, minBarRo
 	return b.String()
 }
 
-// findMail 取指定类型的第一封邮件。
-func findMail(ms []model.MailOutbox, t model.MailType) *model.MailOutbox {
-	for i := range ms {
-		if ms[i].MailType == t {
-			return &ms[i]
+// findTrace 取当日轨迹里指定 subject 的那一行。
+func findTrace(ts []model.RunTrace, subject string) *model.RunTrace {
+	for i := range ts {
+		if ts[i].Subject == subject {
+			return &ts[i]
 		}
 	}
 	return nil

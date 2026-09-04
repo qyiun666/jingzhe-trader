@@ -78,6 +78,12 @@ func (s TicketStatus) CanTransition(to TicketStatus) bool {
 	return false
 }
 
+// ValidTicketStatus 状态名是否在状态机内（对外接口入参白名单）。
+func ValidTicketStatus(s string) bool {
+	_, ok := ticketTransitions[TicketStatus(s)]
+	return ok
+}
+
 // IsTerminal 是否为终态。
 func (s TicketStatus) IsTerminal() bool {
 	return len(ticketTransitions[s]) == 0
@@ -132,29 +138,32 @@ func (a AlertLevel) Valid() bool {
 	}
 }
 
-// ===================== 任务状态 JobStatus =====================
-
-// JobStatus 任务状态：running / success / degraded / failed。
-// degraded 为新增态，表示任务成功但产出物缺失/降级（D1）。
-type JobStatus string
-
-const (
-	JobRunning  JobStatus = "running"
-	JobSuccess  JobStatus = "success"
-	JobDegraded JobStatus = "degraded"
-	JobFailed   JobStatus = "failed"
-)
-
 // ===================== 邮件类型 MailType =====================
 
-// MailType 六类邮件：M1 次日指令 / M2 盘前提醒 / M3 盘中紧急 / M4 档位变更 / M5 日报 / M6 异常。
+// MailType 五类邮件：M1 次日指令 / M2 盘前提醒 / M3 盘中紧急 / M5 日报 / M6 异常告警。
+//
+// 原 M4「档位变更立即发」已删（2026-09-04）：没有任何一处发送过它，
+// 而当前档位就在每封邮件顶部三行的第一行、日报也按档位单列 —— 变更当天必然看得见。
 type MailType string
 
 const (
 	MailM1 MailType = "M1"
 	MailM2 MailType = "M2"
 	MailM3 MailType = "M3"
-	MailM4 MailType = "M4"
 	MailM5 MailType = "M5"
 	MailM6 MailType = "M6"
 )
+
+// OnceDaily 该类型当天只该送达一封。
+//
+// M1/M2/M5 各绑定一个固定的当日时刻（17:00 待买卖 / 09:00 计划 / 18:00 日报），
+// 同一天重跑这个任务不该再发第二封 —— `trigger_task` 手工补跑一次就多一封，
+// 是收件箱被刷爆的成因。M3（盘中止损，每轮内容随本轮新单变化）与
+// M6（告警，一天可有多条不同 code）不在此列：它们重复是有信息量的。
+func (t MailType) OnceDaily() bool {
+	switch t {
+	case MailM1, MailM2, MailM5:
+		return true
+	}
+	return false
+}

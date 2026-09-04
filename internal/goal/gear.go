@@ -6,7 +6,7 @@ import (
 	"jingzhe-trader/internal/model"
 )
 
-// TriggerRule 档位变更触发规则（goal_gear_log.trigger_rule 取值）。
+// TriggerRule 档位变更触发规则（作为变更日志的 trigger 字段）。
 type TriggerRule string
 
 const (
@@ -21,7 +21,7 @@ const (
 	TriggerAlreadyEvaluated TriggerRule = "already_evaluated"  // 当日已评估（每日至多一次）
 )
 
-// State 档位状态机输入状态（与 goal_state 行对应，剥离持久化字段）。
+// State 档位状态机输入状态（与 goal.state 的字段对应，剥离持久化字段）。
 type State struct {
 	Gear          model.Gear
 	ProfitLock    bool
@@ -68,7 +68,7 @@ type Decision struct {
 	NewStreak int
 	Trigger   TriggerRule
 	IsManual  bool
-	Changed   bool // 是否产生状态转移/锁利变化（决定是否写 goal_gear_log）
+	Changed   bool // 是否产生状态转移/锁利变化（决定是否留痕）
 	Reason    string
 }
 
@@ -143,8 +143,8 @@ func Evaluate(st State, m GoalMetrics, cfg GearConfig, opt EvalOptions) Decision
 	}
 
 	// 5. 升档（连续 N 日 + 迟滞带，任一不满足 → streak 清零）
-	recoverG2 := cfg.DefendAtBudget - cfg.UpgradeHysteresis    // G3→G2 需 < 0.85
-	recoverG1 := cfg.TightenAtBudget - cfg.UpgradeHysteresis   // G2→G1 需 < 0.55
+	recoverG2 := cfg.DefendAtBudget - cfg.UpgradeHysteresis  // G3→G2 需 < 0.85
+	recoverG1 := cfg.TightenAtBudget - cfg.UpgradeHysteresis // G2→G1 需 < 0.55
 	switch st.Gear {
 	case model.GearG3:
 		if bc < recoverG2 {

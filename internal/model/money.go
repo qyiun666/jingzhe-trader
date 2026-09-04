@@ -70,17 +70,20 @@ func (f Fen) String() string {
 // IsZero 判断是否为零金额。
 func (f Fen) IsZero() bool { return f == 0 }
 
-// RoundLotDown 向下取整到 100 股。
+// LotShares A 股一手 = 100 股（整手约束的唯一出处）。
+const LotShares = 100
+
+// RoundLotDown 向下取整到一手。
 func (q Qty) RoundLotDown() Qty {
-	return (q / 100) * 100
+	return (q / LotShares) * LotShares
 }
 
-// RoundLotUp 向上取整到 100 股。
+// RoundLotUp 向上取整到一手。
 func (q Qty) RoundLotUp() Qty {
-	if q%100 == 0 {
+	if q%LotShares == 0 {
 		return q
 	}
-	return (q/100 + 1) * 100
+	return (q/LotShares + 1) * LotShares
 }
 
 // Add 数量相加。

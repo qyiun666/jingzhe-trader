@@ -38,13 +38,13 @@ type ArtifactMiss struct {
 //
 // 唯一跳过出口是 Degrade()；禁止在任务函数里直接 return nil 静默跳过。
 type RunCtx struct {
-	ctx        context.Context
-	jobName    string
-	tradeDate  string
-	artifacts  map[string]*Artifact
-	order      []string
-	degrades   []Degradation
-	degraded   bool
+	ctx       context.Context
+	jobName   string
+	tradeDate string
+	artifacts map[string]*Artifact
+	order     []string
+	degrades  []Degradation
+	degraded  bool
 }
 
 // NewRunCtx 创建任务产出物上下文。
@@ -104,10 +104,23 @@ func (c *RunCtx) Assert() []ArtifactMiss {
 				Actual: a.Actual,
 				Code:   ArtifactCode,
 			})
+			// 缺失项同时进降级列表：run_trace 若只记 fail 而不写"缺了什么"，等于没诊断。
+			c.degrades = append(c.degrades, Degradation{
+				Code:   ArtifactCode,
+				Reason: fmt.Sprintf("产出物 %s %s，实际 %d", a.Name, expectText(a.Expect), a.Actual),
+			})
 			c.degraded = true
 		}
 	}
 	return misses
+}
+
+// expectText 把期望值写成人可读口径（-1 是"至少 1 个"的约定值）。
+func expectText(expect int) string {
+	if expect == -1 {
+		return "期望至少 1"
+	}
+	return fmt.Sprintf("期望 %d", expect)
 }
 
 // Degraded 任务是否处于降级态（调用过 Degrade 或 Assert 发现缺失）。
@@ -125,8 +138,5 @@ func (c *RunCtx) Ctx() context.Context {
 	return c.ctx
 }
 
-// JobName 返回任务名。
-func (c *RunCtx) JobName() string { return c.jobName }
-
-// TradeDate 返回交易日期。
+// TradeDate 返回本上下文所属交易日（任务函数与日志统一从这里取，不用 time.Now）。
 func (c *RunCtx) TradeDate() string { return c.tradeDate }

@@ -13,11 +13,6 @@ func Mask(value string) string {
 	return maskLiteral
 }
 
-// Masked 返回是否应当掩码（凭据键）。
-func Masked(spec KeySpec) bool {
-	return spec.Secret
-}
-
 // envName 由配置键推导环境变量名：JZ_ + 大写 + 点号转下划线。
 // 例：tushare.token → JZ_TUSHARE_TOKEN；server.api_token → JZ_SERVER_API_TOKEN。
 func envName(key string) string {

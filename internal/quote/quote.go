@@ -1,17 +1,13 @@
-// Package quote 实时行情源（L2 适配层）：gotdx 主源 + 腾讯降级备用源。
+// Package quote 实时行情源（L2 适配层）：只有 gotdx 一个源。
 //
 // 金额统一使用 model.Fen；外部 IO 仅在本包（§1.2）。
 // 设计要点（docs/tech-constraints.md §6）：
-//   - gotdx 为主实时源，主节点不可达时自动探测切换最快节点；
-//   - 腾讯 qt.gtimg.cn 为降级备用源（GBK 解码）；
-//   - 行情获取失败返回最近一次有效价（缓存兜底），绝不触发止损。
+//   - gotdx 是唯一实时源，默认节点不可达时探测切换最快可达节点（同一个源的换节点，不是换源）；
+//   - 无备用源、无缓存兜底：拿不到当前价就整体失败，由调用方记失败并告警，
+//     盘中用旧价判断止损等于用昨天的价格做今天的决定。
 package quote
 
-import (
-	"context"
-
-	"jingzhe-trader/internal/model"
-)
+import "jingzhe-trader/internal/model"
 
 // Quote 单标的实时报价（金额统一为 model.Fen）。
 type Quote struct {
@@ -22,12 +18,8 @@ type Quote struct {
 	High       model.Fen
 	Low        model.Fen
 	ServerTime string
-	Source     string // gotdx / tencent / cache
+	Source     string // gotdx
 }
 
-// Source 实时行情源接口（可替换为 gotdx / tencent / mock）。
-type Source interface {
-	// Fetch 拉取一批标的实时报价。返回 map[ts_code]Quote。
-	// 失败时返回尽可能多的有效价（含缓存兜底），不触发止损。
-	Fetch(ctx context.Context, tsCodes []string) (map[string]Quote, error)
-}
+// Fetch 语义（GotdxSource.Fetch 即唯一实现）：要么每个请求标的都拿到正价，
+// 要么返回 error —— 不存在"部分成功"，也没有备用源和缓存旧价。

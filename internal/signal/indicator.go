@@ -1,4 +1,5 @@
-// Package signal 买入/卖出规则、技术指标封装、幂等落库（ARCHITECTURE §2.8）。
+// Package signal 决策编排：买入决策交给 LLM 评审（本包只提供证据列与接口），
+// 卖出按规则执行；结果落成 order_ticket，信号本身不落库（ARCHITECTURE §2.8）。
 //
 // 依赖方向：signal 依赖 model / market / risk / store / ticket（编排回执前的最后一级），
 // 不触网；行情与持仓数据由 store 提供。

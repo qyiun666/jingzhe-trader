@@ -41,13 +41,6 @@ func S() *zap.SugaredLogger {
 	return L().Sugar()
 }
 
-// SetLogger 替换进程级日志器（测试可注入）。
-func SetLogger(l *zap.Logger) {
-	if l != nil {
-		defaultLogger = l
-	}
-}
-
 // Sync 刷新缓冲（进程退出前调用）。
 func Sync() {
 	if defaultLogger != nil {

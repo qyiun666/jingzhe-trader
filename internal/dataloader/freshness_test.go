@@ -37,14 +37,13 @@ func findItem(rep *FreshnessReport, name string) (CheckItem, bool) {
 func mkBar(tsCode, date string) model.Bar {
 	return model.Bar{
 		TsCode: tsCode, TradeDate: date,
-		Open: model.FromFloat(100), High: model.FromFloat(101), Low: model.FromFloat(99),
-		Close: model.FromFloat(100), PreClose: model.FromFloat(100), RawClose: model.FromFloat(100), AdjFactor: 1,
+		Close: model.FromFloat(100), VolLot: 0, RawClose: model.FromFloat(100),
 	}
 }
 
 func TestFreshness_CalMissing(t *testing.T) {
 	st := openTestStore(t)
-	rep, err := NewFreshnessGate(st, testMinBarRows).Check(context.Background(), "20260901")
+	rep, err := NewFreshnessGate(st, testMinBarRows, 0).Check(context.Background(), "20260901")
 	if err != nil {
 		t.Fatalf("Check 失败: %v", err)
 	}
@@ -61,9 +60,9 @@ func TestFreshness_NotTradeDay(t *testing.T) {
 	st := openTestStore(t)
 	rc := st.MarketRepo()
 	// 目标日在日历中但非开市
-	_ = rc.UpsertCal(context.Background(), store.CalRow{CalDate: "20260901", IsOpen: false, Exchange: "SSE"})
+	_ = rc.UpsertCal(context.Background(), store.CalRow{CalDate: "20260901", IsOpen: false})
 
-	rep, err := NewFreshnessGate(st, testMinBarRows).Check(context.Background(), "20260901")
+	rep, err := NewFreshnessGate(st, testMinBarRows, 0).Check(context.Background(), "20260901")
 	if err != nil {
 		t.Fatalf("Check 失败: %v", err)
 	}
@@ -80,9 +79,9 @@ func TestFreshness_BarStale(t *testing.T) {
 	st := openTestStore(t)
 	rc := st.MarketRepo()
 	tradeDate := "20260901"
-	_ = rc.UpsertCal(context.Background(), store.CalRow{CalDate: tradeDate, IsOpen: true, Exchange: "SSE"})
+	_ = rc.UpsertCal(context.Background(), store.CalRow{CalDate: tradeDate, IsOpen: true})
 
-	rep, err := NewFreshnessGate(st, testMinBarRows).Check(context.Background(), tradeDate)
+	rep, err := NewFreshnessGate(st, testMinBarRows, 0).Check(context.Background(), tradeDate)
 	if err != nil {
 		t.Fatalf("Check 失败: %v", err)
 	}
@@ -96,11 +95,11 @@ func TestFreshness_BarRowsLow(t *testing.T) {
 	st := openTestStore(t)
 	rc := st.MarketRepo()
 	tradeDate := "20260901"
-	_ = rc.UpsertCal(context.Background(), store.CalRow{CalDate: tradeDate, IsOpen: true, Exchange: "SSE"})
+	_ = rc.UpsertCal(context.Background(), store.CalRow{CalDate: tradeDate, IsOpen: true})
 	// 仅 1 行（< 阈值 3）
 	_ = rc.UpsertBar(context.Background(), mkBar("600519.SH", tradeDate))
 
-	rep, err := NewFreshnessGate(st, testMinBarRows).Check(context.Background(), tradeDate)
+	rep, err := NewFreshnessGate(st, testMinBarRows, 0).Check(context.Background(), tradeDate)
 	if err != nil {
 		t.Fatalf("Check 失败: %v", err)
 	}
@@ -114,14 +113,15 @@ func TestFreshness_BasicRowsLow(t *testing.T) {
 	st := openTestStore(t)
 	rc := st.MarketRepo()
 	tradeDate := "20260901"
-	_ = rc.UpsertCal(context.Background(), store.CalRow{CalDate: tradeDate, IsOpen: true, Exchange: "SSE"})
+	_ = rc.UpsertCal(context.Background(), store.CalRow{CalDate: tradeDate, IsOpen: true})
 	_ = rc.UpsertBar(context.Background(), mkBar("600519.SH", tradeDate))
 	_ = rc.UpsertBar(context.Background(), mkBar("600520.SH", tradeDate))
 	_ = rc.UpsertBar(context.Background(), mkBar("600521.SH", tradeDate))
-	// 每日指标仅 1 行（< 阈值 3）
-	_ = rc.UpsertDailyBasic(context.Background(), model.DailyBasic{TsCode: "600519.SH", TradeDate: tradeDate, Close: model.FromFloat(100)})
+	// 估值截面仅 1 行（< 阈值 3）；截面盖在已有的 stock_basic 行上，不另建行
+	_ = rc.UpsertStockBasic(context.Background(), model.StockBasic{TsCode: "600519.SH", ListStatus: "L"})
+	_ = rc.SaveValuation(context.Background(), tradeDate, []model.Valuation{{TsCode: "600519.SH"}})
 
-	rep, err := NewFreshnessGate(st, testMinBarRows).Check(context.Background(), tradeDate)
+	rep, err := NewFreshnessGate(st, testMinBarRows, 0).Check(context.Background(), tradeDate)
 	if err != nil {
 		t.Fatalf("Check 失败: %v", err)
 	}
@@ -131,47 +131,22 @@ func TestFreshness_BasicRowsLow(t *testing.T) {
 	}
 }
 
-func TestFreshness_LimitRowsLow(t *testing.T) {
-	st := openTestStore(t)
-	rc := st.MarketRepo()
-	tradeDate := "20260901"
-	_ = rc.UpsertCal(context.Background(), store.CalRow{CalDate: tradeDate, IsOpen: true, Exchange: "SSE"})
-	for i := 0; i < testMinBarRows; i++ {
-		code := mkCode(i)
-		_ = rc.UpsertBar(context.Background(), mkBar(code, tradeDate))
-		_ = rc.UpsertDailyBasic(context.Background(), model.DailyBasic{TsCode: code, TradeDate: tradeDate, Close: model.FromFloat(100)})
-	}
-	// 涨跌停仅 1 行（< 阈值 3）
-	_ = rc.UpsertLimit(context.Background(), model.PriceLimit{TsCode: "600519.SH", TradeDate: tradeDate, UpLimit: model.FromFloat(110), DownLimit: model.FromFloat(90)})
-
-	rep, err := NewFreshnessGate(st, testMinBarRows).Check(context.Background(), tradeDate)
-	if err != nil {
-		t.Fatalf("Check 失败: %v", err)
-	}
-	c, _ := findItem(rep, "LimitRows")
-	if c.OK || c.Code != CodeLimitRowsLow {
-		t.Fatalf("期望 LimitRows=%s，实际 OK=%v Code=%q", CodeLimitRowsLow, c.OK, c.Code)
-	}
-}
-
 func TestFreshness_CoverageGap(t *testing.T) {
 	st := openTestStore(t)
 	rc := st.MarketRepo()
 	tradeDate := "20260901"
-	_ = rc.UpsertCal(context.Background(), store.CalRow{CalDate: tradeDate, IsOpen: true, Exchange: "SSE"})
+	_ = rc.UpsertCal(context.Background(), store.CalRow{CalDate: tradeDate, IsOpen: true})
 	// 候选池 3 只（list_status='L'），但仅 2 只有日线 → 覆盖缺口
 	cands := []string{"600519.SH", "600520.SH", "600521.SH"}
 	for _, c := range cands {
-		_ = rc.UpsertStockBasic(context.Background(), model.StockBasic{TsCode: c, ListStatus: "L", UpdatedAt: "20260901"})
+		_ = rc.UpsertStockBasic(context.Background(), model.StockBasic{TsCode: c, ListStatus: "L"})
 	}
 	_ = rc.UpsertBar(context.Background(), mkBar("600519.SH", tradeDate))
 	_ = rc.UpsertBar(context.Background(), mkBar("600520.SH", tradeDate))
-	_ = rc.UpsertDailyBasic(context.Background(), model.DailyBasic{TsCode: "600519.SH", TradeDate: tradeDate, Close: model.FromFloat(100)})
-	_ = rc.UpsertDailyBasic(context.Background(), model.DailyBasic{TsCode: "600520.SH", TradeDate: tradeDate, Close: model.FromFloat(100)})
-	_ = rc.UpsertLimit(context.Background(), model.PriceLimit{TsCode: "600519.SH", TradeDate: tradeDate, UpLimit: model.FromFloat(110), DownLimit: model.FromFloat(90)})
-	_ = rc.UpsertLimit(context.Background(), model.PriceLimit{TsCode: "600520.SH", TradeDate: tradeDate, UpLimit: model.FromFloat(110), DownLimit: model.FromFloat(90)})
+	_ = rc.SaveValuation(context.Background(), tradeDate, []model.Valuation{
+		{TsCode: "600519.SH"}, {TsCode: "600520.SH"}})
 
-	rep, err := NewFreshnessGate(st, testMinBarRows).Check(context.Background(), tradeDate)
+	rep, err := NewFreshnessGate(st, testMinBarRows, 0).Check(context.Background(), tradeDate)
 	if err != nil {
 		t.Fatalf("Check 失败: %v", err)
 	}
@@ -181,31 +156,45 @@ func TestFreshness_CoverageGap(t *testing.T) {
 	}
 }
 
+// TestFreshness_IndexStale 大盘指数日线缺失是阻断项：
+// 买入闸门（跌破 MA20 关漏斗）与卖出规则（大盘恶化）都读这一根，缺了就不能出指令。
 func TestFreshness_IndexStale(t *testing.T) {
 	st := openTestStore(t)
 	rc := st.MarketRepo()
+	ctx := context.Background()
 	tradeDate := "20260901"
-	_ = rc.UpsertCal(context.Background(), store.CalRow{CalDate: tradeDate, IsOpen: true, Exchange: "SSE"})
+	_ = rc.UpsertCal(ctx, store.CalRow{CalDate: tradeDate, IsOpen: true})
 	for i := 0; i < testMinBarRows; i++ {
 		code := mkCode(i)
-		_ = rc.UpsertStockBasic(context.Background(), model.StockBasic{TsCode: code, ListStatus: "L", UpdatedAt: tradeDate})
-		_ = rc.UpsertBar(context.Background(), mkBar(code, tradeDate))
-		_ = rc.UpsertDailyBasic(context.Background(), model.DailyBasic{TsCode: code, TradeDate: tradeDate, Close: model.FromFloat(100)})
-		_ = rc.UpsertLimit(context.Background(), model.PriceLimit{TsCode: code, TradeDate: tradeDate, UpLimit: model.FromFloat(110), DownLimit: model.FromFloat(90)})
+		_ = rc.UpsertStockBasic(ctx, model.StockBasic{TsCode: code, ListStatus: "L"})
+		_ = rc.UpsertBar(ctx, mkBar(code, tradeDate))
+		_ = rc.SaveValuation(ctx, tradeDate, []model.Valuation{{TsCode: code}})
 	}
-	// 不插入 index_daily → INDEX_STALE（非阻断，不使 Fresh=false）
+	// 故意不写指数日线
 
-	rep, err := NewFreshnessGate(st, testMinBarRows).Check(context.Background(), tradeDate)
+	g := NewFreshnessGate(st, testMinBarRows, 0)
+	rep, err := g.Check(ctx, tradeDate)
 	if err != nil {
 		t.Fatalf("Check 失败: %v", err)
 	}
 	c, _ := findItem(rep, "IndexRows")
-	if c.OK || c.Code != CodeIndexStale {
-		t.Fatalf("期望 IndexRows=%s，实际 OK=%v Code=%q", CodeIndexStale, c.OK, c.Code)
+	if c.OK || c.Code != CodeIndexStale || !c.Blocking {
+		t.Fatalf("期望 IndexRows=%s 且 Blocking=true，实际 OK=%v Code=%q Blocking=%v",
+			CodeIndexStale, c.OK, c.Code, c.Blocking)
 	}
-	// 非阻断：其余全通过时 Fresh 应为 true
-	if !rep.Fresh {
-		t.Fatalf("期望 IndexRows 非阻断使 Fresh=true，实际:\n%s", rep.String())
+	if rep.Fresh {
+		t.Fatalf("指数缺失应使门禁整体不新鲜，实际:\n%s", rep.String())
+	}
+
+	// 补上指数日线后同一份数据应当放行（证明拦的确实是指数这一项）
+	_ = rc.UpsertBar(ctx, model.Bar{TsCode: store.MarketIndex, TradeDate: tradeDate,
+		Close: model.FromFloat(4000), RawClose: model.FromFloat(4000)})
+	rep2, err := g.Check(ctx, tradeDate)
+	if err != nil {
+		t.Fatalf("补指数后 Check 失败: %v", err)
+	}
+	if !rep2.Fresh {
+		t.Fatalf("补上 %s 日线后应放行，实际:\n%s", store.MarketIndex, rep2.String())
 	}
 }
 
@@ -214,7 +203,7 @@ func TestFreshness_AllPass(t *testing.T) {
 	st := openTestStore(t)
 	rc := st.MarketRepo()
 	tradeDate := "20260901"
-	_ = rc.UpsertCal(context.Background(), store.CalRow{CalDate: tradeDate, IsOpen: true, Exchange: "SSE"})
+	_ = rc.UpsertCal(context.Background(), store.CalRow{CalDate: tradeDate, IsOpen: true})
 
 	idxCode := "000300.SH" // 指数码，不入候选池（仅 index_daily）
 	stockCodes := make([]string, 0, testMinBarRows)
@@ -222,15 +211,14 @@ func TestFreshness_AllPass(t *testing.T) {
 		stockCodes = append(stockCodes, mkCode(i))
 	}
 	// 指数日线（沪深300）
-	_ = rc.UpsertIndexDaily(context.Background(), model.IndexDaily{TsCode: idxCode, TradeDate: tradeDate, Close: model.FromFloat(4000)})
+	_ = rc.UpsertBar(context.Background(), model.Bar{TsCode: idxCode, TradeDate: tradeDate, Close: model.FromFloat(4000), VolLot: 0, RawClose: 0})
 	for _, c := range stockCodes {
-		_ = rc.UpsertStockBasic(context.Background(), model.StockBasic{TsCode: c, ListStatus: "L", UpdatedAt: tradeDate})
+		_ = rc.UpsertStockBasic(context.Background(), model.StockBasic{TsCode: c, ListStatus: "L"})
 		_ = rc.UpsertBar(context.Background(), mkBar(c, tradeDate))
-		_ = rc.UpsertDailyBasic(context.Background(), model.DailyBasic{TsCode: c, TradeDate: tradeDate, Close: model.FromFloat(100)})
-		_ = rc.UpsertLimit(context.Background(), model.PriceLimit{TsCode: c, TradeDate: tradeDate, UpLimit: model.FromFloat(110), DownLimit: model.FromFloat(90)})
+		_ = rc.SaveValuation(context.Background(), tradeDate, []model.Valuation{{TsCode: c}})
 	}
 
-	rep, err := NewFreshnessGate(st, testMinBarRows).Check(context.Background(), tradeDate)
+	rep, err := NewFreshnessGate(st, testMinBarRows, 0).Check(context.Background(), tradeDate)
 	if err != nil {
 		t.Fatalf("Check 失败: %v", err)
 	}
@@ -250,23 +238,22 @@ func TestFreshness_CoverageSuspendedExcluded(t *testing.T) {
 	st := openTestStore(t)
 	rc := st.MarketRepo()
 	tradeDate := "20260901"
-	_ = rc.UpsertCal(context.Background(), store.CalRow{CalDate: tradeDate, IsOpen: true, Exchange: "SSE"})
+	_ = rc.UpsertCal(context.Background(), store.CalRow{CalDate: tradeDate, IsOpen: true})
 
 	// 候选池 3 只，其中 600521 当日停牌
 	cands := []string{"600519.SH", "600520.SH", "600521.SH"}
 	for _, c := range cands {
-		_ = rc.UpsertStockBasic(context.Background(), model.StockBasic{TsCode: c, ListStatus: "L", UpdatedAt: tradeDate})
+		_ = rc.UpsertStockBasic(context.Background(), model.StockBasic{TsCode: c, ListStatus: "L"})
 	}
-	_ = rc.UpsertSuspend(context.Background(), model.Suspend{TsCode: "600521.SH", TradeDate: tradeDate, SuspendType: "S", SuspendTiming: "H"})
+	_ = rc.SaveSuspended(context.Background(), tradeDate, []string{"600521.SH"})
 
 	// 仅 600519/600520 有日线（600521 停牌无日线）
 	for _, c := range []string{"600519.SH", "600520.SH"} {
 		_ = rc.UpsertBar(context.Background(), mkBar(c, tradeDate))
-		_ = rc.UpsertDailyBasic(context.Background(), model.DailyBasic{TsCode: c, TradeDate: tradeDate, Close: model.FromFloat(100)})
-		_ = rc.UpsertLimit(context.Background(), model.PriceLimit{TsCode: c, TradeDate: tradeDate, UpLimit: model.FromFloat(110), DownLimit: model.FromFloat(90)})
+		_ = rc.SaveValuation(context.Background(), tradeDate, []model.Valuation{{TsCode: c}})
 	}
 
-	rep, err := NewFreshnessGate(st, testMinBarRows).Check(context.Background(), tradeDate)
+	rep, err := NewFreshnessGate(st, testMinBarRows, 0).Check(context.Background(), tradeDate)
 	if err != nil {
 		t.Fatalf("Check 失败: %v", err)
 	}
@@ -284,22 +271,21 @@ func TestFreshness_CoverageGapLarge(t *testing.T) {
 	st := openTestStore(t)
 	rc := st.MarketRepo()
 	tradeDate := "20260901"
-	_ = rc.UpsertCal(context.Background(), store.CalRow{CalDate: tradeDate, IsOpen: true, Exchange: "SSE"})
+	_ = rc.UpsertCal(context.Background(), store.CalRow{CalDate: tradeDate, IsOpen: true})
 
 	const n = 60 // 候选 60 → 容差 = max(60/100, 50) = 50
 	for i := 0; i < n; i++ {
 		code := mkCode(i)
-		_ = rc.UpsertStockBasic(context.Background(), model.StockBasic{TsCode: code, ListStatus: "L", UpdatedAt: tradeDate})
+		_ = rc.UpsertStockBasic(context.Background(), model.StockBasic{TsCode: code, ListStatus: "L"})
 	}
 	// 仅前 5 只有日线 → 缺口 55 > 容差 50（显著缺失，应阻断）
 	for i := 0; i < 5; i++ {
 		code := mkCode(i)
 		_ = rc.UpsertBar(context.Background(), mkBar(code, tradeDate))
-		_ = rc.UpsertDailyBasic(context.Background(), model.DailyBasic{TsCode: code, TradeDate: tradeDate, Close: model.FromFloat(100)})
-		_ = rc.UpsertLimit(context.Background(), model.PriceLimit{TsCode: code, TradeDate: tradeDate, UpLimit: model.FromFloat(110), DownLimit: model.FromFloat(90)})
+		_ = rc.SaveValuation(context.Background(), tradeDate, []model.Valuation{{TsCode: code}})
 	}
 
-	rep, err := NewFreshnessGate(st, testMinBarRows).Check(context.Background(), tradeDate)
+	rep, err := NewFreshnessGate(st, testMinBarRows, 0).Check(context.Background(), tradeDate)
 	if err != nil {
 		t.Fatalf("Check 失败: %v", err)
 	}
@@ -312,5 +298,70 @@ func TestFreshness_CoverageGapLarge(t *testing.T) {
 	}
 	if !c.Blocking {
 		t.Fatalf("期望显著缺口为阻断项，实际 Blocking=false")
+	}
+}
+
+// TestFreshness_WindowShort 回归：当日行数达标但因子窗口缺交易日，必须阻断。
+// 修复前：只查当日行数，窗口缺几天时动量/MA20 会拿 35 年前的残留行凑数，算出跨十年的"涨幅"。
+func TestFreshness_WindowShort(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	rc := st.MarketRepo()
+	tradeDate := "20260901"
+	codes := []string{mkCode(1), mkCode(2), mkCode(3)}
+	for _, c := range codes {
+		_ = rc.UpsertStockBasic(ctx, model.StockBasic{TsCode: c, ListStatus: "L"})
+	}
+	// 日历给 5 个开市日，日线只写最后一天
+	dates := []string{"20260827", "20260828", "20260831", "20260901"}
+	for _, d := range dates {
+		_ = rc.UpsertCal(ctx, store.CalRow{CalDate: d, IsOpen: true})
+		for _, c := range codes {
+			_ = rc.SaveValuation(ctx, d, []model.Valuation{{TsCode: c}})
+		}
+	}
+	for _, c := range codes {
+		_ = rc.UpsertBar(ctx, mkBar(c, tradeDate))
+	}
+	rep, err := NewFreshnessGate(st, testMinBarRows, 4).Check(ctx, tradeDate)
+	if err != nil {
+		t.Fatalf("Check 失败: %v", err)
+	}
+	item, ok := findItem(rep, "WindowOK")
+	if !ok {
+		t.Fatalf("缺少 WindowOK 检查项:\n%s", rep.String())
+	}
+	if item.Code != CodeWindowShort {
+		t.Errorf("WindowOK 失败码 = %q，期望 %q", item.Code, CodeWindowShort)
+	}
+	if rep.Fresh {
+		t.Errorf("窗口缺口应使门禁不新鲜:\n%s", rep.String())
+	}
+}
+
+// TestFreshness_WindowComplete 窗口齐全时 WindowOK 通过。
+func TestFreshness_WindowComplete(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	rc := st.MarketRepo()
+	tradeDate := "20260901"
+	codes := []string{mkCode(1), mkCode(2), mkCode(3)}
+	for _, c := range codes {
+		_ = rc.UpsertStockBasic(ctx, model.StockBasic{TsCode: c, ListStatus: "L"})
+	}
+	for _, d := range []string{"20260826", "20260827", "20260828", "20260831", "20260901"} {
+		_ = rc.UpsertCal(ctx, store.CalRow{CalDate: d, IsOpen: true})
+		for _, c := range codes {
+			_ = rc.UpsertBar(ctx, mkBar(c, d))
+			_ = rc.SaveValuation(ctx, d, []model.Valuation{{TsCode: c}})
+		}
+	}
+	rep, err := NewFreshnessGate(st, testMinBarRows, 5).Check(ctx, tradeDate)
+	if err != nil {
+		t.Fatalf("Check 失败: %v", err)
+	}
+	item, _ := findItem(rep, "WindowOK")
+	if !item.OK {
+		t.Errorf("窗口齐全时 WindowOK 应通过: %s", item.Detail)
 	}
 }

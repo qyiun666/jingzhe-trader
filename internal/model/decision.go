@@ -1,50 +1,55 @@
 package model
 
-// ===================== 选股与信号域模型 =====================
+// ===================== 决策链内存模型 =====================
+//
+// 本文件的类型只在一次运行内传递（选股 → 决策 → 指令单），一律不落库：
+// 落库的结果只有 order_ticket（含成交列）与 position，过程只写日志。
 
-// Signal 信号：买入/卖出规则触发，含可解释理由与风控否决留痕（D1）。
-type Signal struct {
-	ID         int64     `db:"id"`
-	TradeDate  string    `db:"trade_date"`
-	TsCode     string    `db:"ts_code"`
-	Name       string    `db:"name"`
-	Direction  Direction `db:"direction"`
-	Rule       string    `db:"rule"`     // 触发规则名
-	Confidence float64   `db:"confidence"`
-	RefPrice   Fen       `db:"ref_price"` // 分
-	Reason     string    `db:"reason"`
-	Payload    string    `db:"payload"`    // JSON：关键数值快照
-	Status     string    `db:"status"`     // new|passed|rejected|converted
-	RejectRule string    `db:"reject_rule"` // 被风控否决时的规则名
-	RejectMsg  string    `db:"reject_msg"`
-	CreatedAt  string    `db:"created_at"`
-}
-
-// FactorScore 五因子分项得分（可解释）。
+// FactorScore 因子分项得分（可解释，0-100 截面百分位）。
 type FactorScore struct {
-	Momentum  float64 `db:"f_momentum"`
-	Quality   float64 `db:"f_quality"`
-	Value     float64 `db:"f_value"`
-	LowVol    float64 `db:"f_lowvol"`
-	Liquidity float64 `db:"f_liquidity"`
+	Momentum  float64
+	Value     float64
+	LowVol    float64
+	Liquidity float64
 }
 
-// ScreenResult 选股结果：综合排名 + 五因子分项 + 可解释理由。
-type ScreenResult struct {
-	TradeDate     string      `db:"trade_date"`
-	TsCode        string      `db:"ts_code"`
-	Rank          int         `db:"rank"`
-	Score         float64     `db:"score"`
-	Factors       FactorScore `db:"-"`
-	F_Momentum    float64     `db:"f_momentum"`
-	F_Quality     float64     `db:"f_quality"`
-	F_Value       float64     `db:"f_value"`
-	F_LowVol      float64     `db:"f_lowvol"`
-	F_Liquidity   float64     `db:"f_liquidity"`
-	Close         Fen         `db:"close"`
-	CircMvW       float64     `db:"circ_mv_w"`
-	PETtm         float64     `db:"pe_ttm"`
-	PB            float64     `db:"pb"`
-	TurnoverRate  float64     `db:"turnover_rate"`
-	Reason        string      `db:"reason"`
+// Signal 一条买卖决策：买入来自 LLM 评审，卖出来自持仓规则，一律交给指令单落地。
+type Signal struct {
+	TradeDate  string
+	TsCode     string
+	Name       string
+	Direction  Direction
+	Rule       string // 决策来源（买入 llm_review / 卖出为止损止盈等规则名）
+	Confidence float64
+	RefPrice   Fen // 分
+	Reason     string
+}
+
+// Candidate 选股候选：漏斗与 LLM 决策与指令单之间传递的唯一对象。
+// Close 取未复权收盘（与成交成本同口径），Mom 为因子窗口区间涨幅（小数）。
+type Candidate struct {
+	Rank         int
+	PoolSize     int // 因子百分位的截面基数；基数很小时 0/100 只表示相对位置，不是绝对评价
+	TsCode       string
+	Name         string
+	Industry     string
+	Score        float64
+	Factors      FactorScore
+	Close        Fen
+	CircMvW      float64
+	PETtm        float64
+	PB           float64
+	TurnoverRate float64
+	Mom          float64
+	SectorMom    float64
+	Reason       string
+}
+
+// SectorStat 板块强弱统计（只出现在日志与告警正文）。
+type SectorStat struct {
+	Industry string
+	Members  int
+	Scorable int     // 窗口内可算动量的成员数
+	WMom     float64 // 流通市值加权区间涨幅（小数）
+	Retained bool    // 是否进入 Top K 强势板块
 }

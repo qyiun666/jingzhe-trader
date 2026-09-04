@@ -10,17 +10,17 @@ import (
 // ---------- 档位状态机 Evaluate：表驱动验收（§10.5-2，≥30 例覆盖全部分支）----------
 
 type gearCase struct {
-	name       string
-	st         State
-	bc         float64 // GoalMetrics.BudgetConsumed
-	prog       float64 // GoalMetrics.Progress
-	cfg        GearConfig
-	opt        EvalOptions
-	wantTo     model.Gear
-	wantLock   bool
-	wantStreak int
-	wantTrig   TriggerRule
-	wantManual bool
+	name        string
+	st          State
+	bc          float64 // GoalMetrics.BudgetConsumed
+	prog        float64 // GoalMetrics.Progress
+	cfg         GearConfig
+	opt         EvalOptions
+	wantTo      model.Gear
+	wantLock    bool
+	wantStreak  int
+	wantTrig    TriggerRule
+	wantManual  bool
 	wantChanged bool
 }
 

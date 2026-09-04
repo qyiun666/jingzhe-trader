@@ -8,7 +8,6 @@ import (
 
 	"jingzhe-trader/internal/market"
 	"jingzhe-trader/internal/model"
-	"jingzhe-trader/internal/risk"
 	"jingzhe-trader/internal/store"
 )
 
@@ -36,13 +35,11 @@ func openLedger(t *testing.T) (*store.Store, *Ledger) {
 // seedTicket 直接落一张已 issued 的指令单（绕过信号链，聚焦回执记账）。
 func seedTicket(t *testing.T, s *store.Store, tsCode string, dir model.Direction, qty model.Qty, price model.Fen) model.OrderTicket {
 	t.Helper()
-	now := time.Now().UTC().Format(time.RFC3339)
 	tk := model.OrderTicket{
 		TradeDate: "20260901", TsCode: tsCode, Name: "测试" + tsCode, Direction: dir,
-		Qty: qty, RefPriceLow: price, RefPriceHigh: price, StopPrice: model.FromFloat(9),
-		Reason: "单测种子", Urgency: "normal", Source: "test", Status: model.TicketIssued,
+		Qty: qty, RefPrice: price,
+		Reason: "单测种子", Status: model.TicketIssued,
 		ValidUntil: "2026-09-02T15:00:00+08:00", Gear: model.GearG1,
-		CreatedAt: now, UpdatedAt: now,
 	}
 	id, err := s.TradeRepo().InsertTicket(context.Background(), tk)
 	if err != nil {
@@ -56,9 +53,7 @@ func seedTicket(t *testing.T, s *store.Store, tsCode string, dir model.Direction
 func seedBar(t *testing.T, s *store.Store, tsCode, date string, rawClose model.Fen) {
 	t.Helper()
 	b := model.Bar{
-		TsCode: tsCode, TradeDate: date,
-		Open: rawClose, High: rawClose, Low: rawClose, Close: rawClose, PreClose: rawClose,
-		RawClose: rawClose, AdjFactor: 1.0,
+		TsCode: tsCode, TradeDate: date, Close: rawClose, RawClose: rawClose,
 	}
 	if err := s.MarketRepo().UpsertBar(context.Background(), b); err != nil {
 		t.Fatalf("落种子日线失败: %v", err)
@@ -69,13 +64,12 @@ func seedBar(t *testing.T, s *store.Store, tsCode, date string, rawClose model.F
 func TestTicketRequiredFields(t *testing.T) {
 	s, _ := openLedger(t)
 	svc := NewService(s)
-	p := risk.Resolve(risk.DefaultBase(model.FromFloat(10000)), model.GearG1, false, risk.NoPace{})
 	days := []string{"20260901", "20260902"}
 	good := model.Signal{
 		TradeDate: "20260901", TsCode: "sh600519", Name: "贵州茅台", Direction: model.DirBuy,
 		Rule: "buy_trend", Confidence: 0.8, RefPrice: model.FromFloat(50), Reason: "趋势确认",
 	}
-	tk, err := svc.Create(context.Background(), good, 100, p, model.GearG1, days)
+	tk, err := svc.Create(context.Background(), good, 100, model.GearG1, days)
 	if err != nil {
 		t.Fatalf("合法指令单生成失败: %v", err)
 	}
@@ -105,12 +99,12 @@ func TestTicketRequiredFields(t *testing.T) {
 		{Name: "x", TsCode: "sh600519", TradeDate: "20260901", Direction: model.DirBuy, RefPrice: model.FromFloat(50), Reason: ""},
 	}
 	for i, sig := range bad {
-		if _, err := svc.Create(context.Background(), sig, 100, p, model.GearG1, days); !errors.Is(err, ErrRequiredField) {
+		if _, err := svc.Create(context.Background(), sig, 100, model.GearG1, days); !errors.Is(err, ErrRequiredField) {
 			t.Errorf("缺字段用例 %d 应返回 ErrRequiredField, 实际: %v", i, err)
 		}
 	}
 	// qty <= 0 拒绝
-	if _, err := svc.Create(context.Background(), good, 0, p, model.GearG1, days); !errors.Is(err, ErrRequiredField) {
+	if _, err := svc.Create(context.Background(), good, 0, model.GearG1, days); !errors.Is(err, ErrRequiredField) {
 		t.Errorf("qty=0 应返回 ErrRequiredField, 实际: %v", err)
 	}
 }
@@ -136,12 +130,12 @@ func TestReportFillIdempotent(t *testing.T) {
 	if !res2.Duplicate {
 		t.Errorf("第二次回执应标记 Duplicate")
 	}
-	fills, err := s.TradeRepo().CountFills(ctx)
+	fills, err := s.TradeRepo().CountFilled(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if fills != 1 {
-		t.Errorf("fill 行数=%d, 期望 1（回执幂等）", fills)
+		t.Errorf("已登记回执数=%d, 期望 1（回执幂等）", fills)
 	}
 	pos, err := s.TradeRepo().GetPosition(ctx, tk.TsCode)
 	if err != nil {
@@ -151,8 +145,8 @@ func TestReportFillIdempotent(t *testing.T) {
 		t.Errorf("持仓=%d, 期望 900（position 只加一次）", int64(pos.TotalQty))
 	}
 	// T+1：当日买入 available_qty 不增
-	if pos.AvailableQty != 0 {
-		t.Errorf("当日买入 available_qty=%d, 期望 0", int64(pos.AvailableQty))
+	if pos.Available() != 0 {
+		t.Errorf("当日买入 可卖量=%d, 期望 0", int64(pos.Available()))
 	}
 	if pos.TodayBought != 900 {
 		t.Errorf("today_bought=%d, 期望 900", int64(pos.TodayBought))
@@ -188,27 +182,41 @@ func TestReportFillFailureRollsBack(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 制造写库失败：用 RAISE(ABORT) 触发器让 fill 的 INSERT 必然失败（表结构保持完好，便于事后对账）
+	// 制造写库失败：用 RAISE(ABORT) 触发器让持仓写入必然失败。
+	// 故障注入在事务的**第二步**，此时第一步（指令单成交列）已成功写入 ——
+	// 回滚必须把第一步一起撤掉，比让第一步就失败更能证明两步的原子性。
 	tk2 := seedTicket(t, s, "sh600003", model.DirBuy, 300, model.FromFloat(15))
 	if _, err := s.WriteDB().Exec(
-		`CREATE TRIGGER fail_fill_insert BEFORE INSERT ON fill BEGIN SELECT RAISE(ABORT, 'simulated db failure'); END`); err != nil {
+		`CREATE TRIGGER fail_position_insert BEFORE INSERT ON position BEGIN SELECT RAISE(ABORT, 'simulated db failure'); END`); err != nil {
 		t.Fatalf("模拟写库失败环境失败: %v", err)
 	}
 	_, err = led.ReportFill(ctx, FillRequest{TicketID: tk2.ID, Qty: 300, Price: model.FromFloat(15)})
 	if err == nil {
 		t.Fatalf("写库失败应上抛 error")
 	}
-	if _, err := s.WriteDB().Exec("DROP TRIGGER fail_fill_insert"); err != nil {
+	if _, err := s.WriteDB().Exec("DROP TRIGGER fail_position_insert"); err != nil {
 		t.Fatalf("清理触发器失败: %v", err)
 	}
 
-	// 账本未被改动：fill 行数不变、持仓与现金不变
-	fillsAfter, err := s.TradeRepo().CountFills(ctx)
+	// 账本未被改动：回执数不变、失败那单没落下成交列、没新建持仓行、基线持仓与现金不变
+	fillsAfter, err := s.TradeRepo().CountFilled(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if fillsAfter != 1 {
-		t.Errorf("fill 行数=%d, 期望 1（失败回执零写入）", fillsAfter)
+		t.Errorf("已登记回执数=%d, 期望 1（失败回执零写入）", fillsAfter)
+	}
+	if t2, err := s.TradeRepo().GetTicket(ctx, tk2.ID); err != nil {
+		t.Fatal(err)
+	} else if t2.HasFill() {
+		t.Errorf("事务回滚后指令单不应带成交回执: %+v", t2.FillView())
+	}
+	var posRows int
+	if err := s.ReadDB().Get(&posRows, "SELECT COUNT(*) FROM position WHERE ts_code=?", tk2.TsCode); err != nil {
+		t.Fatal(err)
+	}
+	if posRows != 0 {
+		t.Errorf("失败回执不应新建持仓行, 实际 %d 行", posRows)
 	}
 	posAfter, err := s.TradeRepo().GetPosition(ctx, tk.TsCode)
 	if err != nil {
@@ -238,8 +246,8 @@ func TestSettleT1(t *testing.T) {
 		t.Fatalf("回执失败: %v", err)
 	}
 	pos, _ := s.TradeRepo().GetPosition(ctx, tk.TsCode)
-	if pos.AvailableQty != 0 || pos.TodayBought != 800 {
-		t.Fatalf("结转前 available=%d today=%d, 期望 0/800", int64(pos.AvailableQty), int64(pos.TodayBought))
+	if pos.Available() != 0 || pos.TodayBought != 800 {
+		t.Fatalf("结转前 可卖=%d today=%d, 期望 0/800", int64(pos.Available()), int64(pos.TodayBought))
 	}
 	n, err := led.SettleT1(ctx, "20260902")
 	if err != nil {
@@ -252,11 +260,59 @@ func TestSettleT1(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pos.AvailableQty != 800 {
-		t.Errorf("结转后 available_qty=%d, 期望 800", int64(pos.AvailableQty))
+	if pos.Available() != 800 {
+		t.Errorf("结转后 可卖量=%d, 期望 800", int64(pos.Available()))
 	}
 	if pos.TodayBought != 0 {
 		t.Errorf("结转后 today_bought=%d, 期望 0", int64(pos.TodayBought))
+	}
+}
+
+// seedTicketOn 与 seedTicket 同义，但可指定指令单所属交易日（T+1 判据要用成交日）。
+func seedTicketOn(t *testing.T, s *store.Store, tsCode string, dir model.Direction,
+	qty model.Qty, price model.Fen, tradeDate string) model.OrderTicket {
+	t.Helper()
+	tk := model.OrderTicket{
+		TradeDate: tradeDate, TsCode: tsCode, Name: "测试" + tsCode, Direction: dir,
+		Qty: qty, RefPrice: price, Reason: "单测种子", Status: model.TicketIssued,
+		ValidUntil: "2026-09-03T15:00:00+08:00", Gear: model.GearG1,
+	}
+	id, err := s.TradeRepo().InsertTicket(context.Background(), tk)
+	if err != nil {
+		t.Fatalf("落种子指令单失败: %v", err)
+	}
+	tk.ID = id
+	return tk
+}
+
+// TestSettleT1RefusesSameDayFill 当天补跑 morning_plan 不得把当天刚买的股票解锁成可卖。
+//
+// 回归场景：agent 补跑当天的盘前计划（或按历史日期补跑）时，
+// 只看 today_bought 一律归零 = 直接绕过 T+1。
+func TestSettleT1RefusesSameDayFill(t *testing.T) {
+	s, led := openLedger(t)
+	ctx := context.Background()
+	tk := seedTicketOn(t, s, "sh600006", model.DirBuy, 500, model.FromFloat(9), "20260902")
+	if _, err := led.ReportFill(ctx, FillRequest{TicketID: tk.ID, Qty: 500, Price: model.FromFloat(9)}); err != nil {
+		t.Fatalf("回执失败: %v", err)
+	}
+	pos, _ := s.TradeRepo().GetPosition(ctx, tk.TsCode)
+	if pos.TodayBought != 500 || pos.Available() != 0 {
+		t.Fatalf("成交后 today_bought=%d 可卖=%d，期望 500/0", int64(pos.TodayBought), int64(pos.Available()))
+	}
+	// 结转日 == 成交日：不结转
+	if n, err := led.SettleT1(ctx, "20260902"); err != nil || n != 0 {
+		t.Fatalf("当天补跑不应结转任何行，实际 n=%d err=%v", n, err)
+	}
+	if pos, _ = s.TradeRepo().GetPosition(ctx, tk.TsCode); pos.Available() != 0 {
+		t.Fatalf("当天补跑后可卖量变成 %d，T+1 被绕过", int64(pos.Available()))
+	}
+	// 次日：正常结转
+	if n, err := led.SettleT1(ctx, "20260903"); err != nil || n != 1 {
+		t.Fatalf("次日应结转 1 行，实际 n=%d err=%v", n, err)
+	}
+	if pos, _ = s.TradeRepo().GetPosition(ctx, tk.TsCode); pos.Available() != 500 || pos.TodayBought != 0 {
+		t.Fatalf("次日结转后 可卖=%d today=%d，期望 500/0", int64(pos.Available()), int64(pos.TodayBought))
 	}
 }
 
@@ -278,8 +334,8 @@ func TestSellFill(t *testing.T) {
 		t.Fatalf("卖出回执失败: %v", err)
 	}
 	pos, _ := s.TradeRepo().GetPosition(ctx, "sh600005")
-	if pos.TotalQty != 600 || pos.AvailableQty != 600 {
-		t.Errorf("卖出后 total=%d available=%d, 期望 600/600", int64(pos.TotalQty), int64(pos.AvailableQty))
+	if pos.TotalQty != 600 || pos.Available() != 600 {
+		t.Errorf("卖出后 total=%d available=%d, 期望 600/600", int64(pos.TotalQty), int64(pos.Available()))
 	}
 	if pos.CostPrice != model.FromFloat(10) {
 		t.Errorf("卖出不减权成本: cost=%s, 期望 10.00", pos.CostPrice)
@@ -291,8 +347,8 @@ func TestSellFill(t *testing.T) {
 	}
 }
 
-// TestSnapshotMarketValue 对应验收 #13：market_value 现算；停牌股取停牌前收盘。
-func TestSnapshotMarketValue(t *testing.T) {
+// TestAssetsMarketValue 对应验收 #13：市值现算；停牌股取停牌前收盘。资产不落库。
+func TestAssetsMarketValue(t *testing.T) {
 	s, led := openLedger(t)
 	ctx := context.Background()
 	// 甲股：当日（20260901）有行情，收盘 11 元，持仓 1000 股 → 11000 元
@@ -308,9 +364,9 @@ func TestSnapshotMarketValue(t *testing.T) {
 	}
 	seedBar(t, s, "sz000007", "20260829", model.FromFloat(5))
 
-	sn, err := led.TakeSnapshot(ctx, "20260901", model.GearG1, false)
+	sn, err := led.Assets(ctx, "20260901")
 	if err != nil {
-		t.Fatalf("快照失败: %v", err)
+		t.Fatalf("资产计算失败: %v", err)
 	}
 	if want := model.FromFloat(11000) + model.FromFloat(10000); sn.MarketValue != want {
 		t.Errorf("market_value=%s, 期望 %s（停牌股取停牌前收盘）", sn.MarketValue, want)
@@ -328,7 +384,8 @@ func TestInitialCapitalWriteOnce(t *testing.T) {
 	s, led := openLedger(t)
 	ctx := context.Background()
 	items := []PortfolioInput{{TsCode: "sh600008", TotalQty: 100, AvailableQty: 100, CostPrice: model.FromFloat(10)}}
-	n, rejected, err := led.SyncPortfolio(ctx, "20260901", model.FromFloat(10000), items, "test")
+	n, rejected, err := led.SyncPortfolio(ctx, PortfolioSync{Date: "20260901",
+		Capital: model.FromFloat(10000), Cash: model.FromFloat(9000), Items: items, Actor: "test"})
 	if err != nil {
 		t.Fatalf("首次同步失败: %v", err)
 	}
@@ -336,7 +393,8 @@ func TestInitialCapitalWriteOnce(t *testing.T) {
 		t.Errorf("首次同步 n=%d rejected=%v, 期望 1/false", n, rejected)
 	}
 	// 第二次：本金不同 → 拒绝覆盖 + 审计
-	n, rejected, err = led.SyncPortfolio(ctx, "20260902", model.FromFloat(20000), items, "test")
+	n, rejected, err = led.SyncPortfolio(ctx, PortfolioSync{Date: "20260902",
+		Capital: model.FromFloat(20000), Cash: model.FromFloat(9000), Items: items, Actor: "test"})
 	if err != nil {
 		t.Fatalf("二次同步失败: %v", err)
 	}
@@ -346,22 +404,69 @@ func TestInitialCapitalWriteOnce(t *testing.T) {
 	if n != 1 {
 		t.Errorf("二次同步持仓仍应校准: n=%d", n)
 	}
-	// 审计存在
-	var cnt int
-	if err := s.ReadDB().Get(&cnt,
-		"SELECT COUNT(*) FROM action_log WHERE object_id='initial_capital' AND action='rejected_overwrite'"); err != nil {
-		t.Fatal(err)
-	}
-	if cnt != 1 {
-		t.Errorf("拒绝审计日志=%d 条, 期望 1", cnt)
-	}
-	// 本金未被覆盖：config_kv 中仍是首次值
-	row, err := s.ConfigRepo().Get(ctx, "account.initial_capital")
+	// 拒绝留痕已改为运行日志（action_log 表本次删除）。本测试对"拒绝"这个行为的
+	// 断言在上方 rejected 与下方配置值两处，均为行为本身，未因此变弱。
+	// 本金未被覆盖，且量纲是"元"：app.InitialCapitalOf 按元读这个键，
+	// 写成分会让本金凭空放大 100 倍（历史缺陷，这条断言就是它的回归守卫）。
+	all, err := s.ConfigRepo().GetAll(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if row.Value != "1000000" {
-		t.Errorf("本金被覆盖为 %s, 期望 1000000", row.Value)
+	if got := all["account.initial_capital"]; got != "10000" {
+		t.Errorf("本金=%s, 期望 10000（元，且不被二次覆盖）", got)
+	}
+}
+
+// TestSyncPortfolioRequiresCash 校准持仓必须同时给出可用现金，
+// 否则那笔持仓成本会被算成两遍（一遍在持仓里、一遍在现金里）。
+func TestSyncPortfolioRequiresCash(t *testing.T) {
+	_, led := openLedger(t)
+	ctx := context.Background()
+	items := []PortfolioInput{{TsCode: "sh600012", TotalQty: 100, AvailableQty: 100, CostPrice: model.FromFloat(10)}}
+	if _, _, err := led.SyncPortfolio(ctx, PortfolioSync{Date: "20260902",
+		Capital: model.FromFloat(20000), Items: items, Actor: "test"}); err == nil {
+		t.Fatal("不给可用现金的组合同步必须报错，实得 nil")
+	}
+}
+
+// TestCashAnchorNotDoubleCounted 校准进来的持仓没有成交单支撑：
+// 可用资金取券商给的锚点，锚点之前成交不再重复扣减，锚点之后的成交才动现金。
+func TestCashAnchorNotDoubleCounted(t *testing.T) {
+	s, led := openLedger(t)
+	ctx := context.Background()
+	items := []PortfolioInput{{TsCode: "sh600010", TotalQty: 400, AvailableQty: 400, CostPrice: model.FromFloat(20)}}
+	if _, _, err := led.SyncPortfolio(ctx, PortfolioSync{Date: "20260902",
+		Capital: model.FromFloat(20000), Cash: model.FromFloat(12000), Items: items, Actor: "test"}); err != nil {
+		t.Fatalf("组合同步失败: %v", err)
+	}
+	cash, err := led.Cash(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cash != model.FromFloat(12000) {
+		t.Errorf("锚点后现金=%s, 期望 12000（券商给的可用资金，不能再减一遍持仓成本）", cash)
+	}
+
+	// 锚点当日及之前的成交视为已含在快照里：这笔 20260901 的买入不动现金
+	tk := seedTicket(t, s, "sh600011", model.DirBuy, 100, model.FromFloat(10))
+	if _, err := led.ReportFill(ctx, FillRequest{TicketID: tk.ID, Qty: 100, Price: model.FromFloat(10)}); err != nil {
+		t.Fatal(err)
+	}
+	if cash, err = led.Cash(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if cash != model.FromFloat(12000) {
+		t.Errorf("锚点之前成交后现金=%s, 期望仍为 12000", cash)
+	}
+	// 把这笔成交挪到锚点之后：现金必须随买入减少（12000 元 − 1000 元 − 费用）
+	if _, err := s.WriteDB().Exec(`UPDATE order_ticket SET trade_date='20260903' WHERE id=?`, tk.ID); err != nil {
+		t.Fatal(err)
+	}
+	if cash, err = led.Cash(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if cash >= model.FromFloat(12000) || cash < model.FromFloat(10990) {
+		t.Errorf("锚点之后有 1000 元买入成交，现金应略低于 11000，实得 %s", cash)
 	}
 }
 
@@ -375,7 +480,7 @@ func TestTransitionIllegal(t *testing.T) {
 	if err := svc.Transition(ctx, tk.ID, model.TicketDrafted, "test", "非法转移测试"); !errors.Is(err, ErrIllegalTransition) {
 		t.Errorf("非法转移应返回 ErrIllegalTransition, 实际: %v", err)
 	}
-	// 合法转移 issued → skipped 落审计
+	// 合法转移 issued → skipped（结果就写在指令单行上）
 	if err := svc.Transition(ctx, tk.ID, model.TicketSkipped, "test", "人工放弃"); err != nil {
 		t.Fatalf("合法转移失败: %v", err)
 	}
@@ -383,15 +488,11 @@ func TestTransitionIllegal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if t2.Status != model.TicketSkipped || t2.ClosedAt == "" {
-		t.Errorf("终态流转未生效: %+v", t2)
+	if t2.Status != model.TicketSkipped {
+		t.Errorf("终态流转未生效: status=%+v", t2.Status)
 	}
-	var cnt int
-	if err := s.ReadDB().Get(&cnt, "SELECT COUNT(*) FROM action_log WHERE object_type='order_ticket' AND object_id=?",
-		tk.ID); err != nil {
-		t.Fatal(err)
+	if !t2.Status.IsTerminal() {
+		t.Errorf("skipped 应为终态: %+v", t2.Status)
 	}
-	if cnt != 1 {
-		t.Errorf("流转审计=%d 条, 期望 1", cnt)
-	}
+	// 流转留痕已改为运行日志（action_log 表本次删除）；"流转是否落库"由上面的回读断言承担。
 }

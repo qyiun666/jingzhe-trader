@@ -22,7 +22,7 @@ type Client struct {
 	token       string
 	baseURL     string
 	httpClient  *http.Client
-	limiter     *rate.Limiter // 令牌桶：控制每分钟调用次数（慢路径 fina 的限流核心）
+	limiter     *rate.Limiter // 令牌桶：控制每分钟调用次数（对齐 tushare.rate_per_min）
 	maxRetries  int
 	baseBackoff time.Duration
 	rateWindow  time.Duration
@@ -30,21 +30,6 @@ type Client struct {
 
 // Option 可选配置项。
 type Option func(*Client)
-
-// WithHTTPClient 注入自定义 *http.Client（单测用）。
-func WithHTTPClient(h *http.Client) Option { return func(c *Client) { c.httpClient = h } }
-
-// WithRetryPolicy 设置重试次数与基础退避。
-func WithRetryPolicy(maxRetries int, baseBackoff time.Duration) Option {
-	return func(c *Client) {
-		if maxRetries >= 0 {
-			c.maxRetries = maxRetries
-		}
-		if baseBackoff > 0 {
-			c.baseBackoff = baseBackoff
-		}
-	}
-}
 
 // NewClient 构造 Tushare 客户端。
 //   - token: tushare.token（必填）

@@ -1,18 +1,17 @@
 // Package scheduler tick 循环 · 任务编排 · 补跑 · 冷却 · 优雅关机（§5.2 时间线）。
 //
 // 自研 tick 不引 cron（§9.3）：到点触发 + 当日未成功补跑 + 失败冷却 30 分钟
-// 只需 parseClock + HasSucceeded + LastJobAttemptAt 三个判断。
+// 只需 parseClock + TraceRepo().HasSucceeded + TraceRepo().LastAt 三个判断。
 //
 // 原则：
 //   - panic 只允许在 Scheduler.runJob 中 recover（§11.1）；
-//   - 补跑按 job_run 表判定（重启后自动补跑当日未成功任务，验收 §10.5-9）；
+//   - 补跑按 run_trace 轨迹判定（重启后自动补跑当日未做成任务，验收 §10.5-9）；
 //   - 失败冷却 30 分钟内不重复触发（验收 §10.5-10）；
 //   - 时间注入（fake clock）可加速跑完整交易日（验收 §10.5-8）。
 package scheduler
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -86,8 +85,9 @@ type Scheduler struct {
 	dryRun     bool
 
 	mu           sync.Mutex
-	fired        map[string]bool // job@date@trigger → 已触发
+	fired        map[string]bool      // job@date@trigger → 已触发
 	lastInterval map[string]time.Time // 间隔任务最近触发时刻
+	lastTick     time.Time            // 最近一轮调度判定时刻（供 /healthz 探活）
 
 	running bool
 }
@@ -114,29 +114,13 @@ func (s *Scheduler) WithClock(f func() time.Time) *Scheduler {
 	return s
 }
 
-// WithTick 注入 tick 间隔（测试加速用）。
-func (s *Scheduler) WithTick(d time.Duration) *Scheduler {
-	if d > 0 {
-		s.tick = d
-	}
-	return s
-}
-
-// WithCooldown 注入冷却时长（测试用；生产默认 30 分钟）。
-func (s *Scheduler) WithCooldown(d time.Duration) *Scheduler {
-	if d > 0 {
-		s.cooldown = d
-	}
-	return s
-}
-
 // WithOnDone 注册任务完成回调。
 func (s *Scheduler) WithOnDone(f OnJobDone) *Scheduler {
 	s.onDone = f
 	return s
 }
 
-// WithDryRun 演练模式：不执行真实 Run、不写 job_run（时间线验证用）。
+// WithDryRun 演练模式：不执行真实 Run、不写 run_trace（时间线验证用）。
 func (s *Scheduler) WithDryRun(b bool) *Scheduler {
 	s.dryRun = b
 	return s
@@ -174,6 +158,9 @@ func (s *Scheduler) Run(ctx context.Context) error {
 // now 由注入时钟提供；测试可逐次推进 fake clock。
 func (s *Scheduler) Tick(ctx context.Context, now time.Time) []string {
 	now = now.In(market.Loc)
+	s.mu.Lock()
+	s.lastTick = now
+	s.mu.Unlock()
 	date := now.Format("20060102")
 	tradeDay := true
 	if s.isTradeDay != nil {
@@ -195,6 +182,45 @@ func (s *Scheduler) Tick(ctx context.Context, now time.Time) []string {
 		}
 	}
 	return triggered
+}
+
+// JobCount 已注册任务数（specs 在 New 后不再变更，无需加锁）。
+func (s *Scheduler) JobCount() int { return len(s.specs) }
+
+// JobNames 全部任务名（按注册顺序），供外部接口校验入参。
+func (s *Scheduler) JobNames() []string {
+	out := make([]string, 0, len(s.specs))
+	for _, spec := range s.specs {
+		out = append(out, spec.Name)
+	}
+	return out
+}
+
+// RunNamed 立即执行指定任务一次（补跑/调试）。走 runJob，
+// 因此与到点触发共用同一条 run_trace 落库路径（成功/降级/失败都写当日那一行）。
+func (s *Scheduler) RunNamed(ctx context.Context, name, date, trigger string) error {
+	for _, spec := range s.specs {
+		if spec.Name != name {
+			continue
+		}
+		_, err := s.runJob(ctx, spec, date, trigger)
+		return err
+	}
+	return fmt.Errorf("未知任务 %s（可选：%s）", name, strings.Join(s.JobNames(), ", "))
+}
+
+// IsRunning 报告主循环是否在跑（Run 退出后为 false）。
+func (s *Scheduler) IsRunning() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.running
+}
+
+// LastTickAt 最近一轮调度判定时刻；从未跑过返回零值。
+func (s *Scheduler) LastTickAt() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastTick
 }
 
 // dueTriggers 计算某任务当前应触发的 trigger 列表（含冷却/已完成判定）。
@@ -251,17 +277,18 @@ func (s *Scheduler) dueInterval(spec JobSpec, date string, now time.Time) []stri
 	return []string{"interval"}
 }
 
-// shouldSkip 判定任务是否应跳过本轮触发（冷却判定，读 job_run 表，重启后仍生效）：
-// 当日已完成（success/degraded）→ 跳过；最近一次尝试在冷却期内 → 跳过。
+// shouldSkip 判定任务是否应跳过本轮触发（冷却判定，读轨迹表，重启后仍生效）：
+// 当日已完成（ok/partial）→ 跳过；最近一次留痕在冷却期内 → 跳过。
 func (s *Scheduler) shouldSkip(jobName, date string) bool {
 	if s.dryRun {
 		return false
 	}
-	ok, err := s.st.OpsRepo().HasJobSucceeded(context.Background(), jobName, date)
+	subject := model.TraceJob(jobName)
+	ok, err := s.st.TraceRepo().HasSucceeded(context.Background(), subject, date)
 	if err == nil && ok {
 		return true
 	}
-	last, err := s.st.OpsRepo().LastJobAttemptAt(context.Background(), jobName, date)
+	last, err := s.st.TraceRepo().LastAt(context.Background(), subject, date)
 	if err != nil || last == "" {
 		return false
 	}
@@ -272,68 +299,56 @@ func (s *Scheduler) shouldSkip(jobName, date string) bool {
 	return time.Since(t) < s.cooldown
 }
 
-// runJob 执行单个任务：job_run 全程落库（running → 终态），
-// panic 在此 recover（全项目唯一允许 recover 的位置之一，§11.1）。
+// runJob 执行单个任务：跑完写一行轨迹（ok / partial / fail），panic 在此 recover
+// （全项目唯一允许 recover 的位置之一，§11.1）。
+//
+// 不写"开始"行：进程中途死掉就是没有行，而缺行正是自检 [D1] 要抓的信号。
+// 不记尝试次数：重试策略只有 cooldown 一个配置项，从来没有次数上限判定。
 func (s *Scheduler) runJob(ctx context.Context, spec JobSpec, date, trigger string) (string, error) {
 	if s.dryRun {
 		observability.S().Infow("[dry-run] 任务触发", "job", spec.Name, "date", date, "trigger", trigger)
-		return string(model.JobSuccess), nil
+		return model.TraceOK, nil
 	}
-	attempt := 1
-	if n, err := s.st.OpsRepo().JobAttempts(ctx, spec.Name, date); err == nil {
-		attempt = n + 1
-	}
-	started := s.clock().UTC().Format(time.RFC3339)
-	startReal := time.Now()
-	_ = s.st.OpsRepo().UpsertJobRun(ctx, model.JobRun{
-		JobName: spec.Name, TradeDate: date, Attempt: attempt,
-		Status: string(model.JobRunning), StartedAt: started,
-	})
 
 	rc := observability.NewRunCtx(ctx, spec.Name, date)
 	var jobErr error
-	status := string(model.JobSuccess)
 	func() {
 		defer func() {
 			if p := recover(); p != nil {
 				jobErr = fmt.Errorf("任务 %s panic: %v", spec.Name, p)
-				status = string(model.JobFailed)
 				observability.S().Errorw("任务 panic 已隔离", "job", spec.Name, "panic", fmt.Sprint(p))
 			}
 		}()
-		if rerr := spec.Run(ctx, rc); rerr != nil {
-			jobErr = rerr
-			status = string(model.JobFailed)
-		}
+		jobErr = spec.Run(ctx, rc)
 	}()
-	if jobErr == nil {
-		misses := rc.Assert() // 产出物契约断言：缺失自动转 degraded（D1）
-		if rc.Degraded() {
-			status = string(model.JobDegraded)
-		}
-		_ = misses
-	}
-	duration := time.Since(startReal).Milliseconds()
-	finished := s.clock().UTC().Format(time.RFC3339)
-	deg, _ := json.Marshal(rc.Degradations())
-	if err := s.st.OpsRepo().UpsertJobRun(ctx, model.JobRun{
-		JobName: spec.Name, TradeDate: date, Attempt: attempt,
-		Status: status, DurationMs: duration,
-		Error: errStr(jobErr), Degradations: string(deg),
-		StartedAt: started, FinishedAt: finished,
-	}); err != nil {
-		observability.S().Errorw("回写任务终态失败", "job", spec.Name, "err", err.Error())
-	}
-	observability.S().Infow("任务完成", "job", spec.Name, "date", date, "attempt", attempt,
-		"status", status, "duration_ms", duration, "err", errStr(jobErr))
-	return status, jobErr
-}
 
-func errStr(err error) string {
-	if err == nil {
-		return ""
+	outcome, detail := model.TraceOK, ""
+	switch {
+	case jobErr != nil:
+		outcome, detail = model.TraceFail, jobErr.Error()
+	default:
+		// 产出物契约断言：声明了却没交齐的，折成一句降级说明（[D1]）
+		rc.Assert()
+		if deg := rc.Degradations(); len(deg) > 0 {
+			outcome = model.TracePartial
+			parts := make([]string, 0, len(deg))
+			for _, d := range deg {
+				parts = append(parts, d.Code+": "+d.Reason)
+			}
+			detail = "降级 " + strings.Join(parts, "；")
+		}
 	}
-	return err.Error()
+
+	werr := s.st.TraceRepo().Write(ctx, model.RunTrace{
+		TradeDate: date, Subject: model.TraceJob(spec.Name),
+		Outcome: outcome, Detail: detail, At: s.clock().UTC().Format(time.RFC3339),
+	})
+	if werr != nil {
+		observability.S().Errorw("写任务轨迹失败", "job", spec.Name, "err", werr.Error())
+	}
+	observability.S().Infow("任务完成", "job", spec.Name, "date", date,
+		"outcome", outcome, "detail", detail, "trigger", trigger)
+	return outcome, jobErr
 }
 
 // SimulateDay 用注入时钟顺序推演一个完整交易日（06:50→21:00，步长 1 分钟），

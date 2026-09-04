@@ -2,13 +2,22 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/jmoiron/sqlx"
 	"jingzhe-trader/internal/model"
 )
 
-// GoalRepo 目标域仓储：goal_state / goal_gear_log。
+// goalStateKey 档位状态在 config_kv 里的唯一键。
+//
+// 它不配独立一张表：整个状态只有一行，且每次写都是整行覆盖（没有任何按列更新、
+// 没有任何按列查询），列名从来不是查询条件。档位变更的历史只写日志，不入库。
+const goalStateKey = "goal.state"
+
+// GoalRepo 档位状态机读写：一个序列化的 model.GoalState 存在 config_kv 的一个键上。
 type GoalRepo struct {
 	wdb *sqlx.DB
 	rdb *sqlx.DB
@@ -19,50 +28,35 @@ func (s *Store) GoalRepo() *GoalRepo {
 	return &GoalRepo{wdb: s.writeDB, rdb: s.readDB}
 }
 
-// UpsertGoalState 写入/更新档位状态机单行（id=1）。
+// UpsertGoalState 覆盖当前档位状态。
 func (r *GoalRepo) UpsertGoalState(ctx context.Context, g model.GoalState) error {
-	const q = `INSERT INTO goal_state
-		(id, quarter, quarter_start, quarter_end, baseline_asset, peak_asset, current_gear, profit_lock,
-		 upgrade_streak, last_eval_date, override_gear, override_reason, override_until, pace_policy, pace_confirm_date, updated_at)
-		VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-			quarter=excluded.quarter, quarter_start=excluded.quarter_start, quarter_end=excluded.quarter_end,
-			baseline_asset=excluded.baseline_asset, peak_asset=excluded.peak_asset, current_gear=excluded.current_gear,
-			profit_lock=excluded.profit_lock, upgrade_streak=excluded.upgrade_streak, last_eval_date=excluded.last_eval_date,
-			override_gear=excluded.override_gear, override_reason=excluded.override_reason, override_until=excluded.override_until,
-			pace_policy=excluded.pace_policy, pace_confirm_date=excluded.pace_confirm_date, updated_at=excluded.updated_at`
-	if _, err := r.wdb.ExecContext(ctx, q,
-		g.Quarter, g.QuarterStart, g.QuarterEnd, int64(g.BaselineAsset), int64(g.PeakAsset), string(g.CurrentGear), boolToInt(g.ProfitLock),
-		g.UpgradeStreak, g.LastEvalDate, g.OverrideGear, g.OverrideReason, g.OverrideUntil, g.PacePolicy, g.PaceConfirmDate, g.UpdatedAt,
-	); err != nil {
+	raw, err := json.Marshal(g)
+	if err != nil {
+		return fmt.Errorf("序列化档位状态失败: %w", err)
+	}
+	cr := ConfigRepo{db: r.wdb}
+	if err := cr.Set(ctx, goalStateKey, string(raw)); err != nil {
 		return fmt.Errorf("写入档位状态失败: %w", err)
 	}
 	return nil
 }
 
-// GetGoalState 读取档位状态单行。
+// GetGoalState 读取当前档位状态。
+//
+// 尚未初始化时返回包装了 sql.ErrNoRows 的错误 —— goal 的 loadState 据此建初始状态，
+// 这个契约从表时代沿用下来，没有换成 bool 返回值。
 func (r *GoalRepo) GetGoalState(ctx context.Context) (model.GoalState, error) {
-	var g model.GoalState
-	err := r.rdb.GetContext(ctx, &g,
-		`SELECT quarter, quarter_start, quarter_end, baseline_asset, peak_asset, current_gear, profit_lock,
-		 upgrade_streak, last_eval_date, override_gear, override_reason, override_until, pace_policy, pace_confirm_date, updated_at
-		 FROM goal_state WHERE id=1`)
+	var v string
+	err := r.rdb.GetContext(ctx, &v, "SELECT value FROM config_kv WHERE key = ?", goalStateKey)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.GoalState{}, fmt.Errorf("档位状态尚未初始化: %w", sql.ErrNoRows)
+	}
 	if err != nil {
-		return g, fmt.Errorf("读取档位状态失败: %w", err)
+		return model.GoalState{}, fmt.Errorf("读取档位状态失败: %w", err)
+	}
+	var g model.GoalState
+	if err := json.Unmarshal([]byte(v), &g); err != nil {
+		return model.GoalState{}, fmt.Errorf("解析档位状态失败（键 %s）: %w", goalStateKey, err)
 	}
 	return g, nil
-}
-
-// InsertGearLog 插入档位变更日志（可回放）。
-func (r *GoalRepo) InsertGearLog(ctx context.Context, l model.GoalGearLog) error {
-	const q = `INSERT INTO goal_gear_log
-		(trade_date, quarter, from_gear, to_gear, from_lock, to_lock, trigger_rule, progress, budget_consumed, pace_gap, is_manual, reason, params_snapshot, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	if _, err := r.wdb.ExecContext(ctx, q,
-		l.TradeDate, l.Quarter, string(l.FromGear), string(l.ToGear), boolToInt(l.FromLock), boolToInt(l.ToLock),
-		l.TriggerRule, l.Progress, l.BudgetConsumed, l.PaceGap, boolToInt(l.IsManual), l.Reason, l.ParamsSnapshot, l.CreatedAt,
-	); err != nil {
-		return fmt.Errorf("写入档位变更日志失败: %w", err)
-	}
-	return nil
 }

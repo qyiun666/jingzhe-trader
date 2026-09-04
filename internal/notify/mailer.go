@@ -10,12 +10,6 @@ import (
 	"jingzhe-trader/internal/store"
 )
 
-// retryBackoffs 发送失败重试间隔：1 / 5 / 15 分钟（附录 A）。
-var retryBackoffs = []time.Duration{1 * time.Minute, 5 * time.Minute, 15 * time.Minute}
-
-// maxSendAttempts 最大发送尝试次数（3 次后终态 failed）。
-const maxSendAttempts = 3
-
 // MailConfig 邮件通道配置。
 type MailConfig struct {
 	Enabled bool
@@ -23,7 +17,12 @@ type MailConfig struct {
 	To      []string // 收件人（可多个）
 }
 
-// Mailer 邮件发件箱：Enqueue 落库 → Send（SMTP）→ 状态回写 → 重试退避。
+// Mailer 邮件通道：同步发一次，结果落一行轨迹。
+//
+// 原来的发件箱表（pending / attempts / next_retry_at 三级退避 + 跨进程补发）已删除 ——
+// 那是为"SMTP 半夜挂了早上自动补上"设计的，代价是一整张状态机表和一个每轮扫描的定时器。
+// 现在发信只有一次机会：成了写 ok，砸了写 fail 并当场把错误上抛给调用方，
+// 当日轨迹里看得见，不再悄悄排队。
 type Mailer struct {
 	st     *store.Store
 	cfg    MailConfig
@@ -31,7 +30,7 @@ type Mailer struct {
 	sendFn func(to []string, subject, body string) error // 可注入（测试打桩）
 }
 
-// NewMailer 构造邮件发件箱。
+// NewMailer 构造邮件通道。
 func NewMailer(st *store.Store, cfg MailConfig) *Mailer {
 	return &Mailer{st: st, cfg: cfg, now: time.Now, sendFn: cfg.SMTP.Send}
 }
@@ -44,105 +43,62 @@ func (m *Mailer) WithClock(f func() time.Time) *Mailer {
 	return m
 }
 
-// WithSender 注入发送函数（测试打桩，禁止单测打真实 SMTP）。
-func (m *Mailer) WithSender(f func(to []string, subject, body string) error) *Mailer {
-	if f != nil {
-		m.sendFn = f
-	}
-	return m
-}
-
 // Configured 是否具备发送条件（启用 + 收件人 + 发件人）。
 func (m *Mailer) Configured() bool {
 	return m.cfg.Enabled && len(m.cfg.To) > 0 && m.cfg.SMTP.From != ""
 }
 
-// Enqueue 入队邮件。
+// Send 同步发送一封邮件，成败都落一行轨迹（subject = mail:<类型>）并显式返回错误。
 //
-// 未启用时【不是 no-op】：显式落 mail_outbox failed 行（last_error 写明原因），
-// 并返回 ErrNotConfigured 包装错误（验收 §10.5-5）。调用方必须处理该错误。
-func (m *Mailer) Enqueue(ctx context.Context, tradeDate string, typ model.MailType, subject, body string) (int64, error) {
-	nowStr := m.now().UTC().Format(time.RFC3339)
+// 未配置【不是 no-op】：照样写一行 fail 轨迹并返回 ErrNotConfigured 包装错误（验收 §10.5-5），
+// 否则"任务全绿但零邮件"那个历史缺陷（D1）会重新变成不可见。
+//
+// OnceDaily 类型（M1/M2/M5）当日已投递成功过就跳过：`trigger_task` 手工补跑同一个任务
+// 不该往收件箱再塞一封，而 run_trace 按 (trade_date, subject) 覆盖成一行，重复发放在轨迹里看不出来。
+func (m *Mailer) Send(ctx context.Context, tradeDate string, typ model.MailType, subject, body string) error {
+	if typ.OnceDaily() {
+		done, err := m.st.TraceRepo().HasSucceeded(ctx, model.TraceMail(typ), tradeDate)
+		if err != nil {
+			return fmt.Errorf("查询 %s 邮件当日投递状态失败: %w", typ, err)
+		}
+		if done {
+			observability.S().Infow("邮件当日已送达，跳过重复发送", "type", string(typ), "date", tradeDate)
+			return nil
+		}
+	}
 	if !m.Configured() {
 		reason := "mail.enabled=false"
 		if m.cfg.Enabled && len(m.cfg.To) == 0 {
 			reason = "收件人 mail.to 未配置"
 		}
-		id, err := m.st.OpsRepo().InsertMail(ctx, model.MailOutbox{
-			TradeDate: tradeDate, MailType: typ, Subject: subject, Body: body,
-			Status: "failed", Attempts: 0, LastError: reason, CreatedAt: nowStr,
-		})
-		if err != nil {
-			return 0, fmt.Errorf("落邮件失败行失败: %w", err)
-		}
-		return id, fmt.Errorf("入队 %s 邮件失败: %w（%s，已落 mail_outbox failed 行）", typ, ErrNotConfigured, reason)
+		m.trace(ctx, tradeDate, typ, false, "未发送："+reason)
+		return fmt.Errorf("发送 %s 邮件失败: %w（%s）", typ, ErrNotConfigured, reason)
 	}
-	return m.st.OpsRepo().EnqueueMail(ctx, model.MailOutbox{
-		TradeDate: tradeDate, MailType: typ, Subject: subject, Body: body, CreatedAt: nowStr,
-	})
-}
-
-// SendNow 入队并立即发送（urgent 邮件 / RaiseUrgent 用）。
-// 发送失败返回显式错误（重试交给 SendPending 的退避机制）。
-func (m *Mailer) SendNow(ctx context.Context, tradeDate string, typ model.MailType, subject, body string) error {
-	id, err := m.Enqueue(ctx, tradeDate, typ, subject, body)
-	if err != nil {
-		return err
+	if serr := m.sendFn(m.cfg.To, subject, body); serr != nil {
+		m.trace(ctx, tradeDate, typ, false, "SMTP 发送失败: "+serr.Error())
+		return fmt.Errorf("发送 %s 邮件失败: %w", typ, serr)
 	}
-	return m.SendOne(ctx, id)
-}
-
-// SendOne 发送单封邮件并回写状态：成功 → sent；失败 → attempts+1 + 退避，
-// 耗尽 3 次后终态 failed。错误一律显式上抛（不静默）。
-func (m *Mailer) SendOne(ctx context.Context, id int64) error {
-	row, err := m.st.OpsRepo().GetMail(ctx, id)
-	if err != nil {
-		return err
-	}
-	if row.Status == "sent" {
-		return nil // 幂等：已发送不重发
-	}
-	nowStr := m.now().UTC().Format(time.RFC3339)
-	if serr := m.sendFn(m.cfg.To, row.Subject, row.Body); serr != nil {
-		attempts := row.Attempts + 1
-		if attempts >= maxSendAttempts {
-			if ferr := m.st.OpsRepo().MarkMailFailed(ctx, id, attempts, serr.Error()); ferr != nil {
-				return fmt.Errorf("发送失败且回写终态失败: %v / %w", serr, ferr)
-			}
-			return fmt.Errorf("邮件 #%d 发送失败（已重试 %d 次，终态 failed）: %w", id, attempts, serr)
-		}
-		next := m.now().Add(retryBackoffs[min(attempts, len(retryBackoffs))-1]).UTC().Format(time.RFC3339)
-		if rerr := m.st.OpsRepo().UpdateMailRetry(ctx, id, attempts, serr.Error(), next); rerr != nil {
-			return fmt.Errorf("发送失败且回写重试状态失败: %v / %w", serr, rerr)
-		}
-		return fmt.Errorf("邮件 #%d 发送失败（第 %d 次，%s 前不重试）: %w", id, attempts, next, serr)
-	}
-	if serr := m.st.OpsRepo().UpdateMailSent(ctx, id, nowStr); serr != nil {
-		return fmt.Errorf("回写邮件 #%d 已发送失败: %w", id, serr)
-	}
-	observability.S().Infow("邮件已发送", "id", id, "type", string(row.MailType), "date", row.TradeDate)
+	m.trace(ctx, tradeDate, typ, true, "已发送至 "+m.cfg.To[0])
+	observability.S().Infow("邮件已发送", "type", string(typ), "date", tradeDate)
 	return nil
 }
 
-// SendPending 发送所有到期待发邮件，返回成功条数与最后一个错误（显式，不吞）。
-func (m *Mailer) SendPending(ctx context.Context, tradeDate string) (int, error) {
-	rows, err := m.st.OpsRepo().PendingMails(ctx, m.now().UTC().Format(time.RFC3339))
+// trace 落一行发信轨迹。轨迹写失败不掩盖发信结果，只额外记一条日志。
+func (m *Mailer) trace(ctx context.Context, tradeDate string, typ model.MailType, ok bool, detail string) {
+	outcome := model.TraceOK
+	if !ok {
+		outcome = model.TraceFail
+	}
+	err := m.st.TraceRepo().Write(ctx, model.RunTrace{
+		TradeDate: tradeDate,
+		Subject:   model.TraceMail(typ),
+		Outcome:   outcome,
+		Detail:    detail,
+		At:        m.now().UTC().Format(time.RFC3339),
+	})
 	if err != nil {
-		return 0, err
+		observability.S().Errorw("写发信轨迹失败", "type", string(typ), "err", err)
 	}
-	sent := 0
-	var lastErr error
-	for _, row := range rows {
-		if tradeDate != "" && row.TradeDate != tradeDate {
-			continue
-		}
-		if err := m.SendOne(ctx, row.ID); err != nil {
-			lastErr = err
-			continue
-		}
-		sent++
-	}
-	return sent, lastErr
 }
 
 // HealthOK 配置完整性自检（不发信）：返回缺失项清单，空切片 = 健康。
