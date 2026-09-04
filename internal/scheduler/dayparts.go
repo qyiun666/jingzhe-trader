@@ -354,7 +354,9 @@ func sendDailyReport(ctx context.Context, rc *observability.RunCtx, d Deps, date
 	}
 	subject, body := notify.RenderM5(date, block+extra, okJobs, degJobs, failJobs, brief)
 	if err := d.Mail.Send(ctx, date, model.MailM5, subject, body); err != nil {
-		d.raiseU(rc, "MAIL_NOT_SENT", "日报发送失败", err.Error())
+		// warning 而非 urgent：任务本身已 fail，调度器统一落 JOB_FAILED urgent 发 M6；
+		// 这里再发一封是同一根因两条紧急告警（其余三处邮件失败也都是 warning）。
+		d.raiseW(rc, "MAIL_NOT_SENT", "日报发送失败", err.Error())
 		return fmt.Errorf("日报发送失败: %w", err)
 	}
 	rc.Actual("daily_m5", 1) // 发出去才算交付（入队即 Actual 是 [D1] 的假绿）
