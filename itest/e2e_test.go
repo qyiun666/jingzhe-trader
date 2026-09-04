@@ -195,6 +195,22 @@ func TestTradingDayEndToEnd(t *testing.T) {
 			t.Errorf("%s 失败: %v", tc.job, err)
 			continue
 		}
+		if tc.typ == model.MailM1 {
+			// M1 是否必发取决于跑 mail_pending 时待买卖表还有没有活跃单。
+			// 套件在锚日（默认 20260903）次日 15:00 之后跑时，上面 morning_plan 已把
+			// 过有效期的单收口成 expired：空表降级 NO_PENDING_TICKET 不发信是设计内行为，
+			// 倒是发了才要查。单据状态在 mail_pending 前后不变（drafted→issued 都是活跃），
+			// 此刻读到的口径与它判定时一致。
+			acts, aerr := st.TradeRepo().ListActiveTickets(ctx, date)
+			mustNoErr(t, "读取活跃单", aerr)
+			if len(acts) == 0 {
+				outcome, detail := jobOutcome(t, st, date, tc.job)
+				if outcome != model.TracePartial || !strings.Contains(detail, "NO_PENDING_TICKET") {
+					t.Errorf("待买卖表为空时 mail_pending 应降级 NO_PENDING_TICKET（不发信），得到 %s/%s", outcome, detail)
+				}
+				continue
+			}
+		}
 		if !lastTraceOK(t, st, date, model.TraceMail(tc.typ)) {
 			t.Errorf("%s 跑完了但 %s 邮件没有成功投递记录", tc.job, tc.mail)
 		}

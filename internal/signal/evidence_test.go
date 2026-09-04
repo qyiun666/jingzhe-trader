@@ -1,6 +1,7 @@
 package signal
 
 import (
+	"context"
 	"math"
 	"testing"
 
@@ -107,7 +108,7 @@ func TestNoDeciderNeverApproves(t *testing.T) {
 		{Candidate: model.Candidate{TsCode: "sh600001"}},
 		{Candidate: model.Candidate{TsCode: "sz000002"}},
 	}}
-	got, err := NoDecider{}.DecideBatch(nil, req)
+	got, err := NoDecider{}.DecideBatch(context.TODO(), req)
 	if err != nil {
 		t.Fatalf("NoDecider 不应报错: %v", err)
 	}
