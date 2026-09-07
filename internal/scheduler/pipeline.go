@@ -124,7 +124,7 @@ func screenCandidates(ctx context.Context, rc *observability.RunCtx, d Deps, dat
 }
 
 // ScreenBudget 组装选股漏斗的资金与大盘口径：
-// 单笔预算 = 可用现金 / 计划持仓数；大盘跌破 MA20 时当日关闭买入漏斗。
+// 单笔预算 = 可用现金 / 计划持仓数；大盘跌破 MA60 时当日关闭买入漏斗。
 //
 // 现金与指数都是这道闸门必需 inputs：拿不到就失败，不存在"本轮先不判定大盘"——
 // 那等于在最该保守的时候默认放行买入。
@@ -143,10 +143,11 @@ func ScreenBudget(ctx context.Context, st *store.Store, led *ticket.Ledger,
 	if err != nil {
 		return b, err
 	}
-	if idx.MA20 <= 0 {
-		return b, fmt.Errorf("大盘指数 %s 在 %s 前不足 20 根日线，MA20 不可算", store.MarketIndex, date)
+	if idx.MA60 <= 0 {
+		return b, fmt.Errorf("大盘指数 %s 在 %s 前不足 %d 根日线，MA%d 不可算",
+			store.MarketIndex, date, store.MarketMAWindow, store.MarketMAWindow)
 	}
-	b.MarketOK = idx.Close >= idx.MA20
+	b.MarketOK = idx.Close >= idx.MA60
 	return b, nil
 }
 

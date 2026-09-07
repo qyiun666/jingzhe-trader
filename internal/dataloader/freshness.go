@@ -278,7 +278,7 @@ func (g *FreshnessGate) checkWindow(ctx context.Context, tradeDate string) Check
 	return okItem("WindowOK", fmt.Sprintf("因子窗口 %d 个交易日齐全", g.windowDays))
 }
 
-// checkIndex 检查大盘指数日线是否存在。缺失即阻断：买入闸门（跌破 MA20 关漏斗）
+// checkIndex 检查大盘指数日线是否存在。缺失即阻断：买入闸门（跌破 MA60 关漏斗）
 // 与卖出规则（大盘恶化）都以这根指数为输入，没有它当日既不能买也不能判"大盘正常"。
 func (g *FreshnessGate) checkIndex(ctx context.Context, tradeDate string) CheckItem {
 	n, err := g.store.MarketRepo().CountIndexBar(ctx, freshnessIndex, tradeDate)

@@ -144,26 +144,32 @@ func (r *ScreenRepo) LatestBarAt(ctx context.Context, tsCode, beforeInclusive st
 	return b, nil
 }
 
-// IndexQuote 指数行情读取结果：收盘价 + 现算 MA20（分）。
+// IndexQuote 指数行情读取结果：收盘价 + 现算 MA60（分）。
 // 指数与个股共用 daily_bar，指数的 vol_lot/raw_close 列为 0。
 type IndexQuote struct {
 	TsCode    string    `db:"ts_code"`
 	TradeDate string    `db:"trade_date"`
 	Close     model.Fen `db:"close"`
-	MA20      model.Fen `db:"ma20"`
+	MA60      model.Fen `db:"ma60"`
 }
 
-// indexColumns 指数读取列：MA20 由最近 20 个交易日的收盘现算（分）。
-// 不足 20 根时返回 0，调用方据此判"均线不可算"而不是拿部分均值当真值。
-const indexColumns = `ts_code, trade_date, close,
-	(SELECT CASE WHEN COUNT(*) = 20 THEN CAST(AVG(x.close) AS INTEGER) ELSE 0 END
+// indexColumns 指数读取列：MA60 由最近 MarketMAWindow 个交易日的收盘现算（分）。
+// 不足窗口根数时返回 0，调用方据此判"均线不可算"而不是拿部分均值当真值。
+var indexColumns = fmt.Sprintf(`ts_code, trade_date, close,
+	(SELECT CASE WHEN COUNT(*) = %d THEN CAST(AVG(x.close) AS INTEGER) ELSE 0 END
 	   FROM (SELECT close FROM daily_bar i2
 	          WHERE i2.ts_code = i1.ts_code AND i2.trade_date <= i1.trade_date
-	          ORDER BY i2.trade_date DESC LIMIT 20) x) AS ma20`
+	          ORDER BY i2.trade_date DESC LIMIT %d) x) AS ma60`,
+	MarketMAWindow, MarketMAWindow)
 
 // MarketIndex 大盘门槛所用的指数：沪深300。新鲜度门禁检查的也是这一根，
 // 两处必须共用一个常量，否则门禁放行的是一个指数、买入闸门看的是另一个。
 const MarketIndex = "000300.SH"
+
+// MarketMAWindow 大盘门槛均线窗口（交易日）。60 为沪深300 2014-2026 实测的
+// 收益/回撤折中档（notes/implemented/feature/2026-09-07-大盘门槛MA20换MA60.md）；
+// 指数由此成为全项目最深的历史回看消费者，同步回补与保留窗口都不得低于它。
+const MarketMAWindow = 60
 
 // LatestMarketIndex 读取大盘指数截至 beforeInclusive 的最后一根日线。
 //

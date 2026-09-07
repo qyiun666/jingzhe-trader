@@ -22,7 +22,7 @@ type HoldingCtx struct {
 	LastClose model.Fen // 最近可得收盘（停牌股取停牌前收盘，分）
 	LastDate  string    // 该收盘对应交易日
 	InTopN    bool      // 是否在当日候选池 TopN
-	MarketBad bool      // 大盘恶化（指数收盘 < MA20）
+	MarketBad bool      // 大盘恶化（指数收盘 < MA60）
 }
 
 // newSell 构造卖出信号骨架。
@@ -98,16 +98,16 @@ func evalRankOut(date string, h HoldingCtx) *model.Signal {
 		fmt.Sprintf("排名淘汰：未进入当日候选池 TopN（持仓成本 %s）", h.Pos.CostPrice))
 }
 
-// evalMarketBad 规则 5 大盘恶化：指数收盘跌破 MA20。
-func evalMarketBad(date string, h HoldingCtx, indexClose, indexMA20 model.Fen) *model.Signal {
-	if h.Pos.TotalQty <= 0 || indexClose <= 0 || indexMA20 <= 0 {
+// evalMarketBad 规则 5 大盘恶化：指数收盘跌破 MA60。
+func evalMarketBad(date string, h HoldingCtx, indexClose, indexMA60 model.Fen) *model.Signal {
+	if h.Pos.TotalQty <= 0 || indexClose <= 0 || indexMA60 <= 0 {
 		return nil
 	}
-	if indexClose >= indexMA20 {
+	if indexClose >= indexMA60 {
 		return nil
 	}
 	return newSell(date, h, RuleMarketBad,
-		fmt.Sprintf("大盘恶化：指数收盘 %s 元跌破 MA20 %s 元", fmtYuan(indexClose), fmtYuan(indexMA20)))
+		fmt.Sprintf("大盘恶化：指数收盘 %s 元跌破 MA60 %s 元", fmtYuan(indexClose), fmtYuan(indexMA60)))
 }
 
 // fmtYuan 分 → 元展示串。
@@ -115,13 +115,13 @@ func fmtYuan(f model.Fen) string { return fmt.Sprintf("%.2f", float64(f)/100) }
 
 // EvalSell 按优先级评估五条卖出规则，返回首个触发的信号（未触发返回 nil）：
 // 止损 > 移动止盈 > 止盈 > 排名淘汰 > 大盘恶化。
-func EvalSell(date string, h HoldingCtx, p risk.RiskParams, indexClose, indexMA20 model.Fen) *model.Signal {
+func EvalSell(date string, h HoldingCtx, p risk.RiskParams, indexClose, indexMA60 model.Fen) *model.Signal {
 	for _, sig := range []*model.Signal{
 		evalStopLoss(date, h, p),
 		evalTrailingStop(date, h, p),
 		evalTakeProfit(date, h, p),
 		evalRankOut(date, h),
-		evalMarketBad(date, h, indexClose, indexMA20),
+		evalMarketBad(date, h, indexClose, indexMA60),
 	} {
 		if sig != nil {
 			return sig

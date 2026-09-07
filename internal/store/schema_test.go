@@ -14,7 +14,7 @@ import (
 // 这条断言就是"又把过程状态建成一张表"的第一道关。
 var wantTables = []string{
 	"config_kv",    // 配置 + 键目录 | goal.state | suspend:<日期> | 现金锚点
-	"daily_bar",    // 选股因子、指数 MA20、持仓市值与一手价
+	"daily_bar",    // 选股因子、指数 MA60、持仓市值与一手价
 	"order_ticket", // 晨会/盘中邮件、账本现金推算、决策复盘
 	"position",     // 卖出信号、风控仓位、资产合计
 	"run_trace",    // 调度补跑判定、自检、MCP get_logs、日报

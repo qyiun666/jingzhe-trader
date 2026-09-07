@@ -157,7 +157,7 @@ func TestFreshness_CoverageGap(t *testing.T) {
 }
 
 // TestFreshness_IndexStale 大盘指数日线缺失是阻断项：
-// 买入闸门（跌破 MA20 关漏斗）与卖出规则（大盘恶化）都读这一根，缺了就不能出指令。
+// 买入闸门（跌破 MA60 关漏斗）与卖出规则（大盘恶化）都读这一根，缺了就不能出指令。
 func TestFreshness_IndexStale(t *testing.T) {
 	st := openTestStore(t)
 	rc := st.MarketRepo()

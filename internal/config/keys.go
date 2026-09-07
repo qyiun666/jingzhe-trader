@@ -114,7 +114,7 @@ var KeySpecs = []KeySpec{
 	{Key: "scheduler.report", Type: TypeString, Default: "18:00"},
 
 	// ---------- 保留策略（§3.9）----------
-	{Key: "retention.bar_days", Type: TypeInt, Default: "45"},
+	{Key: "retention.bar_days", Type: TypeInt, Default: "100"},
 	// 停牌集合（config_kv 的 suspend:<日期> 一行）只在选股当日读一次，无回测/复算路径，
 	// 留 3 天只是给跨天重跑留余量。
 	{Key: "retention.suspend_days", Type: TypeInt, Default: "3"},

@@ -47,7 +47,7 @@ const (
 	reasonBadPE          = "亏损或PE超标"
 	reasonBadPB          = "PB超标"
 	reasonRankOut        = "排名不足TopN"
-	reasonMarketRegime   = "大盘跌破MA20，当日关闭买入漏斗"
+	reasonMarketRegime   = "大盘跌破MA60，当日关闭买入漏斗"
 	reasonSectorNoRank   = "板块动量数据不足"
 	minSectorDataMembers = 10 // 板块内可算动量的成员不足则放弃该板块排名
 )

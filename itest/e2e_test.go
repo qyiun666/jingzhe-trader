@@ -48,7 +48,7 @@ func TestTradingDayEndToEnd(t *testing.T) {
 	if n, _ := st.MarketRepo().CountValuation(ctx, date); n < 5000 {
 		t.Fatalf("当日估值截面只有 %d 行", n)
 	}
-	// 沪深300 在 MA20 下方时闸门关漏斗，候选 0 是正确结果（partial + SCREEN_EMPTY），不是故障。
+	// 沪深300 在 MA60 下方时闸门关漏斗，候选 0 是正确结果（partial + SCREEN_EMPTY），不是故障。
 	if outcome == model.TracePartial && !strings.Contains(detail, "SCREEN_EMPTY") {
 		t.Errorf("流水线带着非 SCREEN_EMPTY 的降级完成: %s", detail)
 	}

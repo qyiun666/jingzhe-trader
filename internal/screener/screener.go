@@ -34,17 +34,21 @@ func New(st *store.Store, cfg FilterConfig) *Screener {
 	return &Screener{st: st, cfg: cfg, w: DefaultWeights()}
 }
 
-// BarWindow 因子窗口所需交易日数（全项目最深的历史回看口径，其它模块以此为准）。
+// BarWindow 个股因子窗口所需交易日数（freshness 完整性检查与个股证据共用；
+// 指数 MA60 回溯更深，最深消费者口径见 store.MarketMAWindow）。
 func BarWindow() int { return momentumBars }
 
-// SyncBackDays 行情同步应保证的最近交易日数（选股是最深消费者）。
-func (s *Screener) SyncBackDays() int { return momentumBars + syncBackfillMargin }
+// SyncBackDays 行情同步应保证的最近交易日数。最深消费者是大盘门槛的指数
+// MA60 回溯（60 交易日），其次是选股因子窗口（20 交易日）。
+func (s *Screener) SyncBackDays() int {
+	return max(momentumBars, store.MarketMAWindow) + syncBackfillMargin
+}
 
 // Budget 单笔预算：可用现金按计划持仓数均分。Slots<=0 或无现金口径时返回 0（不放行）。
 type Budget struct {
 	Cash     model.Fen
 	Slots    int
-	MarketOK bool // 大盘是否允许开新仓（指数在 MA20 上方）
+	MarketOK bool // 大盘是否允许开新仓（指数在 MA60 上方）
 }
 
 func (b Budget) perSlot() model.Fen {
@@ -120,7 +124,7 @@ func (s *Screener) Run(ctx context.Context, tradeDate string, budget Budget) (*R
 
 	if !budget.MarketOK {
 		rep.Empty = true
-		tr.gate("regime", "大盘门槛(指数≥MA20)", survivors, reasonMarketRegime)
+		tr.gate("regime", "大盘门槛(指数≥MA60)", survivors, reasonMarketRegime)
 		return rep, s.finish(ctx, tradeDate, rep)
 	}
 

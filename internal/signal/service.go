@@ -116,7 +116,7 @@ func (s *Service) sellDecisions(ctx context.Context, tradeDate string, cands []m
 			Pos: pos, LastClose: bar.RawClose, LastDate: bar.TradeDate,
 			InTopN: inTopN[pos.TsCode], MarketBad: idx.bad(),
 		}
-		if sig := EvalSell(tradeDate, h, p, idx.close, idx.ma20); sig != nil {
+		if sig := EvalSell(tradeDate, h, p, idx.close, idx.ma60); sig != nil {
 			nm, e := s.st.ScreenRepo().StockName(ctx, pos.TsCode)
 			if e != nil {
 				return nil, fmt.Errorf("卖出信号 %s 取名称失败: %w", pos.TsCode, e)
@@ -343,27 +343,27 @@ func (s *Service) barSeries(ctx context.Context, tradeDate string) (map[string]B
 	return out, nil
 }
 
-// indexInfo 大盘指数状态（收盘与 MA20 同为分；MA20 由读取层现算）。
+// indexInfo 大盘指数状态（收盘与 MA60 同为分；MA60 由读取层现算）。
 type indexInfo struct {
 	close model.Fen
-	ma20  model.Fen
+	ma60  model.Fen
 }
 
-// bad 大盘恶化判定：指数收盘跌破 MA20。
-func (i indexInfo) bad() bool { return i.close < i.ma20 }
+// bad 大盘恶化判定：指数收盘跌破 MA60。
+func (i indexInfo) bad() bool { return i.close < i.ma60 }
 
-// indexState 读大盘指数。读不到、或 MA20 凑不满 20 根，都是错误：
+// indexState 读大盘指数。读不到、或 MA60 凑不满窗口根数，都是错误：
 // 拿不到基准时把"大盘恶化"判成"没恶化"，等于这条卖出规则今天没跑却没人知道。
 func (s *Service) indexState(ctx context.Context, tradeDate string) (indexInfo, error) {
 	idx, err := s.st.ScreenRepo().LatestMarketIndex(ctx, tradeDate)
 	if err != nil {
 		return indexInfo{}, err
 	}
-	if idx.MA20 <= 0 {
-		return indexInfo{}, fmt.Errorf("大盘指数 %s 在 %s 前不足 20 根日线，MA20 不可算",
-			store.MarketIndex, tradeDate)
+	if idx.MA60 <= 0 {
+		return indexInfo{}, fmt.Errorf("大盘指数 %s 在 %s 前不足 %d 根日线，MA%d 不可算",
+			store.MarketIndex, tradeDate, store.MarketMAWindow, store.MarketMAWindow)
 	}
-	return indexInfo{close: idx.Close, ma20: idx.MA20}, nil
+	return indexInfo{close: idx.Close, ma60: idx.MA60}, nil
 }
 
 // cashFen 可用现金：唯一实现在 ticket.Ledger（本金/现金锚点 + 成交历史推算），

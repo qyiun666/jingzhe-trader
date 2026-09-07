@@ -103,7 +103,7 @@ func TestSellRankOut(t *testing.T) {
 	}
 }
 
-// TestSellMarketBad 规则 5 大盘恶化：指数收盘跌破 MA20 触发。
+// TestSellMarketBad 规则 5 大盘恶化：指数收盘跌破 MA60 触发。
 func TestSellMarketBad(t *testing.T) {
 	p := g1()
 	sig := EvalSell("20260901", holding(model.FromFloat(10), 0, model.FromFloat(10), true, false), p,
@@ -111,13 +111,13 @@ func TestSellMarketBad(t *testing.T) {
 	if sig == nil || sig.Rule != RuleMarketBad {
 		t.Fatalf("应触发大盘恶化: %+v", sig)
 	}
-	if !strings.Contains(sig.Reason, "MA20") {
+	if !strings.Contains(sig.Reason, "MA60") {
 		t.Errorf("理由不可解释: %q", sig.Reason)
 	}
-	// 指数在 MA20 之上 → 不触发
+	// 指数在 MA60 之上 → 不触发
 	if EvalSell("20260901", holding(model.FromFloat(10), 0, model.FromFloat(10), true, false), p,
 		model.FromFloat(3200), model.FromFloat(3100)) != nil {
-		t.Errorf("指数未破 MA20 不应触发")
+		t.Errorf("指数未破 MA60 不应触发")
 	}
 	// 指数数据缺失（close=0）→ 不判定
 	if EvalSell("20260901", holding(model.FromFloat(10), 0, model.FromFloat(10), true, false), p, 0, 0) != nil {

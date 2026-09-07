@@ -21,13 +21,14 @@ type RetentionRule struct {
 // RetentionRules 全部保留策略（与 §3.9 一一对应）。
 var RetentionRules = []RetentionRule{
 	// 窗口按"最深消费者"定：
-	//   daily_bar —— 选股因子窗口 20 个交易日（同步侧保证 25 天），45 自然日 ≈ 30 交易日；
-	//               指数与个股共用本表，MA20 的 20 日回溯同样落在这个窗口内。
+	//   daily_bar —— 个股因子窗口 20 个交易日（同步侧保证 25 天），但大盘门槛 MA60
+	//               要回溯 60 交易日 ≈ 90 自然日，100 自然日 ≈ 68 交易日才盖得住；
+	//               指数与个股共用本表，两个回溯都落在这个窗口内。
 	//   估值截面（stock_basic 的 val_date 列）与持仓同键，随 stock_basic 永久保留、
 	//               每日整批覆盖，不设窗口 —— 原 daily_basic 表 16.6K 行/天的堆积没有了。
 	//   run_trace —— 取代 job_run/agent_alert/action_log/mail_outbox/llm_call，按最深的
 	//               消费者（月度复盘看当日成败）留 90 天；LLM 留痕同窗口，不再单独配键。
-	{Table: "daily_bar", ConfigKey: "retention.bar_days", Days: 45},
+	{Table: "daily_bar", ConfigKey: "retention.bar_days", Days: 100},
 	// 停牌集合挤进了 config_kv，只能按键区间清；它和估值截面一样"当日整批读一次"，
 	// 留 3 天（多出的 2 天是跨天重跑的余量）。
 	{Table: "config_kv", ConfigKey: "retention.suspend_days", Days: 3, KeyPrefix: "suspend:"},
