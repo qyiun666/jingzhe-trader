@@ -157,3 +157,22 @@ func (c *Client) IndexDaily(ctx context.Context, tradeDate string, indexCodes []
 	}
 	return out, nil
 }
+
+// IndexDailyRange 单码一段区间的指数日线：一次调用取回整个窗口。
+//
+// 大盘门槛的均线要回溯 60 个交易日，而这个深度远大于个股因子窗口。指数与个股
+// 共用 daily_bar，若让均线深度去放大逐日全市场回补的天数，等于为一根均线把全市场
+// 重拉几十遍；单码传区间则一次调用就够（实测能拉全）。
+func (c *Client) IndexDailyRange(ctx context.Context, tsCode, startDate, endDate string) ([]model.Bar, error) {
+	fields, items, err := c.Call(ctx, "index_daily",
+		map[string]interface{}{"ts_code": tsCode, "start_date": startDate, "end_date": endDate},
+		"ts_code", "trade_date", "close")
+	if err != nil {
+		return nil, err
+	}
+	var rows []model.Bar
+	if err := DecodeItems(fields, items, &rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}

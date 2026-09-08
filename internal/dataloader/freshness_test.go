@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/store"
@@ -38,6 +39,26 @@ func mkBar(tsCode, date string) model.Bar {
 	return model.Bar{
 		TsCode: tsCode, TradeDate: date,
 		Close: model.FromFloat(100), VolLot: 0, RawClose: model.FromFloat(100),
+	}
+}
+
+// seedIndexBars 从 end 逐日往前写 n 根大盘指数日线。
+//
+// 大盘门槛的均线要 store.MarketMAWindow 根才算得出，正向夹具必须给满窗口，
+// 否则测出来的是"数据不够"，不是闸门判定本身。
+func seedIndexBars(t *testing.T, rc *store.MarketRepo, end string, n int) {
+	t.Helper()
+	d, err := time.Parse("20060102", end)
+	if err != nil {
+		t.Fatalf("解析日期 %s 失败: %v", end, err)
+	}
+	for i := 0; i < n; i++ {
+		bar := model.Bar{TsCode: store.MarketIndex, TradeDate: d.Format("20060102"),
+			Close: model.FromFloat(4000), RawClose: model.FromFloat(4000)}
+		if err := rc.UpsertBar(context.Background(), bar); err != nil {
+			t.Fatalf("写入指数日线 %s 失败: %v", bar.TradeDate, err)
+		}
+		d = d.AddDate(0, 0, -1)
 	}
 }
 
@@ -186,15 +207,27 @@ func TestFreshness_IndexStale(t *testing.T) {
 		t.Fatalf("指数缺失应使门禁整体不新鲜，实际:\n%s", rep.String())
 	}
 
-	// 补上指数日线后同一份数据应当放行（证明拦的确实是指数这一项）
+	// 补上当日一根：闸门"今天有没有出数"过了，但均线窗口还差 MarketMAWindow-1 根 → 仍应阻断
 	_ = rc.UpsertBar(ctx, model.Bar{TsCode: store.MarketIndex, TradeDate: tradeDate,
 		Close: model.FromFloat(4000), RawClose: model.FromFloat(4000)})
 	rep2, err := g.Check(ctx, tradeDate)
 	if err != nil {
-		t.Fatalf("补指数后 Check 失败: %v", err)
+		t.Fatalf("补当日指数日线后 Check 失败: %v", err)
 	}
-	if !rep2.Fresh {
-		t.Fatalf("补上 %s 日线后应放行，实际:\n%s", store.MarketIndex, rep2.String())
+	c2, _ := findItem(rep2, "IndexRows")
+	if c2.OK || c2.Code != CodeIndexWindow || !c2.Blocking {
+		t.Fatalf("期望 IndexRows=%s 且 Blocking=true，实际 OK=%v Code=%q Blocking=%v",
+			CodeIndexWindow, c2.OK, c2.Code, c2.Blocking)
+	}
+
+	// 补满均线窗口后同一份数据应当放行（证明拦的确实是窗口这一项）
+	seedIndexBars(t, rc, tradeDate, store.MarketMAWindow)
+	rep3, err := g.Check(ctx, tradeDate)
+	if err != nil {
+		t.Fatalf("补满窗口后 Check 失败: %v", err)
+	}
+	if !rep3.Fresh {
+		t.Fatalf("补满 %d 根 %s 日线后应放行，实际:\n%s", store.MarketMAWindow, store.MarketIndex, rep3.String())
 	}
 }
 
@@ -205,13 +238,12 @@ func TestFreshness_AllPass(t *testing.T) {
 	tradeDate := "20260901"
 	_ = rc.UpsertCal(context.Background(), store.CalRow{CalDate: tradeDate, IsOpen: true})
 
-	idxCode := "000300.SH" // 指数码，不入候选池（仅 index_daily）
 	stockCodes := make([]string, 0, testMinBarRows)
 	for i := 0; i < testMinBarRows; i++ {
 		stockCodes = append(stockCodes, mkCode(i))
 	}
-	// 指数日线（沪深300）
-	_ = rc.UpsertBar(context.Background(), model.Bar{TsCode: idxCode, TradeDate: tradeDate, Close: model.FromFloat(4000), VolLot: 0, RawClose: 0})
+	// 指数日线：给满大盘门槛的均线窗口
+	seedIndexBars(t, rc, tradeDate, store.MarketMAWindow)
 	for _, c := range stockCodes {
 		_ = rc.UpsertStockBasic(context.Background(), model.StockBasic{TsCode: c, ListStatus: "L"})
 		_ = rc.UpsertBar(context.Background(), mkBar(c, tradeDate))

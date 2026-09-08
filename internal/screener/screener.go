@@ -38,10 +38,12 @@ func New(st *store.Store, cfg FilterConfig) *Screener {
 // 指数 MA60 回溯更深，最深消费者口径见 store.MarketMAWindow）。
 func BarWindow() int { return momentumBars }
 
-// SyncBackDays 行情同步应保证的最近交易日数。最深消费者是大盘门槛的指数
-// MA60 回溯（60 交易日），其次是选股因子窗口（20 交易日）。
+// SyncBackDays 个股日线同步应保证的最近交易日数：最深消费者是个股因子窗口 momentumBars。
+//
+// 大盘指数的 MA60 回溯（60 交易日）不在此列 —— 它由 Dataloader.syncIndexWindow 用
+// 单码一次区间调用单独补齐。把它折进这里，等于为了一根均线每晚重拉全市场 40 天。
 func (s *Screener) SyncBackDays() int {
-	return max(momentumBars, store.MarketMAWindow) + syncBackfillMargin
+	return momentumBars + syncBackfillMargin
 }
 
 // Budget 单笔预算：可用现金按计划持仓数均分。Slots<=0 或无现金口径时返回 0（不放行）。

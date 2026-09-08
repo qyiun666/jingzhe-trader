@@ -13,6 +13,10 @@ type RetentionRule struct {
 	ConfigKey string // 对应 retention.* 配置键
 	Days      int    // 窗口（天），>0 时按 trade_date < now-Days 清理
 	Permanent bool   // 永久保留，不清理
+	// ExceptTSCode 非空 = 该代码不受本规则清理。用于一张表里住着两个深度不同的
+	// 消费者的情形（daily_bar：个股只要 20 个交易日，大盘门槛的均线要 60 根）。
+	// 行数按"豁免者只有指数一根"计，豁免不会让表长回来。
+	ExceptTSCode string
 	// KeyPrefix 非空 = 清理 config_kv 里"一天一键"的集合行：键形如 suspend:<YYYYMMDD>，
 	// 后缀字典序即时间序，按键区间比较即可只命中这一类键（这类表没有 trade_date 列）。
 	KeyPrefix string
@@ -20,15 +24,18 @@ type RetentionRule struct {
 
 // RetentionRules 全部保留策略（与 §3.9 一一对应）。
 var RetentionRules = []RetentionRule{
-	// 窗口按"最深消费者"定：
-	//   daily_bar —— 个股因子窗口 20 个交易日（同步侧保证 25 天），但大盘门槛 MA60
-	//               要回溯 60 交易日 ≈ 90 自然日，100 自然日 ≈ 68 交易日才盖得住；
-	//               指数与个股共用本表，两个回溯都落在这个窗口内。
+	// 窗口按各表**自己的**最深消费者定，不按全项目最深消费者一刀切：
+	//   daily_bar —— 个股侧最深是选股因子窗口 20 个交易日（同步侧保证 25 天），
+	//               45 自然日 ≈ 30 个交易日盖得住。沪深300 指数的均线窗口回溯更深，
+	//               但它每天只新增一根（同步侧按均线窗口单码一次区间调用补齐），
+	//               十年也就 2500 行量级，故豁免出本规则：跟着个股窗口被裁会把
+	//               大盘门槛的均线清零
+	//               （2026-09-08 实测：45 天窗口 ⇒ 32 根 ⇒ MA60 不可算）。
 	//   估值截面（stock_basic 的 val_date 列）与持仓同键，随 stock_basic 永久保留、
 	//               每日整批覆盖，不设窗口 —— 原 daily_basic 表 16.6K 行/天的堆积没有了。
 	//   run_trace —— 取代 job_run/agent_alert/action_log/mail_outbox/llm_call，按最深的
 	//               消费者（月度复盘看当日成败）留 90 天；LLM 留痕同窗口，不再单独配键。
-	{Table: "daily_bar", ConfigKey: "retention.bar_days", Days: 100},
+	{Table: "daily_bar", ConfigKey: "retention.bar_days", Days: 45, ExceptTSCode: MarketIndex},
 	// 停牌集合挤进了 config_kv，只能按键区间清；它和估值截面一样"当日整批读一次"，
 	// 留 3 天（多出的 2 天是跨天重跑的余量）。
 	{Table: "config_kv", ConfigKey: "retention.suspend_days", Days: 3, KeyPrefix: "suspend:"},
@@ -65,6 +72,10 @@ func ApplyRetention(ctx context.Context, s *Store, now time.Time, overrides map[
 		case rule.Days > 0:
 			cutoff := now.AddDate(0, 0, -pick(rule.Days)).Format("20060102")
 			where, args = "trade_date < ?", []interface{}{cutoff}
+			if rule.ExceptTSCode != "" {
+				where += " AND ts_code <> ?"
+				args = append(args, rule.ExceptTSCode)
+			}
 		default:
 			continue
 		}

@@ -229,6 +229,20 @@ func (r *MarketRepo) CountIndexBar(ctx context.Context, tsCode, tradeDate string
 	return n, nil
 }
 
+// CountIndexBarsUpTo 返回指定指数截至 beforeInclusive（含）累计的日线条数。
+//
+// 与 CountIndexBar 的分工：后者答"今天有没有出数"，本方法答"均线窗口凑不凑得满"。
+// 大盘门槛的 MA60 由最近 MarketMAWindow 根现算，凑不满时读取层给 0（不可算），
+// 门禁必须能在用上前就看出这一点。
+func (r *MarketRepo) CountIndexBarsUpTo(ctx context.Context, tsCode, beforeInclusive string) (int, error) {
+	var n int
+	q := `SELECT COUNT(*) FROM daily_bar WHERE ts_code = ? AND trade_date <= ?`
+	if err := r.rdb.GetContext(ctx, &n, q, tsCode, beforeInclusive); err != nil {
+		return 0, fmt.Errorf("统计指数日线累计根数失败: %w", err)
+	}
+	return n, nil
+}
+
 // CandidateCodes 返回可投资候选池（stock_basic 中 list_status='L' 的全部 ts_code，升序）。
 // 用于新鲜度门禁 #7 的覆盖检查。
 func (r *MarketRepo) CandidateCodes(ctx context.Context) ([]string, error) {

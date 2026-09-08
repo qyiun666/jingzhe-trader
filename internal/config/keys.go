@@ -114,7 +114,10 @@ var KeySpecs = []KeySpec{
 	{Key: "scheduler.report", Type: TypeString, Default: "18:00"},
 
 	// ---------- 保留策略（§3.9）----------
-	{Key: "retention.bar_days", Type: TypeInt, Default: "100"},
+	// daily_bar 的**个股**窗口（自然日）：最深消费者是选股因子窗口 20 个交易日，
+	// 45 自然日 ≈ 30 个交易日。大盘指数豁免于本键（store.RetentionRules.ExceptTSCode）——
+	// 它的均线窗口要 60 交易日，但每天只新增一根，没必要为它把 5560 只都留长。
+	{Key: "retention.bar_days", Type: TypeInt, Default: "45"},
 	// 停牌集合（config_kv 的 suspend:<日期> 一行）只在选股当日读一次，无回测/复算路径，
 	// 留 3 天只是给跨天重跑留余量。
 	{Key: "retention.suspend_days", Type: TypeInt, Default: "3"},

@@ -19,10 +19,6 @@ import (
 	"jingzhe-trader/internal/tushare"
 )
 
-// syncIndex 每日同步的大盘指数：只有这一根有读者（买入闸门 + 新鲜度门禁 IndexRows）。
-// 其余指数代码既没有筛选条件消费也没有邮件展示，每天多拉 N 次接口换零读者没有意义。
-var syncIndex = []string{store.MarketIndex}
-
 // SyncStockBasics 同步在市股票清单（名称/行业/上市日/ST）：1 次调用返回全市场。
 //
 // 板块筛与资格筛都读 stock_basic，退市与行业变更只能靠这里带上；
@@ -147,7 +143,10 @@ func (d *Dataloader) fillForwardCalendar(ctx context.Context) (int, error) {
 	return added, nil
 }
 
-// SyncDaily 同步指定交易日日线，并自动回补前 backDays 个交易日以修复缺口。
+// SyncDaily 同步指定交易日个股日线，并自动回补前 backDays 个交易日以修复缺口。
+//
+// backDays 是**个股因子窗口**口径；大盘指数的均线窗口更深，由 syncIndexWindow
+// 单独用一次区间调用保证，两者不互相放大。
 func (d *Dataloader) SyncDaily(ctx context.Context, tradeDate string, backDays int) error {
 	rc := d.store.MarketRepo()
 	days, err := rc.TradeDateList(ctx)
@@ -167,6 +166,45 @@ func (d *Dataloader) SyncDaily(ctx context.Context, tradeDate string, backDays i
 		}
 		observability.L().Info("日线同步完成", zap.String("date", dt))
 	}
+	return d.syncIndexWindow(ctx, tradeDate)
+}
+
+// syncIndexWindow 保证大盘指数截至 tradeDate 凑得满均线窗口：单码一次区间调用。
+//
+// 均线窗口（60 交易日）比个股因子窗口（20）深三倍，把它折进逐日全市场回补就等于
+// 每晚为了一根均线重拉 40 遍全市场。凑不满窗口时大盘门槛不可算，必须当场报错，
+// 不能留下一库"看起来同步成功了但算不出均线"的数据。
+func (d *Dataloader) syncIndexWindow(ctx context.Context, tradeDate string) error {
+	rc := d.store.MarketRepo()
+	need := store.MarketMAWindow
+	days, err := rc.TradeDateList(ctx)
+	if err != nil {
+		return err
+	}
+	window := pickBackDates(days, tradeDate, need-1)
+	if len(window) < need {
+		return fmt.Errorf("日历里 %s 及之前只有 %d 个交易日 < 均线窗口 %d 根，先补齐 calendar 再同步日线",
+			tradeDate, len(window), need)
+	}
+	start := window[0]
+	rows, err := d.tushare.IndexDailyRange(ctx, store.MarketIndex, start, tradeDate)
+	if err != nil {
+		return d.alertTushare(ctx, "index_daily", err)
+	}
+	if len(rows) < need {
+		return fmt.Errorf("指数 %s 区间 %s..%s 返回 %d 根 < 均线窗口 %d 根",
+			store.MarketIndex, start, tradeDate, len(rows), need)
+	}
+	for i := range rows {
+		b := rows[i]
+		if err := rc.UpsertBar(ctx, model.Bar{TsCode: b.TsCode, TradeDate: b.TradeDate,
+			Close: b.Close, VolLot: 0, RawClose: 0}); err != nil {
+			return err
+		}
+	}
+	observability.L().Info("大盘指数均线窗口补齐",
+		zap.String("index", store.MarketIndex), zap.String("from", start),
+		zap.String("to", tradeDate), zap.Int("rows", len(rows)))
 	return nil
 }
 
@@ -197,9 +235,10 @@ func pickBackDates(days []string, tradeDate string, backDays int) []string {
 	return prior[len(prior)-count:]
 }
 
-// syncOneDay 单交易日五接口快路径同步（各一次调用，全市场批量）：
-// daily / daily_basic / adj_factor / suspend_d / index_daily。
+// syncOneDay 单交易日四接口快路径同步（各一次调用，全市场批量）：
+// daily / daily_basic / adj_factor / suspend_d。
 // 不拉 stk_limit 与 moneyflow：前者涨跌停判定无消费者、后者五因子模型不消费，落库表已删除。
+// 大盘指数不在这里：它的均线窗口比个股因子窗口深得多，由 syncIndexWindow 单码一次补齐。
 func (d *Dataloader) syncOneDay(ctx context.Context, rc *store.MarketRepo, date string) error {
 	bars, err := d.tushare.Daily(ctx, date)
 	if err != nil {
@@ -216,10 +255,6 @@ func (d *Dataloader) syncOneDay(ctx context.Context, rc *store.MarketRepo, date 
 	susp, err := d.tushare.Suspend(ctx, date)
 	if err != nil {
 		return d.alertTushare(ctx, "suspend_d", err)
-	}
-	idxs, err := d.tushare.IndexDaily(ctx, date, syncIndex)
-	if err != nil {
-		return d.alertTushare(ctx, "index_daily", err)
 	}
 
 	// 复权因子映射（前复权统一口径：Close/OHLC = RawClose × AdjFactor）
@@ -254,11 +289,6 @@ func (d *Dataloader) syncOneDay(ctx context.Context, rc *store.MarketRepo, date 
 	}
 	if err := rc.SaveSuspended(ctx, date, susp); err != nil {
 		return err
-	}
-	for _, x := range idxs {
-		if err := rc.UpsertBar(ctx, model.Bar{TsCode: x.TsCode, TradeDate: x.TradeDate, Close: x.Close, VolLot: 0, RawClose: 0}); err != nil {
-			return err
-		}
 	}
 	return nil
 }

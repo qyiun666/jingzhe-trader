@@ -150,6 +150,42 @@ func TestApplyRetentionHonorsOverrides(t *testing.T) {
 	}
 }
 
+// TestRetentionExemptsMarketIndex 大盘门槛的均线要回溯 60 个交易日，而 daily_bar 的窗口
+// 按个股口径（45 自然日）裁。指数行必须豁免：跟着一起裁就把均线窗口清零了
+// （2026-09-08 线上实测：窗口 45 天 ⇒ 指数只剩 32 根 ⇒ MA60 不可算 ⇒ 选股整链失败）。
+func TestRetentionExemptsMarketIndex(t *testing.T) {
+	s := openStoreForTest(t)
+	defer s.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 3, 31, 0, 0, 0, 0, time.UTC)
+	old := now.AddDate(0, 0, -120).Format("20060102")
+
+	for _, code := range []string{MarketIndex, "600519.SH"} {
+		if err := s.MarketRepo().UpsertBar(ctx, model.Bar{
+			TsCode: code, TradeDate: old, Close: 400000}); err != nil {
+			t.Fatalf("插入 %s 日线失败: %v", code, err)
+		}
+	}
+	if _, err := ApplyRetention(ctx, s, now, nil); err != nil {
+		t.Fatalf("ApplyRetention 失败: %v", err)
+	}
+
+	count := func(code string) int {
+		var n int
+		q := `SELECT COUNT(*) FROM daily_bar WHERE ts_code = ? AND trade_date = ?`
+		if err := s.ReadDB().GetContext(ctx, &n, q, code, old); err != nil {
+			t.Fatalf("统计 %s 失败: %v", code, err)
+		}
+		return n
+	}
+	if got := count(MarketIndex); got != 1 {
+		t.Fatalf("指数 %s 应豁免于个股窗口，实际剩 %d 行", MarketIndex, got)
+	}
+	if got := count("600519.SH"); got != 0 {
+		t.Fatalf("超窗口的个股行应被清理，实际剩 %d 行", got)
+	}
+}
+
 // TestRetentionPrunesSuspendKeys 停牌集合挤进 config_kv 以后，清理必须只按
 // suspend:<日期> 键区间走 —— 配置键与 goal.state 这些永久状态一键都不能被碰。
 func TestRetentionPrunesSuspendKeys(t *testing.T) {

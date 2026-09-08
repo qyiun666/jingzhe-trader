@@ -22,6 +22,7 @@ const (
 	CodeBasicRowsLow = "BASIC_ROWS_LOW" // 每日指标行数低于阈值
 	CodeCoverageGap  = "COVERAGE_GAP"   // 候选/持仓覆盖缺口
 	CodeIndexStale   = "INDEX_STALE"    // 沪深300指数日线缺失（阻断：买入闸门与大盘卖出规则都读它）
+	CodeIndexWindow  = "INDEX_WINDOW"   // 沪深300指数日线根数不足以算出大盘门槛均线（阻断：闸门"不可算"≠"已关闭"）
 	CodeWindowShort  = "WINDOW_SHORT"   // 因子窗口内有交易日无日线（动量/MA20 会算错）
 )
 
@@ -38,7 +39,8 @@ const freshnessIndex = store.MarketIndex
 //  5. BasicRows   当日估值截面行数≥阈值（不足→BASIC_ROWS_LOW，阻断）
 //  6. MissingCodes 候选∪持仓覆盖完整（缺口→COVERAGE_GAP，阻断）
 //  7. WindowOK    因子窗口内每个交易日都有日线（缺口→WINDOW_SHORT，阻断）
-//  8. IndexRows   大盘指数日线存在（缺失→INDEX_STALE，阻断：没有它买入闸门与大盘卖出规则都跑不了）
+//  8. IndexRows   大盘指数日线存在且累计根数够算门槛均线（缺失→INDEX_STALE、窗口不足→INDEX_WINDOW，
+//     均阻断：买入闸门与大盘卖出规则都读这根均线）
 //
 // Fresh = IsTradeDay && #1 && #3–#8（只有 #2 非阻断：非交易日直接跳过当日）。
 type FreshnessGate struct {
@@ -116,7 +118,7 @@ func (g *FreshnessGate) Check(ctx context.Context, tradeDate string) (*Freshness
 		return rep, nil
 	}
 
-	// 3-7. 数据新鲜度检查（除 IndexRows 外均阻断）
+	// 3-8. 数据新鲜度检查（全部阻断）
 	rep.Checks = append(rep.Checks, g.checkBarDate(ctx, tradeDate))
 	rep.Checks = append(rep.Checks, g.checkRows(ctx, tradeDate, "daily_bar", "trade_date", "BarRows", CodeBarRowsLow))
 	// 估值截面在 stock_basic 的 val_date 上（不再有 daily_basic 表）：日期不符的行算"没有今日截面"。
@@ -278,8 +280,13 @@ func (g *FreshnessGate) checkWindow(ctx context.Context, tradeDate string) Check
 	return okItem("WindowOK", fmt.Sprintf("因子窗口 %d 个交易日齐全", g.windowDays))
 }
 
-// checkIndex 检查大盘指数日线是否存在。缺失即阻断：买入闸门（跌破 MA60 关漏斗）
-// 与卖出规则（大盘恶化）都以这根指数为输入，没有它当日既不能买也不能判"大盘正常"。
+// checkIndex 检查大盘指数日线：既要当日出数，也要累计根数凑满均线窗口。
+//
+// 两项都是阻断的，但含义不同，必须分开报：
+//   - 当日缺数 = 行情没同步到，今天的闸门无从判起；
+//   - 累计不足 MarketMAWindow 根 = 闸门"不可算"（读取层返回 0），而不是"已关闭"。
+//     买入闸门与卖出规则 5 都读这根均线，只查当日有没有一根放行，
+//     等于让流水线跑到 16:41 才在 ScreenBudget 上炸掉整条链。
 func (g *FreshnessGate) checkIndex(ctx context.Context, tradeDate string) CheckItem {
 	n, err := g.store.MarketRepo().CountIndexBar(ctx, freshnessIndex, tradeDate)
 	if err != nil {
@@ -289,5 +296,14 @@ func (g *FreshnessGate) checkIndex(ctx context.Context, tradeDate string) CheckI
 		return failItem("IndexRows", CodeIndexStale,
 			fmt.Sprintf("%s 指数日线缺失（当日不开买入漏斗）", freshnessIndex))
 	}
-	return okItem("IndexRows", fmt.Sprintf("%s 指数日线存在", freshnessIndex))
+	bars, err := g.store.MarketRepo().CountIndexBarsUpTo(ctx, freshnessIndex, tradeDate)
+	if err != nil {
+		return failItem("IndexRows", CodeIndexWindow, fmt.Sprintf("统计指数日线累计根数失败: %v", err))
+	}
+	if bars < store.MarketMAWindow {
+		return failItem("IndexRows", CodeIndexWindow,
+			fmt.Sprintf("%s 累计 %d 根日线 < 均线窗口 %d 根，MA%d 不可算，请补跑 daily --back %d",
+				freshnessIndex, bars, store.MarketMAWindow, store.MarketMAWindow, store.MarketMAWindow-bars))
+	}
+	return okItem("IndexRows", fmt.Sprintf("%s 指数日线存在，均线窗口 %d/%d 根", freshnessIndex, bars, store.MarketMAWindow))
 }
