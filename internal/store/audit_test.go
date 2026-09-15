@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 )
 
 // TestAuditSchemaClean 全新库（现役 schema 建的）必须清点干净。
@@ -238,5 +239,58 @@ func TestAuditSchemaReportsProbeFailure(t *testing.T) {
 	}
 	if _, err := s.AuditSchema(context.Background()); err == nil {
 		t.Fatal("daily_bar 缺失时清点应报错，而不是静默返回")
+	}
+}
+
+// TestRetentionWorksOnUnmigratedDailyBar 未迁移的旧库（daily_bar 仍是 rowid 普通表）
+// 必须照常完成保留清理。
+//
+// 现实风险：线上库不会自动重建，新代码的保留清理改走"主键行值 IN"删除，
+// 若该语法只对 WITHOUT ROWID 成立，一上线就会在清理环节炸掉整条日报链路。
+func TestRetentionWorksOnUnmigratedDailyBar(t *testing.T) {
+	s := openStoreForTest(t)
+	defer s.Close()
+	ctx := context.Background()
+
+	// 退回普通表，模拟尚未执行 db rebuild-bar 的生产库。
+	if _, err := s.writeDB.ExecContext(ctx, `DROP TABLE daily_bar`); err != nil {
+		t.Fatalf("清表失败: %v", err)
+	}
+	if _, err := s.writeDB.ExecContext(ctx, `CREATE TABLE daily_bar (
+		ts_code TEXT NOT NULL, trade_date TEXT NOT NULL, close INTEGER NOT NULL,
+		vol_lot REAL, raw_close INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (ts_code, trade_date))`); err != nil {
+		t.Fatalf("建普通表失败: %v", err)
+	}
+	now := time.Now()
+	old := now.AddDate(0, 0, -100).Format("20060102") // 超出 45 天窗口
+	fresh := now.Format("20060102")
+	// 两条过期行（不同代码）+ 一条当日行。
+	for _, row := range []struct{ code, date string }{
+		{"600000.SH", old}, {"000001.SZ", old}, {"600000.SH", fresh},
+	} {
+		if _, err := s.writeDB.ExecContext(ctx,
+			`INSERT OR IGNORE INTO daily_bar (ts_code, trade_date, close, vol_lot, raw_close) VALUES (?, ?, 1000, 1, 1000)`,
+			row.code, row.date); err != nil {
+			t.Fatalf("造行失败: %v", err)
+		}
+	}
+	if _, err := s.writeDB.ExecContext(ctx,
+		`INSERT OR IGNORE INTO daily_bar (ts_code, trade_date, close, vol_lot, raw_close) VALUES ('000001.SZ', ?, 2000, 1, 2000)`, old); err != nil {
+		t.Fatalf("造行失败: %v", err)
+	}
+
+	del, err := ApplyRetention(ctx, s, now, nil)
+	if err != nil {
+		t.Fatalf("未迁移表上保留清理失败（上线即炸日报链路）: %v", err)
+	}
+	if del["daily_bar"] != 2 {
+		t.Errorf("daily_bar 删除 %d 行，期望 2（两条过期行）", del["daily_bar"])
+	}
+	var left int
+	if err := s.readDB.GetContext(ctx, &left, `SELECT COUNT(*) FROM daily_bar`); err != nil {
+		t.Fatalf("统计失败: %v", err)
+	}
+	if left != 1 {
+		t.Errorf("剩余 %d 行，期望 1（当日行）", left)
 	}
 }
