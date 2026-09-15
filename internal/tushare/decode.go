@@ -171,22 +171,36 @@ func ToModelBar(r RawBar) model.Bar {
 }
 
 // RawValuation 每日指标原始解码结构（Tushare 字段名）。
-// circ_mv 单位为千元，ToModelValuation 换算为万元（模型口径）。
+// circ_mv 单位**万元**，与模型口径相同，ToModelValuation 直接透传。
 type RawValuation struct {
 	TsCode       string  `db:"ts_code"`
 	TurnoverRate float64 `db:"turnover_rate"`
 	PETtm        float64 `db:"pe_ttm"`
 	PB           float64 `db:"pb"`
-	CircMv       float64 `db:"circ_mv"` // 千元
+	CircMv       float64 `db:"circ_mv"` // 万元
 }
 
-// ToModelValuation 将原始每日指标转为 model.Valuation（流通市值千元→万元）。
+// ToModelValuation 将原始每日指标转为 model.Valuation。
+//
+// 单位实测（2026-09-15，trade_date=20260908 原始返回值 vs 已知市值）：
+//
+//	000001.SZ（平安银行）circ_mv=22859896.93 → 2286 亿，即该字段单位为**万元**；
+//	600519.SH（贵州茅台）circ_mv=163673183.9 → 16367 亿，同为万元。
+//
+// 原实现按"千元"再除以 10，把每个流通市值都缩小了 10 倍，致使门槛严了 10 倍
+// （`screen.min_circ_mv_w=500000` 名义 50 亿、实际只放行真值 ≥500 亿的票）。
+// 实测（2026-09-08 截面，data/backtest/vals.csv.gz 口径）：
+//   circ_mv_w ≥ 500000 万元（50 亿）的真值 = 2910 只；
+//   叠加完整硬门槛（50 亿 + 换手≥1% + 0<PE≤80 + 0<PB≤10）后 = 966 只，
+//   而按缩小 10 倍的值过同一组门槛只剩 94 只。
+// 同一错误也经 blocks.go 的 /10000 显示传给 LLM（"流通市值 228.6 亿" vs 真实的 2286 亿），
+// 一并由本修正消除。
 func ToModelValuation(r RawValuation) model.Valuation {
 	return model.Valuation{
 		TsCode:       r.TsCode,
 		TurnoverRate: r.TurnoverRate,
 		PETtm:        r.PETtm,
 		PB:           r.PB,
-		CircMvW:      r.CircMv / 10.0,
+		CircMvW:      r.CircMv,
 	}
 }

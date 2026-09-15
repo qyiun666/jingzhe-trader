@@ -46,9 +46,9 @@
 
 ```
 cmd/
-  jingzhe/      单一二进制：serve（调度器 + MCP 接口）/ jobs / config / run
+  jingzhe/      单一二进制：serve（调度器 + MCP 接口）/ jobs / config / run / db / research
 internal/
-  store/        SQLite 存储与迁移（schema/仓储）
+  store/        SQLite 存储（schema/仓储/结构清点与 daily_bar 重建）
   config/       config_kv 配置（默认值/环境变量/凭据掩码）
   dataloader/   数据同步与新鲜度门禁
   market/       交易日历/成本/季度划分
@@ -61,6 +61,8 @@ internal/
   notify/       邮件构建/折行/告警
   scheduler/    调度器（5 个触发点，每个是一个大方法顺序组装小方法）
   llm/          买入决策：4 条证据 prompt + 1 条决策 prompt（DeepSeek）
+  review/       决策归因：决策当时的置信度 vs 事后实际收益，产出校准统计
+  backtest/     回测研究：深历史回补（库外 CSV.gz）+ 因子 RankIC/ICIR 度量
   mcp/          MCP 接口（12 工具：5 读 + 7 写）
   observability/ 日志（zap）
   model/        领域模型与枚举
@@ -95,14 +97,14 @@ make -f deploy/Makefile build     # 产物 bin/jingzhe
 #   日历补齐 → 行情同步 → 新鲜度门禁 → 档位评估 → 选股漏斗 → LLM 决策 → 落待买卖表
 ./bin/jingzhe -db data/jingzhe.db run task mail_pending  --date 20260903
 ./bin/jingzhe -db data/jingzhe.db run task daily_report  --date 20260903
-#   另有 4 个只有 CLI 提供的数据面任务：calendar / daily / freshness / screen
-#   （screen 是只试跑漏斗不落单；freshness 不新鲜时非零退出，便于脚本判读）
+#   另有 5 个只有 CLI 提供的数据面任务：calendar / daily / freshness / screen / calibrate
+#   （screen 是只试跑漏斗不落单；freshness 不新鲜时非零退出；calibrate 补算决策归因）
 
 # 6) 启动常驻服务（调度器 + MCP 接口，供外部 Agent 接入）
 ./bin/jingzhe -db data/jingzhe.db serve -addr :8080
 ```
 
-## 单一二进制的五个子命令
+## 单一二进制的七个子命令
 
 | 子命令 | 作用 |
 |--------|------|
@@ -110,7 +112,20 @@ make -f deploy/Makefile build     # 产物 bin/jingzhe
 | `jobs` | 演练指定交易日的时间线（dry-run，不执行任务），用于核对 `scheduler.*` 配置 |
 | `config` | `dump` / `get KEY` / `set KEY VALUE`（凭据默认掩码，`--show-secrets` 才显示明文） |
 | `init` | 写账户基线：`-capital` 本金（= 期初总资产，write-once）、`-hold 代码:股数:成本` 当前持仓、`-cash` 可用资金（省略则按本金−持仓成本推算）；顺带补齐 config_kv 默认值 |
-| `run task` | 手工执行单个任务。接受两类名字：**调度器注册名** `morning_plan`/`intraday_scan`/`evening_pipeline`/`mail_pending`/`daily_report`（与 `serve` 同一份注册表、同一条 `runJob`，落库口径一致），以及**只有 CLI 提供的数据面任务** `calendar`/`daily`/`freshness`/`screen`（接入与排查用，没有到点触发） |
+| `run task` | 手工执行单个任务。接受两类名字：**调度器注册名** `morning_plan`/`intraday_scan`/`evening_pipeline`/`mail_pending`/`daily_report`（与 `serve` 同一份注册表、同一条 `runJob`，落库口径一致），以及**只有 CLI 提供的数据面任务** `calendar`/`daily`/`freshness`/`screen`/`calibrate`（接入与排查用，没有到点触发） |
+| `db` | `audit` = 清点库结构与现役 schema 的差异（遗留表/索引、`daily_bar` 是否仍为普通表），有差异非零退出；`rebuild-bar` = 把 `daily_bar` 重建为 `WITHOUT ROWID`（离线执行） |
+| `research` | `backfill` = 从 Tushare 回补多年历史到库外 CSV.gz（`data/backtest/`，不进 SQLite）；`ic` = 在回补历史上计算各因子的 RankIC/ICIR，并对照"当前生产权重 vs IC 反向权重"两个综合分 |
+
+### 因子方向（`screen.factor_mode`）
+
+用 2023-09~2026-09 的 728 个交易日实测（20 日 RankIC）：**当前生产权重下综合分 IC = −0.0896（ICIR −0.648）**，
+即原方向系统性选到跑输的票；把动量/低波/流动性反向使用后 **+0.0927**，前后两段独立样本同为负、方向修正后同为正。
+
+```bash
+jingzhe -db data/jingzhe.db config get screen.factor_mode      # 默认 momentum（原方向，生产行为不变）
+jingzhe -db data/jingzhe.db config set screen.factor_mode reversal   # 采纳 IC 结论（反向使用三条因子）
+jingzhe -db data/jingzhe.db research ic --dir data/backtest --horizon 20   # 复核
+```
 
 ## MCP 对外接口（给外部 Agent）
 

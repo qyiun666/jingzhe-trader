@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -30,6 +31,21 @@ type Client struct {
 
 // Option 可选配置项。
 type Option func(*Client)
+
+// WithProxy 让客户端经 HTTP 代理出网（回补深历史这类大批量任务在受限网络下的可选通道）。
+// 传空串为无操作，便于调用方直接把配置项透传进来。
+func WithProxy(proxyURL string) Option {
+	return func(c *Client) {
+		if strings.TrimSpace(proxyURL) == "" {
+			return
+		}
+		u, err := url.Parse(proxyURL)
+		if err != nil {
+			return // 解析失败保持无代理，调用方会在随后的请求里看到真实网络错误
+		}
+		c.httpClient.Transport = &http.Transport{Proxy: http.ProxyURL(u)}
+	}
+}
 
 // NewClient 构造 Tushare 客户端。
 //   - token: tushare.token（必填）

@@ -75,7 +75,7 @@ func (c *Client) Daily(ctx context.Context, tradeDate string) ([]model.Bar, erro
 	return out, nil
 }
 
-// DailyBasic 按交易日全市场拉取估值截面。circ_mv 千元在转换中折算为万元。
+// DailyBasic 按交易日全市场拉取估值截面。circ_mv 单位为万元，与模型口径一致（直接透传）。
 //
 // 不取 close：一手价用 daily_bar.raw_close（同一天的真实价），两处各存一份必然漂。
 func (c *Client) DailyBasic(ctx context.Context, tradeDate string) ([]model.Valuation, error) {

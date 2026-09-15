@@ -99,8 +99,31 @@ func BatchInsert(ctx context.Context, db *sqlx.DB, table string, columns []strin
 // DeleteBatched 分批删除（每批 ≤ batchLimit，默认 5000），批间提交事务并让出写锁，
 // 单任务总耗时受 ctx 截止时间约束（默认 5 分钟），超时保留剩余并提前退出（返回 DeadlineExceeded）。
 //
+// 走 rowid 子查询，仅适用于普通表。WITHOUT ROWID 表（daily_bar）没有 rowid 列，
+// 必须改用 DeleteBatchedRows 按主键删。
+//
 // 返回：deleted 已删除行数、batches 实际执行且删除>0 的批数、err（超时为 context.DeadlineExceeded）。
 func DeleteBatched(ctx context.Context, db *sqlx.DB, table, where string, args []interface{}, batchLimit int) (deleted int, batches int, err error) {
+	return deleteBatchedBy(ctx, db, table, nil, where, args, batchLimit)
+}
+
+// DeleteBatchedRows 分批删除 WITHOUT ROWID 表：以主键元组作为批定位键。
+//
+// pkCols 是目标表的主键列（顺序不限，但必须与表定义一致且非空）。SQLite 拒绝
+// "DELETE FROM t WHERE (pk...)" 之后再用 rowid，故这里用行值 IN 子查询：
+//
+//	DELETE FROM t WHERE (a, b) IN (SELECT a, b FROM t WHERE <where> LIMIT n)
+//
+// 走的是同一棵主键 B 树（WHERE 里的过滤列辅以普通索引），语义与 rowid 版本一致。
+func DeleteBatchedRows(ctx context.Context, db *sqlx.DB, table string, pkCols []string, where string, args []interface{}, batchLimit int) (int, int, error) {
+	if len(pkCols) == 0 {
+		return 0, 0, fmt.Errorf("DeleteBatchedRows: %s 的主键列不能为空（无 rowid 的表必须按主键删）", table)
+	}
+	return deleteBatchedBy(ctx, db, table, pkCols, where, args, batchLimit)
+}
+
+// deleteBatchedBy 分批删除的统一实现。pkCols 为空走 rowid，非空走主键行值。
+func deleteBatchedBy(ctx context.Context, db *sqlx.DB, table string, pkCols []string, where string, args []interface{}, batchLimit int) (deleted int, batches int, err error) {
 	if batchLimit <= 0 {
 		batchLimit = DefaultBatchDeleteLimit
 	}
@@ -115,13 +138,7 @@ func DeleteBatched(ctx context.Context, db *sqlx.DB, table, where string, args [
 		defer cancel()
 	}
 
-	// 注意：modernc.org/sqlite 未开启 SQLITE_ENABLE_UPDATE_DELETE_LIMIT，
-	// 不支持 "DELETE ... LIMIT" 语法，改用 rowid 子查询（通用且兼容所有表）。
-	base := "DELETE FROM " + table + " WHERE rowid IN (SELECT rowid FROM " + table
-	if where != "" {
-		base += " WHERE " + where
-	}
-	base += fmt.Sprintf(" LIMIT %d)", batchLimit)
+	base := deletePrefix(table, pkCols, where, batchLimit)
 
 	for {
 		if err = effCtx.Err(); err != nil {
@@ -138,9 +155,28 @@ func DeleteBatched(ctx context.Context, db *sqlx.DB, table, where string, args [
 			batches++
 		}
 		if n < int64(batchLimit) {
-			break // 最后一波不足一批，删除完毕
+			break // 不足一批即删除完毕（行数恰为整数倍时多跑一轮空 DELETE，无正确性影响）
 		}
 		runtime.Gosched() // 批间让出写锁（§3.9）
 	}
 	return deleted, batches, nil
+}
+
+// deletePrefix 拼装一批删除语句。表名与列名只来自代码内常量（§11.5 禁止拼接外部输入）。
+func deletePrefix(table string, pkCols []string, where string, batchLimit int) string {
+	if len(pkCols) == 0 {
+		// 注意：modernc.org/sqlite 未开启 SQLITE_ENABLE_UPDATE_DELETE_LIMIT，
+		// 不支持 "DELETE ... LIMIT" 语法，改用 rowid 子查询（通用且兼容所有表）。
+		base := "DELETE FROM " + table + " WHERE rowid IN (SELECT rowid FROM " + table
+		if where != "" {
+			base += " WHERE " + where
+		}
+		return base + fmt.Sprintf(" LIMIT %d)", batchLimit)
+	}
+	cols := strings.Join(pkCols, ", ")
+	base := "DELETE FROM " + table + " WHERE (" + cols + ") IN (SELECT " + cols + " FROM " + table
+	if where != "" {
+		base += " WHERE " + where
+	}
+	return base + fmt.Sprintf(" LIMIT %d)", batchLimit)
 }

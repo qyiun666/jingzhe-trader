@@ -20,6 +20,9 @@ type RetentionRule struct {
 	// KeyPrefix 非空 = 清理 config_kv 里"一天一键"的集合行：键形如 suspend:<YYYYMMDD>，
 	// 后缀字典序即时间序，按键区间比较即可只命中这一类键（这类表没有 trade_date 列）。
 	KeyPrefix string
+	// PKCols 非空 = 本表是 WITHOUT ROWID 表，分批删除必须按主键元组定位
+	// （没有 rowid 列可用）。顺序须与表定义的主键一致。
+	PKCols []string
 }
 
 // RetentionRules 全部保留策略（与 §3.9 一一对应）。
@@ -35,7 +38,8 @@ var RetentionRules = []RetentionRule{
 	//               每日整批覆盖，不设窗口 —— 原 daily_basic 表 16.6K 行/天的堆积没有了。
 	//   run_trace —— 取代 job_run/agent_alert/action_log/mail_outbox/llm_call，按最深的
 	//               消费者（月度复盘看当日成败）留 90 天；LLM 留痕同窗口，不再单独配键。
-	{Table: "daily_bar", ConfigKey: "retention.bar_days", Days: 45, ExceptTSCode: MarketIndex},
+	{Table: "daily_bar", ConfigKey: "retention.bar_days", Days: 45, ExceptTSCode: MarketIndex,
+		PKCols: []string{"ts_code", "trade_date"}},
 	// 停牌集合挤进了 config_kv，只能按键区间清；它和估值截面一样"当日整批读一次"，
 	// 留 3 天（多出的 2 天是跨天重跑的余量）。
 	{Table: "config_kv", ConfigKey: "retention.suspend_days", Days: 3, KeyPrefix: "suspend:"},
@@ -79,7 +83,7 @@ func ApplyRetention(ctx context.Context, s *Store, now time.Time, overrides map[
 		default:
 			continue
 		}
-		deleted, _, err := DeleteBatched(ctx, s.writeDB, rule.Table, where, args, DefaultBatchDeleteLimit)
+		deleted, _, err := deleteBatchedBy(ctx, s.writeDB, rule.Table, rule.PKCols, where, args, DefaultBatchDeleteLimit)
 		results[rule.Table] = deleted
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {

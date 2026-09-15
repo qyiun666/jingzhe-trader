@@ -19,6 +19,7 @@ import (
 	"jingzhe-trader/internal/notify"
 	"jingzhe-trader/internal/observability"
 	"jingzhe-trader/internal/quote"
+	"jingzhe-trader/internal/review"
 	"jingzhe-trader/internal/scheduler"
 	"jingzhe-trader/internal/screener"
 	"jingzhe-trader/internal/signal"
@@ -43,6 +44,7 @@ type Runtime struct {
 	Goal       *goal.Service
 	Mail       *notify.Mailer
 	Alerts     *notify.AlertService
+	Review     *review.Calibrator
 	MinBarRows int
 
 	sched *scheduler.Scheduler
@@ -92,7 +94,7 @@ func BuildRuntime(ctx context.Context, st *store.Store, cfg *config.Config) (*Ru
 		Quote:      quote.NewGotdxSource(),
 		Dataloader: dataloader.New(st, tcli),
 		Freshness:  dataloader.NewFreshnessGate(st, cfg.GetInt("screen.min_bar_rows"), screener.BarWindow()),
-		Screener:   screener.New(st, FilterConfigOf(cfg)),
+		Screener:   screener.New(st, FilterConfigOf(cfg), cfg.GetString("screen.factor_mode")),
 		Signal:     signal.NewService(st, ledger),
 		Decider:    decider,
 		Ledger:     ledger,
@@ -102,6 +104,7 @@ func BuildRuntime(ctx context.Context, st *store.Store, cfg *config.Config) (*Ru
 		Goal:       goal.NewService(st, GoalConfigOf(cfg), ledger).WithAlertFunc(alerts.Raise),
 		Mail:       mail,
 		Alerts:     alerts,
+		Review:     review.NewCalibrator(st),
 		MinBarRows: cfg.GetInt("screen.min_bar_rows"),
 	}
 	// 调度器归 Runtime 持有：常驻的调度循环与 /healthz 探活看的是同一个实例。
@@ -129,6 +132,7 @@ func (r *Runtime) SchedDeps() scheduler.Deps {
 		Goal:         r.Goal,
 		Alerts:       r.Alerts,
 		Mail:         r.Mail,
+		Review:       r.Review,
 		RiskParams:   r.Goal.RiskParams,
 		FilterCfg:    FilterConfigOf(r.Config),
 		MinBarRows:   r.MinBarRows,
@@ -216,6 +220,10 @@ func validateEnums(cfg *config.Config) error {
 	default:
 		return fmt.Errorf("llm.search_context_size=%q 非法（可选 low|medium|high）",
 			cfg.GetString("llm.search_context_size"))
+	}
+	if !screener.ValidFactorMode(cfg.GetString("screen.factor_mode")) {
+		return fmt.Errorf("screen.factor_mode=%q 非法（可选 %s|%s）",
+			cfg.GetString("screen.factor_mode"), screener.ModeMomentum, screener.ModeReversal)
 	}
 	// 触发时刻拼错时调度器只在每次 tick 记一条日志、整天不跑这个任务；装配期直接拒绝。
 	for _, key := range []string{"scheduler.morning", "scheduler.pipeline", "scheduler.mail_pending", "scheduler.report"} {

@@ -51,6 +51,12 @@ func TestAssemblyRefusesBadBaseline(t *testing.T) {
 			want: "goal.pace_policy",
 		},
 		{
+			name: "因子方向拼错",
+			seed: map[string]string{"account.initial_capital": "20000", "watch.mail_to": "me@example.com",
+				"screen.factor_mode": "reversalx"},
+			want: "screen.factor_mode",
+		},
+		{
 			name: "触发时刻写成 9am",
 			seed: map[string]string{"account.initial_capital": "20000", "watch.mail_to": "me@example.com",
 				"scheduler.pipeline": "9am"},

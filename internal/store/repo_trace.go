@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/jmoiron/sqlx"
 	"jingzhe-trader/internal/model"
@@ -79,4 +81,100 @@ func (r *TraceRepo) List(ctx context.Context, tradeDate string) ([]model.RunTrac
 		return nil, fmt.Errorf("读取轨迹 %s 失败: %w", tradeDate, err)
 	}
 	return ts, nil
+}
+
+// llmDecisionSubjectLike 决策留痕行的 subject 模式：llm:<标的>:decision。
+const llmDecisionSubjectLike = "llm:%:" + llmPromptKeyDecision
+
+// llmPromptKeyDecision 决策 prompt 的键（与 llm.KeyDecision 同值）。
+// 这一处刻意用字面量而不 import llm：store 只依赖 model（依赖方向铁律），
+// 而改名时由 repo_trace_test.go 的断言兜住两边同步。
+const llmPromptKeyDecision = "decision"
+
+// ListLLMDecisions 读取区间内的决策留痕行（llm:<标的>:decision），升序。
+//
+// 只取决策行不取证据行：归因要回答的是"模型批不批、多自信"，证据行的立场不参与统计。
+func (r *TraceRepo) ListLLMDecisions(ctx context.Context, fromDate, toDate string) ([]model.LLMCall, error) {
+	var ts []model.RunTrace
+	q := `SELECT ` + traceColumns + ` FROM run_trace
+		WHERE subject LIKE ? AND trade_date >= ? AND trade_date <= ? ORDER BY trade_date, subject`
+	if err := r.rdb.SelectContext(ctx, &ts, q, llmDecisionSubjectLike, fromDate, toDate); err != nil {
+		return nil, fmt.Errorf("读取决策留痕 %s~%s 失败: %w", fromDate, toDate, err)
+	}
+	out := make([]model.LLMCall, 0, len(ts))
+	for _, t := range ts {
+		code := strings.TrimSuffix(strings.TrimPrefix(t.Subject, "llm:"), ":"+llmPromptKeyDecision)
+		if code == "" {
+			continue
+		}
+		var d llmDetail
+		if t.Detail != "" {
+			if err := json.Unmarshal([]byte(t.Detail), &d); err != nil {
+				return nil, fmt.Errorf("决策留痕 %s 正文解不开: %w", t.Subject, err)
+			}
+		}
+		out = append(out, model.LLMCall{
+			TradeDate: t.TradeDate, TsCode: code, PromptKey: llmPromptKeyDecision,
+			Verdict: d.Verdict, Confidence: d.Confidence, WeightPct: d.WeightPct,
+			Rationale: d.Rationale, Status: t.Outcome, Error: d.Error, CreatedAt: t.At,
+		})
+	}
+	return out, nil
+}
+
+// calibDetail 是 cal:<标的> 行的 run_trace.detail 载荷（键压到最短：一天一票一行按日累积）。
+type calibDetail struct {
+	Verdict    string  `json:"v"`
+	Confidence float64 `json:"c"`
+	WeightPct  float64 `json:"w,omitempty"`
+	Ret5       float64 `json:"r5,omitempty"`
+	Ret10      float64 `json:"r10,omitempty"`
+	Ret20      float64 `json:"r20,omitempty"`
+	Has5       bool    `json:"h5,omitempty"`
+	Has10      bool    `json:"h10,omitempty"`
+	Has20      bool    `json:"h20,omitempty"`
+}
+
+// WriteCalibration 写入/覆盖一条决策归因行（幂等键 = 决策日 + cal:<标的>）。
+func (r *TraceRepo) WriteCalibration(ctx context.Context, c model.Calibration) error {
+	d := calibDetail{Verdict: c.Verdict, Confidence: c.Confidence, WeightPct: c.WeightPct,
+		Ret5: c.Ret5, Ret10: c.Ret10, Ret20: c.Ret20, Has5: c.Has5, Has10: c.Has10, Has20: c.Has20}
+	raw, err := json.Marshal(d)
+	if err != nil {
+		return fmt.Errorf("序列化归因 %s/%s 失败: %w", c.TradeDate, c.TsCode, err)
+	}
+	return r.Write(ctx, model.RunTrace{
+		TradeDate: c.TradeDate, Subject: model.TraceCalib(c.TsCode),
+		Outcome: model.TraceOK, Detail: string(raw), At: c.At,
+	})
+}
+
+// ListCalibrations 读取区间内的决策归因行（cal:<标的>），升序。
+func (r *TraceRepo) ListCalibrations(ctx context.Context, fromDate, toDate string) ([]model.Calibration, error) {
+	var ts []model.RunTrace
+	q := `SELECT ` + traceColumns + ` FROM run_trace
+		WHERE subject LIKE 'cal:%' AND trade_date >= ? AND trade_date <= ? ORDER BY trade_date, subject`
+	if err := r.rdb.SelectContext(ctx, &ts, q, fromDate, toDate); err != nil {
+		return nil, fmt.Errorf("读取决策归因 %s~%s 失败: %w", fromDate, toDate, err)
+	}
+	out := make([]model.Calibration, 0, len(ts))
+	for _, t := range ts {
+		code := strings.TrimPrefix(t.Subject, "cal:")
+		if code == "" {
+			continue
+		}
+		var d calibDetail
+		if t.Detail != "" {
+			if err := json.Unmarshal([]byte(t.Detail), &d); err != nil {
+				return nil, fmt.Errorf("归因行 %s 正文解不开: %w", t.Subject, err)
+			}
+		}
+		out = append(out, model.Calibration{
+			TradeDate: t.TradeDate, TsCode: code, Verdict: d.Verdict,
+			Confidence: d.Confidence, WeightPct: d.WeightPct,
+			Ret5: d.Ret5, Ret10: d.Ret10, Ret20: d.Ret20,
+			Has5: d.Has5, Has10: d.Has10, Has20: d.Has20, At: t.At,
+		})
+	}
+	return out, nil
 }

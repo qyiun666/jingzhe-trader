@@ -30,8 +30,9 @@ type Screener struct {
 }
 
 // New 构造选股器。cfg 由组合根从 config screen.* 读出（默认值只有 KeySpec 一份）。
-func New(st *store.Store, cfg FilterConfig) *Screener {
-	return &Screener{st: st, cfg: cfg, w: DefaultWeights()}
+// factorMode 决定因子方向权重（momentum=原始方向 / reversal=IC 验证的反向）。
+func New(st *store.Store, cfg FilterConfig, factorMode string) *Screener {
+	return &Screener{st: st, cfg: cfg, w: WeightsByMode(factorMode)}
 }
 
 // BarWindow 个股因子窗口所需交易日数（freshness 完整性检查与个股证据共用；
@@ -199,7 +200,7 @@ func (s *Screener) pickTopN(pool []model.StockBasic, in *inputs, sectors []model
 			Score: sc.Score, Factors: sc.Factors, Close: in.price(sc.Code),
 			CircMvW: stk.CircMvW, PETtm: stk.PETtm, PB: stk.PB, TurnoverRate: stk.TurnoverRate,
 			Mom: raw[sc.Code].Momentum, SectorMom: sectorMom[stk.Industry],
-			Reason: BuildReason(sc.Factors, sc.Score, stk),
+			Reason: BuildReason(sc.Factors, s.w, sc.Score, stk),
 		})
 	}
 	drops := map[string]int{}

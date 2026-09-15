@@ -26,6 +26,7 @@ import (
 	"jingzhe-trader/internal/notify"
 	"jingzhe-trader/internal/observability"
 	"jingzhe-trader/internal/quote"
+	"jingzhe-trader/internal/review"
 	"jingzhe-trader/internal/risk"
 	"jingzhe-trader/internal/screener"
 	"jingzhe-trader/internal/signal"
@@ -55,6 +56,7 @@ type Deps struct {
 	RiskParams   func(ctx context.Context, date string) (risk.RiskParams, model.Gear, error)
 	FilterCfg    screener.FilterConfig
 	MinBarRows   int
+	Review       *review.Calibrator
 	RetentionNow func() time.Time
 	Config       ConfigReader   // scheduler.* 触发时刻
 	Retention    map[string]int // retention.* 保留窗口覆盖（空=用规则默认值）

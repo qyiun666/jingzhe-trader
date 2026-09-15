@@ -13,6 +13,7 @@
 //	jingzhe -db data/jingzhe.db run task daily     --date 20260901 [--back N]
 //	jingzhe -db data/jingzhe.db run task freshness --date 20260901
 //	jingzhe -db data/jingzhe.db run task screen    --date 20260901
+//	jingzhe -db data/jingzhe.db run task calibrate --date 20260901 [--back 40]
 //	jingzhe -db data/jingzhe.db run task evening_pipeline --date 20260901
 package main
 
@@ -32,7 +33,7 @@ import (
 )
 
 // dataTasks 只有 CLI 提供、不在调度器注册表里的数据面任务。
-var dataTasks = []string{"calendar", "daily", "freshness", "screen"}
+var dataTasks = []string{"calendar", "daily", "freshness", "screen", "calibrate"}
 
 // runRun 处理 `jingzhe run task <name> [flags]`。
 //
@@ -41,7 +42,7 @@ var dataTasks = []string{"calendar", "daily", "freshness", "screen"}
 func runRun(ctx context.Context, st *store.Store, args []string) {
 	if len(args) < 2 || args[0] != "task" {
 		fmt.Fprintln(os.Stderr, "用法: jingzhe run task <任务名> [--date YYYYMMDD] [--back N]")
-		fmt.Fprintln(os.Stderr, "  数据面任务: [calendar daily freshness screen]（calendar 外均需 --date）")
+		fmt.Fprintln(os.Stderr, "  数据面任务: [calendar daily freshness screen calibrate]（calendar 外均需 --date）")
 		fmt.Fprintln(os.Stderr, "  调度器任务: [morning_plan intraday_scan evening_pipeline mail_pending daily_report]（均需 --date）")
 		os.Exit(2)
 	}
@@ -49,7 +50,7 @@ func runRun(ctx context.Context, st *store.Store, args []string) {
 
 	fs := flag.NewFlagSet("run-task", flag.ExitOnError)
 	date := fs.String("date", "", "交易日 YYYYMMDD（除 calendar 外全部必填）")
-	back := fs.Int("back", 0, "回补前 N 个交易日（daily 任务；0=按选股窗口自动定）")
+	back := fs.Int("back", 0, "回补前 N 个交易日（daily 任务；0=按选股窗口自动定）；calibrate 任务=回溯自然日")
 	if err := fs.Parse(args[2:]); err != nil {
 		os.Exit(2)
 	}
@@ -99,6 +100,15 @@ func runRun(ctx context.Context, st *store.Store, args []string) {
 		printScreenerReport(rep)
 		if rep.Empty {
 			os.Exit(3) // 候选 0 条：告警已落库，非零退出便于 agent 判读
+		}
+
+	case "calibrate":
+		needDate(task, *date)
+		st, err := rt.Review.Run(ctx, *date, *back)
+		fatal(task, err)
+		fmt.Printf("决策归因完成（截至 %s，回溯 %d 天）\n%s\n", *date, *back, st.Describe())
+		if note := st.InconclusiveNote(); note != "" {
+			fmt.Println(note)
 		}
 
 	default:

@@ -363,7 +363,7 @@ func sendDailyReport(ctx context.Context, rc *observability.RunCtx, d Deps, date
 	return nil
 }
 
-// reportExtraSections 日报追加两段：当前持仓、次日计划（= 待买卖表未执行单）。
+// reportExtraSections 日报追加三段：当前持仓、次日计划（= 待买卖表未执行单）、决策校准。
 func reportExtraSections(ctx context.Context, d Deps, date string) (string, error) {
 	pos, err := d.Store.TradeRepo().ListPositions(ctx)
 	if err != nil {
@@ -392,7 +392,28 @@ func reportExtraSections(ctx context.Context, d Deps, date string) (string, erro
 		b.WriteString(fmt.Sprintf("  %s %s %d 股 %.2f 元：%s\n",
 			l.TsCode, l.DirLabel, l.Qty, l.Price, l.Reason))
 	}
+	b.WriteString("\n【决策校准】\n")
+	b.WriteString("  " + calibrationLine(ctx, d, date) + "\n")
 	return b.String(), nil
+}
+
+// calibrationLine 决策校准摘要：先补算到期收益，再出分层统计。
+//
+// 归因失败不让日报失败：它是一段观察性内容，缺了不影响当日"该做什么"的交付；
+// 但失败必须显式写在正文里，不能静默渲染成"暂无样本"（那是把故障说成正常）。
+func calibrationLine(ctx context.Context, d Deps, date string) string {
+	if d.Review == nil {
+		return "未装配归因器"
+	}
+	st, err := d.Review.Run(ctx, date, 0)
+	if err != nil {
+		return fmt.Sprintf("归因失败（不影响当日交易）：%v", err)
+	}
+	line := st.Describe()
+	if note := st.InconclusiveNote(); note != "" {
+		line += " → " + note
+	}
+	return line
 }
 
 // applyRetention 保留清理 + WAL checkpoint（放在日报之后：清理失败不影响当日通知）。

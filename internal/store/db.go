@@ -19,7 +19,13 @@ type Store struct {
 	writeDB *sqlx.DB
 	readDB  *sqlx.DB
 	path    string
+	// audit 非空 = 启动清点发现库结构与现役 schema 不一致（遗留表/索引或 daily_bar 未重建）。
+	// store 层禁止 import 业务包（含 observability），故这里只存摘要，由 main 决定怎么报。
+	audit string
 }
+
+// SchemaAuditNote 返回启动清点发现的结构差异摘要；库结构一致时返回空串。
+func (s *Store) SchemaAuditNote() string { return s.audit }
 
 // syncMarkers 文件同步标记：命中则拒绝启动，防止库文件被 Syncthing/云盘同步破坏（D6）。
 var syncMarkers = []string{".stfolder", ".stversions", ".stignore", ".syncthing", "CloudStation"}
@@ -86,6 +92,13 @@ func Open(path string) (*Store, error) {
 		wdb.Close()
 		rdb.Close()
 		return nil, fmt.Errorf("数据库建表失败: %w", err)
+	}
+	// 建表只做加法（IF NOT EXISTS）：跨版本重写后旧表旧索引会永远留在库里。
+	// 清点结果（含清点本身失败）都要透出去 —— 探测失败被读成"库结构干净"就是假绿。
+	if audit, err := st.AuditSchema(context.Background()); err != nil {
+		st.audit = fmt.Sprintf("库结构清点失败（不等于库结构干净）: %v\n", err)
+	} else if !audit.Clean() {
+		st.audit = audit.String()
 	}
 	return st, nil
 }

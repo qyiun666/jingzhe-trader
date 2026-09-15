@@ -91,6 +91,12 @@ var schemaDDL = []string{
 
 	// 个股与指数共用：指数代码（000001.SH 等）不与个股重叠，指数的 vol_lot/raw_close 为 0。
 	// 主键 (ts_code, trade_date) 已覆盖所有以 ts_code 打头的查询，不再另建 ts_code 索引。
+	//
+	// WITHOUT ROWID：本表是全库唯一的窄列复合主键表，主键即唯一访问路径
+	// （按 ts_code+日期取序列、按 trade_date 取截面）。普通表要为这张表额外维护一棵
+	// 10MB 量级的主键索引（2026-09-15 实测：177K 行时主键索引 10.0MB，表数据 6.8MB），
+	// 而 WITHOUT ROWID 让主键 B 树本身就是表，省掉这棵索引。
+	// 代价：分批删除不能再走 rowid 子查询（见 tx.go 的 DeleteBatchedRows）。
 	`CREATE TABLE IF NOT EXISTS daily_bar (
 		ts_code     TEXT NOT NULL,
 		trade_date  TEXT NOT NULL,
@@ -98,7 +104,7 @@ var schemaDDL = []string{
 		vol_lot     REAL,
 		raw_close   INTEGER NOT NULL DEFAULT 0,
 		PRIMARY KEY (ts_code, trade_date)
-	)`,
+	) WITHOUT ROWID`,
 	`CREATE INDEX IF NOT EXISTS idx_bar_date ON daily_bar(trade_date)`,
 
 	// ===================== 交易 =====================
@@ -164,4 +170,20 @@ func CreateTables(db *sqlx.DB) error {
 		}
 	}
 	return nil
+}
+
+// SchemaTables 现役表清单（schemaDDL 的权威镜像，供启动期遗留对象清点与单测断言使用）。
+//
+// 它存在的原因是 CREATE TABLE IF NOT EXISTS 只做加法：跨版本重建后，老二进制留下的
+// 表与索引会永远留在库里，既占空间又让人以为还有读者。启动期拿这份清单跟
+// sqlite_master 对一遍，多出来的就是遗留物（见 audit.go）。
+var SchemaTables = []string{
+	"config_kv", "daily_bar", "order_ticket", "position", "run_trace", "stock_basic", "trade_cal",
+}
+
+// SchemaIndexes 现役具名索引清单（不含 SQLite 自动创建的主键索引 sqlite_autoindex_*）。
+// 历史遗留的重复索引（idx_daily_bar_ts_code 与主键前缀重复、idx_daily_bar_trade_date
+// 与 idx_bar_date 同列重复）不在此列，启动清点会点名它们。
+var SchemaIndexes = []string{
+	"idx_bar_date", "idx_cal_open_date", "idx_ticket_active", "idx_ticket_date_status", "idx_trace_subject",
 }
