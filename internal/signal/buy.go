@@ -44,6 +44,9 @@ type BuyRequest struct {
 	Rules     RuleEvidence
 	RulesOK   bool      // false = 窗口不足以算证据，必须把这句话原样告诉模型
 	Budget    BuyBudget // 风控口径的钱与额度：模型给的权重会被它截断
+	// Holding 非 nil = 该候选已在持仓里，本次是"加仓"判断。模型据此在"加多少"
+	// 与"是否维持"之间取舍；nil 表示这是一笔新仓。
+	Holding *model.Position
 }
 
 // BuyBudget 本次决策可用的钱（分）。模型只在给定额度内表达意愿，越界由风控斩掉。
@@ -52,14 +55,18 @@ type BuyBudget struct {
 	SlotFen    model.Fen // 单票上限（含单笔金额上限取严后的较小值）
 	LotCostFen model.Fen // 一手成本
 	Positions  int       // 当前持仓只数
-	MaxPos     int       // 档位允许的最大持仓只数
+	MaxPos     int       // 风控允许的最大持仓只数
+	// ExistingFen 该票现有敞口（成本口径，分）；新仓为 0。
+	ExistingFen model.Fen
+	// AddRoomFen 该票还能加多少（单票上限 − 现有敞口，分）；新仓为 0（无限制语义）。
+	AddRoomFen model.Fen
 }
 
 // BuyDecision 模型的裁决。
 //
 // WeightPct 是"拟投入占总资产比例"（0~1），不是股数 —— 换成整手股数、扣现金、
-// 卡单票上限是风控的活。置信度低于档位下限会被风控拒（见 risk.Manager）。
-// 止损价不由模型给：日内扫描与指令单止损价一律按档位参数算，
+// 卡单票上限是风控的活。置信度低于下限会被风控拒（见 risk.Manager）。
+// 止损价不由模型给：日内扫描与指令单止损价一律按风控参数算，
 // 模型放宽止损就等于让硬风控失效。
 type BuyDecision struct {
 	Approve    bool

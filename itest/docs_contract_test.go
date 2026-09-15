@@ -232,7 +232,7 @@ func TestAPIDocToolCounts(t *testing.T) {
 	for _, c := range []struct {
 		kind string
 		want int
-	}{{"读类", 5}, {"写类", 7}} {
+	}{{"读类", 5}, {"写类", 5}} {
 		m := regexp.MustCompile(`### ` + c.kind + `（(\d+)）`).FindStringSubmatch(api)
 		if m == nil {
 			t.Errorf("docs/API.md 里没有「### %s（N）」这一节", c.kind)

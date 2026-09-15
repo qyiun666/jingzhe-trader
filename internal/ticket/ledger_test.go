@@ -39,7 +39,7 @@ func seedTicket(t *testing.T, s *store.Store, tsCode string, dir model.Direction
 		TradeDate: "20260901", TsCode: tsCode, Name: "测试" + tsCode, Direction: dir,
 		Qty: qty, RefPrice: price,
 		Reason: "单测种子", Status: model.TicketIssued,
-		ValidUntil: "2026-09-02T15:00:00+08:00", Gear: model.GearG1,
+		ValidUntil: "2026-09-02T15:00:00+08:00",
 	}
 	id, err := s.TradeRepo().InsertTicket(context.Background(), tk)
 	if err != nil {
@@ -69,7 +69,7 @@ func TestTicketRequiredFields(t *testing.T) {
 		TradeDate: "20260901", TsCode: "sh600519", Name: "贵州茅台", Direction: model.DirBuy,
 		Rule: "buy_trend", Confidence: 0.8, RefPrice: model.FromFloat(50), Reason: "趋势确认",
 	}
-	tk, err := svc.Create(context.Background(), good, 100, model.GearG1, days)
+	tk, err := svc.Create(context.Background(), good, 100, days)
 	if err != nil {
 		t.Fatalf("合法指令单生成失败: %v", err)
 	}
@@ -99,12 +99,12 @@ func TestTicketRequiredFields(t *testing.T) {
 		{Name: "x", TsCode: "sh600519", TradeDate: "20260901", Direction: model.DirBuy, RefPrice: model.FromFloat(50), Reason: ""},
 	}
 	for i, sig := range bad {
-		if _, err := svc.Create(context.Background(), sig, 100, model.GearG1, days); !errors.Is(err, ErrRequiredField) {
+		if _, err := svc.Create(context.Background(), sig, 100, days); !errors.Is(err, ErrRequiredField) {
 			t.Errorf("缺字段用例 %d 应返回 ErrRequiredField, 实际: %v", i, err)
 		}
 	}
 	// qty <= 0 拒绝
-	if _, err := svc.Create(context.Background(), good, 0, model.GearG1, days); !errors.Is(err, ErrRequiredField) {
+	if _, err := svc.Create(context.Background(), good, 0, days); !errors.Is(err, ErrRequiredField) {
 		t.Errorf("qty=0 应返回 ErrRequiredField, 实际: %v", err)
 	}
 }
@@ -275,7 +275,7 @@ func seedTicketOn(t *testing.T, s *store.Store, tsCode string, dir model.Directi
 	tk := model.OrderTicket{
 		TradeDate: tradeDate, TsCode: tsCode, Name: "测试" + tsCode, Direction: dir,
 		Qty: qty, RefPrice: price, Reason: "单测种子", Status: model.TicketIssued,
-		ValidUntil: "2026-09-03T15:00:00+08:00", Gear: model.GearG1,
+		ValidUntil: "2026-09-03T15:00:00+08:00",
 	}
 	id, err := s.TradeRepo().InsertTicket(context.Background(), tk)
 	if err != nil {

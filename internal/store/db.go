@@ -93,6 +93,12 @@ func Open(path string) (*Store, error) {
 		rdb.Close()
 		return nil, fmt.Errorf("数据库建表失败: %w", err)
 	}
+	// 建表 DDL 只做加法（IF NOT EXISTS）：删列必须显式执行，否则旧库永远留着无人读的列。
+	if err := dropLegacyColumns(st.writeDB); err != nil {
+		wdb.Close()
+		rdb.Close()
+		return nil, err
+	}
 	// 建表只做加法（IF NOT EXISTS）：跨版本重写后旧表旧索引会永远留在库里。
 	// 清点结果（含清点本身失败）都要透出去 —— 探测失败被读成"库结构干净"就是假绿。
 	if audit, err := st.AuditSchema(context.Background()); err != nil {
@@ -101,6 +107,33 @@ func Open(path string) (*Store, error) {
 		st.audit = audit.String()
 	}
 	return st, nil
+}
+
+// dropLegacyColumns 删除跨版本重写后不再有读者的列。幂等：列不存在时跳过。
+//
+// order_ticket.gear 是档位状态机删除后的遗留列（原记"开单时的档位"），现役代码无读者。
+func dropLegacyColumns(db *sqlx.DB) error {
+	ok, err := hasColumn(db, "order_ticket", "gear")
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	if _, err := db.Exec("ALTER TABLE order_ticket DROP COLUMN gear"); err != nil {
+		return fmt.Errorf("删除遗留列 order_ticket.gear 失败: %w", err)
+	}
+	return nil
+}
+
+// hasColumn 判断表是否含指定列（用 pragma_table_info，不读 DDL 文本）。
+func hasColumn(db *sqlx.DB, table, column string) (bool, error) {
+	var n int
+	q := `SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`
+	if err := db.Get(&n, q, table, column); err != nil {
+		return false, fmt.Errorf("读取表 %s 列信息失败: %w", table, err)
+	}
+	return n > 0, nil
 }
 
 // buildDSN 构造带 PRAGMA 的 DSN。modernc.org/sqlite 的 _pragma 参数对连接池内每个新连接生效。

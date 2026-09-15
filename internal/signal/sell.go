@@ -115,6 +115,9 @@ func fmtYuan(f model.Fen) string { return fmt.Sprintf("%.2f", float64(f)/100) }
 
 // EvalSell 按优先级评估五条卖出规则，返回首个触发的信号（未触发返回 nil）：
 // 止损 > 移动止盈 > 止盈 > 排名淘汰 > 大盘恶化。
+//
+// 这是 16:30 收盘后的一次性卖出判定：排名淘汰与大盘恶化都是日频重平衡概念，
+// 只有在这一刻才有完整口径（当日 TopN 候选与指数收盘）。
 func EvalSell(date string, h HoldingCtx, p risk.RiskParams, indexClose, indexMA60 model.Fen) *model.Signal {
 	for _, sig := range []*model.Signal{
 		evalStopLoss(date, h, p),
@@ -122,6 +125,25 @@ func EvalSell(date string, h HoldingCtx, p risk.RiskParams, indexClose, indexMA6
 		evalTakeProfit(date, h, p),
 		evalRankOut(date, h),
 		evalMarketBad(date, h, indexClose, indexMA60),
+	} {
+		if sig != nil {
+			return sig
+		}
+	}
+	return nil
+}
+
+// EvalPriceRules 盘中每 5 分钟用的卖出判定：只跑三条**价格型**规则
+// （止损 > 移动止盈 > 止盈），不碰排名淘汰与大盘恶化。
+//
+// 不接那两条是刻意的：当日 TopN 候选只在 16:30 内存里（不落库），盘中拿不到就
+// 不能伪造 InTopN；大盘 MA60 用的收盘价现算，盘中重算会随价格漂移、把日频熔断
+// 变成分钟级抖动。三条价格型规则的输入全部来自持仓成本/高点与实时现价，故可安全盘中跑。
+func EvalPriceRules(date string, h HoldingCtx, p risk.RiskParams) *model.Signal {
+	for _, sig := range []*model.Signal{
+		evalStopLoss(date, h, p),
+		evalTrailingStop(date, h, p),
+		evalTakeProfit(date, h, p),
 	} {
 		if sig != nil {
 			return sig

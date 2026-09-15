@@ -13,7 +13,7 @@ import (
 // 加一张表必须同时在这里写清它凭什么不能并进现有表（粒度或保留窗口不同），
 // 这条断言就是"又把过程状态建成一张表"的第一道关。
 var wantTables = []string{
-	"config_kv",    // 配置 + 键目录 | goal.state | suspend:<日期> | 现金锚点
+	"config_kv",    // 配置 + 键目录 | suspend:<日期> | 现金锚点
 	"daily_bar",    // 选股因子、指数 MA60、持仓市值与一手价
 	"order_ticket", // 晨会/盘中邮件、账本现金推算、决策复盘
 	"position",     // 卖出信号、风控仓位、资产合计
@@ -24,7 +24,7 @@ var wantTables = []string{
 
 // goneTables 已按判据折叠或废弃的老表，任何一张都不许复活。
 var goneTables = []string{
-	"daily_basic", "suspend_d", "llm_call", "goal_state",
+	"daily_basic", "suspend_d", "llm_call",
 	"job_run", "agent_alert", "action_log", "mail_outbox", "fill", "index_daily", "schema_version",
 }
 

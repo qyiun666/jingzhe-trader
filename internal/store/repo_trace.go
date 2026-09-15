@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -83,6 +85,26 @@ func (r *TraceRepo) List(ctx context.Context, tradeDate string) ([]model.RunTrac
 	return ts, nil
 }
 
+// LatestBySubject 读取 subject 在 beforeInclusive 当日及之前最近的一行（按 trade_date 降序）。
+//
+// 用途：日报/盘前邮件要引用"最近一次收盘流水线"的结论。当天 16:30 之前（如 09:00 计划邮件）
+// 当日的 job:evening_pipeline 行还不存在，只能取上一交易日的；用 <='到今日' 降序取一行
+// 同时覆盖两种时点，且不必让调用方自己算"上一交易日"。
+// 无记录返回 ok=false。
+func (r *TraceRepo) LatestBySubject(ctx context.Context, subject, beforeInclusive string) (model.RunTrace, bool, error) {
+	var t model.RunTrace
+	err := r.rdb.GetContext(ctx, &t,
+		`SELECT `+traceColumns+` FROM run_trace WHERE subject=? AND trade_date<=?
+		 ORDER BY trade_date DESC, at DESC, id DESC LIMIT 1`, subject, beforeInclusive)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.RunTrace{}, false, nil
+		}
+		return model.RunTrace{}, false, fmt.Errorf("读取 %s（≤%s）最近一行失败: %w", subject, beforeInclusive, err)
+	}
+	return t, true, nil
+}
+
 // llmDecisionSubjectLike 决策留痕行的 subject 模式：llm:<标的>:decision。
 const llmDecisionSubjectLike = "llm:%:" + llmPromptKeyDecision
 
@@ -117,63 +139,6 @@ func (r *TraceRepo) ListLLMDecisions(ctx context.Context, fromDate, toDate strin
 			TradeDate: t.TradeDate, TsCode: code, PromptKey: llmPromptKeyDecision,
 			Verdict: d.Verdict, Confidence: d.Confidence, WeightPct: d.WeightPct,
 			Rationale: d.Rationale, Status: t.Outcome, Error: d.Error, CreatedAt: t.At,
-		})
-	}
-	return out, nil
-}
-
-// calibDetail 是 cal:<标的> 行的 run_trace.detail 载荷（键压到最短：一天一票一行按日累积）。
-type calibDetail struct {
-	Verdict    string  `json:"v"`
-	Confidence float64 `json:"c"`
-	WeightPct  float64 `json:"w,omitempty"`
-	Ret5       float64 `json:"r5,omitempty"`
-	Ret10      float64 `json:"r10,omitempty"`
-	Ret20      float64 `json:"r20,omitempty"`
-	Has5       bool    `json:"h5,omitempty"`
-	Has10      bool    `json:"h10,omitempty"`
-	Has20      bool    `json:"h20,omitempty"`
-}
-
-// WriteCalibration 写入/覆盖一条决策归因行（幂等键 = 决策日 + cal:<标的>）。
-func (r *TraceRepo) WriteCalibration(ctx context.Context, c model.Calibration) error {
-	d := calibDetail{Verdict: c.Verdict, Confidence: c.Confidence, WeightPct: c.WeightPct,
-		Ret5: c.Ret5, Ret10: c.Ret10, Ret20: c.Ret20, Has5: c.Has5, Has10: c.Has10, Has20: c.Has20}
-	raw, err := json.Marshal(d)
-	if err != nil {
-		return fmt.Errorf("序列化归因 %s/%s 失败: %w", c.TradeDate, c.TsCode, err)
-	}
-	return r.Write(ctx, model.RunTrace{
-		TradeDate: c.TradeDate, Subject: model.TraceCalib(c.TsCode),
-		Outcome: model.TraceOK, Detail: string(raw), At: c.At,
-	})
-}
-
-// ListCalibrations 读取区间内的决策归因行（cal:<标的>），升序。
-func (r *TraceRepo) ListCalibrations(ctx context.Context, fromDate, toDate string) ([]model.Calibration, error) {
-	var ts []model.RunTrace
-	q := `SELECT ` + traceColumns + ` FROM run_trace
-		WHERE subject LIKE 'cal:%' AND trade_date >= ? AND trade_date <= ? ORDER BY trade_date, subject`
-	if err := r.rdb.SelectContext(ctx, &ts, q, fromDate, toDate); err != nil {
-		return nil, fmt.Errorf("读取决策归因 %s~%s 失败: %w", fromDate, toDate, err)
-	}
-	out := make([]model.Calibration, 0, len(ts))
-	for _, t := range ts {
-		code := strings.TrimPrefix(t.Subject, "cal:")
-		if code == "" {
-			continue
-		}
-		var d calibDetail
-		if t.Detail != "" {
-			if err := json.Unmarshal([]byte(t.Detail), &d); err != nil {
-				return nil, fmt.Errorf("归因行 %s 正文解不开: %w", t.Subject, err)
-			}
-		}
-		out = append(out, model.Calibration{
-			TradeDate: t.TradeDate, TsCode: code, Verdict: d.Verdict,
-			Confidence: d.Confidence, WeightPct: d.WeightPct,
-			Ret5: d.Ret5, Ret10: d.Ret10, Ret20: d.Ret20,
-			Has5: d.Has5, Has10: d.Has10, Has20: d.Has20, At: t.At,
 		})
 	}
 	return out, nil

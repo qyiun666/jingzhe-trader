@@ -65,7 +65,7 @@ func (r *MarketRepo) LoadTradeCal(ctx context.Context) (map[string]bool, error) 
 	return m, nil
 }
 
-// TradeDateList 返回升序排列的交易日列表（供 market.NextTradeDay/PrevTradeDay 使用）。
+// TradeDateList 返回升序排列的交易日列表（供 market.NextTradeDay 与回补窗口计算使用）。
 func (r *MarketRepo) TradeDateList(ctx context.Context) ([]string, error) {
 	var dates []string
 	if err := r.rdb.SelectContext(ctx, &dates, "SELECT cal_date FROM trade_cal WHERE is_open = 1 ORDER BY cal_date"); err != nil {

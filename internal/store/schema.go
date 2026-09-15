@@ -25,8 +25,6 @@ import (
 //     subject = llm:<标的>:<prompt_key>，结论与理由序列化进 detail。
 //   - suspend_d → config_kv：两个读者都只要"当日停牌代码集合"，一天一行
 //     suspend:<YYYYMMDD> 存逗号分隔代码。见 MarketRepo.SaveSuspended。
-//   - goal_state → config_kv：只有一行、且每次写都整行覆盖（没有按列更新、没有按列查询）。
-//     见 repo_goal.go 的 goal.state 键。
 //   - daily_basic → stock_basic：估值截面每票每日一份，但全项目只有"选股当日"这一个读者，
 //     没有任何历史复算路径读旧日期；它与 stock_basic 同为"按 ts_code 的当前快照"，合并后
 //     省一张表、两个索引、一条保留规则。代价：补跑旧一日选股时估值是更新的，故 screener
@@ -55,15 +53,15 @@ var schemaDDL = []string{
 	// ===================== 配置与状态 =====================
 	// 只有两列：类型/凭据标记/改动人与时间都不存 —— 类型的唯一真相源是代码里的键目录
 	// （config.KeySpecs），库里那份镜像零读者；谁改了配置走服务日志。
-	// 除配置键外还承载三类机器写入的状态：goal.state、suspend:<YYYYMMDD>、
-	// account.cash_anchor*。它们不进键目录，config set 拒绝写、config dump 不显示。
+	// 除配置键外还承载两类机器写入的状态：suspend:<YYYYMMDD>、account.cash_anchor*。
+	// 它们不进键目录，config set 拒绝写、config dump 不显示。
 	`CREATE TABLE IF NOT EXISTS config_kv (
 		key   TEXT PRIMARY KEY,
 		value TEXT NOT NULL
 	)`,
 
 	// ===================== 市场 =====================
-	// 只存"这天开不开市"。前后交易日按 cal_date 行序现算（market.PrevTradeDay/NextTradeDay），
+	// 只存"这天开不开市"。下一交易日按 cal_date 行序现算（market.NextTradeDay），
 	// 原 pretrade_date/nexttrade_date 是从 Tushare 抄回来却没人读的镜像。
 	// synthetic 唯一的读者是"真实日历续上以后整批清掉补齐行重建"。
 	`CREATE TABLE IF NOT EXISTS trade_cal (
@@ -109,7 +107,7 @@ var schemaDDL = []string{
 
 	// ===================== 交易 =====================
 	// 成交回执直接落在本行（一单最多一回执）。不落 stop_price / 仓位比例 / 来源 / 时间戳：
-	// 止损与占比由风控参数按当时档位随时可重算，"哪条规则提的"进日志，流转时刻进日志。
+	// 止损与占比由风控参数随时可重算，"哪条规则提的"进日志，流转时刻进日志。
 	// 费用明细同理不落列：只有含费合计 total_cost 是"这笔实际占用/到账多少现金"的结果。
 	// note 是唯一的人工备注列：作废原因与成交备注都写它（两个写者，查单时读）。
 	`CREATE TABLE IF NOT EXISTS order_ticket (
@@ -123,7 +121,6 @@ var schemaDDL = []string{
 		reason       TEXT NOT NULL,
 		status       TEXT NOT NULL DEFAULT 'drafted',
 		valid_until  TEXT NOT NULL,
-		gear         TEXT NOT NULL,
 		fill_qty     INTEGER NOT NULL DEFAULT 0,
 		fill_price   INTEGER NOT NULL DEFAULT 0,
 		total_cost   INTEGER NOT NULL DEFAULT 0,

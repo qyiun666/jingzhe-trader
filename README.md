@@ -1,31 +1,31 @@
 # 惊蛰（Jingzhe Trader）
 
-> A 股量化交易系统：每日自动选股、出买卖信号、生成指令单并邮件推送；季度目标驱动的动态风控档位；NAS 7×24 常驻，通过 **MCP 接口**供外部 AI Agent 读写。
+> A 股量化交易系统：每日自动选股、出买卖信号、生成指令单并邮件推送；固定基准风控；NAS 7×24 常驻，通过 **MCP 接口**供外部 AI Agent 读写。
 
 ## 它能做什么
 
 - **每日盯盘流水线**：数据同步 → 新鲜度门禁 → 选股漏斗 → 信号 → 风控 → 指令单 → 邮件通知，全自动。
+- **盘中每 5 分钟扫持仓**：实时价触发止损 / 移动止盈 / 止盈即出 M3 紧急邮件（排名淘汰、大盘恶化是日频口径，留 16:30 收盘判定）。
 - **选股是一条流水线**：板块强弱 → 可用资金 → 流动性 → 估值 → 因子排名，每级进出数写日志与
   `run_trace(subject="job:evening_pipeline", outcome)`，候选与买卖决策只在内存里传，落库的结果只有待买卖表；0 候选必落 `alert:SCREEN_EMPTY` 一条轨迹，写清卡在哪一级、板块前三是什么——根治"永远 0 候选"的黑盒问题。
-- **季度目标三档位状态机**：G1 标准 / G2 收紧 / G3 防守，落后时完全放开敞口 + 物理熔断兜底最坏情况。
-- **LLM 决定买什么、买多少**（DeepSeek，4 条证据 prompt + 1 条决策 prompt），风控只做硬截断
-  （单票/总仓/持仓数/一手价/金额下限/置信度）；均线与量比等规则信号降为喂进 prompt 的证据列。
+- **固定基准风控**：一套生效参数（总仓 90% / 单票 40% / 止损 8% / 止盈 15%），物理熔断兜底最坏情况（单票 ≤60% / 总仓 ≤95%）。
+- **LLM 决定买什么、买多少，含对已持有标的的加仓**（DeepSeek，4 条证据 prompt + 1 条决策 prompt），
+  风控只做硬截断（单票/总仓/持仓数/一手价/金额下限/置信度；加仓不占新名额，额度 = 单票上限 − 现有敞口）。
   五条 prompt 都是**整批一次问**：筛选后的候选一次性发过去，所以一天的调用数恒为 5，与候选数无关。
   消息面一条走 Responses API 的 web_search 实测查当期风险公告（其余四条刻意不联网）；
   检索档配置为 high 且一档到底（早先"问不出就降到 low 再问一次"是误诊：真因是请求没传
   `max_output_tokens`，默认输出预算被 reasoning 吃满，整批 JSON 写到一半就停了）。
   所有 prompt 都禁止模型引用训练记忆里的新闻。模型：deepseek-v4-flash。
-- **MCP 对外接口**（12 工具）：外部 Agent 负责「初始化当日流程 → 读买卖指令 → 人工下单后回执成交 → 校准账本 → 每天查日志」。
+- **MCP 对外接口**（10 工具）：外部 Agent 负责「初始化当日流程 → 读买卖指令 → 人工下单后回执成交 → 校准账本 → 每天查日志」。
 - **进程由外部 Agent 托管**：`nohup` 后台拉起，`/healthz` 探活，挂了重启（不再有 systemd/launchd 单元与独立看门狗）。
 
 ## 关键设计决策
 
 | 决策点 | 结论 |
 |--------|------|
-| 季度目标落后时 | 完全放开敞口（允许自主放大仓位追赶），但由物理熔断框定底线 |
-| 资金 / 季度目标 | 本金由 `jingzhe init` 写入（本机测试账户 2 万），季度 10%~20%（均可配置） |
+| 资金 | 本金由 `jingzhe init` 写入（本机测试账户 2 万） |
 | 现金口径 | 不建账户表：本金 − Σ成交推算；但持仓可以是券商校准进来的（无成交单支撑），此时按 `sync_portfolio`/`init` 给的可用资金落一个"现金锚点"，避免持仓成本被双算成可用资金 |
-| LLM 角色 | 买入标的与数量的决策者（风控只截断）；卖出仍按规则执行，不让模型参与止损 |
+| LLM 角色 | 买入标的与数量的决策者（风控只截断），可对仍在 TopN 的持仓加仓；卖出仍按规则执行，不让模型参与止损 |
 | 数据 / 配置 | 全放 SQLite（`modernc.org/sqlite`，纯 Go 无 CGO） |
 | 买卖执行 | 系统只出指令单，由人工在券商 App 执行后回执（不自动下单） |
 | 通知投递 | 一封邮件一次机会：不建发件箱表，发不出去就是任务失败并落 `mail:<类型>` 的 fail 轨迹。当日一封的类型（M1 待买卖 / M2 计划 / M5 日报）与同一告警码的 M6 在重复触发时**只刷新轨迹行、不再重复投递**——`run_trace` 按 (交易日, subject) 覆盖成一行，补跑导致的多发邮件在日志里本来看不出来，收件箱却是实打实被刷爆 |
@@ -33,7 +33,7 @@
 ## 架构（流水线）
 
 ```
-日历 → 日线+估值截面+复权+停牌+指数日线 → 新鲜度门禁 → 选股漏斗 → 目标档位/风控
+日历 → 日线+估值截面+复权+停牌+指数日线 → 新鲜度门禁 → 选股漏斗 → 风控
         → LLM 决策(买) + 规则信号(卖) → 待买卖表 → 邮件 → 回执成交(人工)
                                         ↘ MCP 接口(外部 Agent 读写)
 ```
@@ -46,7 +46,7 @@
 
 ```
 cmd/
-  jingzhe/      单一二进制：serve（调度器 + MCP 接口）/ jobs / config / run / db / research
+  jingzhe/      单一二进制：serve（调度器 + MCP 接口）/ jobs / config / run / db
 internal/
   store/        SQLite 存储（schema/仓储/结构清点与 daily_bar 重建）
   config/       config_kv 配置（默认值/环境变量/凭据掩码）
@@ -55,15 +55,12 @@ internal/
   quote/        行情（只有 gotdx 一个源；取不到价即失败，不降级、不缓存旧价）
   screener/     选股漏斗
   signal/       买卖信号
-  goal/         季度目标档位状态机
   risk/         风控与仓位
   ticket/       指令单/回执/资产实算
   notify/       邮件构建/折行/告警
   scheduler/    调度器（5 个触发点，每个是一个大方法顺序组装小方法）
   llm/          买入决策：4 条证据 prompt + 1 条决策 prompt（DeepSeek）
-  review/       决策归因：决策当时的置信度 vs 事后实际收益，产出校准统计
-  backtest/     回测研究：深历史回补（库外 CSV.gz）+ 因子 RankIC/ICIR 度量
-  mcp/          MCP 接口（12 工具：5 读 + 7 写）
+  mcp/          MCP 接口（10 工具：5 读 + 5 写）
   observability/ 日志（zap）
   model/        领域模型与枚举
   app/          组合根：全进程唯一的依赖装配
@@ -94,17 +91,17 @@ make -f deploy/Makefile build     # 产物 bin/jingzhe
 
 # 5) 手动跑一次当日闭环（任务名 = 调度器注册名，与 serve 到点触发同一条路径）
 ./bin/jingzhe -db data/jingzhe.db run task evening_pipeline --date 20260903
-#   日历补齐 → 行情同步 → 新鲜度门禁 → 档位评估 → 选股漏斗 → LLM 决策 → 落待买卖表
+#   日历补齐 → 行情同步 → 新鲜度门禁 → 选股漏斗 → LLM 决策 → 落待买卖表
 ./bin/jingzhe -db data/jingzhe.db run task mail_pending  --date 20260903
 ./bin/jingzhe -db data/jingzhe.db run task daily_report  --date 20260903
-#   另有 5 个只有 CLI 提供的数据面任务：calendar / daily / freshness / screen / calibrate
-#   （screen 是只试跑漏斗不落单；freshness 不新鲜时非零退出；calibrate 补算决策归因）
+#   另有 4 个只有 CLI 提供的数据面任务：calendar / daily / freshness / screen
+#   （screen 是只试跑漏斗不落单；freshness 不新鲜时非零退出）
 
 # 6) 启动常驻服务（调度器 + MCP 接口，供外部 Agent 接入）
 ./bin/jingzhe -db data/jingzhe.db serve -addr :8080
 ```
 
-## 单一二进制的七个子命令
+## 单一二进制的六个子命令
 
 | 子命令 | 作用 |
 |--------|------|
@@ -112,40 +109,33 @@ make -f deploy/Makefile build     # 产物 bin/jingzhe
 | `jobs` | 演练指定交易日的时间线（dry-run，不执行任务），用于核对 `scheduler.*` 配置 |
 | `config` | `dump` / `get KEY` / `set KEY VALUE`（凭据默认掩码，`--show-secrets` 才显示明文） |
 | `init` | 写账户基线：`-capital` 本金（= 期初总资产，write-once）、`-hold 代码:股数:成本` 当前持仓、`-cash` 可用资金（省略则按本金−持仓成本推算）；顺带补齐 config_kv 默认值 |
-| `run task` | 手工执行单个任务。接受两类名字：**调度器注册名** `morning_plan`/`intraday_scan`/`evening_pipeline`/`mail_pending`/`daily_report`（与 `serve` 同一份注册表、同一条 `runJob`，落库口径一致），以及**只有 CLI 提供的数据面任务** `calendar`/`daily`/`freshness`/`screen`/`calibrate`（接入与排查用，没有到点触发） |
+| `run task` | 手工执行单个任务。接受两类名字：**调度器注册名** `morning_plan`/`intraday_scan`/`evening_pipeline`/`mail_pending`/`daily_report`（与 `serve` 同一份注册表、同一条 `runJob`，落库口径一致），以及**只有 CLI 提供的数据面任务** `calendar`/`daily`/`freshness`/`screen`（接入与排查用，没有到点触发） |
 | `db` | `audit` = 清点库结构与现役 schema 的差异（遗留表/索引、`daily_bar` 是否仍为普通表），有差异非零退出；`rebuild-bar` = 把 `daily_bar` 重建为 `WITHOUT ROWID`（离线执行） |
-| `research` | `backfill` = 从 Tushare 回补多年历史到库外 CSV.gz（`data/backtest/`，不进 SQLite）；`ic` = 在回补历史上计算各因子的 RankIC/ICIR，并对照"当前生产权重 vs IC 反向权重"两个综合分 |
 
 ### 因子方向（`screen.factor_mode`，默认 `reversal`）
 
-用 2023-09~2026-09 的 728 个交易日实测（20 日 RankIC，可投池，689 个截面）：
-
-| 方向 | 综合分 IC | ICIR |
-|---|---|---|
-| 原始权重（动量 0.30/价值 0.25/低波 0.20/流动性 0.25） | **−0.0896** | −0.648 |
-| 反向权重（`ReversalWeights`） | **+0.0930** | +0.494 |
-
-即原始方向系统性选到跑输的票（A 股月频反转，与"高换手/高波动透支"的文献结论一致）。
-前后两段独立样本（300 / 389 个截面）一边同为负、另一边同为正，非样本内挑参，故**默认已取 `reversal`**。
+原始权重（动量 0.30/价值 0.25/低波 0.20/流动性 0.25）在 2023-09~2026-09 的 728 个交易日上
+实测 20 日 RankIC 为负（综合分 IC −0.0896，ICIR −0.648，689 个截面）：原始方向系统性选到跑输的票
+（A 股月频反转，与"高换手/高波动透支"的文献结论一致）。前后两段独立样本（300 / 389 个截面）
+一边同为负、另一边同为正，非样本内挑参，故默认取反向权重 `ReversalWeights`。
 
 ```bash
 jingzhe -db data/jingzhe.db config get screen.factor_mode   # 默认 reversal
-jingzhe -db data/jingzhe.db research ic --dir data/backtest --horizon 20   # 复核 IC（含当前 vs 反向对照）
 jingzhe -db data/jingzhe.db config set screen.factor_mode momentum         # 回退到原始方向（A/B 对照用）
 ```
 
-> 改这一项会影响每一笔选股，属策略层变更。回补历史与跑 IC 的命令见 `jingzhe research` 子命令说明；
-> 回补产物写在 `data/backtest/`（库外 CSV.gz，不进版本库）。
+> 改这一项会影响每一笔选股，属策略层变更。IC 度量所使用的 `research backfill|ic` 子命令
+> 已随回测模块一并移除；上表是判定默认方向时留下的实测结论。
 
 ## MCP 对外接口（给外部 Agent）
 
-系统通过 `serve` 暴露 **12 个 MCP 工具**（5 读 + 7 写），外部 AI Agent 据此完成：
+系统通过 `serve` 暴露 **10 个 MCP 工具**（5 读 + 5 写），外部 AI Agent 据此完成：
 
 1. **初始化**：`init_day` / `trigger_task`
 2. **读指令**：`get_brief` → `get_tickets`（候选与信号不落库，漏斗计数在 `get_logs`）
 3. **回执与校准**：`report_fill`（券商 App 人工下单后回报）/ `sync_portfolio`（存量持仓 + 本金 + 可用资金；
    校准进来的持仓没有成交单支撑，所以必须同时给 `available_cash_yuan`，否则持仓成本会被双算成可用资金）
-4. **干预**：`skip_ticket`（作废指令单）/ `set_gear`（人工改档）/ `confirm_pace`（激进策略续期）
+4. **干预**：`skip_ticket`（作废指令单）
 5. **查日志**：`get_logs`（失败与降级都在返回的 `trace` 数组里，含 `llm:*` 每只票每条 prompt 的结果）
 
 完整接入手册（启动方式、协议、工具参数、每日工作流、错误处理、安全红线）见根目录 **[`MCP-AGENT-GUIDE.md`](./MCP-AGENT-GUIDE.md)**；接口速查见 `docs/API.md`。
@@ -154,7 +144,7 @@ jingzhe -db data/jingzhe.db config set screen.factor_mode momentum         # 回
 
 - 全部配置存 SQLite 的 `config_kv` 表（单一数据源），键目录见 `internal/config/keys.go`。
 - 生效优先级：环境变量 `JZ_*` > 库内值 > 默认值。
-- 键目录只保留**确实有消费方**的键：仓位/止损/持仓数由 `risk.GearTable` 按档位给出，不做配置项暴露。
+- 键目录只保留**确实有消费方**的键：仓位/止损/持仓数/置信度门槛由 `risk.DefaultParams` 给出固定基准，不做配置项暴露。
 - 环境变量模板：`deploy/env.example`（含 Tushare / LLM / 邮件 / MCP 令牌 / 告警收件人）。
 - 注意：根目录 `.env`（真实凭据）被 `.gitignore` 忽略；模板之所以放在 `deploy/` 而非根目录 `.env.example`，是因为 `.gitignore` 的 `.env.*` 规则会连带忽略后者。
 

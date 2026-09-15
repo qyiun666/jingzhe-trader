@@ -10,8 +10,10 @@ import (
 // batchState 构造批次核算的账户状态。
 func batchState(totalAssetYuan, cashYuan, positionsMVYuan float64, posCount int, held ...string) AccountState {
 	heldSet := make(map[string]bool, len(held))
+	heldMV := make(map[string]model.Fen, len(held))
 	for _, c := range held {
 		heldSet[c] = true
+		heldMV[c] = 0 // 敞口未指定时按 0 起算（额度=单票上限）；需要精确额度用 addOnState
 	}
 	return AccountState{
 		TotalAsset:    model.Fen(totalAssetYuan * 100),
@@ -19,21 +21,20 @@ func batchState(totalAssetYuan, cashYuan, positionsMVYuan float64, posCount int,
 		PositionsMV:   model.Fen(positionsMVYuan * 100),
 		PositionCount: posCount,
 		HeldCodes:     heldSet,
+		HeldMV:        heldMV,
 	}
 }
 
-// g1Params 按总资产解析出的 G1 生效参数。10 万元：单票 4 万 / 总仓 9 万 / 最大持仓 6 / 置信度 0.55。
+// addOnState 已持有 code 且其现有敞口为 heldMVYuan（元）的账户状态，用于加仓额度用例。
+func addOnState(totalAssetYuan, cashYuan, positionsMVYuan float64, code string, heldMVYuan float64) AccountState {
+	st := batchState(totalAssetYuan, cashYuan, positionsMVYuan, 1, code)
+	st.HeldMV[code] = model.FromFloat(heldMVYuan)
+	return st
+}
+
+// g1Params 按总资产解析出的生效参数。10 万元：单票 4 万 / 总仓 9 万 / 最大持仓 6 / 置信度 0.55。
 func g1Params(totalAssetYuan float64) RiskParams {
-	return mustResolve(DefaultBase(model.Fen(int64(totalAssetYuan*100))), model.GearG1, false, NoPace{})
-}
-
-// mustResolve Resolve 的测试包装：用例传的都是表内合法档位，返回错误说明测试代码本身写错。
-func mustResolve(base RiskParams, gear model.Gear, lock bool, pace PaceAdjust) RiskParams {
-	p, err := Resolve(base, gear, lock, pace)
-	if err != nil {
-		panic(err)
-	}
-	return p
+	return DefaultParams(model.Fen(int64(totalAssetYuan * 100)))
 }
 
 // intent 构造一笔"决策要求投入 wantYuan 元"的买入意向（缺省要满）。
@@ -104,7 +105,7 @@ func TestCheckBatchAllRules(t *testing.T) {
 		wantIndex int
 	}{
 		{
-			name: "禁开新仓", params: withBias(p, BiasExitOnly, false),
+			name: "禁开新仓", params: withAllowNew(p, false),
 			intents:  []BuyIntent{intent("a", 10, 40000, 0.9)},
 			state:    batchState(100000, 100000, 0, 0),
 			wantRule: RuleAllowNewPosition, wantIndex: 0,
@@ -116,10 +117,11 @@ func TestCheckBatchAllRules(t *testing.T) {
 			wantRule: RuleMinConfidence, wantIndex: 0,
 		},
 		{
-			name: "重复持仓", params: p,
+			name: "加仓额度已满", params: p,
+			// 已持有 a，其敞口已达单票上限 4 万 → 无可加额度
 			intents:  []BuyIntent{intent("a", 10, 40000, 0.9)},
-			state:    batchState(100000, 100000, 0, 1, "a"),
-			wantRule: RuleAlreadyHolding, wantIndex: 0,
+			state:    addOnState(100000, 100000, 40000, "a", 40000),
+			wantRule: RuleSinglePositionFull, wantIndex: 0,
 		},
 		{
 			name: "持仓数达上限", params: withMaxPos(p, 1),
@@ -252,8 +254,7 @@ func TestTargetQty(t *testing.T) {
 
 // ---------- 参数变体辅助 ----------
 
-func withBias(p RiskParams, b StrategyBias, allow bool) RiskParams {
-	p.Bias = b
+func withAllowNew(p RiskParams, allow bool) RiskParams {
 	p.AllowNewPosition = allow
 	return p
 }
@@ -266,4 +267,42 @@ func withMaxPos(p RiskParams, n int) RiskParams {
 func withMinAmount(p RiskParams, fen model.Fen) RiskParams {
 	p.MinSingleAmountFen = fen
 	return p
+}
+
+// TestAddOnAllowsHeldCode 加仓语义：已持有的标的可再买（不再是 already_holding 拒绝），
+// 不占新的持仓名额，且受"单票上限 − 现有敞口"的剩余额度约束。
+func TestAddOnAllowsHeldCode(t *testing.T) {
+	p := g1Params(100000) // 单票上限 4 万 / 最大持仓 6
+
+	// 1) 持仓名额已满（6/6），但加仓不占名额 → 仍可通过
+	full := batchState(100000, 100000, 0, 6, "a")
+	full.HeldMV["a"] = model.FromFloat(10000) // 已占 1 万，还剩 3 万额度
+	got := NewManager(p).CheckBatch([]BuyIntent{intent("a", 10, 40000, 0.9)}, full)
+	if !got[0].Approved {
+		t.Fatalf("持仓名额已满时加仓应通过（不占新名额），实际被拒: %+v", got[0])
+	}
+	// 剩余额度 3 万 → 要 4 万被截断到 3 万 → 3000 股×10 元
+	if got[0].Amount != model.FromFloat(30000) {
+		t.Errorf("加仓金额=%s, 期望 30000.00（单票上限 4 万 − 已占 1 万）", got[0].Amount)
+	}
+
+	// 2) 加仓额度用尽（已占满单票上限）→ 拒，规则是 single_position_full
+	full2 := addOnState(100000, 100000, 40000, "a", 40000)
+	got2 := NewManager(p).CheckBatch([]BuyIntent{intent("a", 10, 40000, 0.9)}, full2)
+	if got2[0].Approved || got2[0].RejectRule != RuleSinglePositionFull {
+		t.Errorf("额度用尽应因 single_position_full 被拒: %+v", got2[0])
+	}
+
+	// 3) 批内先通过一笔新仓，后续同码视为加仓（不占第二名额）
+	p2 := withMaxPos(p, 1)
+	batch := NewManager(p2).CheckBatch([]BuyIntent{
+		intent("a", 10, 30000, 0.9), // 新仓，占满 1 个名额
+		intent("a", 10, 10000, 0.9), // 同码加仓，不占名额，额度 = 4 万 − 3 万 = 1 万
+	}, batchState(100000, 100000, 0, 0))
+	if !batch[0].Approved || !batch[1].Approved {
+		t.Fatalf("新仓 + 同码加仓都应通过: %+v %+v", batch[0], batch[1])
+	}
+	if batch[1].Amount != model.FromFloat(10000) {
+		t.Errorf("同码加仓金额=%s, 期望 10000.00", batch[1].Amount)
+	}
 }

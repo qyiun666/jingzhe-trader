@@ -10,7 +10,7 @@ import (
 func (s *Server) registerReadTools() {
 	s.tools["get_brief"] = &Tool{
 		Name:        "get_brief",
-		Description: "获取当日总览：数据新鲜度、阻断项(blockers)、候选/信号/持仓摘要、账户快照、目标进度。外部 agent 每日必读的第一道入口。",
+		Description: "获取当日总览：数据新鲜度、阻断项(blockers)、指令单与持仓计数、账户资产。外部 agent 每日必读的第一道入口。",
 		InputSchema: objSchema(map[string]interface{}{"date": dateProp}, nil),
 		Handler: func(ctx context.Context, a map[string]interface{}) (interface{}, error) {
 			return s.buildBrief(ctx, argStr(a, "date", today()))
@@ -58,7 +58,7 @@ func (s *Server) registerReadTools() {
 	}
 	s.tools["get_portfolio"] = &Tool{
 		Name:        "get_portfolio",
-		Description: "当前账户资产：可用资金、持仓市值、总资产、持仓数（由成交与持仓实时推算，不读快照表）+ 当日生效档位。",
+		Description: "当前账户资产：可用资金、持仓市值、总资产、持仓数（由成交与持仓实时推算，不读快照表）。",
 		InputSchema: objSchema(map[string]interface{}{}, nil),
 		Handler: func(ctx context.Context, a map[string]interface{}) (interface{}, error) {
 			ast, err := s.deps.Ledger.Assets(ctx, today())
@@ -71,9 +71,6 @@ func (s *Server) registerReadTools() {
 				"market_value":   float64(ast.MarketValue) / 100,
 				"total_asset":    float64(ast.TotalAsset) / 100,
 				"position_count": ast.PositionCount,
-			}
-			if gs, gerr := s.deps.Store.GoalRepo().GetGoalState(ctx); gerr == nil {
-				out["gear"] = gs.CurrentGear
 			}
 			return out, nil
 		},

@@ -16,6 +16,7 @@ import (
 	"jingzhe-trader/internal/observability"
 	"jingzhe-trader/internal/quote"
 	"jingzhe-trader/internal/risk"
+	"jingzhe-trader/internal/signal"
 	"jingzhe-trader/internal/store"
 )
 
@@ -76,9 +77,13 @@ func expireStaleTickets(ctx context.Context, rc *observability.RunCtx, d Deps) e
 	return nil
 }
 
-// todayPlanLines 当日计划 = 未执行指令单 ∪ 持仓（含各自止损参考线）。
+// todayPlanLines 当日计划 = 未过期指令单 ∪ 持仓（含各自止损参考线）。
+//
+// 指令单按"活跃且未过期"取，不按生成日过滤：前一交易日 16:30 生成的单，trade_date 是
+// 那一天，早上按"今天"去查会得到空表（历史缺陷）——有效期才是"该不该执行"的判据。
 func todayPlanLines(ctx context.Context, d Deps, date string) ([]string, error) {
-	acts, err := d.Store.TradeRepo().ListActiveTickets(ctx, date)
+	now := time.Now().In(market.Loc).Format(time.RFC3339)
+	acts, err := d.Store.TradeRepo().ListActiveUnexpired(ctx, now)
 	if err != nil {
 		return nil, fmt.Errorf("读取待买卖表失败: %w", err)
 	}
@@ -98,13 +103,32 @@ func todayPlanLines(ctx context.Context, d Deps, date string) ([]string, error) 
 	return append(items, posLines...), nil
 }
 
+// tradeConclusion 最近一次收盘流水线给当日留下的人话结论（供计划/日报引用）。
+//
+// 数据来源是 job:evening_pipeline 轨迹行：它的 Detail 在"有单"时为空，
+// 在"无单/降级"时写着原因（SCREEN_EMPTY 的关闸说明、ALL_REJECTED、NO_TICKET_FROM_CANDIDATES）。
+// 当日 16:30 之前该行还不存在，故按 ≤date 取最近一行（通常是上一交易日的）。
+func tradeConclusion(ctx context.Context, d Deps, date string) string {
+	t, ok, err := d.Store.TraceRepo().LatestBySubject(ctx, model.TraceJob(JobEveningPipeline), date)
+	if err != nil {
+		return "（读取上一交易日结论失败：" + err.Error() + "）"
+	}
+	if !ok {
+		return "（暂无收盘流水线记录）"
+	}
+	if t.Outcome == model.TraceOK && t.Detail == "" {
+		return fmt.Sprintf("收盘流水线（%s）正常跑完，见下方待执行指令", t.TradeDate)
+	}
+	return fmt.Sprintf("收盘流水线（%s）：%s", t.TradeDate, t.Detail)
+}
+
 // positionLines 持仓逐条：成本与止损参考线（风控参数读不到就整段失败）。
 func positionLines(ctx context.Context, d Deps, date string) ([]string, error) {
 	pos, err := d.Store.TradeRepo().ListPositions(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("读取持仓失败: %w", err)
 	}
-	rp, _, err := d.RiskParams(ctx, date)
+	rp, err := d.RiskParams(ctx, date)
 	if err != nil {
 		return nil, fmt.Errorf("读取止损参考线所需风控参数失败: %w", err)
 	}
@@ -133,11 +157,11 @@ func sendPlanMail(ctx context.Context, rc *observability.RunCtx, d Deps, date st
 		items = []string{"今日无待执行指令、无持仓"}
 	}
 	rc.Declare("mail", "plan_m2", -1)
-	brief, err := goalBriefOf(d, ctx, date)
+	brief, err := accountBriefOf(d, ctx, date)
 	if err != nil {
-		return fmt.Errorf("目标概要读取失败: %w", err)
+		return fmt.Errorf("账户摘要读取失败: %w", err)
 	}
-	subject, body := notify.RenderM2(items, brief)
+	subject, body := notify.RenderM2(items, brief, tradeConclusion(ctx, d, date))
 	if err := d.Mail.Send(ctx, date, model.MailM2, subject, body); err != nil {
 		d.raiseW(rc, "MAIL_NOT_SENT", "计划邮件发送失败", err.Error())
 		return fmt.Errorf("计划邮件(M2)发送失败: %w", err)
@@ -146,9 +170,11 @@ func sendPlanMail(ctx context.Context, rc *observability.RunCtx, d Deps, date st
 	return nil
 }
 
-// intradayScan 盘中每 5 分钟：扫持仓是否跌破止损线，需要卖出的写待买卖表并即时发信。
+// intradayScan 盘中每 5 分钟：扫持仓是否触发价格型卖出规则
+// （止损 / 移动止盈 / 止盈），需要卖出的写待买卖表并即时发信。
 //
 // 去重：该股在待买卖表里已有未执行卖单时，既不重复建单也不重复发信。
+// 排名淘汰与大盘恶化不在此列——它们是日频重平衡概念，见 signal.EvalPriceRules 的说明。
 func intradayScan(ctx context.Context, rc *observability.RunCtx, d Deps) error {
 	date := rc.TradeDate()
 	holding, err := d.Store.TradeRepo().HoldingCodes(ctx)
@@ -163,7 +189,7 @@ func intradayScan(ctx context.Context, rc *observability.RunCtx, d Deps) error {
 	if err != nil {
 		return err
 	}
-	rp, gear, err := d.RiskParams(ctx, date)
+	rp, err := d.RiskParams(ctx, date)
 	if err != nil {
 		return fmt.Errorf("读取生效风控参数失败: %w", err)
 	}
@@ -171,19 +197,19 @@ func intradayScan(ctx context.Context, rc *observability.RunCtx, d Deps) error {
 	if err != nil {
 		return err
 	}
-	fresh, err := stopLossTickets(ctx, rc, d, date, holding, quoted, rp, gear, pending)
+	fresh, err := stopLossTickets(ctx, rc, d, date, holding, quoted, rp, pending)
 	if err != nil {
 		return err
 	}
-	return notifyStopLoss(ctx, rc, d, date, fresh)
+	return notifySell(ctx, rc, d, date, fresh)
 }
 
-// fetchQuotes 取持仓实时价；取不到即失败（不据此判断止损，也不假装判断过了）。
+// fetchQuotes 取持仓实时价；取不到即失败（不据此判断卖出，也不假装判断过了）。
 func fetchQuotes(ctx context.Context, rc *observability.RunCtx, d Deps, codes []string) (map[string]quote.Quote, error) {
 	rc.Declare("quotes", "fetched_codes", len(codes))
 	qs, err := d.Quote.Fetch(ctx, codes)
 	if err != nil {
-		d.raiseU(rc, "QUOTE_FETCH_FAILED", "盘中取价失败，本轮止损未判定", err.Error())
+		d.raiseU(rc, "QUOTE_FETCH_FAILED", "盘中取价失败，本轮卖出未判定", err.Error())
 		return nil, fmt.Errorf("盘中取价失败: %w", err)
 	}
 	rc.Actual("fetched_codes", len(qs))
@@ -205,9 +231,11 @@ func pendingSellSet(ctx context.Context, d Deps, date string) (map[string]bool, 
 	return set, nil
 }
 
-// stopLossTickets 跌破止损线的持仓 → 建卖出指令单，返回本轮新增单（供发信）。
+// stopLossTickets 逐只持仓：先抬升期间最高价（移动止盈的回撤基准），
+// 再按价格型卖出规则（止损/移动止盈/止盈）判定，触发则建卖出指令单。
+// 返回本轮新增单（供发信）。
 func stopLossTickets(ctx context.Context, rc *observability.RunCtx, d Deps, date string,
-	holding []string, quoted map[string]quote.Quote, rp risk.RiskParams, gear model.Gear,
+	holding []string, quoted map[string]quote.Quote, rp risk.RiskParams,
 	pending map[string]bool) ([]notify.TicketLine, error) {
 
 	days, err := d.Store.MarketRepo().TradeDateList(ctx)
@@ -216,16 +244,22 @@ func stopLossTickets(ctx context.Context, rc *observability.RunCtx, d Deps, date
 	}
 	var out []notify.TicketLine
 	for _, code := range holding {
+		q, ok := quoted[code]
+		if !ok {
+			return nil, fmt.Errorf("持仓 %s 无报价（行情源漏返回），本轮卖出未判定", code)
+		}
+		if q.Price <= 0 {
+			return nil, fmt.Errorf("持仓 %s 报价非法（price=%d），无法判断卖出", code, int64(q.Price))
+		}
+		// 先用现价抬升高点：移动止盈的回撤基准必须反映当日盘中创出的新高，
+		// 否则"高点"停在买入价，回撤线永远够不着（历史缺陷）。
+		if err := d.Store.TradeRepo().RaiseHighPrice(ctx, code, q.Price); err != nil {
+			return nil, err
+		}
 		if pending[code] {
 			continue // 已有未执行卖单：不重复建单也不重复发信
 		}
-		q, ok := quoted[code]
-		if !ok {
-			return nil, fmt.Errorf("持仓 %s 无报价（行情源漏返回），本轮止损未判定", code)
-		}
-		if q.Price <= 0 {
-			return nil, fmt.Errorf("持仓 %s 报价非法（price=%d），无法判断止损", code, int64(q.Price))
-		}
+		// 抬升之后再读持仓：移动止盈要用到刚更新的 high_price。
 		pos, err := d.Store.TradeRepo().GetPosition(ctx, code)
 		if err != nil {
 			return nil, fmt.Errorf("读取持仓 %s 失败: %w", code, err)
@@ -234,45 +268,44 @@ func stopLossTickets(ctx context.Context, rc *observability.RunCtx, d Deps, date
 			return nil, fmt.Errorf("持仓 %s 在持仓表里数量为 0，与盘中扫描口径不一致", code)
 		}
 		if pos.CostPrice <= 0 {
-			return nil, fmt.Errorf("持仓 %s 成本非法（cost=%d），算不出止损线", code, int64(pos.CostPrice))
+			return nil, fmt.Errorf("持仓 %s 成本非法（cost=%d），算不出卖出线", code, int64(pos.CostPrice))
 		}
-		stop := model.Fen(float64(pos.CostPrice) * (1 - rp.StopLossPct))
-		if q.Price > stop {
+		sig := signal.EvalPriceRules(date, signal.HoldingCtx{
+			Pos: pos, LastClose: q.Price, LastDate: date,
+		}, rp)
+		if sig == nil {
 			continue
 		}
 		name, err := d.Store.ScreenRepo().StockName(ctx, code)
 		if err != nil {
-			return nil, fmt.Errorf("止损单 %s 取名称失败（stock_basic 未同步？）: %w", code, err)
+			return nil, fmt.Errorf("卖出单 %s 取名称失败（stock_basic 未同步？）: %w", code, err)
 		}
-		sig := model.Signal{
-			TradeDate: date, TsCode: code, Name: name, Direction: model.DirSell, Rule: "intraday_stop",
-			Confidence: 1.0, RefPrice: q.Price,
-			Reason: fmt.Sprintf("盘中现价 %s 元 ≤ 止损线 %s 元", fmtYuan(int64(q.Price)), fmtYuan(int64(stop))),
-		}
-		tk, err := d.Tickets.Create(ctx, sig, pos.Available(), gear, days)
+		sig.Name = name
+		sig.RefPrice = q.Price
+		tk, err := d.Tickets.Create(ctx, *sig, pos.Available(), days)
 		if err != nil {
-			return nil, fmt.Errorf("创建止损指令单 %s 失败: %w", code, err)
+			return nil, fmt.Errorf("创建卖出指令单 %s 失败: %w", code, err)
 		}
 		out = append(out, notify.TicketLine{
 			TsCode: tk.TsCode, Name: tk.Name, Direction: string(tk.Direction), DirLabel: tk.Direction.Label(),
 			Qty: int64(tk.Qty), Price: float64(tk.RefPrice) / 100,
 			ValidUntil: tk.ValidUntil, Reason: tk.Reason,
 		})
-		d.raiseU(rc, "INTRADAY_STOP:"+code+":"+date, "盘中止损触发", sig.Reason)
+		d.raiseU(rc, "INTRADAY_SELL:"+code+":"+date, "盘中卖出触发", sig.Reason)
 	}
 	return out, nil
 }
 
-// notifyStopLoss 有新卖单才发 M3（每轮最多一封，含本轮全部新单）。发不出去即任务失败。
-func notifyStopLoss(ctx context.Context, rc *observability.RunCtx, d Deps, date string, fresh []notify.TicketLine) error {
+// notifySell 有新卖单才发 M3（每轮最多一封，含本轮全部新单）。发不出去即任务失败。
+func notifySell(ctx context.Context, rc *observability.RunCtx, d Deps, date string, fresh []notify.TicketLine) error {
 	if len(fresh) == 0 {
 		return nil
 	}
 	rc.Declare("mail", "stoploss_m3", -1)
-	subject, body := notify.RenderM3(fresh, "盘中触发止损")
+	subject, body := notify.RenderM3(fresh, "盘中触发卖出")
 	if err := d.Mail.Send(ctx, date, model.MailM3, subject, body); err != nil {
-		d.raiseW(rc, "MAIL_NOT_SENT", "止损邮件发送失败", err.Error())
-		return fmt.Errorf("止损邮件(M3)发送失败: %w", err)
+		d.raiseW(rc, "MAIL_NOT_SENT", "卖出邮件发送失败", err.Error())
+		return fmt.Errorf("卖出邮件(M3)发送失败: %w", err)
 	}
 	rc.Actual("stoploss_m3", 1)
 	return nil
@@ -294,9 +327,9 @@ func mailPending(ctx context.Context, rc *observability.RunCtx, d Deps) error {
 		return nil
 	}
 	rc.Declare("mail", "pending_m1", -1)
-	brief, err := goalBriefOf(d, ctx, date)
+	brief, err := accountBriefOf(d, ctx, date)
 	if err != nil {
-		return fmt.Errorf("目标概要读取失败: %w", err)
+		return fmt.Errorf("账户摘要读取失败: %w", err)
 	}
 	subject, body := notify.RenderM1(lines, brief, "")
 	if err := d.Mail.Send(ctx, date, model.MailM1, subject, body); err != nil {
@@ -348,11 +381,11 @@ func sendDailyReport(ctx context.Context, rc *observability.RunCtx, d Deps, date
 	if err != nil {
 		return fmt.Errorf("任务清单读取失败，日报不能装作今天没有失败: %w", err)
 	}
-	brief, err := goalBriefOf(d, ctx, date)
+	brief, err := accountBriefOf(d, ctx, date)
 	if err != nil {
-		return fmt.Errorf("目标概要读取失败: %w", err)
+		return fmt.Errorf("账户摘要读取失败: %w", err)
 	}
-	subject, body := notify.RenderM5(date, block+extra, okJobs, degJobs, failJobs, brief)
+	subject, body := notify.RenderM5(date, block+extra, okJobs, degJobs, failJobs, brief, tradeConclusion(ctx, d, date))
 	if err := d.Mail.Send(ctx, date, model.MailM5, subject, body); err != nil {
 		// warning 而非 urgent：任务本身已 fail，调度器统一落 JOB_FAILED urgent 发 M6；
 		// 这里再发一封是同一根因两条紧急告警（其余三处邮件失败也都是 warning）。
@@ -363,7 +396,7 @@ func sendDailyReport(ctx context.Context, rc *observability.RunCtx, d Deps, date
 	return nil
 }
 
-// reportExtraSections 日报追加三段：当前持仓、次日计划（= 待买卖表未执行单）、决策校准。
+// reportExtraSections 日报追加两段：当前持仓、次日计划（= 待买卖表未执行单）。
 func reportExtraSections(ctx context.Context, d Deps, date string) (string, error) {
 	pos, err := d.Store.TradeRepo().ListPositions(ctx)
 	if err != nil {
@@ -392,28 +425,7 @@ func reportExtraSections(ctx context.Context, d Deps, date string) (string, erro
 		b.WriteString(fmt.Sprintf("  %s %s %d 股 %.2f 元：%s\n",
 			l.TsCode, l.DirLabel, l.Qty, l.Price, l.Reason))
 	}
-	b.WriteString("\n【决策校准】\n")
-	b.WriteString("  " + calibrationLine(ctx, d, date) + "\n")
 	return b.String(), nil
-}
-
-// calibrationLine 决策校准摘要：先补算到期收益，再出分层统计。
-//
-// 归因失败不让日报失败：它是一段观察性内容，缺了不影响当日"该做什么"的交付；
-// 但失败必须显式写在正文里，不能静默渲染成"暂无样本"（那是把故障说成正常）。
-func calibrationLine(ctx context.Context, d Deps, date string) string {
-	if d.Review == nil {
-		return "未装配归因器"
-	}
-	st, err := d.Review.Run(ctx, date, 0)
-	if err != nil {
-		return fmt.Sprintf("归因失败（不影响当日交易）：%v", err)
-	}
-	line := st.Describe()
-	if note := st.InconclusiveNote(); note != "" {
-		line += " → " + note
-	}
-	return line
 }
 
 // applyRetention 保留清理 + WAL checkpoint（放在日报之后：清理失败不影响当日通知）。

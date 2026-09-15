@@ -49,7 +49,7 @@ func headerBlock(it signal.BuyRequest) string {
 	if !it.RulesOK {
 		window += fmt.Sprintf("，但只有 %d 根，指标不足以支撑完整判断", len(it.Bars.Closes))
 	}
-	return fmt.Sprintf(
+	base := fmt.Sprintf(
 		"【标的】%s %s ｜ 行业：%s ｜ 收盘 %.2f 元 ｜ 流通市值 %.1f 亿 ｜ 换手率 %.2f%%\n"+
 			"【估值】PE(TTM) %.1f ｜ PB %.2f\n"+
 			"【选股漏斗】综合分 %.1f（动量 %.0f 价值 %.0f 低波 %.0f 流动性 %.0f）\n"+
@@ -59,6 +59,27 @@ func headerBlock(it signal.BuyRequest) string {
 		c.TsCode, c.Name, c.Industry, c.Close.Float(), c.CircMvW/10000, c.TurnoverRate,
 		c.PETtm, c.PB, c.Score, c.Factors.Momentum, c.Factors.Value, c.Factors.LowVol,
 		c.Factors.Liquidity, c.PoolSize, clip(c.Reason, 120), window)
+	return base + holdingBlock(it)
+}
+
+// holdingBlock 已持有标的的持仓块（新仓返回空串）。模型据此做"加仓/维持"判断：
+// 没有这段，模型根本不知道你手里有这只票，只能把加仓当新仓处理。
+func holdingBlock(it signal.BuyRequest) string {
+	h := it.Holding
+	if h == nil || h.TotalQty <= 0 {
+		return ""
+	}
+	cost, cur := h.CostPrice.Float(), it.Candidate.Close.Float()
+	pnl := 0.0
+	if h.CostPrice > 0 {
+		pnl = (cur/cost - 1) * 100
+	}
+	return fmt.Sprintf(
+		"\n【已持有】本票已有持仓 %d 股 ｜ 成本 %.2f 元 ｜ 现价 %.2f 元（浮盈亏 %+.1f%%）｜ 期间高点 %.2f 元\n"+
+			"　　↑ 这是**加仓**判断：现有敞口 %.0f 元，单票上限内还能加 %.0f 元；"+
+			"weight_pct 表示本次**追加**投入占总资产的比例（不是加完后的总仓位）。",
+		int64(h.TotalQty), cost, cur, pnl, h.HighPrice.Float(),
+		it.Budget.ExistingFen.Float(), it.Budget.AddRoomFen.Float())
 }
 
 // priceBlock 决策段里补一句价格：weight_pct 要落地成股数，模型得知道一手多少钱。

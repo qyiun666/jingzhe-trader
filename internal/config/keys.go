@@ -57,9 +57,8 @@ var KeySpecs = []KeySpec{
 	{Key: "account.cash_anchor_date", Type: TypeString, Default: ""},
 
 	// ---------- 风控 ----------
-	// 仓位上限 / 持仓数 / 止损只由 risk.GearTable 按档位给出（Resolve 无条件覆盖），
-	// 不作为配置键暴露；这里只留档位无关、确实生效的两个旋钮。
-	{Key: "risk.max_sector_pct", Type: TypeFloat, Default: "0.50", RefuseZero: true},
+	// 仓位上限 / 持仓数 / 止损 / 置信度门槛由 risk.DefaultParams 给出固定基准，
+	// 不作为配置键暴露；这里只留确实生效、需要人工调整的止盈线。
 	{Key: "risk.take_profit_pct", Type: TypeFloat, Default: "0.15", RefuseZero: true},
 
 	// ---------- 交易成本 ----------
@@ -86,20 +85,6 @@ var KeySpecs = []KeySpec{
 	// 原始方向综合分 −0.0896（ICIR −0.648，n=689 个截面），反向 +0.0930；
 	// 前后两段独立样本（300 / 389 个截面）一边同为负、另一边同为正，非样本内挑参。
 	{Key: "screen.factor_mode", Type: TypeString, Default: "reversal"},
-
-	// ---------- 季度目标 ----------
-	{Key: "goal.quarterly_target_pct", Type: TypeFloat, Default: "0.15", RefuseZero: true},
-	{Key: "goal.max_drawdown_budget", Type: TypeFloat, Default: "0.10", RefuseZero: true},
-	{Key: "goal.tighten_at_budget", Type: TypeFloat, Default: "0.70"},
-	{Key: "goal.defend_at_budget", Type: TypeFloat, Default: "1.00"},
-	{Key: "goal.upgrade_hysteresis", Type: TypeFloat, Default: "0.15", RefuseZero: true},
-	{Key: "goal.upgrade_days", Type: TypeInt, Default: "3", RefuseZero: true},
-	{Key: "goal.pace_policy", Type: TypeString, Default: "unrestricted"},
-	{Key: "goal.pace_max_boost_pct", Type: TypeFloat, Default: "0.10"},
-	{Key: "goal.pace_allow_if_budget_below", Type: TypeFloat, Default: "0.30"},
-	{Key: "goal.lock_at_progress", Type: TypeFloat, Default: "1.00", RefuseZero: true},
-	{Key: "goal.lock_budget_below", Type: TypeFloat, Default: "0.70", RefuseZero: true},
-
 	// ---------- LLM（买入决策者，不是可选增强）----------
 	// 默认开：关掉它当日不会有任何买单 —— 买什么、买多少由它定，风控只做硬截断。
 	{Key: "llm.enabled", Type: TypeBool, Default: "true"},

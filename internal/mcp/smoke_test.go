@@ -14,7 +14,6 @@ import (
 
 	"jingzhe-trader/internal/config"
 	"jingzhe-trader/internal/dataloader"
-	"jingzhe-trader/internal/goal"
 	"jingzhe-trader/internal/market"
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/store"
@@ -39,7 +38,6 @@ func newTestServer(t *testing.T) (*httptest.Server, func()) {
 	deps := Deps{
 		Store:     st,
 		Config:    cfg,
-		Goal:      goal.NewService(st, goal.DefaultConfig(), ticket.NewLedger(st, market.CostParams{}, model.FromFloat(10000))),
 		Freshness: dataloader.NewFreshnessGate(st, cfg.GetInt("screen.min_bar_rows"), 0),
 		Ledger:    ticket.NewLedger(st, market.CostParams{}, model.FromFloat(10000)),
 		Tickets:   ticket.NewService(st),
@@ -110,7 +108,7 @@ func TestMCPSmoke(t *testing.T) {
 	}
 	want := []string{
 		"get_brief", "get_tickets", "get_positions", "get_portfolio", "get_logs",
-		"init_day", "report_fill", "sync_portfolio", "skip_ticket", "set_gear", "confirm_pace", "trigger_task",
+		"init_day", "report_fill", "sync_portfolio", "skip_ticket", "trigger_task",
 	}
 	for _, n := range want {
 		if !got[n] {

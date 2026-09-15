@@ -626,3 +626,26 @@ func TestExtractJSON(t *testing.T) {
 		t.Errorf("无花括号时应原样返回，实际 %q", got)
 	}
 }
+
+// TestHoldingBlockShownForHeldCandidate 已持有的候选必须在 prompt 里带上持仓块：
+// 不带上这段，模型就不知道你手里有这只票，只能把加仓当新仓处理。
+func TestHoldingBlockShownForHeldCandidate(t *testing.T) {
+	it := item(codeA, "甲")
+	it.Holding = &model.Position{
+		TsCode: codeA, TotalQty: 500, CostPrice: model.FromFloat(10), HighPrice: model.FromFloat(11),
+	}
+	it.Budget.ExistingFen = model.FromFloat(5000)
+	it.Budget.AddRoomFen = model.FromFloat(3000)
+	got := headerBlock(it)
+	for _, want := range []string{"【已持有】", "500 股", "还能加", "3000", "加仓"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("持仓块缺少 %q：\n%s", want, got)
+		}
+	}
+
+	// 未持有（Holding=nil）时不得出现持仓块，否则模型会把新仓误当加仓。
+	fresh := item(codeB, "乙")
+	if strings.Contains(headerBlock(fresh), "【已持有】") {
+		t.Errorf("新仓候选不应渲染持仓块:\n%s", headerBlock(fresh))
+	}
+}

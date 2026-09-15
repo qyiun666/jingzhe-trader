@@ -11,8 +11,8 @@ import (
 // jobEveningPipeline 收盘后一条流水线任务名（与 scheduler.BuildJobs 注册名一致）。
 const jobEveningPipeline = "evening_pipeline"
 
-// registerWriteTools 写工具：人工在券商 App 执行后回报，以及对账本/档位/任务状态的干预。
-// 结果一律写在被改动的那一行上（指令单行 / config_kv 的 goal.state），过程只记服务日志；
+// registerWriteTools 写工具：人工在券商 App 执行后回报，以及对账本/任务状态的干预。
+// 结果一律写在被改动的那一行上（指令单行 / config_kv 状态键），过程只记服务日志；
 // 当日「什么成了什么砸了」的统一落点是 run_trace，由调度器与各通道自己写入，这里不另记账。
 func (s *Server) registerWriteTools() {
 	s.tools["init_day"] = &Tool{
@@ -41,7 +41,7 @@ func (s *Server) registerWriteTools() {
 			if done {
 				return map[string]interface{}{"date": date, "fresh": rep.Fresh, "already_ran": true}, nil
 			}
-			// 与到点触发走同一条流水线（含行情回补、门禁、档位、选股、决策、写单），
+			// 与到点触发走同一条流水线（含行情回补、门禁、选股、决策、写单），
 			// 不在这里另拼一套"选股+信号"——那会跑出一套与调度器不同的当日结果。
 			if err := s.deps.Jobs.RunNamed(ctx, jobEveningPipeline, date, "manual"); err != nil {
 				return nil, fmt.Errorf("补跑收盘流水线失败: %w", err)
@@ -190,41 +190,6 @@ func (s *Server) registerWriteTools() {
 				return nil, err
 			}
 			return map[string]interface{}{"ticket_id": id, "status": string(model.TicketSkipped), "ok": true}, nil
-		},
-	}
-	s.tools["set_gear"] = &Tool{
-		Name:        "set_gear",
-		Description: "人工覆盖档位（G1/G2/G3）。覆盖解除锁利；until 为空默认当日。结果写在 config_kv 的 goal.state 里（override_gear/override_reason/override_until）。",
-		InputSchema: objSchema(map[string]interface{}{
-			"gear":   strProp("目标档位 G1/G2/G3"),
-			"reason": strProp("原因"),
-			"until":  strProp("覆盖有效期 YYYYMMDD，空=当日"),
-			"actor":  actorProp,
-		}, []string{"gear", "reason"}),
-		Handler: func(ctx context.Context, a map[string]interface{}) (interface{}, error) {
-			gear := model.Gear(argStr(a, "gear", ""))
-			if !gear.Valid() {
-				return nil, fmt.Errorf("非法档位: %q（应为 G1/G2/G3）", gear)
-			}
-			res, err := s.deps.Goal.SetGear(ctx, gear, argStr(a, "reason", ""),
-				argStr(a, "until", ""), argStr(a, "actor", defaultActor))
-			if err != nil {
-				return nil, err
-			}
-			return res, nil
-		},
-	}
-	s.tools["confirm_pace"] = &Tool{
-		Name: "confirm_pace",
-		Description: "确认当日「激进（aggressive）落后策略」续期（三重保护③）。goal.pace_policy=aggressive 时，" +
-			"当日未确认则不放大仓位、回落档位原值；默认策略 unrestricted 不读该确认，调用无实际效果。每日一次、幂等。",
-		InputSchema: objSchema(map[string]interface{}{"date": dateProp}, nil),
-		Handler: func(ctx context.Context, a map[string]interface{}) (interface{}, error) {
-			date := argStr(a, "date", today())
-			if err := s.deps.Goal.ConfirmPace(ctx, date); err != nil {
-				return nil, err
-			}
-			return map[string]interface{}{"date": date, "confirmed": true}, nil
 		},
 	}
 	s.tools["trigger_task"] = &Tool{

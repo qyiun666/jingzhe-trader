@@ -45,12 +45,6 @@ func TestAssemblyRefusesBadBaseline(t *testing.T) {
 			want: "llm.search_context_size",
 		},
 		{
-			name: "落后策略拼错",
-			seed: map[string]string{"account.initial_capital": "20000", "watch.mail_to": "me@example.com",
-				"goal.pace_policy": "agresiv"},
-			want: "goal.pace_policy",
-		},
-		{
 			name: "因子方向拼错",
 			seed: map[string]string{"account.initial_capital": "20000", "watch.mail_to": "me@example.com",
 				"screen.factor_mode": "reversalx"},
@@ -150,7 +144,7 @@ func TestConfigLoadRefusesMalformedNumber(t *testing.T) {
 		{"screen.min_bar_rows", "abc"},
 		{"retention.bar_days", "45天"},
 		{"mail.smtp_port", "4o5"},
-		{"goal.quarterly_target_pct", "15%"},
+		{"screen.top_n", "二十"},
 	} {
 		// 该键的环境变量必须清空：env 优先级高于库值，操作者的 .env 一旦给了这个键，
 		// 库里的脏值就被顶掉了，本用例测的就不再是"脏值能否通过自检"。

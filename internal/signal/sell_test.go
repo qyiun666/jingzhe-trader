@@ -8,14 +8,8 @@ import (
 	"jingzhe-trader/internal/risk"
 )
 
-// g1 G1 生效参数（止损 8% / 移动止盈 5% / 止盈 15%）。
-func g1() risk.RiskParams {
-	p, err := risk.Resolve(risk.DefaultBase(model.FromFloat(100000)), model.GearG1, false, risk.NoPace{})
-	if err != nil { // 档位是合法常量，走到这里说明测试代码本身写错
-		panic(err)
-	}
-	return p
-}
+// g1 生效参数（止损 8% / 移动止盈 5% / 止盈 15%）。
+func g1() risk.RiskParams { return risk.DefaultParams(model.FromFloat(100000)) }
 
 // holding 构造持仓上下文。
 func holding(cost, high, last model.Fen, inTopN, marketBad bool) HoldingCtx {
@@ -132,5 +126,41 @@ func TestSellPriority(t *testing.T) {
 	sig := EvalSell("20260901", holding(model.FromFloat(10), 0, model.FromFloat(9), false, false), p, 0, 0)
 	if sig == nil || sig.Rule != RuleStopLoss {
 		t.Fatalf("止损应优先: %+v", sig)
+	}
+}
+
+// TestEvalPriceRulesIntraday 盘中价格型规则：止损/移动止盈/止盈三条可判，
+// 排名淘汰与大盘恶化**不参与**（盘中拿不到 TopN、指数 MA60 不能盘中伪造）。
+func TestEvalPriceRulesIntraday(t *testing.T) {
+	p := g1()
+	// 止损：成本 10 元，现价 9.2 → 触发
+	sig := EvalPriceRules("20260901", holding(model.FromFloat(10), 0, model.FromFloat(9.2), true, false), p)
+	if sig == nil || sig.Rule != RuleStopLoss {
+		t.Fatalf("盘中应触发止损: %+v", sig)
+	}
+	// 移动止盈：成本 10、高点 12、现价 11.4 → 触发
+	sig = EvalPriceRules("20260901", holding(model.FromFloat(10), model.FromFloat(12), model.FromFloat(11.4), true, false), p)
+	if sig == nil || sig.Rule != RuleTrailingStop {
+		t.Fatalf("盘中应触发移动止盈: %+v", sig)
+	}
+	// 止盈：成本 10、现价 11.5（+15%）→ 触发
+	sig = EvalPriceRules("20260901", holding(model.FromFloat(10), 0, model.FromFloat(11.5), true, false), p)
+	if sig == nil || sig.Rule != RuleTakeProfit {
+		t.Fatalf("盘中应触发止盈: %+v", sig)
+	}
+	// 关键：跌出 TopN（inTopN=false）但价格未触发任何价格型规则时，盘中**不**产生卖出信号
+	if got := EvalPriceRules("20260901", holding(model.FromFloat(10), 0, model.FromFloat(10), false, true), p); got != nil {
+		t.Errorf("排名淘汰/大盘恶化不应在盘中触发，实际得到 %+v", got)
+	}
+}
+
+// TestEvalPriceRulesPriority 盘中优先级与 EvalSell 一致：止损 > 移动止盈 > 止盈。
+func TestEvalPriceRulesPriority(t *testing.T) {
+	p := g1()
+	// 同时满足止损（9.0 < 9.2）与止盈（9.0 不满足）；构造同时满足移动止盈与止盈：
+	// 成本 10、高点 12、现价 11.4 → 移动止盈线 11.40 破；止盈线 11.5 未到；以移动止盈为先。
+	sig := EvalPriceRules("20260901", holding(model.FromFloat(10), model.FromFloat(12), model.FromFloat(11.4), true, false), p)
+	if sig == nil || sig.Rule != RuleTrailingStop {
+		t.Fatalf("移动止盈应优先: %+v", sig)
 	}
 }

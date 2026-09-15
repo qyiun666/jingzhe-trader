@@ -11,7 +11,6 @@ import (
 
 	"jingzhe-trader/internal/config"
 	"jingzhe-trader/internal/dataloader"
-	"jingzhe-trader/internal/goal"
 	"jingzhe-trader/internal/llm"
 	"jingzhe-trader/internal/market"
 	"jingzhe-trader/internal/mcp"
@@ -19,7 +18,7 @@ import (
 	"jingzhe-trader/internal/notify"
 	"jingzhe-trader/internal/observability"
 	"jingzhe-trader/internal/quote"
-	"jingzhe-trader/internal/review"
+	"jingzhe-trader/internal/risk"
 	"jingzhe-trader/internal/scheduler"
 	"jingzhe-trader/internal/screener"
 	"jingzhe-trader/internal/signal"
@@ -41,10 +40,8 @@ type Runtime struct {
 	Decider    signal.BuyDecider
 	Ledger     *ticket.Ledger
 	Tickets    *ticket.Service
-	Goal       *goal.Service
 	Mail       *notify.Mailer
 	Alerts     *notify.AlertService
-	Review     *review.Calibrator
 	MinBarRows int
 
 	sched *scheduler.Scheduler
@@ -99,12 +96,8 @@ func BuildRuntime(ctx context.Context, st *store.Store, cfg *config.Config) (*Ru
 		Decider:    decider,
 		Ledger:     ledger,
 		Tickets:    ticket.NewService(st),
-		// WithAlertFunc 必须接上：PACE_BOOST_DENIED / EXPIRED 是设计上"人必须知道"的事件，
-		// 回调留 nil 就等于这条告警永远发不出去（那正是装配期的静默）。
-		Goal:       goal.NewService(st, GoalConfigOf(cfg), ledger).WithAlertFunc(alerts.Raise),
 		Mail:       mail,
 		Alerts:     alerts,
-		Review:     review.NewCalibrator(st),
 		MinBarRows: cfg.GetInt("screen.min_bar_rows"),
 	}
 	// 调度器归 Runtime 持有：常驻的调度循环与 /healthz 探活看的是同一个实例。
@@ -129,11 +122,9 @@ func (r *Runtime) SchedDeps() scheduler.Deps {
 		Decider:      r.Decider,
 		Ledger:       r.Ledger,
 		Tickets:      r.Tickets,
-		Goal:         r.Goal,
 		Alerts:       r.Alerts,
 		Mail:         r.Mail,
-		Review:       r.Review,
-		RiskParams:   r.Goal.RiskParams,
+		RiskParams:   RiskParamsOf(r),
 		FilterCfg:    FilterConfigOf(r.Config),
 		MinBarRows:   r.MinBarRows,
 		RetentionNow: time.Now,
@@ -149,7 +140,6 @@ func (r *Runtime) MCPDeps() mcp.Deps {
 		Config:     r.Config,
 		Ledger:     r.Ledger,
 		Tickets:    r.Tickets,
-		Goal:       r.Goal,
 		Freshness:  r.Freshness,
 		Liveness:   r.sched,
 		Jobs:       r.sched,
@@ -209,12 +199,6 @@ func CostParamsOf(cfg *config.Config) market.CostParams {
 // validateEnums 枚举类配置在装配期严格校验：拼错一个字母就"认不出来用默认"，
 // 等于把一个看得见配置项变成掷骰子。
 func validateEnums(cfg *config.Config) error {
-	switch cfg.GetString("goal.pace_policy") {
-	case "unrestricted", "conservative", "aggressive":
-	default:
-		return fmt.Errorf("goal.pace_policy=%q 非法（可选 unrestricted|conservative|aggressive）",
-			cfg.GetString("goal.pace_policy"))
-	}
 	switch cfg.GetString("llm.search_context_size") {
 	case "low", "medium", "high":
 	default:
@@ -255,28 +239,21 @@ func RetentionOverridesOf(cfg *config.Config) map[string]int {
 	return out
 }
 
-// GoalConfigOf 由全局 config 拼装目标域配置。
+// RiskParamsOf 由组合根提供生效风控参数的读取函数：总资产取自账本实时推算，
+// 其余为 risk.DefaultParams 的固定基准 + config 覆盖项（止盈线）。
 //
-// 季度基准不在这里给：它由 goal 在首次评估时按实时总资产写入，之后一直用状态里那一份。
-func GoalConfigOf(cfg *config.Config) goal.Config {
-	return goal.Config{
-		TargetPct: cfg.GetFloat("goal.quarterly_target_pct"),
-		BudgetPct: cfg.GetFloat("goal.max_drawdown_budget"),
-		Pace: goal.PaceSettings{
-			Policy:      cfg.GetString("goal.pace_policy"),
-			MaxBoostPct: cfg.GetFloat("goal.pace_max_boost_pct"),
-			BudgetBelow: cfg.GetFloat("goal.pace_allow_if_budget_below"),
-		},
-		MaxSectorPct:  cfg.GetFloat("risk.max_sector_pct"),
-		TakeProfitPct: cfg.GetFloat("risk.take_profit_pct"),
-		Gear: goal.GearConfig{
-			TightenAtBudget:   cfg.GetFloat("goal.tighten_at_budget"),
-			DefendAtBudget:    cfg.GetFloat("goal.defend_at_budget"),
-			UpgradeHysteresis: cfg.GetFloat("goal.upgrade_hysteresis"),
-			UpgradeDays:       cfg.GetInt("goal.upgrade_days"),
-			LockAtProgress:    cfg.GetFloat("goal.lock_at_progress"),
-			LockBudgetBelow:   cfg.GetFloat("goal.lock_budget_below"),
-		},
+// 调度器与 MCP 共用这一份，手工补跑与到点自动跑的风控参数因此完全同源。
+func RiskParamsOf(r *Runtime) func(ctx context.Context, date string) (risk.RiskParams, error) {
+	return func(ctx context.Context, date string) (risk.RiskParams, error) {
+		ast, err := r.Ledger.Assets(ctx, date)
+		if err != nil {
+			return risk.RiskParams{}, fmt.Errorf("读取账户资产失败，风控参数不可算: %w", err)
+		}
+		p := risk.DefaultParams(ast.TotalAsset)
+		if tp := r.Config.GetFloat("risk.take_profit_pct"); tp > 0 {
+			p.TakeProfitPct = tp
+		}
+		return p, nil
 	}
 }
 
@@ -299,7 +276,7 @@ func (r *Runtime) TaskNames() []string {
 
 // InitialCapitalOf 本金（config account.initial_capital，单位元）。
 //
-// 没有回落值：本金是现金推算、档位与仓位的共同基线，编一个默认值等于
+// 没有回落值：本金是现金推算与仓位的共同基线，编一个默认值等于
 // 让整天的仓位计算建立在一个没人说过的数字上。真实基线由 init / sync_portfolio 写入。
 func InitialCapitalOf(cfg *config.Config) (model.Fen, error) {
 	v := cfg.GetFloat("account.initial_capital")

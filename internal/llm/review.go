@@ -286,7 +286,7 @@ type askAsk struct {
 //
 // 与之相对，以前那套"按检索档轮流问"（high 问不出降 low）已经删掉：它是对②③的误诊，
 // 真因之一是请求没传 max_output_tokens（见 client 的 maxOutputTokens），
-// 另一个成因（空手收尾）与档位无关。
+// 另一个成因（空手收尾）与检索档无关。
 const askAttempts = 3
 
 func (r *Reviewer) ask(ctx context.Context, a askAsk, decode func(string) error) error {

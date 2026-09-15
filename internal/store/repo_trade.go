@@ -24,7 +24,7 @@ func (s *Store) TradeRepo() *TradeRepo {
 
 // ticketColumns 指令单读取列（可空列 COALESCE 兜底，避免 NULL 扫描进 string 报错）。
 const ticketColumns = `id, trade_date, ts_code, name, direction, qty, ref_price, reason,
-	 status, valid_until, gear,
+	 status, valid_until,
 	 fill_qty, fill_price, total_cost,
      COALESCE(reported_by,'') AS reported_by, COALESCE(reported_at,'') AS reported_at,
 	 COALESCE(note,'') AS note`
@@ -32,11 +32,11 @@ const ticketColumns = `id, trade_date, ts_code, name, direction, qty, ref_price,
 // InsertTicket 插入指令单，返回自增 id。
 func (r *TradeRepo) InsertTicket(ctx context.Context, t model.OrderTicket) (int64, error) {
 	const q = `INSERT INTO order_ticket
-		(trade_date, ts_code, name, direction, qty, ref_price, reason, status, valid_until, gear)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		(trade_date, ts_code, name, direction, qty, ref_price, reason, status, valid_until)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	res, err := r.wdb.ExecContext(ctx, q,
 		t.TradeDate, t.TsCode, t.Name, string(t.Direction), int64(t.Qty), int64(t.RefPrice),
-		t.Reason, string(t.Status), t.ValidUntil, string(t.Gear),
+		t.Reason, string(t.Status), t.ValidUntil,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("插入指令单失败: %w", err)
@@ -78,6 +78,22 @@ func (r *TradeRepo) ListActiveTickets(ctx context.Context, tradeDate string) ([]
 	q := `SELECT ` + ticketColumns + ` FROM order_ticket WHERE trade_date=? AND status IN ('drafted','issued') ORDER BY id`
 	if err := r.rdb.SelectContext(ctx, &ts, q, tradeDate); err != nil {
 		return nil, fmt.Errorf("读取活跃指令单 %s 失败: %w", tradeDate, err)
+	}
+	return ts, nil
+}
+
+// ListActiveUnexpired 读取全部"活跃且未过期"的指令单（不按 trade_date 过滤）。
+//
+// 指令单的 trade_date 是**生成日**（前一交易日 16:30），有效期是**次一交易日 15:00**。
+// 早上的计划邮件若按 trade_date=今天 去查，永远查不到昨晚生成的单（这正是历史缺陷）。
+// 正确的三要素是"活跃 + 未过期"：drafted/issued 且 valid_until ≥ cutoff（cutoff 为当前
+// 交易所时区时刻的 RFC3339 串，与库内格式同偏移，字典序即时间序）。
+func (r *TradeRepo) ListActiveUnexpired(ctx context.Context, cutoff string) ([]model.OrderTicket, error) {
+	var ts []model.OrderTicket
+	q := `SELECT ` + ticketColumns + ` FROM order_ticket
+		WHERE status IN ('drafted','issued') AND valid_until >= ? ORDER BY trade_date, id`
+	if err := r.rdb.SelectContext(ctx, &ts, q, cutoff); err != nil {
+		return nil, fmt.Errorf("读取未过期活跃指令单失败: %w", err)
 	}
 	return ts, nil
 }
@@ -211,6 +227,22 @@ func (r *TradeRepo) HoldingCodes(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("读取持仓代码失败: %w", err)
 	}
 	return codes, nil
+}
+
+// RaiseHighPrice 抬升某持仓的期间最高价（high_price），只升不降。
+//
+// 这个列是移动止盈的回撤基准。原实现只在买入成交时更新它（见 ticket.Ledger.applyPosition），
+// 于是高点永远停在买入价、移动止盈几乎不可能触发。盘中扫描与收盘流水线各自把当日现价/收盘
+// 送进来抬升它，"只升不降"由 SQL 的 WHERE high_price < ? 保证（并发下也不会被较小的值覆盖）。
+func (r *TradeRepo) RaiseHighPrice(ctx context.Context, tsCode string, price model.Fen) error {
+	if price <= 0 {
+		return nil
+	}
+	const q = `UPDATE position SET high_price = ? WHERE ts_code = ? AND high_price < ?`
+	if _, err := r.wdb.ExecContext(ctx, q, int64(price), tsCode, int64(price)); err != nil {
+		return fmt.Errorf("抬升持仓 %s 最高价失败: %w", tsCode, err)
+	}
+	return nil
 }
 
 // LastBuyDates 每个标的最近一笔已成交买单的交易日（无成交记录则不出现在结果里）。

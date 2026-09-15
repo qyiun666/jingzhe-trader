@@ -93,8 +93,8 @@ var dateArgKeys = []string{"date", "until"}
 
 // checkDateArgs 分发前统一校验日期参数。
 //
-// 放在这里而不是各 handler 里，是因为下游 market.QuarterOf / PrevTradeDay 按 date[:4]
-// 定长切片：一个短串会在任务里 panic，被调度器 recover 成一条说不清原因的失败。
+// 放在这里而不是各 handler 里，是因为下游按 date[:4] 定长切片的纯函数遇到短串会 panic，
+// 被调度器 recover 成一条说不清原因的失败。
 // 空串放过＝"用当天"，由各 handler 自行取 today。
 func checkDateArgs(t *Tool, args map[string]interface{}) error {
 	for _, k := range dateArgKeys {

@@ -5,7 +5,7 @@ package model
 // OrderTicket 指令单：人在回路的唯一载体，回执的唯一锚点（D3）。
 //
 // 每列都要点得出读者，算得出的不落：
-//   - 止损价、仓位占比 —— 风控参数按当时档位现算，单据不复述一遍算错的旧值；
+//   - 止损价、仓位占比 —— 风控参数现算，单据不复述一遍算错的旧值；
 //   - 来源（哪条规则提的单）—— 写在 reason 文本里；
 //   - 创建/更新时间 —— 状态流转写服务日志；
 //   - 成交金额 = fill_qty × fill_price，三项费用 = 金额 × 费率配置；
@@ -25,7 +25,6 @@ type OrderTicket struct {
 
 	Status     TicketStatus `db:"status"`
 	ValidUntil string       `db:"valid_until"` // RFC3339（Asia/Shanghai，带 +08:00 偏移）
-	Gear       Gear         `db:"gear"`        // 开单时的档位
 
 	// 成交回执
 	FillQty    Qty    `db:"fill_qty"`

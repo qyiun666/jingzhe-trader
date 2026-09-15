@@ -21,12 +21,10 @@ import (
 	"time"
 
 	"jingzhe-trader/internal/dataloader"
-	"jingzhe-trader/internal/goal"
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/notify"
 	"jingzhe-trader/internal/observability"
 	"jingzhe-trader/internal/quote"
-	"jingzhe-trader/internal/review"
 	"jingzhe-trader/internal/risk"
 	"jingzhe-trader/internal/screener"
 	"jingzhe-trader/internal/signal"
@@ -50,13 +48,11 @@ type Deps struct {
 	Decider      signal.BuyDecider
 	Ledger       *ticket.Ledger
 	Tickets      *ticket.Service
-	Goal         GoalService
 	Alerts       AlertService
 	Mail         *notify.Mailer
-	RiskParams   func(ctx context.Context, date string) (risk.RiskParams, model.Gear, error)
+	RiskParams   func(ctx context.Context, date string) (risk.RiskParams, error)
 	FilterCfg    screener.FilterConfig
 	MinBarRows   int
-	Review       *review.Calibrator
 	RetentionNow func() time.Time
 	Config       ConfigReader   // scheduler.* 触发时刻
 	Retention    map[string]int // retention.* 保留窗口覆盖（空=用规则默认值）
@@ -74,11 +70,14 @@ func (d Deps) at(key string) []string {
 	return out
 }
 
-// GoalService 目标服务最小接口。
-type GoalService interface {
-	Evaluate(ctx context.Context, tradeDate string) (*goal.Result, error)
-	ConfirmPace(ctx context.Context, tradeDate string) error
-	Brief(ctx context.Context, tradeDate string) (notify.GoalBrief, error)
+// accountBriefOf 取账户摘要（邮件顶部"多少钱"）。读不到就返回错误：
+// 空概要会把邮件里的总资产/现金渲染成 0.00 元，那是假数据而不是缺省值。
+func accountBriefOf(d Deps, ctx context.Context, date string) (notify.Brief, error) {
+	ast, err := d.Ledger.Assets(ctx, date)
+	if err != nil {
+		return notify.Brief{}, fmt.Errorf("读取账户资产失败: %w", err)
+	}
+	return notify.Brief{CashYuan: float64(ast.Cash) / 100, TotalYuan: float64(ast.TotalAsset) / 100}, nil
 }
 
 // AlertService 告警服务最小接口。
@@ -101,15 +100,8 @@ func (d Deps) raiseU(rc *observability.RunCtx, code, title, content string) {
 	}
 }
 
-// goalBriefOf 取目标概要（邮件顶部"目标还差多少"）。读不到就返回错误：
-// 空概要会把邮件里的总资产/现金渲染成 0.00 元，那是假数据而不是缺省值。
-func goalBriefOf(d Deps, ctx context.Context, date string) (notify.GoalBrief, error) {
-	b, err := d.Goal.Brief(ctx, date)
-	if err != nil {
-		return notify.GoalBrief{}, fmt.Errorf("goal.Brief(%s): %w", date, err)
-	}
-	return b, nil
-}
+// JobEveningPipeline 收盘后一条流水线任务名（调度器注册名，日报引用其结论时用）。
+const JobEveningPipeline = "evening_pipeline"
 
 // BuildJobs 构建 5 个触发点。顺序即同一时刻的执行次序。
 func BuildJobs(d Deps) []JobSpec {
@@ -125,7 +117,7 @@ func BuildJobs(d Deps) []JobSpec {
 			Run:          func(ctx context.Context, rc *observability.RunCtx) error { return intradayScan(ctx, rc, d) },
 		},
 		{
-			Name: "evening_pipeline", At: d.at("scheduler.pipeline"), TradeDayOnly: true,
+			Name: JobEveningPipeline, At: d.at("scheduler.pipeline"), TradeDayOnly: true,
 			Run: func(ctx context.Context, rc *observability.RunCtx) error { return eveningPipeline(ctx, rc, d) },
 		},
 		{

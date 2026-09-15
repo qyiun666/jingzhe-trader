@@ -8,24 +8,26 @@ import (
 
 // 否决规则名（落 order_ticket 记录与日志，验收 #7/#8 的取值契约）。
 const (
-	RuleAllowNewPosition = "allow_new_position"
-	RuleMinConfidence    = "min_confidence"
-	RuleMaxPositions     = "max_positions"
-	RuleAlreadyHolding   = "already_holding"
-	RuleLotUnaffordable  = "lot_unaffordable"
-	RuleMinAmount        = "min_amount"
-	RuleCashInsufficient = "cash_insufficient"
-	RuleMaxTotalPosition = "max_total_position"
-	RuleIllegalPrice     = "illegal_price"
+	RuleAllowNewPosition   = "allow_new_position"
+	RuleMinConfidence      = "min_confidence"
+	RuleMaxPositions       = "max_positions"
+	RuleAlreadyHolding     = "already_holding" // 保留为契约取值；已持有现在走加仓路径，不再据此拒绝
+	RuleSinglePositionFull = "single_position_full"
+	RuleLotUnaffordable    = "lot_unaffordable"
+	RuleMinAmount          = "min_amount"
+	RuleCashInsufficient   = "cash_insufficient"
+	RuleMaxTotalPosition   = "max_total_position"
+	RuleIllegalPrice       = "illegal_price"
 )
 
 // AccountState 风控核算的账户状态快照（金额一律分）。
 type AccountState struct {
-	TotalAsset    model.Fen       // 总资产
-	Cash          model.Fen       // 可用现金
-	PositionsMV   model.Fen       // 持仓市值（成本或最新价口径，由调用方决定）
-	PositionCount int             // 当前持仓只数
-	HeldCodes     map[string]bool // 已持有代码集合
+	TotalAsset    model.Fen            // 总资产
+	Cash          model.Fen            // 可用现金
+	PositionsMV   model.Fen            // 持仓市值（成本或最新价口径，由调用方决定）
+	PositionCount int                  // 当前持仓只数
+	HeldCodes     map[string]bool      // 已持有代码集合
+	HeldMV        map[string]model.Fen // 已持有代码 → 当前市值（成本口径），加仓时算剩余单票额度
 }
 
 // BuyIntent 单笔买入意向：决策链给出"买这只、想要这么多钱"，Manager 负责砍到硬上限之内。
@@ -70,6 +72,14 @@ func (m *Manager) CheckBatch(intents []BuyIntent, st AccountState) []Decision {
 	singleCap := m.P.SingleCapFen()
 	minAmount := m.P.MinAmountFloor()
 	lotCost := func(price model.Fen) model.Fen { return price.Mul(model.LotShares) }
+	// 本批会就地累计"已持有/敞口"（同一批里先通过的新仓，后续同码即视为加仓），
+	// 故两个 map 都必须可写：调用方给 nil 时在此补齐，避免写 nil map panic。
+	if st.HeldCodes == nil {
+		st.HeldCodes = make(map[string]bool, len(intents))
+	}
+	if st.HeldMV == nil {
+		st.HeldMV = make(map[string]model.Fen, len(intents))
+	}
 
 	for _, in := range intents {
 		dec := Decision{TsCode: in.TsCode}
@@ -79,25 +89,24 @@ func (m *Manager) CheckBatch(intents []BuyIntent, st AccountState) []Decision {
 			dec.RejectMsg = msg
 		}
 
-		// 1) 档位开关
-		if !m.P.AllowNewPosition || m.P.Bias == BiasExitOnly {
-			reject(RuleAllowNewPosition, fmt.Sprintf("当前档位 %s 禁止开新仓", m.P.Bias))
+		// 1) 开新仓开关
+		if !m.P.AllowNewPosition {
+			reject(RuleAllowNewPosition, "当前风控参数禁止开新仓")
 			out = append(out, dec)
 			continue
 		}
 		// 2) 决策置信度下限（决策方自报值，风控保留的唯一质量门槛）
 		if in.Confidence < m.P.MinConfidence {
-			reject(RuleMinConfidence, fmt.Sprintf("决策置信度 %.2f 低于档位下限 %.2f", in.Confidence, m.P.MinConfidence))
+			reject(RuleMinConfidence, fmt.Sprintf("决策置信度 %.2f 低于下限 %.2f", in.Confidence, m.P.MinConfidence))
 			out = append(out, dec)
 			continue
 		}
-		// 3) 持仓数与重复持仓
-		if st.HeldCodes[in.TsCode] {
-			reject(RuleAlreadyHolding, "已持有该标的，不重复建仓")
-			out = append(out, dec)
-			continue
-		}
-		if posCount >= m.P.MaxPositions {
+		// 3) 持仓数与重复持仓。
+		//
+		// 已持有的标的不是"重复建仓"而是**加仓**：它不占新的持仓名额，
+		// 但仍受单票上限约束——额度是"单票上限 − 该票现有敞口"，加满是上限不是无限加。
+		isAdd := st.HeldCodes[in.TsCode]
+		if !isAdd && posCount >= m.P.MaxPositions {
 			reject(RuleMaxPositions, fmt.Sprintf("持仓数 %d（含本批在途）达到上限 %d", posCount, m.P.MaxPositions))
 			out = append(out, dec)
 			continue
@@ -108,15 +117,26 @@ func (m *Manager) CheckBatch(intents []BuyIntent, st AccountState) []Decision {
 			out = append(out, dec)
 			continue
 		}
-		if lotCost(in.RefPrice) > singleCap {
-			reject(RuleLotUnaffordable, fmt.Sprintf("一手成本 %s 元超过单票上限 %s 元",
-				lotCost(in.RefPrice), singleCap))
+		// 单票可用额度：新仓 = 单票上限；加仓 = 单票上限 − 已占用敞口。
+		roomCap := singleCap
+		if isAdd {
+			roomCap = singleCap - st.HeldMV[in.TsCode]
+			if roomCap <= 0 {
+				reject(RuleSinglePositionFull, fmt.Sprintf("该标的已占用 %s 元，已达单票上限 %s 元，无可加额度",
+					st.HeldMV[in.TsCode], singleCap))
+				out = append(out, dec)
+				continue
+			}
+		}
+		if lotCost(in.RefPrice) > roomCap {
+			reject(RuleLotUnaffordable, fmt.Sprintf("一手成本 %s 元超过本笔可用额度 %s 元",
+				lotCost(in.RefPrice), roomCap))
 			out = append(out, dec)
 			continue
 		}
 		intent := in.WantFen
-		if singleCap < intent {
-			intent = singleCap
+		if roomCap < intent {
+			intent = roomCap
 		}
 		if st.Cash < intent {
 			intent = st.Cash
@@ -124,7 +144,7 @@ func (m *Manager) CheckBatch(intents []BuyIntent, st AccountState) []Decision {
 		qty := TargetQty(intent, in.RefPrice)
 		amount := in.RefPrice.Mul(qty)
 		if qty <= 0 || amount < minAmount {
-			reject(RuleMinAmount, fmt.Sprintf("按现价只能投入 %s 元，低于本档生效单笔下限 %s 元",
+			reject(RuleMinAmount, fmt.Sprintf("按现价只能投入 %s 元，低于生效单笔下限 %s 元",
 				amount, minAmount))
 			out = append(out, dec)
 			continue
@@ -142,14 +162,20 @@ func (m *Manager) CheckBatch(intents []BuyIntent, st AccountState) []Decision {
 			continue
 		}
 
-		// 通过：累计在途，供后续笔核算
+		// 通过：累计在途，供后续笔核算。加仓不占新名额（posCount 只在开新仓时递增）。
 		dec.Approved = true
 		dec.Qty = qty
 		dec.Amount = amount
 		dec.PlannedPct = float64(amount) / float64(st.TotalAsset)
 		committed += amount
 		st.Cash -= amount
-		posCount++
+		if isAdd {
+			st.HeldMV[in.TsCode] += amount
+		} else {
+			posCount++
+			st.HeldCodes[in.TsCode] = true
+			st.HeldMV[in.TsCode] = amount
+		}
 		out = append(out, dec)
 	}
 	return out

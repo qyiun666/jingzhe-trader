@@ -187,7 +187,7 @@ func TestRetentionExemptsMarketIndex(t *testing.T) {
 }
 
 // TestRetentionPrunesSuspendKeys 停牌集合挤进 config_kv 以后，清理必须只按
-// suspend:<日期> 键区间走 —— 配置键与 goal.state 这些永久状态一键都不能被碰。
+// suspend:<日期> 键区间走 —— 配置键与现金锚点这些永久状态一键都不能被碰。
 func TestRetentionPrunesSuspendKeys(t *testing.T) {
 	s := openStoreForTest(t)
 	defer s.Close()
@@ -200,10 +200,6 @@ func TestRetentionPrunesSuspendKeys(t *testing.T) {
 			t.Fatalf("写入 %s 失败: %v", k, err)
 		}
 	}
-	if err := s.GoalRepo().UpsertGoalState(ctx, model.GoalState{Quarter: "2026Q1", CurrentGear: model.GearG1}); err != nil {
-		t.Fatalf("写入档位状态失败: %v", err)
-	}
-
 	res, err := ApplyRetention(ctx, s, now, nil)
 	if err != nil {
 		t.Fatalf("ApplyRetention 失败: %v", err)
@@ -218,7 +214,7 @@ func TestRetentionPrunesSuspendKeys(t *testing.T) {
 	if _, ok := all["suspend:20260101"]; ok {
 		t.Error("过期停牌集合未被清理")
 	}
-	for _, k := range []string{"suspend:20260329", "tushare.token", "account.cash_anchor", goalStateKey} {
+	for _, k := range []string{"suspend:20260329", "tushare.token", "account.cash_anchor"} {
 		if _, ok := all[k]; !ok {
 			t.Errorf("%s 不该被保留策略删掉", k)
 		}

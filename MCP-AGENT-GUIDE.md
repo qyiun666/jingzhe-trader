@@ -2,13 +2,13 @@
 
 > 本文档面向**接入本系统的外部 AI Agent**（以下简称「你」）。
 > 读完本文，你应当能够：连上服务、读懂每日总览、按指令在券商 App 人工下单后回执成交、每天核查日志并处理告警。
-> 代码已通过冒烟测试（`internal/mcp/smoke_test.go` 中的 `TestMCPSmoke` 验证 healthz / 鉴权 / initialize / tools.list(12 个工具名逐个比对) / 读工具 / 写工具幂等语义全通）。
+> 代码已通过冒烟测试（`internal/mcp/smoke_test.go` 中的 `TestMCPSmoke` 验证 healthz / 鉴权 / initialize / tools.list(10 个工具名逐个比对) / 读工具 / 写工具幂等语义全通）。
 
 ---
 
 ## 0. 一句话定位
 
-惊蛰是一个 **A 股量化交易系统（Go）**，核心引擎（选股、信号、风控、目标档位、邮件通知、调度）跑在本地/NAS 上。
+惊蛰是一个 **A 股量化交易系统（Go）**，核心引擎（选股、信号、风控、邮件通知、调度）跑在本地/NAS 上。
 你（外部 Agent）**不负责交易决策与下单执行**，你负责**出入接口层**：
 
 | 你的职责 | 对应工具 |
@@ -20,7 +20,6 @@
 | 首次接入与纠错：用券商实际持仓校准账本 | `sync_portfolio` |
 | 认为某张指令单不该执行时作废它 | `skip_ticket` |
 | 每天查日志、看什么成了什么砸了 | `get_logs` |
-| 必要时人工覆盖档位 / 确认激进节奏策略 | `set_gear` / `confirm_pace` |
 
 **关键约束（务必记住）**：系统产出「指令单（order_ticket）」，你在券商 App 里**人工执行**买卖，执行完用 `report_fill` 把真实成交回报给系统。系统**不会**自动连券商下单。这是有意为之的人机协作闭环，避免自动交易风险。
 
@@ -152,14 +151,14 @@ Authorization: Bearer <token>
 
 ---
 
-## 3. 工具清单（共 12 个）
+## 3. 工具清单（共 10 个）
 
 读类（5）：`get_brief` `get_tickets` `get_positions` `get_portfolio` `get_logs`
-写类（7）：`init_day` `report_fill` `sync_portfolio` `skip_ticket` `set_gear` `confirm_pace` `trigger_task`
+写类（5）：`init_day` `report_fill` `sync_portfolio` `skip_ticket` `trigger_task`
 
 > 日期参数统一为 `YYYYMMDD`（如 `20260901`），缺省为「今天」——按**交易所时区 Asia/Shanghai** 判定，
 > 与承载机器的时区无关（UTC 主机上北京时间 08:00 前机器日期还是昨天）。
-> 格式在服务端分发前统一校验（`date` 与 `set_gear.until` 都算），不合式立即返回工具错误并在服务端留一行
+> 格式在服务端分发前统一校验（`date`），不合式立即返回工具错误并在服务端留一行
 > `MCP 调用被拒：日期格式非法`。**读工具不会把坏日期当成「当天没有数据」返空列表**——那会让 agent 把
 > 一次拼错的调用读成「今天无事」。
 >
@@ -171,15 +170,14 @@ Authorization: Bearer <token>
 > 读工具的字段名是 Go 结构体字段（PascalCase，如 `TsCode` / `TotalQty`）；空结果一律返回 `[]` 而不是 `null`。
 
 ### 3.1 get_brief（每日第一入口）
-读取当日总览：数据新鲜度、阻断项、当日指令单与待执行数、持仓数、账户资产、目标进度。
+读取当日总览：数据新鲜度、阻断项、当日指令单与待执行数、持仓数、账户资产。
 - 参数：`date?`（string）
 - 关注返回里的：
   - `data_fresh`（bool）——**为 false 时今天不应做任何交易动作**
   - `blockers`（[]string）—— 若有 `DATA_STALE` 等，说明当日不宜交易
   - `tickets_total` / `tickets_pending`（指令单计数，当日唯一落库的决策结果）
   - `positions`（持仓只数）、`pipeline_done`（收盘流水线今日是否已成功跑完）
-  - `portfolio`（cash_yuan / market_value / total_asset / position_count / gear）
-  - `goal`（季度目标进度、当前档位）
+  - `portfolio`（cash_yuan / market_value / total_asset / position_count）
 - 典型调用：`tools/call` `get_brief` `{"date":"20260901"}`
 
 ### 3.2 get_tickets
@@ -195,7 +193,7 @@ Authorization: Bearer <token>
 - 返回：`{positions:[...]}`
 
 ### 3.4 get_portfolio
-读取**当前**账户资产：可用资金、持仓市值、总资产、持仓数 + 当日生效档位（金额字段以元计，键名 `*_yuan`）。
+读取**当前**账户资产：可用资金、持仓市值、总资产、持仓数（金额字段以元计，键名 `*_yuan`）。
 - 参数：无
 - 数值全部现场推算：现金 = 本金 − Σ买入总成本 + Σ卖出净到账，市值 = 持仓 × 最新收盘价（停牌取停牌前收盘）。
   系统不再存每日资产快照，所以取不到"历史某一天"的资产；历史序列看每日 18:00 日报。
@@ -229,23 +227,12 @@ Authorization: Bearer <token>
 - 返回三态：`{date, fresh:true, already_ran:bool, ran:"evening_pipeline"}`（当日已跑完 / 已补跑）、
   `{fresh:false, message, detail}`（数据不新鲜，**今日不要做任何交易动作**）、
   `{date, skipped:true, message}`（**非交易日**，当日没有流程可初始化，也不会去补跑流水线）。
-- 补跑走的是调度器同一条任务路径（同步→门禁→档位→选股→决策→写单），不是另拼一套逻辑，
+- 补跑走的是调度器同一条任务路径（同步→门禁→选股→决策→写单），不是另拼一套逻辑，
   所以手工补跑与到点自动跑的结果一致，同样落一条 `run_trace(subject="job:evening_pipeline", outcome)`。
 - 拿 `date` 调这个工具前先确认它是交易日；早先版本非交易日会放行、再在流水线里报
   「数据不新鲜 …… 总体: 跳过（非交易日）」这种自相矛盾的失败，现在不会了。
 
-### 3.8 set_gear
-人工覆盖档位（G1/G2/G3）。覆盖会解除锁利；`until` 空则默认当日。
-- 参数：`gear`（G1/G2/G3）、`reason`（必填）、`until?`、`actor?`
-- 结果直接写在 `config_kv` 的 `goal.state` 这一个 JSON 值里（`override_gear` / `override_reason` / `override_until` 三个字段；当前生效档位就是 `current_gear`）。
-  档位状态只有一行、每次整行覆盖，已并入配置表；变更过程只记服务日志，没有"档位变更历史"这张表。
-
-### 3.9 confirm_pace
-确认执行激进节奏策略（`pace_policy` 的人工放行出口）；未确认时该策略不生效。
-- 参数：`date?`
-- 结果写在 `goal.state` 的 `pace_policy` / `pace_confirm_date` 两个字段，返回 `{date, confirmed:true}`。
-
-### 3.10 trigger_task
+### 3.8 trigger_task
 立即执行一个触发点（补跑/调试），任务名与自动时刻表完全一致：
 `morning_plan` / `intraday_scan` / `evening_pipeline` / `mail_pending` / `daily_report`。
 - 参数：`task`（必填）、`date?`
@@ -256,9 +243,9 @@ Authorization: Bearer <token>
   `intraday_scan` 每轮最多一封 M3（内容随本轮新单变化），不受此限；urgent 告警（M6）**同一个 code 当天也只发一封**，
   但轨迹行每次都会刷新——所以想知道"这件事今天砸了几次"要看 `get_logs` 的 `detail`，不能数邮件。
 
-### 3.11 sync_portfolio（首次接入与纠错，必读）
+### 3.9 sync_portfolio（首次接入与纠错，必读）
 以**券商实际持仓**为准校准账本。系统只知道自己指令单回报过的成交——你接管一个已有持仓的账户时，
-必须先用它把存量持仓、本金和可用资金灌进账本，否则卖出规则、仓位上限、季度基准全部算错。
+必须先用它把存量持仓、本金和可用资金灌进账本，否则卖出规则与仓位上限全部算错。
 命令行侧有等价入口：`jingzhe init -capital … -hold 代码:股数:成本`（同一个实现，只是不用起服务）。
 - 参数：
   - `positions`（必填，数组）：每项 `{ts_code, total_qty, available_qty?, today_bought?, cost_price?, high_price?}`
@@ -271,7 +258,7 @@ Authorization: Bearer <token>
     系统把它落成**现金锚点**：锚点当日及之前的成交不再重复扣减现金，之后的成交才动现金。
     不给这个参数直接报错——否则那笔持仓成本会被算两遍（一遍在持仓、一遍在可用资金），账户虚增。
   - `initial_capital_yuan?`（number）：本金 = 期初总资产（**元**，含持仓成本），`0`/省略 = 不动本金。
-    它是季度目标的基准，不是可用资金。
+    它是仓位与现金推算的基准，不是可用资金。
   - `date?`、`actor?`
 - **本金是 write-once**：首次写入生效；库里已有非零本金时再传不同值，**本金不改**、
   持仓与现金照常同步，返回 `capital_rejected:true`，并在服务日志落一条 warn（拒绝这件事不建表，也不占当日轨迹行）。
@@ -301,7 +288,7 @@ Authorization: Bearer <token>
 
 ### 第 0 步：首次接入只做一次
 如果 `get_positions` 返回空但你已知券商里**有存量持仓**，先跑 **`sync_portfolio`** 把实际持仓与本金灌进账本。
-跳过这一步，后面的仓位上限、卖出规则、季度目标进度全是错的。
+跳过这一步，后面的仓位上限与卖出规则全是错的。
 
 ### 上午 / 开盘前
 1. **`init_day`** —— 初始化当日。看返回：
@@ -309,7 +296,7 @@ Authorization: Bearer <token>
    - `fresh:true` → 继续。
 2. **`get_brief`** —— 读总览。重点看：
    - `blockers` 是否为空；`data_fresh` 是否为 true。
-   - `goal.Gear`（当前档位，注意读工具输出的是 Go 字段名 `Gear`/`GearLabel`）、`portfolio`（现金/市值）。
+   - `portfolio`（现金/市值）。
    - 若有阻断项 → 不要继续，先处理或转人工。
 3. **`get_tickets` `{"status":"issued"}`**（或 `drafted`）—— 取出当日**待执行指令单**。这就是你要在券商 App 里操作的清单。
 4. （可选）**`get_logs`** —— 看返回的 `trace[]`：`subject~"job:evening_pipeline"` 的 `outcome="ok"` 表示成功；若有 `outcome="fail"` 则需补跑。
@@ -320,13 +307,18 @@ Authorization: Bearer <token>
    - 已知 `ticket_id`：`{"ticket_id":<id>, "qty":<股>, "price":<元>}`
    - 只有代码：`{"ts_code":"600000.SH", "qty":1000, "price":12.35}`；若返回 `need_confirm:true`，从 `candidates` 取 `ticket_id` 重试。
    - 重复回报会被 `duplicate:true` 安全去重，放心重试。
-7. 若需强制调整档位，用 **`set_gear`**（结果写在 `goal.state` 的 override_* 三个字段上）。
+7. **盘中随时可能来 M3 紧急邮件**：系统每 5 分钟用实时价扫持仓，触发止损 / 移动止盈 / 止盈就出卖单并立即发信。
+   收到后先 `get_tickets` 取那张新单，再按第 5/6 步执行与回执。
 
 ### 收盘后 / 每日收尾
 8. **`get_logs`** —— 查当日轨迹行：
    - 有没有 `outcome="fail"` 的 job/alert？如有 → 记入并视情况 `trigger_task` 补跑或转人工。
    - 有没有 `subject~"alert:"` 且 `outcome="fail"` 的告警？
 9. 向用户/系统汇报当日执行与日志结论（可借助 `get_portfolio` `get_positions` 给出持仓与资产概览）。
+
+> 说明：18:00 的 M5 日报置顶有一段「今日结论」，09:00 的 M2 计划邮件带「昨日收盘结论」。
+> 它们直接写清"今天买了几笔 / 为什么没买（关闸 or 漏斗筛空）"，引用的是 `job:evening_pipeline`
+> 轨迹的 Detail，所以你通常不必再自己去拼这句话。
 
 ---
 
@@ -351,7 +343,7 @@ Authorization: Bearer <token>
 
 ### 5.2 改配置：MCP 不提供写配置的口子
 
-所有配置项（时刻表、选股阈值、成本费率、保留窗口、季度目标）只能经运维 CLI 改，**改完必须重启进程才生效**：
+所有配置项（时刻表、选股阈值、成本费率、保留窗口）只能经运维 CLI 改，**改完必须重启进程才生效**：
 
 ```bash
 ./bin/jingzhe -db data/jingzhe.db config dump                 # 看全部键与当前生效值
@@ -363,8 +355,8 @@ pkill -f 'jingzhe .*serve' && nohup ./bin/jingzhe -db data/jingzhe.db serve -add
 - `scheduler.*`：4 个键 —— `scheduler.morning`(09:00) / `scheduler.pipeline`(16:30，整链一条顺序
   流水线) / `scheduler.mail_pending`(17:00 待买卖邮件) / `scheduler.report`(18:00 日报)。
   盘中扫描窗口（09:30–11:30 / 13:00–15:00，每 5 分钟）写在代码里，不占键。
-- `screen.*` / `goal.*` / `cost.*` / `retention.*` / `risk.max_sector_pct` / `risk.take_profit_pct`：阈值与窗口。
-  **仓位上限、持仓数、止损不在其中**——它们由 `risk.GearTable` 按档位给出，只能 `set_gear` 换档。
+- `screen.*` / `cost.*` / `retention.*` / `risk.take_profit_pct`：阈值与窗口。
+  **仓位上限、持仓数、止损不在其中**——它们由 `risk.DefaultParams` 给出固定基准，不做配置项暴露。
 - 键目录里列出的每一个键都有真实消费方；不在这个清单里的键，`config set` 会直接报「未知配置键」。
 - 凭据键（`tushare.token` / `mail.password` / `llm.api_key` / `server.api_token`）默认掩码，需 `--show-secrets`。
 
@@ -420,7 +412,7 @@ curl -s -X POST $JZ_MCP \
 4. **`skip_ticket` ≠ `report_fill`**：没成交就 `skip_ticket`。把未成交的单回报成成交会凭空造出持仓与现金流出。
 5. **数据不新鲜就停手**：任何 `DATA_STALE` / `data_fresh:false` 出现时，停止交易动作，转人工。
 6. **可安全重试**：`report_fill` / `init_day` 均为幂等设计，重复调用不会重复记账。
-7. **留痕**：人工干预的结果直接落在被改动的表上（作废 → `order_ticket.status=skipped`，改档 → `goal.state` 的 override_*），过程只记服务日志；当日成败汇总一律看 `get_logs` 的 `run_trace`。
+7. **留痕**：人工干预的结果直接落在被改动的表上（作废 → `order_ticket.status=skipped`），过程只记服务日志；当日成败汇总一律看 `get_logs` 的 `run_trace`。
 
 ---
 

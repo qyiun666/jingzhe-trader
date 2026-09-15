@@ -6,7 +6,7 @@ import (
 	"jingzhe-trader/internal/model"
 )
 
-// buildBrief 组装当日总览：数据新鲜度、阻断项、指令单与持仓计数、账户资产、目标进度。
+// buildBrief 组装当日总览：数据新鲜度、阻断项、指令单与持仓计数、账户资产。
 // 与诊断不黑盒：任何缺失都显式进入 blockers，便于外部 agent 判断当天能否交易。
 func (s *Server) buildBrief(ctx context.Context, date string) (map[string]interface{}, error) {
 	out := map[string]interface{}{"trade_date": date}
@@ -56,9 +56,6 @@ func (s *Server) buildBrief(ctx context.Context, date string) (map[string]interf
 			"total_asset":    float64(ast.TotalAsset) / 100,
 			"position_count": ast.PositionCount,
 		}
-	}
-	if b, e := s.deps.Goal.Brief(ctx, date); e == nil {
-		out["goal"] = b
 	}
 	return out, nil
 }

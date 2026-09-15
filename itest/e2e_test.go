@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"jingzhe-trader/internal/app"
 	"jingzhe-trader/internal/mcp"
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/quote"
@@ -19,7 +20,7 @@ import (
 )
 
 // TestTradingDayEndToEnd 一个完整交易日的真实闭环：
-// 同步 → 门禁 → 选股 → LLM 决策 → 指令单 → 四类邮件 + 盘中紧急告警 → 组合同步 → 定目标 → MCP 对外接口。
+// 同步 → 门禁 → 选股 → LLM 决策 → 指令单 → 四类邮件 + 盘中紧急告警 → 组合同步 → MCP 对外接口。
 //
 // 这是唯一能回答"每天到底能不能正常跑"的测试：单元测试全用桩，
 // 而历史上出问题的一直是桩覆盖不到的接缝（邮件配置缺失、指数缺失、行情降级）。
@@ -30,7 +31,7 @@ func TestTradingDayEndToEnd(t *testing.T) {
 	date := tradeDateOr(t, "20260903")
 	st := rt.Store
 
-	// ---------- ① 每日闭环：同步 → 门禁 → 档位 → 选股漏斗 ----------
+	// ---------- ① 每日闭环：同步 → 门禁 → 选股漏斗 ----------
 	started := time.Now()
 	mustNoErr(t, "evening_pipeline", rt.RunTaskOnce(ctx, "evening_pipeline", date, "itest"))
 	outcome, detail := jobOutcome(t, st, date, "evening_pipeline")
@@ -66,18 +67,17 @@ func TestTradingDayEndToEnd(t *testing.T) {
 	}
 	// 整批都问：截断正是在"一批 6 只 + 长理由"时才出现，砍到 3 只就测不到了。
 	ask := cand.Candidates
-	rp0, gear0, err := rt.Goal.RiskParams(ctx, date)
+	rp0, err := app.RiskParamsOf(rt)(ctx, date)
 	mustNoErr(t, "RiskParams", err)
 	// 生效风控参数不许带零值：零值止损＝成本价即止损线，会把每个持仓都判成该清仓。
-	// 这一串断言防的是"档位状态读出来是空的但没人报错"这类静默口径失效。
 	if rp0.StopLossPct <= 0 || rp0.StopLossPct >= 1 {
-		t.Fatalf("%s 档生效止损线=%.3f，不在 (0,1) 内", gear0, rp0.StopLossPct)
+		t.Fatalf("生效止损线=%.3f，不在 (0,1) 内", rp0.StopLossPct)
 	}
 	if rp0.TrailingStopPct <= 0 || rp0.MaxPositions <= 0 || rp0.MaxTotalPositionPct <= 0 {
-		t.Fatalf("%s 档生效风控参数疑似读空: 移动止盈=%.3f 最大持仓=%d 总仓上限=%.3f",
-			gear0, rp0.TrailingStopPct, rp0.MaxPositions, rp0.MaxTotalPositionPct)
+		t.Fatalf("生效风控参数疑似读空: 移动止盈=%.3f 最大持仓=%d 总仓上限=%.3f",
+			rp0.TrailingStopPct, rp0.MaxPositions, rp0.MaxTotalPositionPct)
 	}
-	drep, err := rt.Signal.Generate(ctx, date, ask, rp0, gear0, rt.Decider)
+	drep, err := rt.Signal.Generate(ctx, date, ask, rp0, rt.Decider)
 	mustNoErr(t, "Signal.Generate", err)
 	if drep.Approved+drep.Declined+drep.Failed != len(ask) {
 		t.Errorf("LLM 裁决没有覆盖整批候选: 批准%d 否决%d 失败%d，问了 %d 只",
@@ -134,31 +134,6 @@ func TestTradingDayEndToEnd(t *testing.T) {
 		t.Errorf("现金口径为 %d，锚点没落地", int64(ast.Cash))
 	}
 	t.Log(describe("持仓行", synced, "现金", int64(ast.Cash), "总资产", int64(ast.TotalAsset)))
-
-	// ---------- ③ 定目标：季度评估 + 人工改档 + 档位真的改变风控口径 ----------
-	res, err := rt.Goal.Evaluate(ctx, date)
-	mustNoErr(t, "goal.Evaluate", err)
-	t.Log(describe("档位", string(res.Decision.To), "进度", fmt.Sprintf("%.2f%%", res.Metrics.Progress*100)))
-
-	res2, err := rt.Goal.SetGear(ctx, model.GearG3, "集成测试改档", "20991231", "itest")
-	if err != nil {
-		t.Fatalf("SetGear: %v", err)
-	}
-	// 改档回包里的度量必须是真数：曾经这里返回一串零，agent 会把"没算"读成"目标 0%"。
-	if res2.Metrics.TargetPct <= 0 || res2.Metrics.TotalDays <= 0 || res2.Metrics.CurrentAsset <= 0 {
-		t.Errorf("set_gear 回包的度量为零值: %+v", res2.Metrics)
-	}
-	rp, gear, err := rt.Goal.RiskParams(ctx, date)
-	mustNoErr(t, "RiskParams", err)
-	if gear != model.GearG3 {
-		t.Fatalf("改档后生效档位是 %s，期望 G3", gear)
-	}
-	if rp.AllowNewPosition {
-		t.Error("G3 防守档仍允许开新仓，档位状态机没生效")
-	}
-	if rp.StopLossPct <= 0 {
-		t.Errorf("G3 止损线为 %v，风控参数读空", rp.StopLossPct)
-	}
 
 	// ---------- ④ 盘中紧急：持仓深亏 → 必出止损单 + M3 邮件 ----------
 	// 成本价刻意设为现价 3 倍，止损线远高于现价，扫描必然触发。
@@ -263,7 +238,7 @@ func TestTradingDayEndToEnd(t *testing.T) {
 		t.Errorf("trigger_task 对未知任务没有报错: %s", out.text)
 	}
 
-	// 日期格式在服务端分发前就要拒掉：下游 market.QuarterOf 按 date[:4] 定长切片，
+	// 日期格式在服务端分发前就要拒掉：下游按 date[:4] 定长切片的纯函数，
 	// "2026" 这种短串会先在纯函数里 panic，再被调度器 recover 成一条看不出所以然的失败。
 	for _, bad := range []string{"2026", "2026-09-03", "20260230", "abc"} {
 		if out := callTool(t, ts, token, "trigger_task",

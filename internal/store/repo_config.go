@@ -13,7 +13,7 @@ import (
 // （config.KeySpecs），不在库里再存一份镜像 —— 那份镜像从来没被读过。
 // 谁在什么时候改了配置，写服务日志，不占列。
 //
-// 除配置键外，库里还有三类机器写入的状态键：goal.state、suspend:<YYYYMMDD>、
+// 除配置键外，库里还有两类机器写入的状态键：suspend:<YYYYMMDD>、
 // account.cash_anchor*。它们不进键目录，所以 config set 拒绝写、config dump 不显示。
 type ConfigRepo struct {
 	db *sqlx.DB

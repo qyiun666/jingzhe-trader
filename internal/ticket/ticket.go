@@ -39,9 +39,9 @@ func NewService(st *store.Store) *Service { return &Service{st: st} }
 // 必填字段：trade_date / ts_code / name / direction / qty(>0) / reason / valid_until，
 // 任一缺失返回 ErrRequiredField（验收 #9）。有效期 = 下一交易日 15:00（EOD）。
 //
-// 不接风控参数：止损价与本单占比按档位随时可重算，单据不复述一份会过期的副本；
+// 不接风控参数：止损价与本单占比按风控参数随时可重算，单据不复述一份会过期的副本；
 // 信号来自哪条规则只写日志（sig.Rule），不占列。
-func (s *Service) Create(ctx context.Context, sig model.Signal, qty model.Qty, gear model.Gear, tradeDays []string) (model.OrderTicket, error) {
+func (s *Service) Create(ctx context.Context, sig model.Signal, qty model.Qty, tradeDays []string) (model.OrderTicket, error) {
 	if sig.TradeDate == "" || sig.TsCode == "" || sig.Name == "" || !sig.Direction.Valid() ||
 		qty <= 0 || sig.Reason == "" {
 		return model.OrderTicket{}, fmt.Errorf("%w: trade_date=%q ts_code=%q name=%q direction=%q qty=%d reason长度=%d",
@@ -52,7 +52,7 @@ func (s *Service) Create(ctx context.Context, sig model.Signal, qty model.Qty, g
 		return model.OrderTicket{}, err
 	}
 	validUntil := vu.Format(time.RFC3339)
-	// 单据只记"当时决定要做什么"：止损价与本单占比由风控参数按档位现算，不落列复述；
+	// 单据只记"当时决定要做什么"：止损价与本单占比由风控参数现算，不落列复述；
 	// 来源（sig.Rule）与创建时间进日志与 reason 文本。
 	t := model.OrderTicket{
 		TradeDate:  sig.TradeDate,
@@ -64,7 +64,6 @@ func (s *Service) Create(ctx context.Context, sig model.Signal, qty model.Qty, g
 		Reason:     sig.Reason,
 		Status:     model.TicketDrafted,
 		ValidUntil: validUntil,
-		Gear:       gear,
 	}
 	id, err := s.st.TradeRepo().InsertTicket(ctx, t)
 	if err != nil {
@@ -74,7 +73,7 @@ func (s *Service) Create(ctx context.Context, sig model.Signal, qty model.Qty, g
 	observability.S().Infow("指令单已生成",
 		"ticket_id", id, "date", t.TradeDate, "ts_code", t.TsCode,
 		"direction", string(t.Direction), "qty", int64(t.Qty),
-		"gear", string(gear), "rule", sig.Rule)
+		"rule", sig.Rule)
 	return t, nil
 }
 

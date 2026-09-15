@@ -57,7 +57,7 @@ type buyProposal struct {
 
 // Generate 执行决策主流程：① 读行情窗口与持仓 → ② 卖出决策（规则）→ ③ 买入决策（LLM）→ ④ 写指令单。
 func (s *Service) Generate(ctx context.Context, tradeDate string, cands []model.Candidate,
-	p risk.RiskParams, gear model.Gear, decider BuyDecider) (*Report, error) {
+	p risk.RiskParams, decider BuyDecider) (*Report, error) {
 	if decider == nil {
 		decider = NoDecider{}
 	}
@@ -83,11 +83,11 @@ func (s *Service) Generate(ctx context.Context, tradeDate string, cands []model.
 	if err != nil {
 		return nil, err
 	}
-	buys, err := s.buyDecisions(ctx, tradeDate, cands, series, state, p, decider, rep)
+	buys, err := s.buyDecisions(ctx, tradeDate, cands, series, positions, state, p, decider, rep)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.writeTickets(ctx, tradeDate, buys, sells, state, p, gear, rep); err != nil {
+	if err := s.writeTickets(ctx, tradeDate, buys, sells, state, p, rep); err != nil {
 		return nil, err
 	}
 	rep.Empty = len(cands) == 0 && rep.Tickets == 0
@@ -130,16 +130,27 @@ func (s *Service) sellDecisions(ctx context.Context, tradeDate string, cands []m
 }
 
 // buyDecisions 候选批量 × 证据 → LLM 一次裁决整批。规则不再否决任何候选，只提供证据列。
+//
+// positions 用于把"该候选是否已持有"传给模型：已持有走加仓判断（Holding 非 nil），
+// 未持有才是新仓。这也让风控的加仓路径有据可依（单票剩余额度）。
 func (s *Service) buyDecisions(ctx context.Context, tradeDate string, cands []model.Candidate,
-	series map[string]BarSeries, state risk.AccountState, p risk.RiskParams,
+	series map[string]BarSeries, positions []model.Position, state risk.AccountState, p risk.RiskParams,
 	decider BuyDecider, rep *Report) ([]buyProposal, error) {
+	held := make(map[string]*model.Position, len(positions))
+	for i := range positions {
+		if positions[i].TotalQty <= 0 {
+			continue
+		}
+		held[positions[i].TsCode] = &positions[i]
+	}
 	items := make([]BuyRequest, 0, len(cands))
 	for _, c := range cands {
 		bs := series[c.TsCode]
 		ev, evOK := EvaluateRules(bs)
 		items = append(items, BuyRequest{
 			TradeDate: tradeDate, Candidate: c, Bars: bs, Rules: ev, RulesOK: evOK,
-			Budget: budgetOf(state, p, c.Close),
+			Budget:  budgetOf(state, p, c.TsCode, c.Close),
+			Holding: held[c.TsCode],
 		})
 	}
 	if len(items) == 0 {
@@ -197,13 +208,23 @@ func (s *Service) pendingBuy(it BuyRequest, d BuyDecision, total model.Fen, rep 
 }
 
 // budgetOf 把风控口径翻译成模型能读懂的几个钱数：能动用的现金、单票上限、一手成本、
-// 还剩几个持仓名额。模型只在这些数之内表达意愿，越界由 Manager 斩掉。
-func budgetOf(state risk.AccountState, p risk.RiskParams, price model.Fen) BuyBudget {
-	return BuyBudget{
+// 还剩几个持仓名额，以及（若已持有该代码）现有敞口与还能加多少。
+// 模型只在这些数之内表达意愿，越界由 Manager 斩掉。
+func budgetOf(state risk.AccountState, p risk.RiskParams, code string, price model.Fen) BuyBudget {
+	b := BuyBudget{
 		CashFen: state.Cash, SlotFen: p.SingleCapFen(),
 		LotCostFen: price.Mul(model.LotShares),
 		Positions:  state.PositionCount, MaxPos: p.MaxPositions,
 	}
+	if held, ok := state.HeldMV[code]; ok {
+		room := p.SingleCapFen() - held
+		if room < 0 {
+			room = 0
+		}
+		b.ExistingFen = held
+		b.AddRoomFen = room
+	}
+	return b
 }
 
 // clampWeight 模型给的仓位比例收口到 [0,1]：越界是模型输出异常，不做解释性放大。
@@ -222,7 +243,7 @@ const DecideRuleName = "llm_review"
 
 // writeTickets 决策落地为指令单：买入受硬截断，卖出按可卖量。
 func (s *Service) writeTickets(ctx context.Context, tradeDate string, buys []buyProposal, sells []model.Signal,
-	state risk.AccountState, p risk.RiskParams, gear model.Gear, rep *Report) error {
+	state risk.AccountState, p risk.RiskParams, rep *Report) error {
 	existing, err := s.activeKeys(ctx, tradeDate)
 	if err != nil {
 		return err
@@ -232,16 +253,16 @@ func (s *Service) writeTickets(ctx context.Context, tradeDate string, buys []buy
 		return err
 	}
 	svc := ticket.NewService(s.st)
-	if err := s.writeBuys(ctx, svc, buys, existing, state, p, gear, days, rep); err != nil {
+	if err := s.writeBuys(ctx, svc, buys, existing, state, p, days, rep); err != nil {
 		return err
 	}
-	return s.writeSells(ctx, svc, sells, existing, p, gear, days, rep)
+	return s.writeSells(ctx, svc, sells, existing, p, days, rep)
 }
 
 // writeBuys 买入决策 → 硬风控截断 → 指令单（否决全部记录，禁静默丢弃）。
 func (s *Service) writeBuys(ctx context.Context, svc *ticket.Service, buys []buyProposal,
 	existing map[ticketKey]bool, state risk.AccountState, p risk.RiskParams,
-	gear model.Gear, days []string, rep *Report) error {
+	days []string, rep *Report) error {
 	if len(buys) == 0 {
 		return nil
 	}
@@ -262,7 +283,7 @@ func (s *Service) writeBuys(ctx context.Context, svc *ticket.Service, buys []buy
 				"rule", dec.RejectRule, "msg", dec.RejectMsg)
 			continue
 		}
-		if _, err := s.createOnce(ctx, svc, sig, dec.Qty, existing, p, gear, days, rep); err != nil {
+		if _, err := s.createOnce(ctx, svc, sig, dec.Qty, existing, p, days, rep); err != nil {
 			return err
 		}
 	}
@@ -271,7 +292,7 @@ func (s *Service) writeBuys(ctx context.Context, svc *ticket.Service, buys []buy
 
 // writeSells 卖出决策 → 指令单（数量 = 可卖量，T+1 当日买入不可卖）。
 func (s *Service) writeSells(ctx context.Context, svc *ticket.Service, sells []model.Signal,
-	existing map[ticketKey]bool, p risk.RiskParams, gear model.Gear, days []string, rep *Report) error {
+	existing map[ticketKey]bool, p risk.RiskParams, days []string, rep *Report) error {
 	for _, sig := range sells {
 		pos, err := s.st.TradeRepo().GetPosition(ctx, sig.TsCode)
 		if err != nil {
@@ -280,7 +301,7 @@ func (s *Service) writeSells(ctx context.Context, svc *ticket.Service, sells []m
 		if pos.Available() <= 0 {
 			continue // 当日买入不可卖：决策保留到次日
 		}
-		if _, err := s.createOnce(ctx, svc, sig, pos.Available(), existing, p, gear, days, rep); err != nil {
+		if _, err := s.createOnce(ctx, svc, sig, pos.Available(), existing, p, days, rep); err != nil {
 			return err
 		}
 	}
@@ -289,13 +310,13 @@ func (s *Service) writeSells(ctx context.Context, svc *ticket.Service, sells []m
 
 // createOnce 写一张指令单；当日已有同标的同方向活跃单则跳过（重跑幂等）。
 func (s *Service) createOnce(ctx context.Context, svc *ticket.Service, sig model.Signal, qty model.Qty,
-	existing map[ticketKey]bool, p risk.RiskParams, gear model.Gear, days []string, rep *Report) (bool, error) {
+	existing map[ticketKey]bool, p risk.RiskParams, days []string, rep *Report) (bool, error) {
 	k := ticketKey{sig.TsCode, sig.Direction}
 	if existing[k] {
 		rep.Skipped++
 		return false, nil
 	}
-	if _, err := svc.Create(ctx, sig, qty, gear, days); err != nil {
+	if _, err := svc.Create(ctx, sig, qty, days); err != nil {
 		return false, fmt.Errorf("生成 %s %s 指令单失败: %w", sig.Direction, sig.TsCode, err)
 	}
 	existing[k] = true
@@ -379,13 +400,16 @@ func (s *Service) cashFen(ctx context.Context) (model.Fen, error) {
 func accountStateOf(positions []model.Position, cash model.Fen) risk.AccountState {
 	state := risk.AccountState{Cash: cash}
 	state.HeldCodes = make(map[string]bool, len(positions))
+	state.HeldMV = make(map[string]model.Fen, len(positions))
 	for _, pos := range positions {
 		if pos.TotalQty <= 0 {
 			continue
 		}
+		mv := pos.CostPrice.Mul(pos.TotalQty)
 		state.PositionCount++
-		state.PositionsMV += pos.CostPrice.Mul(pos.TotalQty)
+		state.PositionsMV += mv
 		state.HeldCodes[pos.TsCode] = true
+		state.HeldMV[pos.TsCode] = mv
 	}
 	state.TotalAsset = state.Cash + state.PositionsMV
 	return state

@@ -12,7 +12,6 @@ import (
 
 	"jingzhe-trader/internal/config"
 	"jingzhe-trader/internal/dataloader"
-	"jingzhe-trader/internal/goal"
 	"jingzhe-trader/internal/market"
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/store"
@@ -36,7 +35,6 @@ func newTestServerForFields(t *testing.T) (*httptest.Server, func()) {
 	deps := Deps{
 		Store:     st,
 		Config:    cfg,
-		Goal:      goal.NewService(st, goal.DefaultConfig(), ticket.NewLedger(st, market.CostParams{}, model.FromFloat(10000))),
 		Freshness: dataloader.NewFreshnessGate(st, cfg.GetInt("screen.min_bar_rows"), 0),
 		Ledger:    ticket.NewLedger(st, market.CostParams{}, model.FromFloat(10000)),
 		Tickets:   ticket.NewService(st),
@@ -78,17 +76,13 @@ func TestField_MissingRequiredParams(t *testing.T) {
 		{"skip_ticket 缺 ticket_id", "skip_ticket", map[string]interface{}{"reason": "test"}, true},
 		{"skip_ticket 缺 reason", "skip_ticket", map[string]interface{}{"ticket_id": 1}, true},
 
-		// set_gear: gear + reason
-		{"set_gear 缺 gear", "set_gear", map[string]interface{}{"reason": "test"}, true},
-		{"set_gear 缺 reason", "set_gear", map[string]interface{}{"gear": "G1"}, true},
 
 		// trigger_task: task 必填。缺失必须在进 handler 之前被拒 —
 		// 否则它会先摸到未注入的 Deps.Jobs 并 panic（HTTP 层恢复后客户端只拿到断连）。
 		{"trigger_task 缺 task", "trigger_task", map[string]interface{}{}, true},
 
-		// init_day / confirm_pace: date 非必填
+		// init_day: date 非必填
 		{"init_day 无参", "init_day", map[string]interface{}{}, false},
-		{"confirm_pace 无参", "confirm_pace", map[string]interface{}{}, false},
 	}
 
 	for _, c := range cases {
@@ -132,9 +126,6 @@ func TestField_InvalidEnumAndFormat(t *testing.T) {
 		{"get_tickets status=rejected", "get_tickets", map[string]interface{}{"date": "20260901", "status": "rejected"}},
 		{"get_tickets status=invalid", "get_tickets", map[string]interface{}{"date": "20260901", "status": "invalid_status"}},
 
-		// set_gear: gear 非法
-		{"set_gear gear=G0", "set_gear", map[string]interface{}{"gear": "G0", "reason": "test"}},
-		{"set_gear gear=X", "set_gear", map[string]interface{}{"gear": "X", "reason": "test"}},
 
 		// report_fill: price 负数
 		{"report_fill price<0", "report_fill", map[string]interface{}{"ticket_id": 1, "qty": 1000, "price": -100}},
@@ -156,7 +147,7 @@ func TestField_InvalidEnumAndFormat(t *testing.T) {
 
 // TestField_BadDateFormatRejected 日期参数必须在分发前拒掉。
 //
-// 下游 market.QuarterOf / PrevTradeDay 按 date[:4] 定长切片：短一个字符就在纯函数里 panic，
+// 下游按 date[:4] 定长切片的纯函数：短一个字符就会 panic，
 // 被调度器 recover 之后只剩一条看不出所以然的失败；读工具则会把它当成「当天没有数据」
 // 回一个空列表 —— 对外部 agent 来说那是假绿。
 func TestField_BadDateFormatRejected(t *testing.T) {
@@ -173,7 +164,6 @@ func TestField_BadDateFormatRejected(t *testing.T) {
 		{"get_tickets", map[string]interface{}{"date": "abc"}},
 		{"get_logs", map[string]interface{}{"date": "2026"}},
 		{"trigger_task", map[string]interface{}{"task": "daily_report", "date": "2026"}},
-		{"set_gear", map[string]interface{}{"gear": "G1", "reason": "覆盖到期日写错", "until": "2026-12-31"}},
 	}
 	for _, c := range cases {
 		name := c.method + " date=" + fmt.Sprint(c.args["date"])
@@ -298,7 +288,6 @@ func TestField_PriceUnitConversion(t *testing.T) {
 	deps := Deps{
 		Store:     st,
 		Config:    cfg,
-		Goal:      goal.NewService(st, goal.DefaultConfig(), ticket.NewLedger(st, market.CostParams{}, model.FromFloat(10000))),
 		Freshness: dataloader.NewFreshnessGate(st, cfg.GetInt("screen.min_bar_rows"), 0),
 		Ledger:    ticket.NewLedger(st, market.CostParams{}, model.FromFloat(10000)),
 		Tickets:   ticket.NewService(st),
@@ -379,7 +368,6 @@ func TestField_SyncPortfolioUnits(t *testing.T) {
 	deps := Deps{
 		Store:     st,
 		Config:    cfg,
-		Goal:      goal.NewService(st, goal.DefaultConfig(), ticket.NewLedger(st, market.CostParams{}, model.FromFloat(10000))),
 		Freshness: dataloader.NewFreshnessGate(st, cfg.GetInt("screen.min_bar_rows"), 0),
 		Ledger:    ticket.NewLedger(st, market.CostParams{}, model.FromFloat(10000)),
 		Tickets:   ticket.NewService(st),
@@ -573,7 +561,6 @@ func TestField_ReportFillIdempotent(t *testing.T) {
 	deps := Deps{
 		Store:     st,
 		Config:    cfg,
-		Goal:      goal.NewService(st, goal.DefaultConfig(), ticket.NewLedger(st, market.CostParams{}, model.FromFloat(10000))),
 		Freshness: dataloader.NewFreshnessGate(st, cfg.GetInt("screen.min_bar_rows"), 0),
 		Ledger:    ticket.NewLedger(st, market.CostParams{}, model.FromFloat(10000)),
 		Tickets:   ticket.NewService(st),
@@ -722,7 +709,6 @@ func TestField_WriteToolsInputOutput(t *testing.T) {
 	deps := Deps{
 		Store:     st,
 		Config:    cfg,
-		Goal:      goal.NewService(st, goal.DefaultConfig(), ticket.NewLedger(st, market.CostParams{}, model.FromFloat(10000))),
 		Freshness: dataloader.NewFreshnessGate(st, cfg.GetInt("screen.min_bar_rows"), 0),
 		Ledger:    ticket.NewLedger(st, market.CostParams{}, model.FromFloat(10000)),
 		Tickets:   ticket.NewService(st),
@@ -756,29 +742,6 @@ func TestField_WriteToolsInputOutput(t *testing.T) {
 		}
 	})
 
-	t.Run("set_gear 返回 gear 字段", func(t *testing.T) {
-		res := mcpCallOK(t, ts, "set_gear", map[string]interface{}{
-			"gear": "G1", "reason": "test_reason",
-		})
-		// set_gear 返回复杂结构，包含 Decision 字段
-		decision, ok := res["Decision"].(map[string]interface{})
-		if !ok {
-			t.Fatalf("set_gear 返回无 Decision 字段：%v", res)
-		}
-		gear, ok := decision["To"].(string)
-		if !ok || gear != "G1" {
-			t.Errorf("set_gear 返回体缺少正确 gear 字段 (To)，实际=%v", decision)
-		}
-	})
-
-	t.Run("confirm_pace 返回 confirmed", func(t *testing.T) {
-		res := mcpCallOK(t, ts, "confirm_pace", map[string]interface{}{
-			"date": "20260901",
-		})
-		if res["confirmed"] != true {
-			t.Errorf("confirm_pace 应返回 confirmed=true，实际=%v", res)
-		}
-	})
 }
 
 // ============================================================================
@@ -790,7 +753,7 @@ func createDummyTicket(ctx context.Context, st *store.Store, date, tsCode string
 	return st.TradeRepo().InsertTicket(ctx, model.OrderTicket{
 		TradeDate: date, TsCode: tsCode, Name: "测试股", Direction: dir,
 		Qty: model.Qty(qty), RefPrice: model.FromFloat(10.5), Reason: "测试原因",
-		Status: model.TicketDrafted, ValidUntil: "2026-09-02T15:00:00+08:00", Gear: model.GearG1,
+		Status: model.TicketDrafted, ValidUntil: "2026-09-02T15:00:00+08:00",
 	})
 }
 

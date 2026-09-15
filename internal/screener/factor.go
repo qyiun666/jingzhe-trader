@@ -8,7 +8,7 @@ import (
 	"jingzhe-trader/internal/model"
 )
 
-// FactorWeights 四因子权重（各档位可覆盖；权重**可为负**，负号表示该因子反向使用）。
+// FactorWeights 四因子权重（权重**可为负**，负号表示该因子反向使用）。
 //
 // 评分口径：Composite = Σ wᵢ × scoreᵢ，scoreᵢ 是"该因子原始方向的截面百分位"
 // （动量=涨幅高、低波=波动低、流动性=换手高、价值=越便宜越高）。

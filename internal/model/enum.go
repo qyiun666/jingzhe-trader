@@ -1,51 +1,5 @@
 package model
 
-import "fmt"
-
-// ===================== 风险档位 Gear =====================
-
-// Gear 风险档位：G1 标准 / G2 收紧 / G3 防守。
-type Gear string
-
-const (
-	GearG1 Gear = "G1"
-	GearG2 Gear = "G2"
-	GearG3 Gear = "G3"
-)
-
-// Valid 是否为合法档位。
-func (g Gear) Valid() bool {
-	switch g {
-	case GearG1, GearG2, GearG3:
-		return true
-	default:
-		return false
-	}
-}
-
-// Label 中文标签。
-func (g Gear) Label() string {
-	switch g {
-	case GearG1:
-		return "标准"
-	case GearG2:
-		return "收紧"
-	case GearG3:
-		return "防守"
-	default:
-		return "未知"
-	}
-}
-
-// ParseGear 解析档位字符串，非法返回 error。
-func ParseGear(s string) (Gear, error) {
-	g := Gear(s)
-	if !g.Valid() {
-		return "", fmt.Errorf("非法风险档位: %q（应为 G1/G2/G3）", s)
-	}
-	return g, nil
-}
-
 // ===================== 指令单状态 TicketStatus =====================
 
 // TicketStatus 指令单状态机：drafted → issued → {filled|skipped|expired}。
@@ -142,8 +96,7 @@ func (a AlertLevel) Valid() bool {
 
 // MailType 五类邮件：M1 次日指令 / M2 盘前提醒 / M3 盘中紧急 / M5 日报 / M6 异常告警。
 //
-// 原 M4「档位变更立即发」已删（2026-09-04）：没有任何一处发送过它，
-// 而当前档位就在每封邮件顶部三行的第一行、日报也按档位单列 —— 变更当天必然看得见。
+// 原 M4「档位变更立即发」已删（2026-09-04，随目标档位状态机一并下线）。
 type MailType string
 
 const (

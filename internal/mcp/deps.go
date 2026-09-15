@@ -8,7 +8,6 @@ import (
 
 	"jingzhe-trader/internal/config"
 	"jingzhe-trader/internal/dataloader"
-	"jingzhe-trader/internal/goal"
 	"jingzhe-trader/internal/store"
 	"jingzhe-trader/internal/ticket"
 )
@@ -34,7 +33,6 @@ type Deps struct {
 	Config     *config.Config
 	Ledger     *ticket.Ledger
 	Tickets    *ticket.Service
-	Goal       *goal.Service
 	Freshness  *dataloader.FreshnessGate
 	Liveness   Liveness
 	Jobs       JobRunner

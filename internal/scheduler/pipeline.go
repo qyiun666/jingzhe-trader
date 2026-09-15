@@ -14,8 +14,8 @@ import (
 
 // eveningPipeline 收盘后整链大方法：一条顺序流水线，任一步失败即整链失败（落 run_trace outcome=fail）。
 //
-// ① 行情同步 → ② 新鲜度门禁 → ③ 季度档位 → ④ 选股漏斗 → ⑤ 买卖决策 → ⑥ 写待买卖表。
-// 只有 ①③⑥ 写库：行情是缓存、档位是一行状态、指令单是结果；④⑤ 的中间产物全部在内存里传递，
+// ① 行情同步 → ② 新鲜度门禁 → ③ 选股漏斗 → ④ 买卖决策 → ⑤ 写待买卖表。
+// 只有 ①⑤ 写库：行情是缓存、指令单是结果；③④ 的中间产物全部在内存里传递，
 // 每级进出计数写日志。
 func eveningPipeline(ctx context.Context, rc *observability.RunCtx, d Deps) error {
 	date := rc.TradeDate()
@@ -26,19 +26,45 @@ func eveningPipeline(ctx context.Context, rc *observability.RunCtx, d Deps) erro
 		d.raiseU(rc, "DATA_STALE", "数据不新鲜，当日不出指令", err.Error())
 		return fmt.Errorf("② 新鲜度门禁: %w", err)
 	}
-	if err := evaluateGear(ctx, rc, d, date); err != nil {
-		return fmt.Errorf("③ 档位评估: %w", err)
-	}
-	rp, gear, err := d.RiskParams(ctx, date)
+	rp, err := d.RiskParams(ctx, date)
 	if err != nil {
 		return fmt.Errorf("读取生效风控参数失败: %w", err)
 	}
+	// 收盘后先用当日收盘抬升持仓期间高点：这是移动止盈回撤基准的兜底更新
+	// （盘中扫描每 5 分钟也抬一次；网络/行情缺失导致盘中没跑成时，这里补上）。
+	if err := raiseHighWatermarks(ctx, d, date); err != nil {
+		return fmt.Errorf("更新持仓期间高点: %w", err)
+	}
 	cands, err := screenCandidates(ctx, rc, d, date, rp)
 	if err != nil {
-		return fmt.Errorf("④ 选股: %w", err)
+		return fmt.Errorf("③ 选股: %w", err)
 	}
-	if err := buildTickets(ctx, rc, d, date, cands, rp, gear); err != nil {
-		return fmt.Errorf("⑤ 买卖决策: %w", err)
+	if err := buildTickets(ctx, rc, d, date, cands, rp); err != nil {
+		return fmt.Errorf("④ 买卖决策: %w", err)
+	}
+	return nil
+}
+
+// raiseHighWatermarks 用当日收盘价抬升每个持仓的期间最高价（只升不降）。
+//
+// 移动止盈的回撤基准就是这个列，而它此前只在买入成交时写入 —— 不补这一手，
+// "自高点回撤"永远从买入价起算，移动止盈形同虚设。
+func raiseHighWatermarks(ctx context.Context, d Deps, date string) error {
+	pos, err := d.Store.TradeRepo().ListPositions(ctx)
+	if err != nil {
+		return fmt.Errorf("读取持仓失败: %w", err)
+	}
+	for _, p := range pos {
+		if p.TotalQty <= 0 {
+			continue
+		}
+		bar, err := d.Store.ScreenRepo().LatestBarAt(ctx, p.TsCode, date)
+		if err != nil {
+			return fmt.Errorf("读取持仓 %s 收盘价失败: %w", p.TsCode, err)
+		}
+		if err := d.Store.TradeRepo().RaiseHighPrice(ctx, p.TsCode, bar.RawClose); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -83,21 +109,6 @@ func gateFreshness(ctx context.Context, d Deps, date string) error {
 	return nil
 }
 
-// evaluateGear 季度档位评估：总资产由 goal 经注入的资产源实时推算（不落库），
-// 结果只更新档位状态这一个键（config_kv 的 goal.state）。
-func evaluateGear(ctx context.Context, rc *observability.RunCtx, d Deps, date string) error {
-	rc.Declare("state", "goal", -1)
-	res, err := d.Goal.Evaluate(ctx, date)
-	if err != nil {
-		return fmt.Errorf("季度档位评估失败: %w", err)
-	}
-	rc.Actual("goal", 1)
-	observability.S().Infow("档位评估完成",
-		"date", date, "gear", string(res.Decision.To), "changed", res.Decision.Changed,
-		"reason", res.Decision.Reason, "progress_pct", res.Metrics.Progress)
-	return nil
-}
-
 // screenCandidates 跑选股漏斗（全程内存），返回进入决策链的候选。
 func screenCandidates(ctx context.Context, rc *observability.RunCtx, d Deps, date string,
 	rp risk.RiskParams) ([]model.Candidate, error) {
@@ -118,10 +129,35 @@ func screenCandidates(ctx context.Context, rc *observability.RunCtx, d Deps, dat
 		rc.Actual(key, st.Out)
 	}
 	if rep.Empty {
-		rc.Degrade("SCREEN_EMPTY", "候选 0 条，卡在哪一级见上方漏斗行")
+		rc.Degrade("SCREEN_EMPTY", emptyReason(rep))
 	}
 	return rep.Candidates, nil
 }
+
+// emptyReason 候选为空的人话原因：区分"大盘闸门关闭"（设计内、非故障）与
+// "漏斗某级把票筛光"。日报/计划邮件直接引用这句，用户不必去翻日志。
+func emptyReason(rep *screener.Report) string {
+	for _, st := range rep.Stages {
+		if st.Slug == "regime" && st.Out == 0 {
+			return "大盘在 MA60 下方，当日按规则关闭买入漏斗（非故障）"
+		}
+	}
+	// 非关闸：报出最后一级把池子筛到 0 的环节。
+	var last string
+	for _, st := range rep.Stages {
+		if st.Out == 0 {
+			last = st.Name
+			break
+		}
+	}
+	if last != "" {
+		return "漏斗在「" + last + "」筛光候选（打分样本 " + itoa(rep.ScoredTotal) + " 只）"
+	}
+	return "候选 0 条（打分样本 " + itoa(rep.ScoredTotal) + " 只）"
+}
+
+// itoa 小整型转串（避免为一处拼接引入 strconv 依赖）。
+func itoa(n int) string { return fmt.Sprintf("%d", n) }
 
 // ScreenBudget 组装选股漏斗的资金与大盘口径：
 // 单笔预算 = 可用现金 / 计划持仓数；大盘跌破 MA60 时当日关闭买入漏斗。
@@ -156,12 +192,12 @@ func ScreenBudget(ctx context.Context, st *store.Store, led *ticket.Ledger,
 // 买入决策权在 LLM 评审员手里，因此 llm.enabled=false 不是"少一道终审"，而是"当日不可能有买单"——
 // 这一点必须显式告警，否则人会以为流水线跑通了却什么都没买到。
 func buildTickets(ctx context.Context, rc *observability.RunCtx, d Deps, date string,
-	cands []model.Candidate, rp risk.RiskParams, gear model.Gear) error {
+	cands []model.Candidate, rp risk.RiskParams) error {
 	if !d.Decider.Enabled() {
 		d.raiseU(rc, "LLM_DISABLED", "买入决策未启用，当日不会有任何买单",
 			"llm.enabled=false 或 api_key/model 缺失；风控参数不会替代决策者")
 	}
-	rep, err := d.Signal.Generate(ctx, date, cands, rp, gear, d.Decider)
+	rep, err := d.Signal.Generate(ctx, date, cands, rp, d.Decider)
 	if err != nil {
 		return err
 	}
@@ -184,6 +220,13 @@ func buildTickets(ctx context.Context, rc *observability.RunCtx, d Deps, date st
 	if rep.Rejected > 0 && rep.Tickets == 0 && rep.Approved+rep.SellSignals > 0 {
 		d.raiseU(rc, "ALL_REJECTED", "有决策但全被风控否决", fmt.Sprintf("否决 %d 条", rep.Rejected))
 		rc.Degrade("ALL_REJECTED", fmt.Sprintf("否决 %d 条", rep.Rejected))
+	}
+	// 有候选却 0 指令：候选非空说明漏斗正常，是"评审全否/风控全拒"这类要交代的结论。
+	// 单列一条降级让日报/计划邮件能引用（不重复：ALL_REJECTED 已覆盖"有决策被全拒"）。
+	if len(cands) > 0 && rep.Tickets == 0 && rep.Rejected == 0 {
+		rc.Degrade("NO_TICKET_FROM_CANDIDATES",
+			fmt.Sprintf("有 %d 只候选但当日 0 指令（模型否决 %d、未问出 %d）",
+				len(cands), rep.Declined, rep.Failed))
 	}
 	return nil
 }
