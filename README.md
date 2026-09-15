@@ -116,16 +116,26 @@ make -f deploy/Makefile build     # 产物 bin/jingzhe
 | `db` | `audit` = 清点库结构与现役 schema 的差异（遗留表/索引、`daily_bar` 是否仍为普通表），有差异非零退出；`rebuild-bar` = 把 `daily_bar` 重建为 `WITHOUT ROWID`（离线执行） |
 | `research` | `backfill` = 从 Tushare 回补多年历史到库外 CSV.gz（`data/backtest/`，不进 SQLite）；`ic` = 在回补历史上计算各因子的 RankIC/ICIR，并对照"当前生产权重 vs IC 反向权重"两个综合分 |
 
-### 因子方向（`screen.factor_mode`）
+### 因子方向（`screen.factor_mode`，默认 `reversal`）
 
-用 2023-09~2026-09 的 728 个交易日实测（20 日 RankIC）：**当前生产权重下综合分 IC = −0.0896（ICIR −0.648）**，
-即原方向系统性选到跑输的票；把动量/低波/流动性反向使用后 **+0.0927**，前后两段独立样本同为负、方向修正后同为正。
+用 2023-09~2026-09 的 728 个交易日实测（20 日 RankIC，可投池，689 个截面）：
+
+| 方向 | 综合分 IC | ICIR |
+|---|---|---|
+| 原始权重（动量 0.30/价值 0.25/低波 0.20/流动性 0.25） | **−0.0896** | −0.648 |
+| 反向权重（`ReversalWeights`） | **+0.0930** | +0.494 |
+
+即原始方向系统性选到跑输的票（A 股月频反转，与"高换手/高波动透支"的文献结论一致）。
+前后两段独立样本（300 / 389 个截面）一边同为负、另一边同为正，非样本内挑参，故**默认已取 `reversal`**。
 
 ```bash
-jingzhe -db data/jingzhe.db config get screen.factor_mode      # 默认 momentum（原方向，生产行为不变）
-jingzhe -db data/jingzhe.db config set screen.factor_mode reversal   # 采纳 IC 结论（反向使用三条因子）
-jingzhe -db data/jingzhe.db research ic --dir data/backtest --horizon 20   # 复核
+jingzhe -db data/jingzhe.db config get screen.factor_mode   # 默认 reversal
+jingzhe -db data/jingzhe.db research ic --dir data/backtest --horizon 20   # 复核 IC（含当前 vs 反向对照）
+jingzhe -db data/jingzhe.db config set screen.factor_mode momentum         # 回退到原始方向（A/B 对照用）
 ```
+
+> 改这一项会影响每一笔选股，属策略层变更。回补历史与跑 IC 的命令见 `jingzhe research` 子命令说明；
+> 回补产物写在 `data/backtest/`（库外 CSV.gz，不进版本库）。
 
 ## MCP 对外接口（给外部 Agent）
 

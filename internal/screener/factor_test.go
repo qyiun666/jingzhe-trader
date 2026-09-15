@@ -28,9 +28,26 @@ func TestWeightsByModeReversalFlipsSign(t *testing.T) {
 	if r.Value <= 0 {
 		t.Errorf("价值因子 IC 为正，反向模式下应保持正权重，实际 %.2f", r.Value)
 	}
-	// 未知模式回落 momentum（装配期 validateEnums 会先拦，此处是兜底）。
-	if got := WeightsByMode("bogus"); got != d {
-		t.Errorf("未知模式应回落 momentum 权重")
+	// 兜底与 config 键目录的默认值一致（reversal），不是任意一侧。
+	// 非法取值由装配期 validateEnums 与 research ic 各自 fail-closed 拦下。
+	if got := WeightsByMode(""); got != ReversalWeights() {
+		t.Errorf("空模式应回落 reversal（与默认值一致），实际 %+v", got)
+	}
+	if got := WeightsByMode("bogus"); got != ReversalWeights() {
+		t.Errorf("未知模式应回落 reversal（与默认值一致），实际 %+v", got)
+	}
+}
+
+// TestDefaultFactorModeIsReversal 键目录默认值与 WeightsByMode 的兜底必须同向：
+// 两处一旦分叉，"生产在用哪个方向"就没有唯一答案。
+func TestDefaultFactorModeIsReversal(t *testing.T) {
+	// 与 internal/config/keys.go 的 screen.factor_mode 默认值保持同一口径。
+	const keyDefault = "reversal"
+	if !ValidFactorMode(keyDefault) {
+		t.Fatalf("%s 不是合法模式", keyDefault)
+	}
+	if got := WeightsByMode(keyDefault); got != ReversalWeights() {
+		t.Errorf("键目录默认值 %s 应映射到 ReversalWeights，实际 %+v", keyDefault, got)
 	}
 }
 

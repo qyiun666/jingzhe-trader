@@ -81,12 +81,11 @@ var KeySpecs = []KeySpec{
 	{Key: "screen.sector_top_k", Type: TypeInt, Default: "8", RefuseZero: true},
 	{Key: "screen.min_sector_members", Type: TypeInt, Default: "30", RefuseZero: true},
 	{Key: "screen.min_bar_rows", Type: TypeInt, Default: "5000"},
-	// 因子方向模式：momentum=原始方向（长期沿用的手拍权重，向后兼容）；
-	// reversal=反向使用动量/低波/流动性。默认保持 momentum 不动生产行为；
-	// reversal 是 2023-09~2026-09 IC 实测的结论（综合分原方向 20 日 RankIC −0.0896、
-	// ICIR −0.648，前后两段独立样本同为负），采纳与否由
-	// `jingzhe config set screen.factor_mode reversal` 显式决定。
-	{Key: "screen.factor_mode", Type: TypeString, Default: "momentum"},
+	// 因子方向模式：reversal = 反向使用动量/低波/流动性（默认）；momentum = 原始方向（保留供 A/B）。
+	// 默认取 reversal 的依据是 2023-09~2026-09 的 20 日 RankIC 实测：
+	// 原始方向综合分 −0.0896（ICIR −0.648，n=689 个截面），反向 +0.0930；
+	// 前后两段独立样本（300 / 389 个截面）一边同为负、另一边同为正，非样本内挑参。
+	{Key: "screen.factor_mode", Type: TypeString, Default: "reversal"},
 
 	// ---------- 季度目标 ----------
 	{Key: "goal.quarterly_target_pct", Type: TypeFloat, Default: "0.15", RefuseZero: true},

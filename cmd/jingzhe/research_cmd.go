@@ -140,7 +140,6 @@ func researchIC(ctx context.Context, st *store.Store, args []string) {
 	cfg.MinCodes = *minCodes
 	cfg.From = *from
 	cfg.To = *to
-	cfg.Weights = screener.WeightsByMode(mode)
 	switch *universe {
 	case "broad":
 		fmt.Println("口径：全市场（未套硬门槛，会被微盘股污染，仅供参考）")
@@ -155,11 +154,26 @@ func researchIC(ctx context.Context, st *store.Store, args []string) {
 		fmt.Fprintf(os.Stderr, "IC 计算失败: %v\n", err)
 		os.Exit(1)
 	}
-	printICReport(res, *horizon)
+	printICReport(res, *horizon, mode)
 }
 
 // printICReport 输出 IC 报告（含带符号的权重建议）。
-func printICReport(res backtest.Result, onlyHorizon int) {
+//
+// 两个综合分并排展示：composite 是**当前配置的方向**，composite_rev 是 IC 反向方向。
+// 标签按当前模式生成——写死"当前生产权重"会在默认翻成 reversal 后指向错误的一侧。
+func printICReport(res backtest.Result, onlyHorizon int, mode string) {
+	// 两个综合分是固定方向，标签标出哪个是当前生效方向；不写死，否则默认一变就指错侧。
+	const alt = "（备用，A/B 对照）"
+	origLabel, revLabel := "综合分(原始 momentum 权重)", "综合分(IC 反向权重)"
+	curComposite := "composite_rev"
+	if mode == screener.ModeMomentum {
+		origLabel += "（当前生效）"
+		revLabel += alt
+		curComposite = "composite"
+	} else {
+		origLabel += alt
+		revLabel += "（当前生效）"
+	}
 	fmt.Printf("参与截面 %d 个\n\n", res.TradeDates)
 	for _, hz := range backtest.Horizons {
 		if onlyHorizon != 0 && hz != onlyHorizon {
@@ -171,15 +185,11 @@ func printICReport(res backtest.Result, onlyHorizon int) {
 				fmt.Println("  " + f.Describe())
 			}
 		}
-		// 两个综合分并排：直接看方向修正是否把 IC 由负转正。
-		for _, name := range []string{"composite", "composite_rev"} {
-			if f, ok := res.Find(name, hz); ok {
-				label := "综合分(当前生产权重)"
-				if name == "composite_rev" {
-					label = "综合分(IC 反向权重)"
-				}
-				fmt.Printf("  %-22s IC=%+.4f  ICIR=%+.3f  n=%d\n", label, f.ICMean, f.ICIR, f.N)
-			}
+		if f, ok := res.Find("composite", hz); ok {
+			fmt.Printf("  %s IC=%+.4f  ICIR=%+.3f  n=%d\n", origLabel, f.ICMean, f.ICIR, f.N)
+		}
+		if f, ok := res.Find("composite_rev", hz); ok {
+			fmt.Printf("  %s IC=%+.4f  ICIR=%+.3f  n=%d\n", revLabel, f.ICMean, f.ICIR, f.N)
 		}
 		if w := res.WeightsFor(hz); len(w) > 0 {
 			fmt.Printf("  按 IC **带符号**归一的可选权重（负号=该因子方向与收益相反，应反向使用）: ")
@@ -194,16 +204,16 @@ func printICReport(res backtest.Result, onlyHorizon int) {
 		}
 		fmt.Println()
 	}
-	// 综合分 IC 是最该看的一个数：它就是当前选股公式的预测力。
-	if f, ok := res.Find("composite", 20); ok {
+	// 当前生效方向的综合分 IC 是最该看的一个数：它就是当前选股公式的预测力。
+	if f, ok := res.Find(curComposite, 20); ok {
 		verdict := "正向可用"
 		switch {
 		case !f.Usable():
 			verdict = "无显著预测力"
 		case f.ICMean < 0:
-			verdict = "⚠ 反向：当前权重下综合分系统性选到跑输的票"
+			verdict = "⚠ 反向：当前配置下综合分系统性选到跑输的票"
 		}
-		fmt.Printf("综合分（生产当前权重）20 日 IC=%+.4f ICIR=%+.3f → %s\n", f.ICMean, f.ICIR, verdict)
+		fmt.Printf("当前生效方向 %s 20 日 IC=%+.4f ICIR=%+.3f → %s\n", mode, f.ICMean, f.ICIR, verdict)
 	}
 }
 

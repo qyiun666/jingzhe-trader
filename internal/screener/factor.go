@@ -20,17 +20,16 @@ type FactorWeights struct {
 	Liquidity float64
 }
 
-// DefaultWeights 均衡权重（原始方向，合计 1.0）。
+// DefaultWeights 原始方向权重（合计 1.0）。**已不是默认**，保留供 A/B 对照。
 //
-// ⚠ 这是长期沿用的手拍权重，未经 IC 验证。2023-09~2026-09 的 IC 实测显示它的
-// 综合分是**反向**的（2026-09-15：20 日 RankIC −0.0896，ICIR −0.648，样本 689 个截面，
-// 前后两段独立样本同为负）——保留它只为向后兼容与 A/B 对照，
-// 有证据的替代是 ReversalWeights（见 screen.factor_mode 配置）。
+// ⚠ 这是长期沿用的手拍权重，未经 IC 验证：2023-09~2026-09 实测其综合分是**反向**的
+// （20 日 RankIC −0.0896、ICIR −0.648，n=689 个截面；前后两段独立样本同为负）。
+// 默认方向已改为 ReversalWeights（见 screen.factor_mode）。
 func DefaultWeights() FactorWeights {
 	return FactorWeights{Momentum: 0.30, Value: 0.25, LowVol: 0.20, Liquidity: 0.25}
 }
 
-// ReversalWeights 按 2023-09~2026-09 IC 实测得出的方向权重（Σ|w| = 1）。
+// ReversalWeights IC 实测得出的方向权重（Σ|w| = 1，当前默认）。
 //
 // 实测结论（20 日 RankIC，可投池，n=689 个截面；前后两段独立复核）：
 //
@@ -40,27 +39,29 @@ func DefaultWeights() FactorWeights {
 //	价值 +0.026（+0.041 / +0.015）→ 方向为正但弱，给较小正权重
 //
 // 三条负 IC 与 A 股"月频反转、高换手/高波动透支"的文献结论一致。
-// 幅度按 |IC| 归一到合计 1（价值因未达 |IC|≥0.03 门槛，按最小可辨权重 0.1 给）。
+// 综合分由 −0.0896 转为 +0.0930。
 //
-// 这不是"最优参数"：它只把已被数据否定的三个方向掉头，未做参数寻优
-// （本仓已有先例：MA40 全样本最优因属样本内挑参而弃用）。方向由 IC 决定，
-// 幅度保持朴素，避免过拟合。
+// 幅度是"三等分 + 价值 0.10"的朴素取整，不是严格按 |IC| 复算：方向由 IC 决定，
+// 幅度不做参数寻优（本仓已有先例：MA40 全样本最优因属样本内挑参而弃用）。
+//
+// 注意 LowVol 因子的原始口径是"日收益波动率"（分越高波动越大），故负权重
+// 实际等价于**买入低波动**——与因子名一致，方向上正是低波异象。
 func ReversalWeights() FactorWeights {
 	return FactorWeights{Momentum: -0.30, Value: 0.10, LowVol: -0.30, Liquidity: -0.30}
 }
 
 // WeightsByMode 按配置的模式取权重。
 //
-//	"momentum"（默认，向后兼容）：原始方向
-//	"reversal"（IC 验证）：反向使用动量/低波/流动性
+//	"momentum"：原始方向（A/B 对照用）
+//	其余（含 "" 与反常值）：IC 验证的反向方向
 //
-// 未知取值回落到默认：装配期 validateEnums 会拒绝非法值，但 CLI 的 db/research/config
-// 等入口不走装配（见 research_cmd 的调用点），回落是这些入口的兜底而非静默容错。
+// 兜底走 reversal 而非 momentum：config 键目录的默认值就是 reversal，这里取"与默认一致"
+// 而不是任意一侧。非法取值由装配期 validateEnums 与 research ic 各自 fail-closed 拦下。
 func WeightsByMode(mode string) FactorWeights {
-	if mode == ModeReversal {
-		return ReversalWeights()
+	if mode == ModeMomentum {
+		return DefaultWeights()
 	}
-	return DefaultWeights()
+	return ReversalWeights()
 }
 
 // ValidFactorMode 模式取值是否合法（供 config set 与装配期共用同一份判据）。

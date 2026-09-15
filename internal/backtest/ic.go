@@ -82,8 +82,7 @@ func (r *Result) Find(name string, horizon int) (FactorIC, bool) {
 
 // Config IC 计算参数。
 type Config struct {
-	Weights screener.FactorWeights // 综合分权重（默认与生产一致）
-	MinBars int                    // 因子窗口根数（与选股器一致）
+	MinBars int // 因子窗口根数（必须与 screener.BarWindow 一致，见 validate）
 	// MinCodes 单截面的最小样本数：少于它该截面不参与（样本太小的 IC 是噪声）。
 	MinCodes int
 	// Step 采样步长（每 N 个交易日算一个截面）。1 = 每个交易日都算。
@@ -99,7 +98,7 @@ type Config struct {
 
 // DefaultConfig 与生产同口径的默认参数。
 func DefaultConfig() Config {
-	return Config{Weights: screener.DefaultWeights(), MinBars: 20, MinCodes: 50, Step: 1}
+	return Config{MinBars: screener.BarWindow(), MinCodes: 50, Step: 1}
 }
 
 // RunIC 在历史数据上计算各因子的 RankIC 序列。
@@ -265,8 +264,9 @@ func crossSection(h *History, window []string, date string, cfg Config) ([]strin
 	fs := screener.BuildFactorScores(codes, raw, pePB)
 
 	out := map[string][]float64{}
-	// composite 用配置权重（= 当前生产方向），composite_rev 恒用 IC 验证的反向权重，
-	// 两者并排输出才能直接对照"改用反向权重后综合分 IC 是否由负转正"。
+	// 两个综合分是**固定**的两个方向（原始 vs 反向），不随当前配置移动：
+	// 若按"当前配置 + 反向"取值，默认翻成 reversal 后两者会算成同一个公式，
+	// A/B 对照直接塌缩成一行相同数字（曾如此）。标签由 CLI 按当前模式生成。
 	for _, name := range FactorNames {
 		col := make([]float64, len(codes))
 		for i, c := range codes {
@@ -280,7 +280,7 @@ func crossSection(h *History, window []string, date string, cfg Config) ([]strin
 			case "liquidity":
 				col[i] = fs[c].Liquidity
 			case "composite":
-				col[i] = screener.Composite(fs[c], cfg.Weights)
+				col[i] = screener.Composite(fs[c], screener.DefaultWeights())
 			case "composite_rev":
 				col[i] = screener.Composite(fs[c], screener.ReversalWeights())
 			}
