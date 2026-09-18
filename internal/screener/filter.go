@@ -131,25 +131,6 @@ func hasValuation(s model.StockBasic, tradeDate string) bool {
 	return s.ValDate == tradeDate
 }
 
-// HardFilters 复现生产漏斗里"只依赖估值与价格"的硬门槛（流动性 + 估值 + 一手可负担性）。
-//
-// 存在的理由：IC/回测必须在与选股器**同一个可投池**上度量。用全市场算出来的因子 IC
-// 会被微盘股（生产已按 50 亿流通市值剔除）的行为污染，尤其换手率与波动率这两个因子
-// 在微盘股上的表现与可投池内差别很大。
-//
-// 刻意不覆盖三处需要额外数据的门槛（ST/上市天数/停牌/行业），它们要 stock_basic 的
-// 名称与上市日、以及当日停牌集合：回测历史里没有这些列，硬凑会造假数据。
-// 因此本函数给出的是"可投池的近似"，比全市场近一步，但不是生产池的精确复刻。
-func HardFilters(s model.StockBasic, price model.Fen, cfg FilterConfig) bool {
-	if ok, _ := liquidityStage(s, cfg); !ok {
-		return false
-	}
-	if ok, _ := valuationStage(s, price, cfg); !ok {
-		return false
-	}
-	return true
-}
-
 // listDaysBetween 计算上市天数（listDate/tradeDate 均为 YYYYMMDD；解析失败返回 -1）。
 func listDaysBetween(listDate, tradeDate string) int {
 	if len(listDate) != 8 || len(tradeDate) != 8 {

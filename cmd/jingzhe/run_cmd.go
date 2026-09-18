@@ -197,12 +197,22 @@ func printScreenerReport(rep *screener.Report) {
 	for _, st := range rep.Stages {
 		fmt.Printf("  [%d] %-22s %6d → %6d  %s\n", st.Stage, st.Name, st.In, st.Out, dropText(st.Drops))
 	}
+	if len(rep.Shadow) > 0 {
+		fmt.Printf("大盘闸门关闭，当日不出单；影子候选 %d 只（漏斗各级照常执行，仅不进入决策）：\n", len(rep.Shadow))
+		printCandidates(rep.Shadow)
+		return
+	}
 	if rep.Empty {
-		fmt.Println("候选 0 条：已落 SCREEN_EMPTY urgent 告警（卡在哪一级见上方漏斗）")
+		fmt.Println("候选 0 条：已落 alert:SCREEN_EMPTY 轨迹（卡在哪一级见上方漏斗）")
 		return
 	}
 	fmt.Printf("候选 Top%d：\n", len(rep.Candidates))
-	for _, c := range rep.Candidates {
+	printCandidates(rep.Candidates)
+}
+
+// printCandidates 逐只打印候选/影子候选的因子构成与理由。
+func printCandidates(list []model.Candidate) {
+	for _, c := range list {
 		fmt.Printf("  #%02d %s %s 收盘 %s元｜评分 %.1f [动量%.0f 价值%.0f 低波%.0f 流动%.0f] 板块 %s(%+.1f%%)\n      %s\n",
 			c.Rank, c.TsCode, c.Name, c.Close, c.Score,
 			c.Factors.Momentum, c.Factors.Value, c.Factors.LowVol, c.Factors.Liquidity,

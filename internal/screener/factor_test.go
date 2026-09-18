@@ -29,7 +29,7 @@ func TestWeightsByModeReversalFlipsSign(t *testing.T) {
 		t.Errorf("价值因子 IC 为正，反向模式下应保持正权重，实际 %.2f", r.Value)
 	}
 	// 兜底与 config 键目录的默认值一致（reversal），不是任意一侧。
-	// 非法取值由装配期 validateEnums 与 research ic 各自 fail-closed 拦下。
+	// 非法取值由装配期 validateEnums 在启动时拦下。
 	if got := WeightsByMode(""); got != ReversalWeights() {
 		t.Errorf("空模式应回落 reversal（与默认值一致），实际 %+v", got)
 	}
@@ -79,32 +79,55 @@ func TestCompositeDirectionMatters(t *testing.T) {
 	}
 }
 
-// TestHardFiltersMatchesProductionStages HardFilters 是全部 IC 数字的"可投池"定义，
-// 它必须与生产漏斗的流动性/估值两级判定一致。漏掉任一级会让 IC 静默漂移。
-func TestHardFiltersMatchesProductionStages(t *testing.T) {
+// TestPoolStagesDropReasons 可投池两级的边界与淘汰原因。这两个函数就是生产漏斗真正
+// 执行的那两级，改门槛文案或判定顺序时这里必须同步——原 HardFilters 那层包装已随
+// 回测模块一起下线，留着它等于给同一个池子写两套实现。
+func TestPoolStagesDropReasons(t *testing.T) {
 	cfg := FilterConfig{MinCircMvW: 500000, MinTurnoverRate: 1.0, PriceLow: 2.0, PETtmMax: 80, PBMax: 10}
 	price := model.FromFloat(10)
-	good := model.StockBasic{CircMvW: 600000, TurnoverRate: 1.5, PETtm: 20, PB: 2}
-	if !HardFilters(good, price, cfg) {
-		t.Error("全部达标的票应通过")
+	good := model.StockBasic{CircMvW: 600000, TurnoverRate: 1.5, PETtm: 20, PB: 2, ValDate: "20260918"}
+
+	if ok, why := liquidityStage(good, cfg); !ok {
+		t.Errorf("全部达标的票应通过流动性筛，实际淘汰原因 %q", why)
 	}
-	cases := []struct {
+	if ok, why := valuationStage(good, price, cfg); !ok {
+		t.Errorf("全部达标的票应通过估值筛，实际淘汰原因 %q", why)
+	}
+
+	liqCases := []struct {
+		name string
+		mut  func(*model.StockBasic)
+		want string
+	}{
+		{"流通市值不足", func(s *model.StockBasic) { s.CircMvW = 400000 }, reasonSmallMV},
+		{"市值未知", func(s *model.StockBasic) { s.CircMvW = 0 }, reasonSmallMV},
+		{"换手不足", func(s *model.StockBasic) { s.TurnoverRate = 0.5 }, reasonIlliquid},
+	}
+	for _, c := range liqCases {
+		s := good
+		c.mut(&s)
+		if ok, why := liquidityStage(s, cfg); ok || why != c.want {
+			t.Errorf("%s：应淘汰为 %q，实际 ok=%t why=%q", c.name, c.want, ok, why)
+		}
+	}
+
+	valCases := []struct {
 		name  string
 		mut   func(*model.StockBasic)
 		price model.Fen
+		want  string
 	}{
-		{"流通市值不足", func(s *model.StockBasic) { s.CircMvW = 400000 }, price},
-		{"换手不足", func(s *model.StockBasic) { s.TurnoverRate = 0.5 }, price},
-		{"价格过低", func(s *model.StockBasic) {}, model.FromFloat(1.5)},
-		{"亏损(PE<=0)", func(s *model.StockBasic) { s.PETtm = -1 }, price},
-		{"PE 超标", func(s *model.StockBasic) { s.PETtm = 200 }, price},
-		{"PB 超标", func(s *model.StockBasic) { s.PB = 30 }, price},
+		{"价格过低", func(s *model.StockBasic) {}, model.FromFloat(1.5), reasonPriceOut},
+		{"报不出价", func(s *model.StockBasic) {}, model.Fen(0), reasonPriceOut},
+		{"亏损(PE<=0)", func(s *model.StockBasic) { s.PETtm = -1 }, price, reasonBadPE},
+		{"PE 超标", func(s *model.StockBasic) { s.PETtm = 200 }, price, reasonBadPE},
+		{"PB 超标", func(s *model.StockBasic) { s.PB = 30 }, price, reasonBadPB},
 	}
-	for _, c := range cases {
+	for _, c := range valCases {
 		s := good
 		c.mut(&s)
-		if HardFilters(s, c.price, cfg) {
-			t.Errorf("%s：应被剔除，实际通过", c.name)
+		if ok, why := valuationStage(s, c.price, cfg); ok || why != c.want {
+			t.Errorf("%s：应淘汰为 %q，实际 ok=%t why=%q", c.name, c.want, ok, why)
 		}
 	}
 }

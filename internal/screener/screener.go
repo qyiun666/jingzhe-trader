@@ -70,6 +70,14 @@ type Report struct {
 	ScoredTotal int
 	Empty       bool
 	Notes       []string
+
+	// RegimeClosed 大盘闸门关闭（指数在 MA60 下方）。判定这一件事原先只有一处依据
+	// ——遍历 Stages 找 slug=regime 且 Out==0，闸门一旦改成不清零池子那个依据就没了，
+	// 故由漏斗自己落一个旗标，下游（告警文案、产出物期望）只读它。
+	RegimeClosed bool
+	// Shadow 闸门关闭时跑完漏斗得到的候选：只用于展示"若开闸会选到谁"，
+	// 不进决策链（Candidates 保持 nil ⇒ 0 指令）。
+	Shadow []model.Candidate
 }
 
 // StageStat 漏斗单级进出统计（只写日志，不落库）。
@@ -106,8 +114,11 @@ func (in *inputs) price(tsCode string) model.Fen {
 	return model.Fen(int64(r[len(r)-1] + 0.5))
 }
 
-// Run 执行选股流水线：板块强弱排名 → 资格 → 板块 → 可用资金 → 流动性 → 估值 → 因子排名 TopN。
+// Run 执行选股流水线：板块强弱排名 → 资格 → 大盘门槛 → 板块 → 可用资金 → 流动性 → 估值 → 因子排名 TopN。
 // 数据全部读自本地缓存，本函数不触网；任何过程都不写库，只有候选为空时落一条告警。
+//
+// 大盘闸门关闭时各级照常执行，产出落在 Report.Shadow，Candidates 保持 nil ——
+// "关闸不出单"这条不变量只由 Candidates 为空来保证，不靠中途 return。
 func (s *Screener) Run(ctx context.Context, tradeDate string, budget Budget) (*Report, error) {
 	in, err := s.load(ctx, tradeDate)
 	if err != nil {
@@ -126,9 +137,11 @@ func (s *Screener) Run(ctx context.Context, tradeDate string, budget Budget) (*R
 	})
 
 	if !budget.MarketOK {
-		rep.Empty = true
-		tr.gate("regime", "大盘门槛(指数≥MA60)", survivors, reasonMarketRegime)
-		return rep, s.finish(ctx, tradeDate, rep)
+		// 闸门关闭不再短路漏斗：跑完打分，结果记为影子候选。关闸期间下游各级从未被完整
+		// 执行过，等指数收复 MA60 那天才是它第一次真跑——把首次执行放到有现金风险的
+		// 那一天，等于把验证和下注合成一个动作。
+		rep.RegimeClosed = true
+		tr.emitRaw("regime", "大盘门槛(关闭，下方为影子)", len(survivors), len(survivors), nil)
 	}
 
 	survivors = s.filterStage(tr, "sector", "板块强弱TopK", survivors, func(stk model.StockBasic) (bool, string) {
@@ -154,7 +167,13 @@ func (s *Screener) Run(ctx context.Context, tradeDate string, budget Budget) (*R
 	})
 
 	rep.ScoredTotal = len(survivors)
-	rep.Candidates = s.pickTopN(survivors, in, sectors, tr)
+	scored := s.pickTopN(survivors, in, sectors, tr)
+	if rep.RegimeClosed {
+		rep.Shadow = scored
+		rep.Empty = true // 关闸当日仍是"0 候选"，只是原因明确且带影子清单
+		return rep, s.finish(ctx, tradeDate, rep)
+	}
+	rep.Candidates = scored
 	rep.Empty = len(rep.Candidates) == 0
 	return rep, s.finish(ctx, tradeDate, rep)
 }
@@ -211,7 +230,7 @@ func (s *Screener) pickTopN(pool []model.StockBasic, in *inputs, sectors []model
 	return out
 }
 
-// finish 收尾：每级计数写日志；候选为 0 落一条 fail 轨迹（当日日报按降级列出）。
+// finish 收尾：每级计数写日志；候选为 0 落一条轨迹（当日日报按降级列出）。
 //
 // 刻意不发邮件：大盘闸门关闭时"0 候选"是规则的正常输出，天天一封会把告警信道变成噪音。
 // 需要立刻知道的异常（数据不新鲜、评审失败、止损触发）由调度器那条 urgent 路径发。
@@ -224,23 +243,55 @@ func (s *Screener) finish(ctx context.Context, tradeDate string, rep *Report) er
 		return nil
 	}
 	summary := funnelSummary(rep.Stages)
-	observability.S().Warnw("选股候选为 0", "date", tradeDate, "funnel", summary, "notes", rep.Notes)
+	observability.S().Warnw("选股候选为 0", "date", tradeDate, "funnel", summary,
+		"regime_closed", rep.RegimeClosed, "shadow", len(rep.Shadow), "notes", rep.Notes)
 	return s.raiseEmptyAlert(ctx, tradeDate, rep, summary)
 }
 
-// raiseEmptyAlert 候选为 0 时落一条 alert:SCREEN_EMPTY 轨迹（TraceFail）。
+// raiseEmptyAlert 候选为 0 时落一条 alert:SCREEN_EMPTY 轨迹。
+//
+// 两种 0 候选必须分开定级：闸门关闭是规则的正常输出（partial，无需人介入，
+// 但给出影子清单证明漏斗本身是通的）；漏斗某级把池子筛光才是要人看的故障（fail）。
+// 两者混写成同一句"请人工介入"时，人每天被叫去介入一个不需要介入的东西，
+// 真出故障那天这句就没有分量了。
 func (s *Screener) raiseEmptyAlert(ctx context.Context, tradeDate string, rep *Report, summary string) error {
-	detail := fmt.Sprintf("%s 选股候选 0 条（打分样本 %d 只）。漏斗：%s。板块前三：%s。请人工介入。",
+	detail := fmt.Sprintf("%s 选股候选 0 条（打分样本 %d 只）。漏斗：%s。板块前三：%s。",
 		tradeDate, rep.ScoredTotal, summary, strings.Join(topSectorNames(rep.Sectors, 3), "、"))
+	outcome := model.TraceFail
+	if rep.RegimeClosed {
+		detail += reasonMarketRegime + "，无需介入；" + rep.ShadowBrief()
+		outcome = model.TracePartial
+	} else {
+		detail += "请人工介入。"
+	}
 	trace := model.RunTrace{
 		TradeDate: tradeDate, Subject: model.TraceAlert(AlertCodeScreenEmpty),
-		Outcome: model.TraceFail, Detail: detail, At: time.Now().UTC().Format(time.RFC3339),
+		Outcome: outcome, Detail: detail, At: time.Now().UTC().Format(time.RFC3339),
 	}
 	if err := s.st.TraceRepo().Write(ctx, trace); err != nil {
 		return fmt.Errorf("落 SCREEN_EMPTY 轨迹失败：%w", err)
 	}
 	return nil
 }
+
+// ShadowBrief 影子清单摘要（关闸日让人看见"若开闸会选到谁"，也顺带证明漏斗下游是通的）。
+// 告警正文与日报/计划邮件共用这一句，两处各写一遍就会漂移成两个口径。
+func (r *Report) ShadowBrief() string {
+	if !r.RegimeClosed {
+		return ""
+	}
+	if len(r.Shadow) == 0 {
+		return "影子清单为空（下游各级同样筛不出票，需在开闸前排查）。"
+	}
+	names := make([]string, 0, shadowTop)
+	for _, c := range r.Shadow[:min(shadowTop, len(r.Shadow))] {
+		names = append(names, fmt.Sprintf("#%d %s %s 评分%.1f", c.Rank, c.Name, c.Industry, c.Score))
+	}
+	return fmt.Sprintf("若开闸，因子排名前 %d：%s。", len(names), strings.Join(names, "、"))
+}
+
+// shadowTop 告警正文里列出的影子候选条数（只取前几名，全量在日志与 CLI）。
+const shadowTop = 5
 
 // load 读取因子窗口内的全部截面数据；窗口有日线缺口时直接报错（不拿旧日期凑数）。
 func (s *Screener) load(ctx context.Context, tradeDate string) (*inputs, error) {
@@ -420,11 +471,6 @@ func (t *tracer) emitRaw(slug, name string, in, out int, drops map[string]int) {
 	t.rep.Stages = append(t.rep.Stages, StageStat{
 		Stage: len(t.rep.Stages) + 1, Slug: slug, Name: name, In: in, Out: out, Drops: drops,
 	})
-}
-
-// gate 整级清零的一级（大盘门槛）：全部成员按同一原因淘汰。
-func (t *tracer) gate(slug, name string, pool []model.StockBasic, why string) {
-	t.emitRaw(slug, name, len(pool), 0, map[string]int{why: len(pool)})
 }
 
 // funnelSummary 漏斗的可读摘要（"基础资格 5554→4213；板块强弱TopK 4213→1180 …"）。

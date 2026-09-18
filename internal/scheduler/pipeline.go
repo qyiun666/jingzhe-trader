@@ -120,7 +120,7 @@ func screenCandidates(ctx context.Context, rc *observability.RunCtx, d Deps, dat
 	if err != nil {
 		return nil, err
 	}
-	rc.Declare("rows", "candidates", -1)
+	rc.Declare("rows", "candidates", candidateExpect(rep))
 	rc.Actual("candidates", len(rep.Candidates))
 	// 每一级漏斗的存量都写进运行日志：期望 0，因此不会因"筛空"被判缺失。
 	for _, st := range rep.Stages {
@@ -134,13 +134,23 @@ func screenCandidates(ctx context.Context, rc *observability.RunCtx, d Deps, dat
 	return rep.Candidates, nil
 }
 
+// candidateExpect 候选产出物的期望数量。
+//
+// 关闸当日候选必为 0，那是规则的结论而不是缺产出——按 -1 断言会让每个关闸日稳定
+// 产出一条 ARTIFACT_MISSING，紧跟在同一句"（非故障）"后面进同一封邮件。
+// 开闸时仍要求至少 1：漏斗正常执行却一只都没选出来，才是要被拦住的情况。
+func candidateExpect(rep *screener.Report) int {
+	if rep.RegimeClosed {
+		return 0
+	}
+	return -1
+}
+
 // emptyReason 候选为空的人话原因：区分"大盘闸门关闭"（设计内、非故障）与
 // "漏斗某级把票筛光"。日报/计划邮件直接引用这句，用户不必去翻日志。
 func emptyReason(rep *screener.Report) string {
-	for _, st := range rep.Stages {
-		if st.Slug == "regime" && st.Out == 0 {
-			return "大盘在 MA60 下方，当日按规则关闭买入漏斗（非故障）"
-		}
+	if rep.RegimeClosed {
+		return "大盘在 MA60 下方，当日按规则关闭买入漏斗（非故障）；" + rep.ShadowBrief()
 	}
 	// 非关闸：报出最后一级把池子筛到 0 的环节。
 	var last string

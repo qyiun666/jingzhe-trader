@@ -56,7 +56,7 @@ func ReversalWeights() FactorWeights {
 //	其余（含 "" 与反常值）：IC 验证的反向方向
 //
 // 兜底走 reversal 而非 momentum：config 键目录的默认值就是 reversal，这里取"与默认一致"
-// 而不是任意一侧。非法取值由装配期 validateEnums 与 research ic 各自 fail-closed 拦下。
+// 而不是任意一侧。非法取值由装配期 validateEnums 在启动时拦下。
 func WeightsByMode(mode string) FactorWeights {
 	if mode == ModeMomentum {
 		return DefaultWeights()
