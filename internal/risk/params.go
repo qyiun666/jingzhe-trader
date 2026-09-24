@@ -71,6 +71,44 @@ const (
 // 默认单笔金额下限：5000 元（保费率 ≤0.1%；小资金账户由 MinAmountFloor 自动缩放）。
 const DefaultMinSingleAmountFen = model.Fen(5000 * 100)
 
+// 弱势试探基准（组长 20260924 批准）：门槛关闭（screen.gate_enabled=false）且大盘
+// 判定为弱势时，仓位上限收缩到这组值。12000 元账户 ≈ 每笔最多 1200 元，
+// 单笔最大亏损（8% 止损）≈ 96 元，全账户弱势日敞口 ≤1.6%。
+const (
+	WeakMaxTotalPctDefault  = 0.20
+	WeakMaxSinglePctDefault = 0.10
+)
+
+// WeakParams 把风控参数收缩到弱势试探口径：只收紧、永不放宽——
+// 上限配置坏值不静默放行：越界值按物理熔断钳回，非正/不可解析回落到默认档。
+// 止损/止盈/持仓数/置信度不动：弱势下的"快跑"能力比"少亏"能力更值钱。
+func WeakParams(p RiskParams, maxTotalPct, maxSinglePct float64) RiskParams {
+	if maxTotalPct <= 0 || maxTotalPct > CircuitMaxTotalPct {
+		if maxTotalPct <= 0 {
+			maxTotalPct = WeakMaxTotalPctDefault
+		} else {
+			maxTotalPct = CircuitMaxTotalPct
+		}
+	}
+	if maxSinglePct <= 0 || maxSinglePct > CircuitMaxSinglePct {
+		if maxSinglePct <= 0 {
+			maxSinglePct = WeakMaxSinglePctDefault
+		} else {
+			maxSinglePct = CircuitMaxSinglePct
+		}
+	}
+	if maxSinglePct > maxTotalPct {
+		maxSinglePct = maxTotalPct
+	}
+	if p.MaxTotalPositionPct > maxTotalPct {
+		p.MaxTotalPositionPct = maxTotalPct
+	}
+	if p.MaxPositionPct > maxSinglePct {
+		p.MaxPositionPct = maxSinglePct
+	}
+	return p
+}
+
 // DefaultParams 给定总资产，输出生效风控参数：固定基准 → 持仓数自适应 → 物理熔断收口。
 //
 // totalAsset 用于持仓数自适应与金额核算。持仓数自适应（<5万→2，<20万→4，否则 6）

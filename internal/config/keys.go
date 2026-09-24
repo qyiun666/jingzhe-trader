@@ -87,6 +87,11 @@ var KeySpecs = []KeySpec{
 	// gate_ma_window 合法区间 1..60（上限是同步与保留保证的指数深度，见 store.MarketMAWindow）。
 	{Key: "screen.gate_enabled", Type: TypeBool, Default: "true"},
 	{Key: "screen.gate_ma_window", Type: TypeInt, Default: "60", RefuseZero: true},
+	// 弱势试探仓位上限（仅在 gate_enabled=false 且判定为弱势时生效）：
+	// 门槛人为放开后若仍按正常风控（单票40%/总仓90%）建仓，弱势市场等于裸奔。
+	// 默认总仓 20%、单票 10%（组长 20260924 批准）；装配期校验 ≤ 物理熔断且 single≤total。
+	{Key: "screen.gate_off_max_total_pct", Type: TypeFloat, Default: "0.20", RefuseZero: true},
+	{Key: "screen.gate_off_max_single_pct", Type: TypeFloat, Default: "0.10", RefuseZero: true},
 	// 因子方向模式：reversal = 反向使用动量/低波/流动性（默认）；momentum = 原始方向（保留供 A/B）。
 	// 默认取 reversal 的依据是 2023-09~2026-09 的 20 日 RankIC 实测：
 	// 原始方向综合分 −0.0896（ICIR −0.648，n=689 个截面），反向 +0.0930；

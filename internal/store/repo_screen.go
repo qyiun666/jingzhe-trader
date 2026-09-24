@@ -151,7 +151,7 @@ type IndexQuote struct {
 	TradeDate string    `db:"trade_date"`
 	Close     model.Fen `db:"close"`
 	MA        model.Fen `db:"ma"` // 最近 window 根收盘的均值；窗口凑不满为 0（不可算）
-	Window    int       `db:"-"` // 本次计算所用的窗口（回显给展示层，避免文案写死 MA60）
+	Window    int       `db:"-"`  // 本次计算所用的窗口（回显给展示层，避免文案写死 MA60）
 }
 
 // indexColumns 指数读取列：均线由最近 window 个交易日的收盘现算（分）。
@@ -171,7 +171,7 @@ const MarketIndex = "000300.SH"
 
 // MarketMAWindow 指数日线在同步与保留上保证的最小深度（交易日）：
 // 60 为沪深300 2014-2026 实测的收益/回撤折中档
-//（notes/implemented/feature/2026-09-07-大盘门槛MA20换MA60.md）。
+// （notes/implemented/feature/2026-09-07-大盘门槛MA20换MA60.md）。
 // 门槛的**计算窗口**已可配置（screen.gate_ma_window），本常量退居为读取窗口的
 // 上限与同步回补/保留豁免的最小深度：配置窗口不得超过它，否则均线会因数据不够
 // 而不可算——那是把配置项变成每日事故的开关。

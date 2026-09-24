@@ -97,3 +97,38 @@ func assertEqF(t *testing.T, caseName, field string, got, want float64) {
 		t.Errorf("%s: %s=%.6f, 期望 %.6f", caseName, field, got, want)
 	}
 }
+
+// TestWeakParamsShrinksOnly 弱势试探收缩：只允许把仓位上限压低，任何输入都
+// 不能把单票/总仓抬到高于正常基准或物理熔断；坏值回落默认档而不是放行。
+func TestWeakParamsShrinksOnly(t *testing.T) {
+	base := DefaultParams(baseAsset()) // 单票 0.40 / 总仓 0.90
+
+	// 正常收缩：20%/10%
+	p := WeakParams(base, 0.20, 0.10)
+	assertEqF(t, "收缩", "MaxTotalPositionPct", p.MaxTotalPositionPct, 0.20)
+	assertEqF(t, "收缩", "MaxPositionPct", p.MaxPositionPct, 0.10)
+
+	// 上限配得比正常档还宽：钳到不超过入参，且不超过熔断
+	p = WeakParams(base, 0.99, 0.99)
+	if p.MaxTotalPositionPct > CircuitMaxTotalPct {
+		t.Errorf("总仓 %v 越物理熔断 %v", p.MaxTotalPositionPct, CircuitMaxTotalPct)
+	}
+	if p.MaxPositionPct > CircuitMaxSinglePct {
+		t.Errorf("单票 %v 越物理熔断 %v", p.MaxPositionPct, CircuitMaxSinglePct)
+	}
+	if p.MaxPositionPct > p.MaxTotalPositionPct {
+		t.Errorf("单票 %v 不应大于总仓 %v", p.MaxPositionPct, p.MaxTotalPositionPct)
+	}
+
+	// 非正/坏值回落弱势默认档
+	p = WeakParams(base, 0, -1)
+	assertEqF(t, "坏值回落", "MaxTotalPositionPct", p.MaxTotalPositionPct, WeakMaxTotalPctDefault)
+	assertEqF(t, "坏值回落", "MaxPositionPct", p.MaxPositionPct, WeakMaxSinglePctDefault)
+
+	// 只动仓位上限：止损/止盈/持仓数/置信度原样保留
+	p = WeakParams(base, 0.20, 0.10)
+	if p.StopLossPct != base.StopLossPct || p.TakeProfitPct != base.TakeProfitPct ||
+		p.MaxPositions != base.MaxPositions || p.MinConfidence != base.MinConfidence {
+		t.Errorf("WeakParams 不应改动仓位以外的风控字段")
+	}
+}

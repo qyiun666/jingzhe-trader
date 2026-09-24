@@ -54,6 +54,12 @@ type Budget struct {
 	MarketOK bool // 大盘是否允许开新仓（指数在门槛均线上方；门槛关闭时恒 true）
 	// MAWindow 本次判定所用的大盘均线窗口（供文案回显，0 视为默认深度）。
 	MAWindow int
+	// WeakRegime 门槛关闭（gate_enabled=false）且大盘仍处弱势（收盘<均线，
+	// 或指数不可读——宁缩量不在数据未知下满仓）。调用方据此收缩风控（risk.WeakParams）。
+	// 门槛开启时恒 false：那时的弱势表达方式是关闸（RegimeClosed），不是试探。
+	WeakRegime bool
+	// WeakNote 弱势判定原因（"指数不可读，按弱势降级"等），进 run_trace 供事后归因。
+	WeakNote string
 }
 
 func (b Budget) perSlot() model.Fen {

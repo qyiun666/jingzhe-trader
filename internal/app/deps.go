@@ -215,6 +215,22 @@ func validateEnums(cfg *config.Config) error {
 		return fmt.Errorf("screen.gate_ma_window=%d 非法（合法 1..%d，超过部分指数日线本就不回补）",
 			w, store.MarketMAWindow)
 	}
+	// 弱势试探上限同样装配期卡死：越界值运行期虽会被 gateOffCapsOf/WeakParams 钳回，
+	// 但那等于"配置写错了系统悄悄替你做主"——和掷骰子一样该在启动时就拦下。
+	total := cfg.GetFloat("screen.gate_off_max_total_pct")
+	single := cfg.GetFloat("screen.gate_off_max_single_pct")
+	if total <= 0 || total > risk.CircuitMaxTotalPct {
+		return fmt.Errorf("screen.gate_off_max_total_pct=%g 非法（合法 0..%.2f，物理熔断上限）",
+			total, risk.CircuitMaxTotalPct)
+	}
+	if single <= 0 || single > risk.CircuitMaxSinglePct {
+		return fmt.Errorf("screen.gate_off_max_single_pct=%g 非法（合法 0..%.2f，物理熔断上限）",
+			single, risk.CircuitMaxSinglePct)
+	}
+	if single > total {
+		return fmt.Errorf("screen.gate_off_max_single_pct=%g 大于总仓上限 %g（单票不可能超过总仓）",
+			single, total)
+	}
 	// 触发时刻拼错时调度器只在每次 tick 记一条日志、整天不跑这个任务；装配期直接拒绝。
 	for _, key := range []string{"scheduler.morning", "scheduler.pipeline", "scheduler.mail_pending", "scheduler.report"} {
 		for _, hm := range strings.Split(cfg.GetString(key), ",") {
