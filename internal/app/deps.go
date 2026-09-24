@@ -92,7 +92,7 @@ func BuildRuntime(ctx context.Context, st *store.Store, cfg *config.Config) (*Ru
 		Dataloader: dataloader.New(st, tcli),
 		Freshness:  dataloader.NewFreshnessGate(st, cfg.GetInt("screen.min_bar_rows"), screener.BarWindow()),
 		Screener:   screener.New(st, FilterConfigOf(cfg), cfg.GetString("screen.factor_mode")),
-		Signal:     signal.NewService(st, ledger),
+		Signal:     signal.NewService(st, ledger, scheduler.MarketGateOf(cfg)),
 		Decider:    decider,
 		Ledger:     ledger,
 		Tickets:    ticket.NewService(st),
@@ -208,6 +208,12 @@ func validateEnums(cfg *config.Config) error {
 	if !screener.ValidFactorMode(cfg.GetString("screen.factor_mode")) {
 		return fmt.Errorf("screen.factor_mode=%q 非法（可选 %s|%s）",
 			cfg.GetString("screen.factor_mode"), screener.ModeMomentum, screener.ModeReversal)
+	}
+	// 大盘门槛窗口在装配期卡死在 [1, store.MarketMAWindow]：超过同步保证的深度时
+	// 均线永远不可算，等于把"可配置"变成"每天定时整链失败"的配置。
+	if w := cfg.GetInt("screen.gate_ma_window"); w < 1 || w > store.MarketMAWindow {
+		return fmt.Errorf("screen.gate_ma_window=%d 非法（合法 1..%d，超过部分指数日线本就不回补）",
+			w, store.MarketMAWindow)
 	}
 	// 触发时刻拼错时调度器只在每次 tick 记一条日志、整天不跑这个任务；装配期直接拒绝。
 	for _, key := range []string{"scheduler.morning", "scheduler.pipeline", "scheduler.mail_pending", "scheduler.report"} {

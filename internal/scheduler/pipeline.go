@@ -3,6 +3,8 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/observability"
@@ -11,6 +13,22 @@ import (
 	"jingzhe-trader/internal/store"
 	"jingzhe-trader/internal/ticket"
 )
+
+// MarketGateOf 由配置构建大盘门槛口径（组合根与 CLI 手工试跑共用，同一份判据）。
+// 只走 ConfigReader 的字符串读取：解析失败的坏值在装配期被启动自检拦下（malformed），
+// 这里兜底的默认值是给"键缺失的旧库"用的——窗口越界同样按深度上限钳回，
+// 宁可按默认深度算，也不让非法窗口把整条链炸在运行中。
+func MarketGateOf(cfg ConfigReader) store.MarketGate {
+	w, err := strconv.Atoi(strings.TrimSpace(cfg.GetString("screen.gate_ma_window")))
+	if err != nil || w < 1 || w > store.MarketMAWindow {
+		w = store.MarketMAWindow
+	}
+	enabled, err := strconv.ParseBool(strings.TrimSpace(cfg.GetString("screen.gate_enabled")))
+	if err != nil {
+		enabled = true
+	}
+	return store.MarketGate{Enabled: enabled, Window: w}
+}
 
 // eveningPipeline 收盘后整链大方法：一条顺序流水线，任一步失败即整链失败（落 run_trace outcome=fail）。
 //
@@ -112,7 +130,7 @@ func gateFreshness(ctx context.Context, d Deps, date string) error {
 // screenCandidates 跑选股漏斗（全程内存），返回进入决策链的候选。
 func screenCandidates(ctx context.Context, rc *observability.RunCtx, d Deps, date string,
 	rp risk.RiskParams) ([]model.Candidate, error) {
-	budget, err := ScreenBudget(ctx, d.Store, d.Ledger, date, rp)
+	budget, err := ScreenBudget(ctx, d.Store, d.Ledger, date, rp, MarketGateOf(d.Config))
 	if err != nil {
 		return nil, err
 	}
@@ -150,7 +168,7 @@ func candidateExpect(rep *screener.Report) int {
 // "漏斗某级把票筛光"。日报/计划邮件直接引用这句，用户不必去翻日志。
 func emptyReason(rep *screener.Report) string {
 	if rep.RegimeClosed {
-		return "大盘在 MA60 下方，当日按规则关闭买入漏斗（非故障）；" + rep.ShadowBrief()
+		return "大盘在 " + rep.RegimeMALabel() + " 下方，当日按规则关闭买入漏斗（非故障）；" + rep.ShadowBrief()
 	}
 	// 非关闸：报出最后一级把池子筛到 0 的环节。
 	var last string
@@ -170,30 +188,36 @@ func emptyReason(rep *screener.Report) string {
 func itoa(n int) string { return fmt.Sprintf("%d", n) }
 
 // ScreenBudget 组装选股漏斗的资金与大盘口径：
-// 单笔预算 = 可用现金 / 计划持仓数；大盘跌破 MA60 时当日关闭买入漏斗。
+// 单笔预算 = 可用现金 / 计划持仓数；门槛开启且大盘跌破均线时当日关闭买入漏斗。
 //
-// 现金与指数都是这道闸门必需 inputs：拿不到就失败，不存在"本轮先不判定大盘"——
-// 那等于在最该保守的时候默认放行买入。
+// 现金是这道闸门必需 inputs：拿不到就失败——那等于在最该保守的时候默认放行买入。
+// 指数口径则随 gate 分两种：gate.Enabled 时读不到/算不出均线同样失败（历史行为，
+// 拿不到基准就把"大盘恶化"判成"没恶化"是静默放行）；gate 关闭时不读指数——
+// 判定不参与，把无关的指数数据问题升级成整链停摆正是这次要修的故障模式。
 //
 // 调度器与 `jingzhe run task screen` 共用这一个实现：两边各写一套判据，
 // 手工复现出的漏斗就与到点自动跑的不一致（历史上 CLI 那套把 MarketOK 写死为 true）。
 func ScreenBudget(ctx context.Context, st *store.Store, led *ticket.Ledger,
-	date string, rp risk.RiskParams) (screener.Budget, error) {
-	b := screener.Budget{Slots: rp.MaxPositions}
+	date string, rp risk.RiskParams, gate store.MarketGate) (screener.Budget, error) {
+	b := screener.Budget{Slots: rp.MaxPositions, MAWindow: gate.Window}
 	ast, err := led.Assets(ctx, date)
 	if err != nil {
 		return b, fmt.Errorf("读取账户现金失败，可用资金筛无法判定: %w", err)
 	}
 	b.Cash = ast.Cash
-	idx, err := st.ScreenRepo().LatestMarketIndex(ctx, date)
+	if !gate.Enabled {
+		b.MarketOK = true
+		return b, nil
+	}
+	idx, err := st.ScreenRepo().LatestMarketIndex(ctx, date, gate.Window)
 	if err != nil {
 		return b, err
 	}
-	if idx.MA60 <= 0 {
+	if idx.MA <= 0 {
 		return b, fmt.Errorf("大盘指数 %s 在 %s 前不足 %d 根日线，MA%d 不可算",
-			store.MarketIndex, date, store.MarketMAWindow, store.MarketMAWindow)
+			store.MarketIndex, date, gate.Window, gate.Window)
 	}
-	b.MarketOK = idx.Close >= idx.MA60
+	b.MarketOK = idx.Close >= idx.MA
 	return b, nil
 }
 

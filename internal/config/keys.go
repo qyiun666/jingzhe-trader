@@ -80,6 +80,13 @@ var KeySpecs = []KeySpec{
 	{Key: "screen.sector_top_k", Type: TypeInt, Default: "8", RefuseZero: true},
 	{Key: "screen.min_sector_members", Type: TypeInt, Default: "30", RefuseZero: true},
 	{Key: "screen.min_bar_rows", Type: TypeInt, Default: "5000"},
+	// 大盘门槛开关与均线窗口。此前窗口写死为编译期常量 store.MarketMAWindow，
+	// 结果是弱势市场里整条买入链停摆、且无任何运行期退路（agent_issues #7）。
+	// gate_enabled=false：买入漏斗恒放行、卖出规则 5（大盘恶化）停用——
+	// 只开买入关不配卖出，试探仓会在当晚被"排名淘汰/大盘恶化"清光，两者必须同源。
+	// gate_ma_window 合法区间 1..60（上限是同步与保留保证的指数深度，见 store.MarketMAWindow）。
+	{Key: "screen.gate_enabled", Type: TypeBool, Default: "true"},
+	{Key: "screen.gate_ma_window", Type: TypeInt, Default: "60", RefuseZero: true},
 	// 因子方向模式：reversal = 反向使用动量/低波/流动性（默认）；momentum = 原始方向（保留供 A/B）。
 	// 默认取 reversal 的依据是 2023-09~2026-09 的 20 日 RankIC 实测：
 	// 原始方向综合分 −0.0896（ICIR −0.648，n=689 个截面），反向 +0.0930；

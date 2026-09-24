@@ -144,43 +144,61 @@ func (r *ScreenRepo) LatestBarAt(ctx context.Context, tsCode, beforeInclusive st
 	return b, nil
 }
 
-// IndexQuote 指数行情读取结果：收盘价 + 现算 MA60（分）。
+// IndexQuote 指数行情读取结果：收盘价 + 按请求窗口现算的均线（分）。
 // 指数与个股共用 daily_bar，指数的 vol_lot/raw_close 列为 0。
 type IndexQuote struct {
 	TsCode    string    `db:"ts_code"`
 	TradeDate string    `db:"trade_date"`
 	Close     model.Fen `db:"close"`
-	MA60      model.Fen `db:"ma60"`
+	MA        model.Fen `db:"ma"` // 最近 window 根收盘的均值；窗口凑不满为 0（不可算）
+	Window    int       `db:"-"` // 本次计算所用的窗口（回显给展示层，避免文案写死 MA60）
 }
 
-// indexColumns 指数读取列：MA60 由最近 MarketMAWindow 个交易日的收盘现算（分）。
+// indexColumns 指数读取列：均线由最近 window 个交易日的收盘现算（分）。
 // 不足窗口根数时返回 0，调用方据此判"均线不可算"而不是拿部分均值当真值。
-var indexColumns = fmt.Sprintf(`ts_code, trade_date, close,
-	(SELECT CASE WHEN COUNT(*) = %d THEN CAST(AVG(x.close) AS INTEGER) ELSE 0 END
-	   FROM (SELECT close FROM daily_bar i2
-	          WHERE i2.ts_code = i1.ts_code AND i2.trade_date <= i1.trade_date
-	          ORDER BY i2.trade_date DESC LIMIT %d) x) AS ma60`,
-	MarketMAWindow, MarketMAWindow)
+func indexColumns(window int) string {
+	return fmt.Sprintf(`ts_code, trade_date, close,
+		(SELECT CASE WHEN COUNT(*) = %d THEN CAST(AVG(x.close) AS INTEGER) ELSE 0 END
+		   FROM (SELECT close FROM daily_bar i2
+		          WHERE i2.ts_code = i1.ts_code AND i2.trade_date <= i1.trade_date
+		          ORDER BY i2.trade_date DESC LIMIT %d) x) AS ma`,
+		window, window)
+}
 
 // MarketIndex 大盘门槛所用的指数：沪深300。新鲜度门禁检查的也是这一根，
 // 两处必须共用一个常量，否则门禁放行的是一个指数、买入闸门看的是另一个。
 const MarketIndex = "000300.SH"
 
-// MarketMAWindow 大盘门槛均线窗口（交易日）。60 为沪深300 2014-2026 实测的
-// 收益/回撤折中档（notes/implemented/feature/2026-09-07-大盘门槛MA20换MA60.md）；
-// 指数由此成为全项目最深的历史回看消费者，同步回补与保留窗口都不得低于它。
+// MarketMAWindow 指数日线在同步与保留上保证的最小深度（交易日）：
+// 60 为沪深300 2014-2026 实测的收益/回撤折中档
+//（notes/implemented/feature/2026-09-07-大盘门槛MA20换MA60.md）。
+// 门槛的**计算窗口**已可配置（screen.gate_ma_window），本常量退居为读取窗口的
+// 上限与同步回补/保留豁免的最小深度：配置窗口不得超过它，否则均线会因数据不够
+// 而不可算——那是把配置项变成每日事故的开关。
 const MarketMAWindow = 60
 
-// LatestMarketIndex 读取大盘指数截至 beforeInclusive 的最后一根日线。
+// MarketGate 大盘门槛的生效口径（组合根从 config screen.gate.* 构建后注入）。
+// Enabled=false 表示人为关闭门槛：买入漏斗恒放行、卖出规则 5（大盘恶化）停用。
+type MarketGate struct {
+	Enabled bool
+	Window  int // 均线窗口（交易日），1..MarketMAWindow
+}
+
+// LatestMarketIndex 读取大盘指数截至 beforeInclusive 的最后一根日线，
+// 均线按 window 根现算。window 越界是装配错误，直接报错而不是悄悄换成默认值。
 //
 // 只认 MarketIndex，没有"退而取任意指数"的余地：指数与个股共用 daily_bar，
 // 早先那条不加 ts_code 过滤的兜底查询读到的是某只股票的收盘价，却被当成大盘。
-func (r *ScreenRepo) LatestMarketIndex(ctx context.Context, beforeInclusive string) (IndexQuote, error) {
+func (r *ScreenRepo) LatestMarketIndex(ctx context.Context, beforeInclusive string, window int) (IndexQuote, error) {
 	var d IndexQuote
-	q := `SELECT ` + indexColumns + ` FROM daily_bar i1
+	if window < 1 || window > MarketMAWindow {
+		return d, fmt.Errorf("大盘均线窗口 %d 非法（合法 1..%d）", window, MarketMAWindow)
+	}
+	q := `SELECT ` + indexColumns(window) + ` FROM daily_bar i1
 		WHERE i1.ts_code = ? AND i1.trade_date <= ? ORDER BY i1.trade_date DESC LIMIT 1`
 	if err := r.rdb.GetContext(ctx, &d, q, MarketIndex, beforeInclusive); err != nil {
 		return d, fmt.Errorf("读取大盘指数 %s 日线（≤%s）失败: %w", MarketIndex, beforeInclusive, err)
 	}
+	d.Window = window
 	return d, nil
 }

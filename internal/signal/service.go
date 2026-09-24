@@ -19,11 +19,14 @@ import (
 type Service struct {
 	st     *store.Store
 	ledger *ticket.Ledger // 现金/资产的唯一口径（含组合同步的现金锚点）
+	gate   store.MarketGate
 }
 
-// NewService 构造决策服务。
-func NewService(st *store.Store, ledger *ticket.Ledger) *Service {
-	return &Service{st: st, ledger: ledger}
+// NewService 构造决策服务。gate 决定卖出规则 5（大盘恶化）是否参与判定、
+// 用多深的均线——必须与买入漏斗吃的是同一份配置，否则会出现
+// "买入放行了、持仓当晚被大盘恶化规则清光"这种左右互搏。
+func NewService(st *store.Store, ledger *ticket.Ledger, gate store.MarketGate) *Service {
+	return &Service{st: st, ledger: ledger, gate: gate}
 }
 
 // Rejection 风控否决记录（回显给调用方并写日志；禁静默丢弃，D1）。
@@ -364,27 +367,32 @@ func (s *Service) barSeries(ctx context.Context, tradeDate string) (map[string]B
 	return out, nil
 }
 
-// indexInfo 大盘指数状态（收盘与 MA60 同为分；MA60 由读取层现算）。
+// indexInfo 大盘指数状态（收盘与均线同为分；均线按门槛窗口由读取层现算）。
 type indexInfo struct {
 	close model.Fen
-	ma60  model.Fen
+	ma60  model.Fen // 门槛均线（字段名沿用历史；窗口可配置后实际为 MA{gate.Window}）
 }
 
-// bad 大盘恶化判定：指数收盘跌破 MA60。
+// bad 大盘恶化判定：指数收盘跌破门槛均线。
 func (i indexInfo) bad() bool { return i.close < i.ma60 }
 
-// indexState 读大盘指数。读不到、或 MA60 凑不满窗口根数，都是错误：
+// indexState 读大盘指数。门槛关闭时不读：返回零值（bad()=false，规则 5 自然停用），
+// 判据不参与判定时把"指数数据不可读"升级成整链失败，等于修一个停摆换来另一个停摆。
+// 门槛开启时读不到、或均线凑不满窗口根数，都是错误：
 // 拿不到基准时把"大盘恶化"判成"没恶化"，等于这条卖出规则今天没跑却没人知道。
 func (s *Service) indexState(ctx context.Context, tradeDate string) (indexInfo, error) {
-	idx, err := s.st.ScreenRepo().LatestMarketIndex(ctx, tradeDate)
+	if !s.gate.Enabled {
+		return indexInfo{}, nil
+	}
+	idx, err := s.st.ScreenRepo().LatestMarketIndex(ctx, tradeDate, s.gate.Window)
 	if err != nil {
 		return indexInfo{}, err
 	}
-	if idx.MA60 <= 0 {
+	if idx.MA <= 0 {
 		return indexInfo{}, fmt.Errorf("大盘指数 %s 在 %s 前不足 %d 根日线，MA%d 不可算",
-			store.MarketIndex, tradeDate, store.MarketMAWindow, store.MarketMAWindow)
+			store.MarketIndex, tradeDate, s.gate.Window, s.gate.Window)
 	}
-	return indexInfo{close: idx.Close, ma60: idx.MA60}, nil
+	return indexInfo{close: idx.Close, ma60: idx.MA}, nil
 }
 
 // cashFen 可用现金：唯一实现在 ticket.Ledger（本金/现金锚点 + 成交历史推算），

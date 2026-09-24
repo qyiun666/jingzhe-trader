@@ -144,7 +144,7 @@ func screenBudgetOf(ctx context.Context, rt *app.Runtime, date string) (screener
 	if err != nil {
 		return screener.Budget{}, fmt.Errorf("读取风控参数失败: %w", err)
 	}
-	return scheduler.ScreenBudget(ctx, rt.Store, rt.Ledger, date, rp)
+	return scheduler.ScreenBudget(ctx, rt.Store, rt.Ledger, date, rp, scheduler.MarketGateOf(rt.Config))
 }
 
 // fatal 统一的任务失败出口（打印带任务名的原因并以 1 退出）。

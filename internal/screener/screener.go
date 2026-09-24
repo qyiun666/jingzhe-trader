@@ -36,7 +36,7 @@ func New(st *store.Store, cfg FilterConfig, factorMode string) *Screener {
 }
 
 // BarWindow 个股因子窗口所需交易日数（freshness 完整性检查与个股证据共用；
-// 指数 MA60 回溯更深，最深消费者口径见 store.MarketMAWindow）。
+// 指数门槛均线回溯更深，深度保证口径见 store.MarketMAWindow）。
 func BarWindow() int { return momentumBars }
 
 // SyncBackDays 个股日线同步应保证的最近交易日数：最深消费者是个股因子窗口 momentumBars。
@@ -51,7 +51,9 @@ func (s *Screener) SyncBackDays() int {
 type Budget struct {
 	Cash     model.Fen
 	Slots    int
-	MarketOK bool // 大盘是否允许开新仓（指数在 MA60 上方）
+	MarketOK bool // 大盘是否允许开新仓（指数在门槛均线上方；门槛关闭时恒 true）
+	// MAWindow 本次判定所用的大盘均线窗口（供文案回显，0 视为默认深度）。
+	MAWindow int
 }
 
 func (b Budget) perSlot() model.Fen {
@@ -71,10 +73,13 @@ type Report struct {
 	Empty       bool
 	Notes       []string
 
-	// RegimeClosed 大盘闸门关闭（指数在 MA60 下方）。判定这一件事原先只有一处依据
+	// RegimeClosed 大盘闸门关闭（指数在门槛均线下方）。判定这一件事原先只有一处依据
 	// ——遍历 Stages 找 slug=regime 且 Out==0，闸门一旦改成不清零池子那个依据就没了，
 	// 故由漏斗自己落一个旗标，下游（告警文案、产出物期望）只读它。
 	RegimeClosed bool
+	// RegimeMA 关闸判定所用的均线窗口（来自 Budget.MAWindow；0 按默认深度展示）。
+	// 文案必须跟着它走：窗口配成 20 还说"跌破 MA60"，日报就是在对用户撒谎。
+	RegimeMA int
 	// Shadow 闸门关闭时跑完漏斗得到的候选：只用于展示"若开闸会选到谁"，
 	// 不进决策链（Candidates 保持 nil ⇒ 0 指令）。
 	Shadow []model.Candidate
@@ -138,9 +143,10 @@ func (s *Screener) Run(ctx context.Context, tradeDate string, budget Budget) (*R
 
 	if !budget.MarketOK {
 		// 闸门关闭不再短路漏斗：跑完打分，结果记为影子候选。关闸期间下游各级从未被完整
-		// 执行过，等指数收复 MA60 那天才是它第一次真跑——把首次执行放到有现金风险的
+		// 执行过，等指数收复均线那天才是它第一次真跑——把首次执行放到有现金风险的
 		// 那一天，等于把验证和下注合成一个动作。
 		rep.RegimeClosed = true
+		rep.RegimeMA = budget.MAWindow
 		tr.emitRaw("regime", "大盘门槛(关闭，下方为影子)", len(survivors), len(survivors), nil)
 	}
 
@@ -259,7 +265,7 @@ func (s *Screener) raiseEmptyAlert(ctx context.Context, tradeDate string, rep *R
 		tradeDate, rep.ScoredTotal, summary, strings.Join(topSectorNames(rep.Sectors, 3), "、"))
 	outcome := model.TraceFail
 	if rep.RegimeClosed {
-		detail += reasonMarketRegime + "，无需介入；" + rep.ShadowBrief()
+		detail += fmt.Sprintf(reasonMarketRegime, rep.RegimeMALabel()) + "，无需介入；" + rep.ShadowBrief()
 		outcome = model.TracePartial
 	} else {
 		detail += "请人工介入。"
@@ -272,6 +278,17 @@ func (s *Screener) raiseEmptyAlert(ctx context.Context, tradeDate string, rep *R
 		return fmt.Errorf("落 SCREEN_EMPTY 轨迹失败：%w", err)
 	}
 	return nil
+}
+
+// RegimeMALabel 关闸文案里的均线名：窗口可配置后不能再写死 MA60，
+// 未回填窗口（老数据/测试构造）按默认深度显示，与 store 的同步保证一致。
+// 导出：告警正文与日报/计划邮件共用这一句，各写一遍就会漂移成两个口径。
+func (r *Report) RegimeMALabel() string {
+	w := r.RegimeMA
+	if w <= 0 {
+		w = store.MarketMAWindow
+	}
+	return fmt.Sprintf("MA%d", w)
 }
 
 // ShadowBrief 影子清单摘要（关闸日让人看见"若开闸会选到谁"，也顺带证明漏斗下游是通的）。

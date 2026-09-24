@@ -22,7 +22,7 @@ type HoldingCtx struct {
 	LastClose model.Fen // 最近可得收盘（停牌股取停牌前收盘，分）
 	LastDate  string    // 该收盘对应交易日
 	InTopN    bool      // 是否在当日候选池 TopN
-	MarketBad bool      // 大盘恶化（指数收盘 < MA60）
+	MarketBad bool      // 大盘恶化（指数收盘低于门槛均线，见 evalMarketBad）
 }
 
 // newSell 构造卖出信号骨架。
@@ -98,7 +98,9 @@ func evalRankOut(date string, h HoldingCtx) *model.Signal {
 		fmt.Sprintf("排名淘汰：未进入当日候选池 TopN（持仓成本 %s）", h.Pos.CostPrice))
 }
 
-// evalMarketBad 规则 5 大盘恶化：指数收盘跌破 MA60。
+// evalMarketBad 规则 5 大盘恶化：指数收盘跌破门槛均线（MA{gate.Window}）。
+// 门槛关闭（screen.gate_enabled=false）时调用方给出零值指数，本规则自然不触发——
+// 买入闸门与这条卖出规则同源，不允许"放行买入、当晚清仓"的左右互搏。
 func evalMarketBad(date string, h HoldingCtx, indexClose, indexMA60 model.Fen) *model.Signal {
 	if h.Pos.TotalQty <= 0 || indexClose <= 0 || indexMA60 <= 0 {
 		return nil
