@@ -19,6 +19,12 @@ type SchemaAudit struct {
 	LegacyTables  []string // 库里有、现役 schema 里没有的表
 	MissingTables []string // 现役 schema 里该有、库里没有的表
 	LegacyIndexes []string // 库里有、现役 schema 里没有的具名索引
+	// MissingColumns / LegacyColumns 用 "表名.列名" 定位（issue #8 教训：表级一致
+	// 不代表列级一致，gear 事故里表清点报的就是"一致"）。缺列若带 AddDDL 已在启动期
+	// ensureColumns 补过，仍出现在这里的就是补不了的（主键 / NOT NULL 无默认），
+	// 只能走离线重建；遗留列只点名不删除 —— 删列不可逆，跟删表同一判据。
+	MissingColumns []string // 现役列清单里该有、库里没有的列
+	LegacyColumns  []string // 库里有、现役列清单里没有的列
 	// DailyBarNormal bool= daily_bar 仍是普通表（有 rowid）。false 表示已按现役
 	// schema 建成 WITHOUT ROWID。旧库需要 offline 重建才能拿到省下的主键索引空间。
 	DailyBarNormal bool
@@ -27,7 +33,8 @@ type SchemaAudit struct {
 // Clean 是否与现役 schema 完全一致（遗留物为空且 daily_bar 已是 WITHOUT ROWID）。
 func (a SchemaAudit) Clean() bool {
 	return len(a.LegacyTables) == 0 && len(a.MissingTables) == 0 &&
-		len(a.LegacyIndexes) == 0 && !a.DailyBarNormal
+		len(a.LegacyIndexes) == 0 && len(a.MissingColumns) == 0 &&
+		len(a.LegacyColumns) == 0 && !a.DailyBarNormal
 }
 
 // String 人读摘要（启动日志与 CLI 输出共用，避免两处各写一套文案）。
@@ -39,8 +46,14 @@ func (a SchemaAudit) String() string {
 	if len(a.MissingTables) > 0 {
 		fmt.Fprintf(&b, "缺失表 %d（重跑建表可补）: %s\n", len(a.MissingTables), strings.Join(a.MissingTables, ", "))
 	}
+	if len(a.MissingColumns) > 0 {
+		fmt.Fprintf(&b, "缺失列 %d（可回填的启动期已补，剩余需离线重建）: %s\n", len(a.MissingColumns), strings.Join(a.MissingColumns, ", "))
+	}
 	if len(a.LegacyTables) > 0 {
 		fmt.Fprintf(&b, "遗留表 %d（现役代码无读者，确认后 DROP）: %s\n", len(a.LegacyTables), strings.Join(a.LegacyTables, ", "))
+	}
+	if len(a.LegacyColumns) > 0 {
+		fmt.Fprintf(&b, "遗留列 %d（现役列清单无此列，确认后 DROP）: %s\n", len(a.LegacyColumns), strings.Join(a.LegacyColumns, ", "))
 	}
 	if len(a.LegacyIndexes) > 0 {
 		fmt.Fprintf(&b, "遗留索引 %d（现役代码未建，多数与主键重复）: %s\n", len(a.LegacyIndexes), strings.Join(a.LegacyIndexes, ", "))
@@ -85,9 +98,35 @@ func (s *Store) AuditSchema(ctx context.Context) (SchemaAudit, error) {
 			a.LegacyIndexes = append(a.LegacyIndexes, name)
 		}
 	}
+
+	// 列级比对：表本身缺失的跳过（MissingTables 已点名，不在每张缺表上重复报一屏缺列）。
+	for _, tc := range SchemaColumns {
+		if !have[tc.Table] {
+			continue
+		}
+		got, err := s.tableColumns(ctx, tc.Table)
+		if err != nil {
+			return a, err
+		}
+		wantCol := make(map[string]bool, len(tc.Columns))
+		for _, c := range tc.Columns {
+			wantCol[c.Name] = true
+			if !got[c.Name] {
+				a.MissingColumns = append(a.MissingColumns, tc.Table+"."+c.Name)
+			}
+		}
+		for name := range got {
+			if !wantCol[name] {
+				a.LegacyColumns = append(a.LegacyColumns, tc.Table+"."+name)
+			}
+		}
+	}
+
 	sort.Strings(a.LegacyTables)
 	sort.Strings(a.MissingTables)
 	sort.Strings(a.LegacyIndexes)
+	sort.Strings(a.MissingColumns)
+	sort.Strings(a.LegacyColumns)
 
 	rowid, err := s.dailyBarHasRowid(ctx)
 	if err != nil {
@@ -103,6 +142,21 @@ func (s *Store) objectNames(ctx context.Context, typ string) (map[string]bool, e
 	q := `SELECT name FROM sqlite_master WHERE type = ? AND name NOT LIKE 'sqlite_%'`
 	if err := s.readDB.SelectContext(ctx, &names, q, typ); err != nil {
 		return nil, fmt.Errorf("读取库内 %s 清单失败: %w", typ, err)
+	}
+	out := make(map[string]bool, len(names))
+	for _, n := range names {
+		out[n] = true
+	}
+	return out, nil
+}
+
+// tableColumns 返回一张表当前的列名集合（pragma_table_info 按行返回，不读 DDL 文本，
+// 与 db.go 的 hasColumn 同一判据来源）。表不存在时返回空集合而非错误：
+// 调用方要么已确认表存在（列级清点跳过缺表），要么把缺表交给 MissingTables 报。
+func (s *Store) tableColumns(ctx context.Context, table string) (map[string]bool, error) {
+	var names []string
+	if err := s.readDB.SelectContext(ctx, &names, `SELECT name FROM pragma_table_info(?)`, table); err != nil {
+		return nil, fmt.Errorf("读取表 %s 列信息失败: %w", table, err)
 	}
 	out := make(map[string]bool, len(names))
 	for _, n := range names {

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/jmoiron/sqlx"
 	_ "modernc.org/sqlite" // 纯 Go SQLite 驱动，无 CGO（硬约束）
@@ -99,14 +100,65 @@ func Open(path string) (*Store, error) {
 		rdb.Close()
 		return nil, err
 	}
+	// 缺列回填必须在清点之前：清点报的是"修完之后仍对不上"的部分（不可回填的缺列、
+	// 只报不删的遗留列），回填动作本身也进摘要，让启动日志看得见库被动过什么。
+	repaired, err := ensureColumns(st.writeDB)
+	if err != nil {
+		wdb.Close()
+		rdb.Close()
+		return nil, err
+	}
 	// 建表只做加法（IF NOT EXISTS）：跨版本重写后旧表旧索引会永远留在库里。
 	// 清点结果（含清点本身失败）都要透出去 —— 探测失败被读成"库结构干净"就是假绿。
+	auditNote := ""
+	if len(repaired) > 0 {
+		auditNote = fmt.Sprintf("启动期回填缺失列 %d（幂等 ADD COLUMN）: %s\n", len(repaired), strings.Join(repaired, ", "))
+	}
 	if audit, err := st.AuditSchema(context.Background()); err != nil {
-		st.audit = fmt.Sprintf("库结构清点失败（不等于库结构干净）: %v\n", err)
+		st.audit = auditNote + fmt.Sprintf("库结构清点失败（不等于库结构干净）: %v\n", err)
 	} else if !audit.Clean() {
-		st.audit = audit.String()
+		st.audit = auditNote + audit.String()
+	} else {
+		st.audit = auditNote // 干净但补过列时仍要出声；两者皆无则为空串
 	}
 	return st, nil
+}
+
+// ensureColumns 按 SchemaColumns 幂等补齐存量库缺失的可回填列（agent_issues #8 的机制化）。
+//
+// 只补 ColumnSpec.AddDDL 非空的列（可空或带常数默认值）：SQLite 的 ADD COLUMN 对这类列
+// 不改写存量行、不需要为旧行编造业务语义，失败即中止启动（结构与代码预期不符时
+// 让每一条 SQL 都失败，比假装能跑安全）。补不了的列（主键、NOT NULL 无默认）留给
+// AuditSchema 点名走离线重建；多余列不删，与删表同一判据 —— 不可逆动作交人决定。
+func ensureColumns(db *sqlx.DB) ([]string, error) {
+	var added []string
+	for _, tc := range SchemaColumns {
+		var n int
+		if err := db.Get(&n, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, tc.Table); err != nil {
+			return added, fmt.Errorf("探测表 %s 失败: %w", tc.Table, err)
+		}
+		if n == 0 {
+			continue // 缺表由建表路径负责，这里不补（表都不在，列无所附）
+		}
+		var cols []string
+		if err := db.Select(&cols, `SELECT name FROM pragma_table_info(?)`, tc.Table); err != nil {
+			return added, fmt.Errorf("读取表 %s 列信息失败: %w", tc.Table, err)
+		}
+		have := make(map[string]bool, len(cols))
+		for _, c := range cols {
+			have[c] = true
+		}
+		for _, c := range tc.Columns {
+			if have[c.Name] || c.AddDDL == "" {
+				continue
+			}
+			if _, err := db.Exec(`ALTER TABLE ` + tc.Table + ` ADD COLUMN ` + c.AddDDL); err != nil {
+				return added, fmt.Errorf("回填列 %s.%s 失败: %w", tc.Table, c.Name, err)
+			}
+			added = append(added, tc.Table+"."+c.Name)
+		}
+	}
+	return added, nil
 }
 
 // dropLegacyColumns 删除跨版本重写后不再有读者的列。幂等：列不存在时跳过。

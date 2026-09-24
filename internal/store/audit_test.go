@@ -3,9 +3,20 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
+
+// openStoreAtPath 与 openStoreForTest 同一构造，但库路径由调用方定（需要关库再重开的用例）。
+func openStoreAtPath(t *testing.T, path string) *Store {
+	t.Helper()
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("store.Open(%s) 失败: %v", path, err)
+	}
+	return s
+}
 
 // TestAuditSchemaClean 全新库（现役 schema 建的）必须清点干净。
 func TestAuditSchemaClean(t *testing.T) {
@@ -292,5 +303,113 @@ func TestRetentionWorksOnUnmigratedDailyBar(t *testing.T) {
 	}
 	if left != 1 {
 		t.Errorf("剩余 %d 行，期望 1（当日行）", left)
+	}
+}
+
+// TestAuditSchemaDetectsColumnDrift 列级清点（agent_issues #8 的机制化）：
+// 旧库缺"后来加的列"时表级清点报的是"一致"（假绿），列级必须点名；
+// ensureColumns 只补可回填的（带默认值/可空），遗留列只报不删。
+func TestAuditSchemaDetectsColumnDrift(t *testing.T) {
+	s := openStoreForTest(t)
+	defer s.Close()
+	ctx := context.Background()
+
+	// 模拟旧二进制建的库：position 缺 high_price、daily_bar 缺 raw_close（两者可回填），
+	// run_trace 缺 outcome（NOT NULL 无默认，不可回填），外加一列无人读的死档。
+	stmts := []string{
+		`ALTER TABLE position DROP COLUMN high_price`,
+		`ALTER TABLE daily_bar DROP COLUMN raw_close`,
+		`ALTER TABLE run_trace DROP COLUMN outcome`,
+		`ALTER TABLE position ADD COLUMN dead_marker TEXT`,
+	}
+	for _, q := range stmts {
+		if _, err := s.writeDB.ExecContext(ctx, q); err != nil {
+			t.Fatalf("造列漂移失败（%s）: %v", q, err)
+		}
+	}
+
+	a, err := s.AuditSchema(ctx)
+	if err != nil {
+		t.Fatalf("清点失败: %v", err)
+	}
+	if a.Clean() {
+		t.Fatal("造出了缺列与遗留列，清点却报干净 —— 列级探测失效")
+	}
+	for _, want := range []string{"position.high_price", "daily_bar.raw_close", "run_trace.outcome"} {
+		if !contains(a.MissingColumns, want) {
+			t.Errorf("MissingColumns 缺 %s，实际 %v", want, a.MissingColumns)
+		}
+	}
+	if !contains(a.LegacyColumns, "position.dead_marker") {
+		t.Errorf("LegacyColumns 缺 position.dead_marker，实际 %v", a.LegacyColumns)
+	}
+
+	added, err := ensureColumns(s.writeDB)
+	if err != nil {
+		t.Fatalf("回填失败: %v", err)
+	}
+	// 幂等可补的都补了；不可补的（AddDDL 为空）不硬试。
+	if len(added) != 2 || !contains(added, "position.high_price") || !contains(added, "daily_bar.raw_close") {
+		t.Fatalf("回填清单 = %v，期望恰为 position.high_price 与 daily_bar.raw_close", added)
+	}
+
+	a, err = s.AuditSchema(ctx)
+	if err != nil {
+		t.Fatalf("回填后再清点失败: %v", err)
+	}
+	if !contains(a.MissingColumns, "run_trace.outcome") {
+		t.Errorf("不可回填的缺列应仍被点名，实际 MissingColumns=%v", a.MissingColumns)
+	}
+	if contains(a.MissingColumns, "position.high_price") {
+		t.Errorf("已回填的列不该再被报缺，实际 MissingColumns=%v", a.MissingColumns)
+	}
+	if !contains(a.LegacyColumns, "position.dead_marker") {
+		t.Errorf("遗留列只报不删，应仍在清单里，实际 LegacyColumns=%v", a.LegacyColumns)
+	}
+
+	// 再跑一次 ensureColumns 必须一无所补（幂等），且存量数据没被回填动作波及。
+	again, err := ensureColumns(s.writeDB)
+	if err != nil || len(again) != 0 {
+		t.Fatalf("二次回填应为幂等空操作，实际 added=%v err=%v", again, err)
+	}
+	if _, err := s.writeDB.ExecContext(ctx,
+		`INSERT INTO position (ts_code, total_qty) VALUES ('600000.SH', 100) ON CONFLICT(ts_code) DO NOTHING`); err != nil {
+		t.Fatalf("回填后写 position 失败: %v", err)
+	}
+	var hp int
+	if err := s.readDB.GetContext(ctx, &hp, `SELECT high_price FROM position WHERE ts_code='600000.SH'`); err != nil {
+		t.Fatalf("回填列读取失败: %v", err)
+	}
+	if hp != 0 {
+		t.Errorf("回填列默认值 = %d，期望 0", hp)
+	}
+}
+
+// TestOpenRepairsMissingColumns 启动路径闭环：带缺列的库文件重新 Open 即自愈，
+// 且动作（补了哪几列）与不可自愈项都进 SchemaAuditNote，启动日志看得见。
+func TestOpenRepairsMissingColumns(t *testing.T) {
+	path := t.TempDir() + "/repair.db"
+	s := openStoreAtPath(t, path)
+	if _, err := s.writeDB.Exec(`ALTER TABLE order_ticket DROP COLUMN total_cost`); err != nil {
+		t.Fatalf("造缺列失败: %v", err)
+	}
+	s.Close()
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("带缺列的库重新打开失败: %v", err)
+	}
+	defer s2.Close()
+
+	var n int
+	if err := s2.readDB.Get(&n, `SELECT COUNT(*) FROM pragma_table_info('order_ticket') WHERE name='total_cost'`); err != nil {
+		t.Fatalf("读取列信息失败: %v", err)
+	}
+	if n != 1 {
+		t.Fatal("启动后 order_ticket.total_cost 没有被回填")
+	}
+	note := s2.SchemaAuditNote()
+	if !strings.Contains(note, "order_ticket.total_cost") {
+		t.Errorf("回填动作应写进结构摘要，实际 note=%q", note)
 	}
 }

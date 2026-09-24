@@ -184,3 +184,93 @@ var SchemaTables = []string{
 var SchemaIndexes = []string{
 	"idx_bar_date", "idx_cal_open_date", "idx_ticket_active", "idx_ticket_date_status", "idx_trace_subject",
 }
+
+// ColumnSpec 列级清点对单列的期望。
+//
+// AddDDL 非空 = 该列可在启动期用 `ALTER TABLE ... ADD COLUMN <AddDDL>` 幂等补出：
+// 判据是 SQLite 的加法约束 —— 可空、或带常数默认值（存量行自动取默认，不改写数据、
+// 不需要为旧行编造语义）。主键与"NOT NULL 且无默认"的列填 ""：缺了只能报点名走重建，
+// 自动化碰不得。
+type ColumnSpec struct {
+	Name   string
+	AddDDL string // 形如 "high_price INTEGER NOT NULL DEFAULT 0"；"" = 不可启动期回填
+}
+
+// TableColumns 一张表的列清单。
+type TableColumns struct {
+	Table   string
+	Columns []ColumnSpec
+}
+
+// SchemaColumns 逐表列清单（schemaDDL 的权威镜像，与 SchemaTables/SchemaIndexes 同一意图）。
+//
+// 它存在的理由是 agent_issues #8 的教训：`CREATE TABLE IF NOT EXISTS` 对已存在的表
+// 是纯加法 —— 新二进制预期新列、旧库没有该列时，表级清点照样报"库结构与现役
+// schema 一致"（假绿），要到第一条读该列的 SQL 在运行期炸出来才知道。
+// 启动期 ensureColumns 按本清单补可回填的缺列，AuditSchema 把剩余差异（补不了的缺列、
+// 无人读的遗留列）报进结构摘要。列清单与 DDL 的一致性由 TestSchemaColumnsMirrorDDL
+// 锁死：镜像漂移本身就是测试失败，不靠人肉同步两份真相。
+var SchemaColumns = []TableColumns{
+	{"config_kv", []ColumnSpec{
+		{"key", ""},                                // PRIMARY KEY，缺了必须重建
+		{"value", ""},                              // NOT NULL 无默认，空表才可能补，不赌
+	}},
+	{"trade_cal", []ColumnSpec{
+		{"cal_date", ""},
+		{"is_open", ""}, // NOT NULL 无默认
+		{"synthetic", "synthetic INTEGER NOT NULL DEFAULT 0"},
+	}},
+	{"stock_basic", []ColumnSpec{
+		{"ts_code", ""},
+		{"name", ""}, // NOT NULL 无默认
+		{"industry", "industry TEXT"},
+		{"list_date", "list_date TEXT"},
+		{"list_status", "list_status TEXT"},
+		{"val_date", "val_date TEXT"},
+		{"turnover_rate", "turnover_rate REAL"},
+		{"pe_ttm", "pe_ttm REAL"},
+		{"pb", "pb REAL"},
+		{"circ_mv_w", "circ_mv_w REAL"},
+	}},
+	{"daily_bar", []ColumnSpec{
+		{"ts_code", ""},    // 复合主键成员
+		{"trade_date", ""}, // 复合主键成员
+		{"close", ""},      // NOT NULL 无默认
+		{"vol_lot", "vol_lot REAL"},
+		{"raw_close", "raw_close INTEGER NOT NULL DEFAULT 0"},
+	}},
+	{"order_ticket", []ColumnSpec{
+		{"id", ""}, // AUTOINCREMENT 主键
+		{"trade_date", ""},
+		{"ts_code", ""},
+		{"name", ""},
+		{"direction", ""},
+		{"qty", ""},
+		{"ref_price", ""},
+		{"reason", ""},
+		{"status", "status TEXT NOT NULL DEFAULT 'drafted'"},
+		{"valid_until", ""},
+		{"fill_qty", "fill_qty INTEGER NOT NULL DEFAULT 0"},
+		{"fill_price", "fill_price INTEGER NOT NULL DEFAULT 0"},
+		{"total_cost", "total_cost INTEGER NOT NULL DEFAULT 0"},
+		{"reported_by", "reported_by TEXT"},
+		{"reported_at", "reported_at TEXT"},
+		{"note", "note TEXT"},
+	}},
+	{"position", []ColumnSpec{
+		{"ts_code", ""},
+		{"total_qty", "total_qty INTEGER NOT NULL DEFAULT 0"},
+		{"today_bought", "today_bought INTEGER NOT NULL DEFAULT 0"},
+		{"cost_price", "cost_price INTEGER NOT NULL DEFAULT 0"},
+		{"high_price", "high_price INTEGER NOT NULL DEFAULT 0"},
+		{"first_open_date", "first_open_date TEXT"},
+	}},
+	{"run_trace", []ColumnSpec{
+		{"id", ""},
+		{"trade_date", ""},
+		{"subject", ""},
+		{"outcome", ""},
+		{"detail", "detail TEXT NOT NULL DEFAULT ''"},
+		{"at", ""},
+	}},
+}

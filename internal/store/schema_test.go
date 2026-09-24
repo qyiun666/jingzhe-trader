@@ -62,6 +62,55 @@ func hasTable(t *testing.T, db *sqlx.DB, name string) bool {
 	return n > 0
 }
 
+// TestSchemaColumnsMirrorDDL 列级镜像必须与 schemaDDL 实际建出的列一字不差。
+//
+// SchemaColumns 是手抄的清单（DDL 是真相源），没有这条断言，清单自身漂移就会让
+// 列级审计与启动回填建立在错误期望上——比没有清单更糟（假绿换了一处发生）。
+// 加列、删列、改列名都会在这里第一秒被抓住，而不是等线上 SQL 炸。
+func TestSchemaColumnsMirrorDDL(t *testing.T) {
+	s := openStoreForTest(t)
+	defer s.Close()
+
+	// 清单覆盖的表集合 == SchemaTables，一张不落。
+	covered := make(map[string]bool)
+	for _, tc := range SchemaColumns {
+		if covered[tc.Table] {
+			t.Fatalf("SchemaColumns 里 %s 出现两次", tc.Table)
+		}
+		covered[tc.Table] = true
+	}
+	if len(covered) != len(SchemaTables) {
+		t.Fatalf("列清单覆盖 %d 张表，SchemaTables 有 %d 张", len(covered), len(SchemaTables))
+	}
+	for _, tab := range SchemaTables {
+		if !covered[tab] {
+			t.Errorf("表 %s 没有列清单条目", tab)
+		}
+	}
+
+	// 每张表的列名集合与库内实际一致（双向差集都要为空）。
+	for _, tc := range SchemaColumns {
+		got, err := s.tableColumns(context.Background(), tc.Table)
+		if err != nil {
+			t.Fatalf("读取 %s 列失败: %v", tc.Table, err)
+		}
+		want := make(map[string]bool, len(tc.Columns))
+		for _, c := range tc.Columns {
+			want[c.Name] = true
+		}
+		for name := range want {
+			if !got[name] {
+				t.Errorf("列清单写了 %s.%s，但 DDL 没建出来（镜像漂移）", tc.Table, name)
+			}
+		}
+		for name := range got {
+			if !want[name] {
+				t.Errorf("DDL 建出了 %s.%s，但列清单没写（镜像漂移）", tc.Table, name)
+			}
+		}
+	}
+}
+
 // TestStockBasicCarriesValuation 估值截面并入 stock_basic 后的三条硬约定：
 // 按 val_date 认日期、只盖已有行、静态属性与估值互不覆盖。
 func TestStockBasicCarriesValuation(t *testing.T) {
