@@ -161,19 +161,26 @@ func ensureColumns(db *sqlx.DB) ([]string, error) {
 	return added, nil
 }
 
+// legacyDropColumns 跨版本重写后不再有读者的死档列清单（dropLegacyColumns 的数据）。
+// 每条都要写清"谁删的它"：删列的依据是代码里再没有读者，不是看着不顺眼。
+var legacyDropColumns = []struct{ table, column, why string }{
+	{"order_ticket", "gear", `档位状态机在 2345695 整体删除，原记「开单时的档位」`},
+	{"config_kv", "updated_at", `旧"整份文档存 key='config'"设计的更新时刻；config_kv 转逐键行后无写者，schema 注释明确"改动人与时间都不存"（2026-09-24 列级审计在存量库点名的第一个真发现）`},
+}
+
 // dropLegacyColumns 删除跨版本重写后不再有读者的列。幂等：列不存在时跳过。
-//
-// order_ticket.gear 是档位状态机删除后的遗留列（原记"开单时的档位"），现役代码无读者。
 func dropLegacyColumns(db *sqlx.DB) error {
-	ok, err := hasColumn(db, "order_ticket", "gear")
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return nil
-	}
-	if _, err := db.Exec("ALTER TABLE order_ticket DROP COLUMN gear"); err != nil {
-		return fmt.Errorf("删除遗留列 order_ticket.gear 失败: %w", err)
+	for _, lc := range legacyDropColumns {
+		ok, err := hasColumn(db, lc.table, lc.column)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s", lc.table, lc.column)); err != nil {
+			return fmt.Errorf("删除遗留列 %s.%s 失败: %w", lc.table, lc.column, err)
+		}
 	}
 	return nil
 }

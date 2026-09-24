@@ -385,6 +385,57 @@ func TestAuditSchemaDetectsColumnDrift(t *testing.T) {
 	}
 }
 
+// TestDropLegacyColumnsRemovesDeadArchive 死档列清除走 dropLegacyColumns 清单：
+// 给新库人为加回 config_kv.updated_at（存量库里真实存在的旧设计残留），
+// 启动路径必须把它删掉且不动任何键值行。
+func TestDropLegacyColumnsRemovesDeadArchive(t *testing.T) {
+	s := openStoreForTest(t)
+	defer s.Close()
+	ctx := context.Background()
+
+	if _, err := s.writeDB.ExecContext(ctx, `ALTER TABLE config_kv ADD COLUMN updated_at TEXT`); err != nil {
+		t.Fatalf("模拟旧残留失败: %v", err)
+	}
+	if _, err := s.writeDB.ExecContext(ctx,
+		`INSERT INTO config_kv (key, value) VALUES ('screen.min_bar_rows', '5000')`); err != nil {
+		t.Fatalf("造配置行失败: %v", err)
+	}
+	a, err := s.AuditSchema(ctx)
+	if err != nil {
+		t.Fatalf("清点失败: %v", err)
+	}
+	if !contains(a.LegacyColumns, "config_kv.updated_at") {
+		t.Fatalf("列级清点应点名 config_kv.updated_at，实际 LegacyColumns=%v", a.LegacyColumns)
+	}
+
+	if err := dropLegacyColumns(s.writeDB); err != nil {
+		t.Fatalf("dropLegacyColumns 失败: %v", err)
+	}
+	if hasColumnAfter(t, s, "config_kv", "updated_at") {
+		t.Error("dropLegacyColumns 后 updated_at 仍在")
+	}
+	var v string
+	if err := s.readDB.GetContext(ctx, &v, `SELECT value FROM config_kv WHERE key='screen.min_bar_rows'`); err != nil {
+		t.Fatalf("删列不该动配置行: %v", err)
+	}
+	if v != "5000" {
+		t.Errorf("配置值 = %s，期望 5000", v)
+	}
+	// 幂等：再跑一次不该报错。
+	if err := dropLegacyColumns(s.writeDB); err != nil {
+		t.Fatalf("二次 dropLegacyColumns 应幂等，失败: %v", err)
+	}
+}
+
+func hasColumnAfter(t *testing.T, s *Store, table, column string) bool {
+	t.Helper()
+	ok, err := hasColumn(s.writeDB, table, column)
+	if err != nil {
+		t.Fatalf("探测列 %s.%s 失败: %v", table, column, err)
+	}
+	return ok
+}
+
 // TestOpenRepairsMissingColumns 启动路径闭环：带缺列的库文件重新 Open 即自愈，
 // 且动作（补了哪几列）与不可自愈项都进 SchemaAuditNote，启动日志看得见。
 func TestOpenRepairsMissingColumns(t *testing.T) {
