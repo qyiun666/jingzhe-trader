@@ -32,11 +32,11 @@ func morningPlan(ctx context.Context, rc *observability.RunCtx, d Deps) error {
 	if err := expireStaleTickets(ctx, rc, d); err != nil {
 		return fmt.Errorf("②b 过期未执行单收口: %w", err)
 	}
-	items, err := todayPlanLines(ctx, d, date)
+	items, tickets, err := todayPlanLines(ctx, d, date)
 	if err != nil {
 		return fmt.Errorf("③ 组装当日计划: %w", err)
 	}
-	return sendPlanMail(ctx, rc, d, date, items)
+	return sendPlanMail(ctx, rc, d, date, items, tickets)
 }
 
 // renewCalendar 日历前向覆盖不足 30 个交易日则续拉（交易日判定 isTradeDay 依赖它）。
@@ -81,13 +81,15 @@ func expireStaleTickets(ctx context.Context, rc *observability.RunCtx, d Deps) e
 //
 // 指令单按"活跃且未过期"取，不按生成日过滤：前一交易日 16:30 生成的单，trade_date 是
 // 那一天，早上按"今天"去查会得到空表（历史缺陷）——有效期才是"该不该执行"的判据。
-func todayPlanLines(ctx context.Context, d Deps, date string) ([]string, error) {
+// 第二个返回值是同一批指令单的邮件行（供 M2 内嵌条件单速填参数块）。
+func todayPlanLines(ctx context.Context, d Deps, date string) ([]string, []notify.TicketLine, error) {
 	now := time.Now().In(market.Loc).Format(time.RFC3339)
 	acts, err := d.Store.TradeRepo().ListActiveUnexpired(ctx, now)
 	if err != nil {
-		return nil, fmt.Errorf("读取待买卖表失败: %w", err)
+		return nil, nil, fmt.Errorf("读取待买卖表失败: %w", err)
 	}
 	var items []string
+	var tickets []notify.TicketLine
 	for _, t := range acts {
 		if !t.IsActive() {
 			continue
@@ -95,12 +97,17 @@ func todayPlanLines(ctx context.Context, d Deps, date string) ([]string, error) 
 		items = append(items, fmt.Sprintf("待执行 #%d %s %s %d 股，参考价 %s 元，有效期至 %s",
 			t.ID, t.TsCode, t.Direction.Label(), int64(t.Qty),
 			fmtYuan(int64(t.RefPrice)), t.ValidUntil))
+		tickets = append(tickets, notify.TicketLine{
+			TsCode: t.TsCode, Name: t.Name, Direction: string(t.Direction), DirLabel: t.Direction.Label(),
+			Qty: int64(t.Qty), Price: float64(t.RefPrice) / 100,
+			ValidUntil: t.ValidUntil, Reason: t.Reason,
+		})
 	}
 	posLines, err := positionLines(ctx, d, date)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return append(items, posLines...), nil
+	return append(items, posLines...), tickets, nil
 }
 
 // tradeConclusion 最近一次收盘流水线给当日留下的人话结论（供计划/日报引用）。
@@ -152,7 +159,7 @@ func positionLines(ctx context.Context, d Deps, date string) ([]string, error) {
 //
 // 邮件没发出去就是任务失败：以前配置缺失只记一条降级并返回 nil，
 // 于是"任务绿、零邮件"这个历史缺陷（D1）每天都发生一遍还没人看得见。
-func sendPlanMail(ctx context.Context, rc *observability.RunCtx, d Deps, date string, items []string) error {
+func sendPlanMail(ctx context.Context, rc *observability.RunCtx, d Deps, date string, items []string, tickets []notify.TicketLine) error {
 	if len(items) == 0 {
 		items = []string{"今日无待执行指令、无持仓"}
 	}
@@ -161,7 +168,7 @@ func sendPlanMail(ctx context.Context, rc *observability.RunCtx, d Deps, date st
 	if err != nil {
 		return fmt.Errorf("账户摘要读取失败: %w", err)
 	}
-	subject, body := notify.RenderM2(items, brief, tradeConclusion(ctx, d, date))
+	subject, body := notify.RenderM2(items, tickets, brief, tradeConclusion(ctx, d, date))
 	if err := d.Mail.Send(ctx, date, model.MailM2, subject, body); err != nil {
 		d.raiseW(rc, "MAIL_NOT_SENT", "计划邮件发送失败", err.Error())
 		return fmt.Errorf("计划邮件(M2)发送失败: %w", err)
@@ -424,6 +431,9 @@ func reportExtraSections(ctx context.Context, d Deps, date string) (string, erro
 	for _, l := range lines {
 		b.WriteString(fmt.Sprintf("  %s %s %d 股 %.2f 元：%s\n",
 			l.TsCode, l.DirLabel, l.Qty, l.Price, l.Reason))
+		for _, ln := range strings.Split(notify.CondOrderBlock(l), "\n") {
+			b.WriteString("  " + ln + "\n")
+		}
 	}
 	return b.String(), nil
 }
