@@ -164,8 +164,12 @@ func TestSyncETFWindow_SplitIsAdjusted(t *testing.T) {
 		t.Errorf("未复权折算日收益 %.4f，期望 ≈−0.65（份额 1:3 折算的原始形态）", rawRet)
 	}
 	// ③ 双列关系：close = round(raw_close × 当日因子)（ClosePoint 两列都是分，float64）。
+	//
+	// ETF 申报价是 0.001 元/份（1.156 元 = 115.6 分），而 daily_bar 的两列都是整数分：
+	// 这一行同时是"落库必须四舍五入、不能截断"的锁——截断会得到 115（模型侧
+	// signal/etf 一手预算用 math.Round，截断就和它漂移，误差按手放大）。
 	if want := float64(116); cur.RawClose != want {
-		t.Errorf("RawClose=%v，期望 %v 分（1.156 元）", cur.RawClose, want)
+		t.Errorf("RawClose=%v，期望 %v 分（1.156 元四舍五入；截断会得到 115）", cur.RawClose, want)
 	}
 	if want := float64(348); cur.Close != want {
 		t.Errorf("Close=%v，期望 %v 分（116×3.0）", cur.Close, want)
