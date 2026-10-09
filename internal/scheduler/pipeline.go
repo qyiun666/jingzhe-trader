@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -120,12 +121,65 @@ func syncTodayBars(ctx context.Context, rc *observability.RunCtx, d Deps, date s
 	if err := d.Dataloader.SyncDaily(ctx, date, d.Screener.SyncBackDays()); err != nil {
 		return err
 	}
+	// ETF 补口挂在个股日线之后、同一交易日、同一条幂等写入路径：开不开由总闸决定，
+	// 关掉时这一段一行都不执行（部署当日零行为变化）。
+	d.syncETFBars(ctx, rc, date)
 	n, err := d.Store.MarketRepo().CountBar(ctx, date)
 	if err != nil {
 		return fmt.Errorf("核对日线行数失败: %w", err)
 	}
 	rc.Actual("daily_bar", n)
 	return nil
+}
+
+// syncETFBars ETF 补口的当日同步（screen.etf_enabled=false 时整段不执行）。
+//
+// 刻意"只降级不中止"：这条链是为了补"弱势期个股链选不出可负担科技标的"这个缺口，
+// 不是主链。fund_daily/fund_adj 某天没发布或被限流时，正确反应是当日少一个候选来源
+// （选股侧会因"窗口日线不足/当日无报价"把它剔掉并把原因写进 Notes），
+// 而不是把整条 evening_pipeline 一起掐掉——个股候选不该为 ETF 的可用性陪葬。
+func (d Deps) syncETFBars(ctx context.Context, rc *observability.RunCtx, date string) {
+	raw := d.Config.GetString("screen.etf_enabled")
+	enabled, err := strconv.ParseBool(strings.TrimSpace(raw))
+	if err != nil || !enabled {
+		return // 非法值在装配期已被 validateETF 拦下；这里兜的是键缺失的旧库
+	}
+	codes := etfCodesOf(d.Config)
+	if len(codes) == 0 {
+		d.raiseW(rc, "ETF_POOL_EMPTY", "ETF 已启用但白名单解析不出代码", "检查 screen.etf_whitelist")
+		return
+	}
+	rc.Declare("rows", "etf_bar", 0)
+	n, err := d.Dataloader.SyncETF(ctx, date, codes)
+	rc.Actual("etf_bar", n)
+	if err != nil {
+		d.raiseW(rc, "ETF_SYNC", "ETF 日线同步降级（不中止当日链路）", err.Error())
+		return
+	}
+	observability.S().Infow("ETF 日线同步完成", "date", date, "codes", len(codes), "rows", n)
+}
+
+// etfCodesOf 从 ETF 白名单取代码列（同步侧只需要代码）。
+//
+// 与 MarketGateOf 同一条兜底口径：装配期的 validateETF 已经把非法值拦在启动之外，
+// 这里的宽容解析只为"键缺失的旧库"和"运行期被人改坏"这两条路径留出降级空间。
+// 格式 code[:name[:track]]，与 screener 侧的白名单解析一致；合并后应统一走那一个解析器
+// （app ↔ screener 之间存在依赖方向约束，scheduler 这侧不便直接复用其返回类型）。
+func etfCodesOf(cfg ConfigReader) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, item := range strings.FieldsFunc(cfg.GetString("screen.etf_whitelist"), func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\t' || r == ' '
+	}) {
+		code := strings.ToUpper(strings.TrimSpace(strings.Split(item, ":")[0]))
+		if code == "" || seen[code] {
+			continue
+		}
+		seen[code] = true
+		out = append(out, code)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // gateFreshness 数据新鲜度门禁。不新鲜返回 error → 整链中止，当日不出任何指令。
