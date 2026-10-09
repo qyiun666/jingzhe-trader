@@ -47,11 +47,18 @@ func (s *Screener) SyncBackDays() int {
 	return momentumBars + syncBackfillMargin
 }
 
-// Budget 单笔预算：可用现金按计划持仓数均分。Slots<=0 或无现金口径时返回 0（不放行）。
+// Budget 单笔预算：可用现金按计划持仓数均分，再收口到风控的单票上限。
+// Slots<=0 或无现金口径时返回 0（不放行）。
 type Budget struct {
 	Cash     model.Fen
 	Slots    int
 	MarketOK bool // 大盘是否允许开新仓（指数在门槛均线上方；门槛关闭时恒 true）
+	// CapFen 风控口径的单票上限（risk.RiskParams.SingleCapFen），0 表示调用方没给口径。
+	// "买不买得起"必须以它为准而不是现金均分：现金 11833.80/2 槽 = 5916.90 元，
+	// 而弱势试探的单票上限只有 1183.38 元，用均分口径选出来的高价股，
+	// 进决策链必被 RuleLotUnaffordable 斩掉（20260930/20261008 实测各 7/20、4/20 只），
+	// 等于每天白跑一遍 LLM 评审并让"候选池"这个观测口径失真。
+	CapFen model.Fen
 	// MAWindow 本次判定所用的大盘均线窗口（供文案回显，0 视为默认深度）。
 	MAWindow int
 	// WeakRegime 门槛关闭（gate_enabled=false）且大盘仍处弱势（收盘<均线，
@@ -62,11 +69,35 @@ type Budget struct {
 	WeakNote string
 }
 
+// perSlot 漏斗"一手买得起吗"这一级的预算线：现金均分与风控单票上限取严。
+//
+// CapFen<=0（调用方没给风控口径）时退化成纯均分，与参数化之前的行为逐位一致；
+// 不给口径不等于不收紧，但也不越权凭空造一条限制线。
 func (b Budget) perSlot() model.Fen {
 	if b.Slots <= 0 || b.Cash <= 0 {
 		return 0
 	}
-	return b.Cash / model.Fen(b.Slots)
+	p := b.Cash / model.Fen(b.Slots)
+	if b.CapFen > 0 && b.CapFen < p {
+		return b.CapFen
+	}
+	return p
+}
+
+// budgetNote 把"可用资金"这一级实际生效的预算线写成一行日志。
+//
+// 加它的原因是归因成本：20261008 盘查"为什么没有科技股"时，这条线只能从现金、
+// 持仓数与风控参数反推，而它恰恰是解释候选构成最关键的一级。
+func budgetNote(b Budget) string {
+	avg := model.Fen(0)
+	if b.Slots > 0 && b.Cash > 0 {
+		avg = b.Cash / model.Fen(b.Slots)
+	}
+	if b.CapFen > 0 && b.CapFen < avg {
+		return fmt.Sprintf("单笔预算 %.2f 元（现金均分 %.2f → 风控单票上限 %.2f 取严）",
+			b.CapFen.Float(), avg.Float(), b.CapFen.Float())
+	}
+	return fmt.Sprintf("单笔预算 %.2f 元（现金均分口径）", b.perSlot().Float())
 }
 
 // Report 一次选股运行的产出（供 CLI 打印与日志）。
@@ -141,6 +172,7 @@ func (s *Screener) Run(ctx context.Context, tradeDate string, budget Budget) (*R
 	rep.Sectors = sectors
 	hot := hotSectors(sectors, s.cfg.SectorTopK)
 	rep.Notes = append(rep.Notes, "板块排名 "+strings.Join(topSectorNames(sectors, s.cfg.SectorTopK), "、"))
+	rep.Notes = append(rep.Notes, budgetNote(budget))
 
 	tr := &tracer{rep: rep}
 	survivors := s.filterStage(tr, "elig", "基础资格(ST/新股/停牌)", in.stocks, func(stk model.StockBasic) (bool, string) {

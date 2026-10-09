@@ -54,18 +54,17 @@ func eveningPipeline(ctx context.Context, rc *observability.RunCtx, d Deps) erro
 	if err := raiseHighWatermarks(ctx, d, date); err != nil {
 		return fmt.Errorf("更新持仓期间高点: %w", err)
 	}
-	cands, budget, err := screenCandidates(ctx, rc, d, date, rp)
+	caps := WeakCapsOf(d.Config)
+	cands, budget, rp, err := screenCandidates(ctx, rc, d, date, rp, caps)
 	if err != nil {
 		return fmt.Errorf("③ 选股: %w", err)
 	}
-	// 弱势试探：门槛被人为关闭（gate_enabled=false）且大盘仍弱势时，风控收缩到
-	// 试探档再进决策链。不收紧的话，"放开闸门"与"满仓接飞刀"是同一件事。
-	// 判定结果（含数据不可用的降级）必须留在 run_trace：试探模式的每一笔都靠它归因。
+	// 弱势试探留痕：门槛被人为关闭（gate_enabled=false）且大盘仍弱势时，风控已在
+	// ScreenBudget 里按同一份 caps 收缩到试探档，漏斗与决策链共用同一条单票上限线
+	// （不收紧的话，"放开闸门"与"满仓接飞刀"是同一件事）。这里只负责让判定可归因。
 	if budget.WeakRegime {
-		total, single := gateOffCapsOf(d.Config)
-		rp = risk.WeakParams(rp, total, single)
 		note := fmt.Sprintf("%s；试探风控收紧：总仓≤%.0f%% 单票≤%.0f%%",
-			budget.WeakNote, total*100, single*100)
+			budget.WeakNote, caps.TotalPct*100, caps.SinglePct*100)
 		rc.Degrade("WEAK_REGIME", note)
 		d.raiseWeakTrace(ctx, date, note)
 		observability.S().Infow("弱势试探模式", "date", date, "note", note)
@@ -140,16 +139,17 @@ func gateFreshness(ctx context.Context, d Deps, date string) error {
 	return nil
 }
 
-// screenCandidates 跑选股漏斗（全程内存），返回候选与本轮大盘口径（供弱势收紧）。
+// screenCandidates 跑选股漏斗（全程内存），返回候选、本轮大盘口径与**生效后的**风控参数
+// （弱势收缩发生在 ScreenBudget 内，调用方拿到的 rp 与漏斗用的是同一份）。
 func screenCandidates(ctx context.Context, rc *observability.RunCtx, d Deps, date string,
-	rp risk.RiskParams) ([]model.Candidate, screener.Budget, error) {
-	budget, err := ScreenBudget(ctx, d.Store, d.Ledger, date, rp, MarketGateOf(d.Config))
+	rp risk.RiskParams, caps WeakCaps) ([]model.Candidate, screener.Budget, risk.RiskParams, error) {
+	budget, rp, err := ScreenBudget(ctx, d.Store, d.Ledger, date, rp, MarketGateOf(d.Config), caps)
 	if err != nil {
-		return nil, budget, err
+		return nil, budget, rp, err
 	}
 	rep, err := d.Screener.Run(ctx, date, budget)
 	if err != nil {
-		return nil, budget, err
+		return nil, budget, rp, err
 	}
 	rc.Declare("rows", "candidates", candidateExpect(rep))
 	rc.Actual("candidates", len(rep.Candidates))
@@ -162,7 +162,7 @@ func screenCandidates(ctx context.Context, rc *observability.RunCtx, d Deps, dat
 	if rep.Empty {
 		rc.Degrade("SCREEN_EMPTY", emptyReason(rep))
 	}
-	return rep.Candidates, budget, nil
+	return rep.Candidates, budget, rp, nil
 }
 
 // candidateExpect 候选产出物的期望数量。
@@ -201,7 +201,11 @@ func emptyReason(rep *screener.Report) string {
 func itoa(n int) string { return fmt.Sprintf("%d", n) }
 
 // ScreenBudget 组装选股漏斗的资金与大盘口径：
-// 单笔预算 = 可用现金 / 计划持仓数；门槛开启且大盘跌破均线时当日关闭买入漏斗。
+// 单笔预算 = 可用现金 / 计划持仓数，再收口到风控单票上限；门槛开启且大盘跌破均线时当日关闭买入漏斗。
+//
+// 返回第二个值是**本轮生效的风控参数**：弱势判定要收缩风控，而漏斗必须和决策链用同一条
+// 单票上限线，所以收缩在这里一次完成、把结果交回调用方，而不是"漏斗用旧口径选完、
+// 决策链再按新口径把高价股全部否决"（那正是 20260930/20261008 的实跑形态）。
 //
 // 现金是这道闸门必需 inputs：拿不到就失败——那等于在最该保守的时候默认放行买入。
 // 指数口径则随 gate 分两种：gate.Enabled 时读不到/算不出均线同样失败（历史行为，
@@ -212,30 +216,35 @@ func itoa(n int) string { return fmt.Sprintf("%d", n) }
 // 调度器与 `jingzhe run task screen` 共用这一个实现：两边各写一套判据，
 // 手工复现出的漏斗就与到点自动跑的不一致（历史上 CLI 那套把 MarketOK 写死为 true）。
 func ScreenBudget(ctx context.Context, st *store.Store, led *ticket.Ledger,
-	date string, rp risk.RiskParams, gate store.MarketGate) (screener.Budget, error) {
+	date string, rp risk.RiskParams, gate store.MarketGate, caps WeakCaps) (screener.Budget, risk.RiskParams, error) {
 	b := screener.Budget{Slots: rp.MaxPositions, MAWindow: gate.Window}
 	ast, err := led.Assets(ctx, date)
 	if err != nil {
-		return b, fmt.Errorf("读取账户现金失败，可用资金筛无法判定: %w", err)
+		return b, rp, fmt.Errorf("读取账户现金失败，可用资金筛无法判定: %w", err)
 	}
 	b.Cash = ast.Cash
 	if !gate.Enabled {
 		b.MarketOK = true
 		// 门槛被人为关闭不等于大盘变好：弱势判定照常做，只是不再据此关闸，
-		// 而是让调用方收缩到试探风控。指数读不到也算弱势——数据未知时宁缩量不满仓。
+		// 而是收缩到试探风控后让漏斗与决策链一起用它。指数读不到也算弱势——数据未知时宁缩量不满仓。
 		b.WeakRegime, b.WeakNote = detectWeakRegime(ctx, st, date, gate.Window)
-		return b, nil
+		if b.WeakRegime {
+			rp = risk.WeakParams(rp, caps.TotalPct, caps.SinglePct)
+		}
+	} else {
+		idx, err := st.ScreenRepo().LatestMarketIndex(ctx, date, gate.Window)
+		if err != nil {
+			return b, rp, err
+		}
+		if idx.MA <= 0 {
+			return b, rp, fmt.Errorf("大盘指数 %s 在 %s 前不足 %d 根日线，MA%d 不可算",
+				store.MarketIndex, date, gate.Window, gate.Window)
+		}
+		b.MarketOK = idx.Close >= idx.MA
 	}
-	idx, err := st.ScreenRepo().LatestMarketIndex(ctx, date, gate.Window)
-	if err != nil {
-		return b, err
-	}
-	if idx.MA <= 0 {
-		return b, fmt.Errorf("大盘指数 %s 在 %s 前不足 %d 根日线，MA%d 不可算",
-			store.MarketIndex, date, gate.Window, gate.Window)
-	}
-	b.MarketOK = idx.Close >= idx.MA
-	return b, nil
+	// 单票上限按生效后的 rp 算：弱势收缩在上一步已经落进 rp。
+	b.CapFen = rp.SingleCapFen()
+	return b, rp, nil
 }
 
 // detectWeakRegime 门槛关闭时的大盘弱势判定（best-effort，永不返回 error）：
@@ -278,6 +287,18 @@ func gateOffCapsOf(cfg ConfigReader) (total, single float64) {
 		single = risk.CircuitMaxSinglePct
 	}
 	return total, single
+}
+
+// WeakCaps 弱势试探的两个上限（占总资产比例），成对传递避免两个裸 float 参数搞混顺序。
+type WeakCaps struct {
+	TotalPct  float64
+	SinglePct float64
+}
+
+// WeakCapsOf 读出弱势上限的结构化形态（判据全在 gateOffCapsOf 里，这里只做封装）。
+func WeakCapsOf(cfg ConfigReader) WeakCaps {
+	total, single := gateOffCapsOf(cfg)
+	return WeakCaps{TotalPct: total, SinglePct: single}
 }
 
 // raiseWeakTrace 弱势判定单独落一条 alert:WEAK_REGIME 轨迹（与 alert:SCREEN_EMPTY

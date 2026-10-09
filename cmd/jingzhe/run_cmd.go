@@ -139,12 +139,15 @@ func hasName(names []string, want string) bool {
 
 // screenBudgetOf 手工试跑漏斗的资金与大盘口径：直接复用调度器的 ScreenBudget。
 // 判据失败即退出——手工复现的全部意义在于与到点自动跑的一致，缺一项口径就不可比。
+// 弱势收缩后的单票上限也由 ScreenBudget 一并算出（rp 不与调度器再分叉，这里用不上）。
 func screenBudgetOf(ctx context.Context, rt *app.Runtime, date string) (screener.Budget, error) {
 	rp, err := app.RiskParamsOf(rt)(ctx, date)
 	if err != nil {
 		return screener.Budget{}, fmt.Errorf("读取风控参数失败: %w", err)
 	}
-	return scheduler.ScreenBudget(ctx, rt.Store, rt.Ledger, date, rp, scheduler.MarketGateOf(rt.Config))
+	b, _, err := scheduler.ScreenBudget(ctx, rt.Store, rt.Ledger, date, rp,
+		scheduler.MarketGateOf(rt.Config), scheduler.WeakCapsOf(rt.Config))
+	return b, err
 }
 
 // fatal 统一的任务失败出口（打印带任务名的原因并以 1 退出）。
