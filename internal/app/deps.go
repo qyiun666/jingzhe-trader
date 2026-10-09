@@ -6,6 +6,9 @@ package app
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -231,6 +234,9 @@ func validateEnums(cfg *config.Config) error {
 		return fmt.Errorf("screen.gate_off_max_single_pct=%g 大于总仓上限 %g（单票不可能超过总仓）",
 			single, total)
 	}
+	if err := validateETF(cfg); err != nil {
+		return err
+	}
 	// 触发时刻拼错时调度器只在每次 tick 记一条日志、整天不跑这个任务；装配期直接拒绝。
 	for _, key := range []string{"scheduler.morning", "scheduler.pipeline", "scheduler.mail_pending", "scheduler.report"} {
 		for _, hm := range strings.Split(cfg.GetString(key), ",") {
@@ -326,4 +332,84 @@ func MailConfigOf(cfg *config.Config) notify.MailConfig {
 		},
 		To: to,
 	}
+}
+
+// etfCodeRe 场内标的代码：6 位数字 + 交易所后缀。白名单里的每一项都要严格对上，
+// 因为代码写错不会报错——fund_daily 只会返回空，于是一整条 ETF 链静默地一只候选都没有。
+var etfCodeRe = regexp.MustCompile(`^\d{6}\.(SH|SZ|BJ)$`)
+
+// etfSeparator ETF 白名单的分隔符集合（逗号/分号/换行/制表/空格）。
+func etfSeparator(r rune) bool {
+	return r == ',' || r == ';' || r == '\n' || r == '\t' || r == ' '
+}
+
+// ETFWhitelistCodes 解析 screen.etf_whitelist 的代码列（格式 code[:name[:track]]）。
+//
+// 与选股侧的白名单解析同格式：这里只取代码给数据同步用，不复用它的返回类型，
+// 以免 app ↔ screener 互相依赖。合并后可以收拢成一处解析（见群里交接说明）。
+func ETFWhitelistCodes(raw string) ([]string, error) {
+	seen := map[string]bool{}
+	var codes []string
+	for _, item := range strings.FieldsFunc(raw, etfSeparator) {
+		code := strings.ToUpper(strings.TrimSpace(strings.Split(item, ":")[0]))
+		if code == "" {
+			continue
+		}
+		if !etfCodeRe.MatchString(code) {
+			return nil, fmt.Errorf("screen.etf_whitelist 条目 %q 的代码不合法（应为 6 位数字 + .SH/.SZ/.BJ）", item)
+		}
+		if seen[code] {
+			return nil, fmt.Errorf("screen.etf_whitelist 代码 %s 重复（同一标的会在同一次评审里出现两次）", code)
+		}
+		seen[code] = true
+		codes = append(codes, code)
+	}
+	sort.Strings(codes)
+	return codes, nil
+}
+
+// validateETF ETF 补口的装配期校验。
+//
+// 空串按 KeySpec 默认值处理（关 / 2.0 亿）：那是"键还没落库"的形态，不是坏值——
+// 真实运行期由 config.Load 兜默认，只有手工拼装 Config 的测试与旧库会走到这里。
+// 一旦显式写了值，就必须严格：非法布尔、非正阈值、代码格式错、重复代码统统拒绝启动，
+// 因为 ETF 这条链的失败形态是"静默 0 候选"（代码写错时 fund_daily 只返回空），
+// 那种错在运行期永远看不见，只能在启动那一下拦。
+//
+// 只在总闸打开时严格要求白名单可用：关掉时（默认）这是一份"还没启用的配置"，
+// 里面缺个名称不该让今天的服务起不来；打开时缺名称就意味着待发的那张指令单上
+// 标的名称是空的——那必须拒绝启动，而不是运行期悄悄少一只候选。
+func validateETF(cfg *config.Config) error {
+	rawEnabled := strings.TrimSpace(cfg.GetString("screen.etf_enabled"))
+	enabled := false
+	if rawEnabled != "" {
+		v, err := strconv.ParseBool(rawEnabled)
+		if err != nil {
+			return fmt.Errorf("screen.etf_enabled=%q 不是布尔值（可选 true|false）", rawEnabled)
+		}
+		enabled = v
+	}
+	if raw := strings.TrimSpace(cfg.GetString("screen.etf_min_avg_amount_yi")); raw != "" {
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil || v <= 0 {
+			return fmt.Errorf("screen.etf_min_avg_amount_yi=%q 非法（须为正数，单位亿元；设 0 等于取消流动性这一级）", raw)
+		}
+	}
+	codes, err := ETFWhitelistCodes(cfg.GetString("screen.etf_whitelist"))
+	if err != nil {
+		return err
+	}
+	if !enabled {
+		return nil
+	}
+	if len(codes) == 0 {
+		return fmt.Errorf("screen.etf_enabled=true 但 screen.etf_whitelist 为空：启用补口却没有标的池")
+	}
+	for _, item := range strings.FieldsFunc(cfg.GetString("screen.etf_whitelist"), etfSeparator) {
+		parts := strings.Split(item, ":")
+		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
+			return fmt.Errorf("screen.etf_whitelist 条目 %q 缺少名称：名称要进指令单与邮件，必须由人工按 fund_basic.name 复核过", item)
+		}
+	}
+	return nil
 }

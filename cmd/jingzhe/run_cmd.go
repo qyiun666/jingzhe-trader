@@ -5,12 +5,13 @@
 //	调度器注册名（与 serve 到点触发同一份、同一条 runJob 路径）：
 //	  morning_plan / intraday_scan / evening_pipeline / mail_pending / daily_report
 //	CLI 独有的数据面任务（没有到点触发，只用于接入与排查）：
-//	  calendar / daily / freshness / screen
+//	  calendar / daily / etf / freshness / screen
 //
 // 用法:
 //
 //	jingzhe -db data/jingzhe.db run task calendar
 //	jingzhe -db data/jingzhe.db run task daily     --date 20260901 [--back N]
+//	jingzhe -db data/jingzhe.db run task etf       --date 20260901 [--back N]
 //	jingzhe -db data/jingzhe.db run task freshness --date 20260901
 //	jingzhe -db data/jingzhe.db run task screen    --date 20260901
 //	jingzhe -db data/jingzhe.db run task evening_pipeline --date 20260901
@@ -32,7 +33,7 @@ import (
 )
 
 // dataTasks 只有 CLI 提供、不在调度器注册表里的数据面任务。
-var dataTasks = []string{"calendar", "daily", "freshness", "screen"}
+var dataTasks = []string{"calendar", "daily", "etf", "freshness", "screen"}
 
 // runRun 处理 `jingzhe run task <name> [flags]`。
 //
@@ -41,7 +42,7 @@ var dataTasks = []string{"calendar", "daily", "freshness", "screen"}
 func runRun(ctx context.Context, st *store.Store, args []string) {
 	if len(args) < 2 || args[0] != "task" {
 		fmt.Fprintln(os.Stderr, "用法: jingzhe run task <任务名> [--date YYYYMMDD] [--back N]")
-		fmt.Fprintln(os.Stderr, "  数据面任务: [calendar daily freshness screen]（calendar 外均需 --date）")
+		fmt.Fprintln(os.Stderr, "  数据面任务: [calendar daily etf freshness screen]（calendar 外均需 --date）")
 		fmt.Fprintln(os.Stderr, "  调度器任务: [morning_plan intraday_scan evening_pipeline mail_pending daily_report]（均需 --date）")
 		os.Exit(2)
 	}
@@ -49,7 +50,7 @@ func runRun(ctx context.Context, st *store.Store, args []string) {
 
 	fs := flag.NewFlagSet("run-task", flag.ExitOnError)
 	date := fs.String("date", "", "交易日 YYYYMMDD（除 calendar 外全部必填）")
-	back := fs.Int("back", 0, "回补前 N 个交易日（daily 任务；0=按选股窗口自动定）")
+	back := fs.Int("back", 0, "回补前 N 个交易日（daily/etf 任务；daily 的 0=按选股窗口自动定，etf 的 0=仅当日）")
 	if err := fs.Parse(args[2:]); err != nil {
 		os.Exit(2)
 	}
@@ -78,6 +79,36 @@ func runRun(ctx context.Context, st *store.Store, args []string) {
 		}
 		fatal(task, rt.Dataloader.SyncDaily(ctx, *date, days))
 		fmt.Printf("daily 同步完成（%s，覆盖最近 %d 个交易日）\n", *date, days+1)
+
+	case "etf":
+		// ETF 白名单日线的接入通道：与 nightly 同步同一函数（SyncETFWindow），
+		// 差别只在区间深度 —— 单码一次区间调用就能拉满 4 年，比个股逐日回补便宜两个数量级。
+		// 开闸前用它把窗口深度补齐（否则选股侧的"窗口日线不足"会把整池剔光），
+		// 总闸关闭时也可以用它先把数据备好：写 daily_bar 不影响任何个股判定。
+		needDate(task, *date)
+		codes, err := app.ETFWhitelistCodes(cfg.GetString("screen.etf_whitelist"))
+		fatal(task, err)
+		if len(codes) == 0 {
+			fmt.Fprintln(os.Stderr, "screen.etf_whitelist 解析后没有任何代码")
+			os.Exit(2)
+		}
+		window, err := st.ScreenRepo().WindowDates(ctx, *date, *back+1)
+		fatal(task, err)
+		if len(window) == 0 {
+			fmt.Fprintf(os.Stderr, "日历里 %s 及之前没有开市日，先跑 calendar\n", *date)
+			os.Exit(1)
+		}
+		start := window[0]
+		n, err := rt.Dataloader.SyncETFWindow(ctx, start, *date, codes)
+		if *back == 0 {
+			// 单日增量与夜间路径同构：规模校验只在补当日数据时顺带做一次
+			// （深历史回补逐日份额不是这条路径的目的，且会把调用量放大 3 倍）。
+			if serr := rt.Dataloader.CheckETFScale(ctx, *date, codes); serr != nil && err == nil {
+				err = serr
+			}
+		}
+		fatal(task, err)
+		fmt.Printf("etf 同步完成（%s..%s，%d 只，写入 %d 行）\n", start, *date, len(codes), n)
 
 	case "freshness":
 		needDate(task, *date)
