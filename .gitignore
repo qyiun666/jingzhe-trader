@@ -41,6 +41,16 @@ data/.stignore
 data/.stfolder/
 data/.stversions/
 
+# ==================== 库与备份目录级排除（2026-10-09 补） ====================
+# 上面的 data/*.db 只挡主库文件名，挡不住两类实际存在的副本：
+#   1) data/ 根下 21 份 data/jingzhe.db.pre-* 与 .backup-before-vacuum*（部署/清理快照）
+#   2) 仓库根的 data.bak.20260827-1923/ 与 data.bak.20260828-1700/（换库期整目录备份）
+# 这些全是含明文凭据的整库副本（config_kv 里有 tushare token / LLM key / SMTP 授权码），
+# 逐条加模式永远追不上快照命名，故按目录整体排除 —— 防 23 份含明文凭据的库副本
+# 进入 git add -A 的待推清单（GitHub 红线：只推代码）。
+/data/
+/data.bak*/
+
 # Log files
 logs/
 *.log
