@@ -3,7 +3,6 @@ package scheduler
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -163,23 +162,13 @@ func (d Deps) syncETFBars(ctx context.Context, rc *observability.RunCtx, date st
 //
 // 与 MarketGateOf 同一条兜底口径：装配期的 validateETF 已经把非法值拦在启动之外，
 // 这里的宽容解析只为"键缺失的旧库"和"运行期被人改坏"这两条路径留出降级空间。
-// 格式 code[:name[:track]]，与 screener 侧的白名单解析一致；合并后应统一走那一个解析器
-// （app ↔ screener 之间存在依赖方向约束，scheduler 这侧不便直接复用其返回类型）。
+//
+// 解析本身收拢到 screener 那一份（ETFWhitelistCodes）：分隔符集合、code:name:track
+// 三段式、裸六位代码补交易所后缀、大小写与去重都在那里。同步侧与漏斗侧必须读到
+// 同一串代码 —— 两处各自 split 迟早漂移，而漂移的症状是"日线明明同步了却整天
+// 窗口日线不足"，是最难归因的一类。依赖方向是 app/scheduler → screener，不构成环。
 func etfCodesOf(cfg ConfigReader) []string {
-	seen := map[string]bool{}
-	var out []string
-	for _, item := range strings.FieldsFunc(cfg.GetString("screen.etf_whitelist"), func(r rune) bool {
-		return r == ',' || r == ';' || r == '\n' || r == '\t' || r == ' '
-	}) {
-		code := strings.ToUpper(strings.TrimSpace(strings.Split(item, ":")[0]))
-		if code == "" || seen[code] {
-			continue
-		}
-		seen[code] = true
-		out = append(out, code)
-	}
-	sort.Strings(out)
-	return out
+	return screener.ETFWhitelistCodes(cfg.GetString("screen.etf_whitelist"))
 }
 
 // gateFreshness 数据新鲜度门禁。不新鲜返回 error → 整链中止，当日不出任何指令。

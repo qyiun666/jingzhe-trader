@@ -6,8 +6,6 @@ package app
 import (
 	"context"
 	"fmt"
-	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -334,38 +332,18 @@ func MailConfigOf(cfg *config.Config) notify.MailConfig {
 	}
 }
 
-// etfCodeRe 场内标的代码：6 位数字 + 交易所后缀。白名单里的每一项都要严格对上，
-// 因为代码写错不会报错——fund_daily 只会返回空，于是一整条 ETF 链静默地一只候选都没有。
-var etfCodeRe = regexp.MustCompile(`^\d{6}\.(SH|SZ|BJ)$`)
-
-// etfSeparator ETF 白名单的分隔符集合（逗号/分号/换行/制表/空格）。
-func etfSeparator(r rune) bool {
-	return r == ',' || r == ';' || r == '\n' || r == '\t' || r == ' '
-}
-
 // ETFWhitelistCodes 解析 screen.etf_whitelist 的代码列（格式 code[:name[:track]]）。
 //
-// 与选股侧的白名单解析同格式：这里只取代码给数据同步用，不复用它的返回类型，
-// 以免 app ↔ screener 互相依赖。合并后可以收拢成一处解析（见群里交接说明）。
+// 切分规则只有一份，长在 screener 那边（分隔符集合、三段式、裸六位代码补交易所后缀、
+// 大小写归一与去重）：漏斗侧与同步侧读到不同的代码集时，症状是"日线明明同步了
+// 却整天窗口日线不足"，是最难归因的一类。依赖方向是 app → screener（组合根本来就
+// 依赖选股包），不构成环。这里保留 error 返回值，是为了让 run task etf 这类
+// 动手前先校验的调用方把非法配置当场喊停。
 func ETFWhitelistCodes(raw string) ([]string, error) {
-	seen := map[string]bool{}
-	var codes []string
-	for _, item := range strings.FieldsFunc(raw, etfSeparator) {
-		code := strings.ToUpper(strings.TrimSpace(strings.Split(item, ":")[0]))
-		if code == "" {
-			continue
-		}
-		if !etfCodeRe.MatchString(code) {
-			return nil, fmt.Errorf("screen.etf_whitelist 条目 %q 的代码不合法（应为 6 位数字 + .SH/.SZ/.BJ）", item)
-		}
-		if seen[code] {
-			return nil, fmt.Errorf("screen.etf_whitelist 代码 %s 重复（同一标的会在同一次评审里出现两次）", code)
-		}
-		seen[code] = true
-		codes = append(codes, code)
+	if err := screener.ValidateETFWhitelist(raw, false); err != nil {
+		return nil, err
 	}
-	sort.Strings(codes)
-	return codes, nil
+	return screener.ETFWhitelistCodes(raw), nil
 }
 
 // validateETF ETF 补口的装配期校验。
@@ -379,6 +357,7 @@ func ETFWhitelistCodes(raw string) ([]string, error) {
 // 只在总闸打开时严格要求白名单可用：关掉时（默认）这是一份"还没启用的配置"，
 // 里面缺个名称不该让今天的服务起不来；打开时缺名称就意味着待发的那张指令单上
 // 标的名称是空的——那必须拒绝启动，而不是运行期悄悄少一只候选。
+// 白名单那一段的严格判据与选股侧共用同一份实现（screener.ValidateETFWhitelist）。
 func validateETF(cfg *config.Config) error {
 	rawEnabled := strings.TrimSpace(cfg.GetString("screen.etf_enabled"))
 	enabled := false
@@ -395,21 +374,5 @@ func validateETF(cfg *config.Config) error {
 			return fmt.Errorf("screen.etf_min_avg_amount_yi=%q 非法（须为正数，单位亿元；设 0 等于取消流动性这一级）", raw)
 		}
 	}
-	codes, err := ETFWhitelistCodes(cfg.GetString("screen.etf_whitelist"))
-	if err != nil {
-		return err
-	}
-	if !enabled {
-		return nil
-	}
-	if len(codes) == 0 {
-		return fmt.Errorf("screen.etf_enabled=true 但 screen.etf_whitelist 为空：启用补口却没有标的池")
-	}
-	for _, item := range strings.FieldsFunc(cfg.GetString("screen.etf_whitelist"), etfSeparator) {
-		parts := strings.Split(item, ":")
-		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
-			return fmt.Errorf("screen.etf_whitelist 条目 %q 缺少名称：名称要进指令单与邮件，必须由人工按 fund_basic.name 复核过", item)
-		}
-	}
-	return nil
+	return screener.ValidateETFWhitelist(cfg.GetString("screen.etf_whitelist"), enabled)
 }
