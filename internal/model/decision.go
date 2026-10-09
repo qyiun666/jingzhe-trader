@@ -25,11 +25,23 @@ type Signal struct {
 	Reason     string
 }
 
+// 品种类别：选股漏斗与决策链按它区分个股与场内 ETF。
+//
+// 必须是候选身上的显式旗标而不是"行业字段等于某个值"这类隐式约定：两者的可得数据
+// 完全不同（ETF 没有 PE/PB/换手率/流通市值），prompt 与告警文案按同一套字段渲染
+// 就会把"没有这个数据"讲成"这个数据是 0"——PE 0.0 在模型眼里是极其便宜，不是缺数据。
+const (
+	// KindStock 个股。Candidate 的零值按个股处理，老路径不必显式赋值。
+	KindStock = "stock"
+	KindETF   = "etf"
+)
+
 // Candidate 选股候选：漏斗与 LLM 决策与指令单之间传递的唯一对象。
 // Close 取未复权收盘（与成交成本同口径），Mom 为因子窗口区间涨幅（小数）。
 type Candidate struct {
 	Rank         int
-	PoolSize     int // 因子百分位的截面基数；基数很小时 0/100 只表示相对位置，不是绝对评价
+	PoolSize     int    // 因子百分位的截面基数；基数很小时 0/100 只表示相对位置，不是绝对评价
+	Kind         string // KindStock（零值）/ KindETF
 	TsCode       string
 	Name         string
 	Industry     string
@@ -44,6 +56,9 @@ type Candidate struct {
 	SectorMom    float64
 	Reason       string
 }
+
+// IsETF 是否场内 ETF：下游（LLM prompt、告警文案）按它换一套字段渲染。
+func (c Candidate) IsETF() bool { return c.Kind == KindETF }
 
 // SectorStat 板块强弱统计（只出现在日志与告警正文）。
 type SectorStat struct {

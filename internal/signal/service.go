@@ -20,13 +20,51 @@ type Service struct {
 	st     *store.Store
 	ledger *ticket.Ledger // 现金/资产的唯一口径（含组合同步的现金锚点）
 	gate   store.MarketGate
+	etf    ETFUniverse // 白名单认定的场内 ETF（豁免规则 4 + 显示名兜底）
 }
+
+// ETFUniverse 白名单声明的场内 ETF：ts_code → 人工复核过的显示名。
+//
+// 两个用途都关系到钱，不能靠代码前缀猜：
+//  1. 卖出规则 4（排名淘汰）对它跳过 —— ETF 候选只在弱势试探期存在且不排名，
+//     按个股口径"跌出榜单就卖"会在恢复开闸当晚无条件清掉 ETF 仓位。
+//  2. 指令单显示名兜底 —— 名称原先只能从 stock_basic 取，取不到就是整链 error；
+//     ETF 是白名单自带名字的补口品种，缺行不该让一张止损单发不出去。
+type ETFUniverse map[string]string
 
 // NewService 构造决策服务。gate 决定卖出规则 5（大盘恶化）是否参与判定、
 // 用多深的均线——必须与买入漏斗吃的是同一份配置，否则会出现
 // "买入放行了、持仓当晚被大盘恶化规则清光"这种左右互搏。
-func NewService(st *store.Store, ledger *ticket.Ledger, gate store.MarketGate) *Service {
-	return &Service{st: st, ledger: ledger, gate: gate}
+//
+// etf 传 screen.etf_whitelist 的解析结果（与 ETF 漏斗共用同一份配置，见
+// scheduler.ETFOptionsOf）。按白名单而不是按 etf_enabled 生效：关闸买入不等于
+// 手里没有 ETF，试探期买到的仓位在停闸之后仍要按正确的规则退出。
+func NewService(st *store.Store, ledger *ticket.Ledger, gate store.MarketGate, etf ETFUniverse) *Service {
+	return &Service{st: st, ledger: ledger, gate: gate, etf: etf}
+}
+
+// isETF 判定代码是否由白名单声明为场内 ETF。
+func (s *Service) isETF(code string) bool {
+	_, ok := s.etf[code]
+	return ok
+}
+
+// SellName 补卖出指令单的显示名：优先取 stock_basic，缺失时回落到白名单名称。
+//
+// 个股沿用原口径（取不到就是错误：说明数据链没跑，必须出声）；只对白名单内的
+// ETF 回落，因为它的名字本来就是配置里人工复核过的一手信息，不存在"数据没到"
+// 的问题。盘中 M3 与收盘决策共用这一个实现，两条退出路径的名称口径不会漂移。
+func (s *Service) SellName(ctx context.Context, code string) (string, error) {
+	nm, err := s.st.ScreenRepo().StockName(ctx, code)
+	if err == nil {
+		return nm, nil
+	}
+	if alt := s.etf[code]; alt != "" {
+		observability.S().Infow("持仓名称取自 ETF 白名单（stock_basic 无此行）",
+			"ts_code", code, "name", alt, "err", err.Error())
+		return alt, nil
+	}
+	return "", err
 }
 
 // Rejection 风控否决记录（回显给调用方并写日志；禁静默丢弃，D1）。
@@ -117,10 +155,10 @@ func (s *Service) sellDecisions(ctx context.Context, tradeDate string, cands []m
 		}
 		h := HoldingCtx{
 			Pos: pos, LastClose: bar.RawClose, LastDate: bar.TradeDate,
-			InTopN: inTopN[pos.TsCode], MarketBad: idx.bad(),
+			InTopN: inTopN[pos.TsCode], MarketBad: idx.bad(), IsETF: s.isETF(pos.TsCode),
 		}
 		if sig := EvalSell(tradeDate, h, p, idx.close, idx.ma60); sig != nil {
-			nm, e := s.st.ScreenRepo().StockName(ctx, pos.TsCode)
+			nm, e := s.SellName(ctx, pos.TsCode)
 			if e != nil {
 				return nil, fmt.Errorf("卖出信号 %s 取名称失败: %w", pos.TsCode, e)
 			}

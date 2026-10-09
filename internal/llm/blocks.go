@@ -44,11 +44,11 @@ func decisionUser(items []signal.BuyRequest, conclusions map[string][]string) st
 
 // headerBlock 标的基本信息与选股漏斗给出的数（每只票每段都带一次）。
 func headerBlock(it signal.BuyRequest) string {
-	c := it.Candidate
-	window := fmt.Sprintf("截至 %s 收盘的最近 %d 个交易日", it.TradeDate, len(it.Bars.Closes))
-	if !it.RulesOK {
-		window += fmt.Sprintf("，但只有 %d 根，指标不足以支撑完整判断", len(it.Bars.Closes))
+	if it.Candidate.IsETF() {
+		return etfHeaderBlock(it)
 	}
+	c := it.Candidate
+	window := windowLine(it)
 	base := fmt.Sprintf(
 		"【标的】%s %s ｜ 行业：%s ｜ 收盘 %.2f 元 ｜ 流通市值 %.1f 亿 ｜ 换手率 %.2f%%\n"+
 			"【估值】PE(TTM) %.1f ｜ PB %.2f\n"+
@@ -60,6 +60,33 @@ func headerBlock(it signal.BuyRequest) string {
 		c.PETtm, c.PB, c.Score, c.Factors.Momentum, c.Factors.Value, c.Factors.LowVol,
 		c.Factors.Liquidity, c.PoolSize, clip(c.Reason, 120), window)
 	return base + holdingBlock(it)
+}
+
+// windowLine 数据窗口那一行（个股与 ETF 共用）。
+func windowLine(it signal.BuyRequest) string {
+	window := fmt.Sprintf("截至 %s 收盘的最近 %d 个交易日", it.TradeDate, len(it.Bars.Closes))
+	if !it.RulesOK {
+		window += fmt.Sprintf("，但只有 %d 根，指标不足以支撑完整判断", len(it.Bars.Closes))
+	}
+	return window
+}
+
+// etfHeaderBlock 场内 ETF 的基本信息块。
+//
+// 与个股那一段的差别不是措辞而是**字段是否存在**：ETF 没有 PE/PB/流通市值/换手率，
+// 也没有"行业"（它跟踪的是一篮子股票）。若照个股模板套，这几栏会被渲染成
+// "PE(TTM) 0.0 ｜ PB 0.00"——那是把"没有数据"说成"数据为零"，模型会据此
+// 判出"估值极低"这种结论。所以这里换一套只讲实话的字段，并把缺口明写出来。
+func etfHeaderBlock(it signal.BuyRequest) string {
+	c := it.Candidate
+	return fmt.Sprintf(
+		"【标的】%s %s ｜ 品种：场内 ETF ｜ 跟踪方向：%s\n"+
+			"【成交规则】T+1 交割 ｜ 免印花税 ｜ 最小申报 100 份 ｜ 收盘 %.3f 元（本地按分取整，真实申报价以券商端为准）\n"+
+			"【入围依据】%s\n"+
+			"【没有的数据】无 PE / PB / 流通市值 / 换手率 / 个股级风险公告 —— 空白就是空白，不得当成 0 或低估值证据\n"+
+			"【数据窗口】%s",
+		c.TsCode, c.Name, c.Industry, c.Close.Float(), clip(c.Reason, 120), windowLine(it)) +
+		holdingBlock(it)
 }
 
 // holdingBlock 已持有标的的持仓块（新仓返回空串）。模型据此做"加仓/维持"判断：
@@ -74,18 +101,27 @@ func holdingBlock(it signal.BuyRequest) string {
 	if h.CostPrice > 0 {
 		pnl = (cur/cost - 1) * 100
 	}
+	unit, pfmt := "股", "%.2f"
+	if it.Candidate.IsETF() {
+		unit, pfmt = "份", "%.3f" // ETF 报价到厘：按两位显示会把 0.905 说成 0.90
+	}
 	return fmt.Sprintf(
-		"\n【已持有】本票已有持仓 %d 股 ｜ 成本 %.2f 元 ｜ 现价 %.2f 元（浮盈亏 %+.1f%%）｜ 期间高点 %.2f 元\n"+
+		"\n【已持有】本标的已有持仓 %d %s ｜ 成本 %s 元 ｜ 现价 %s 元（浮盈亏 %+.1f%%）｜ 期间高点 %s 元\n"+
 			"　　↑ 这是**加仓**判断：现有敞口 %.0f 元，单票上限内还能加 %.0f 元；"+
 			"weight_pct 表示本次**追加**投入占总资产的比例（不是加完后的总仓位）。",
-		int64(h.TotalQty), cost, cur, pnl, h.HighPrice.Float(),
+		int64(h.TotalQty), unit,
+		fmt.Sprintf(pfmt, cost), fmt.Sprintf(pfmt, cur), pnl, fmt.Sprintf(pfmt, h.HighPrice.Float()),
 		it.Budget.ExistingFen.Float(), it.Budget.AddRoomFen.Float())
 }
 
 // priceBlock 决策段里补一句价格：weight_pct 要落地成股数，模型得知道一手多少钱。
 func priceBlock(it signal.BuyRequest) string {
-	return fmt.Sprintf("【成交口径】收盘 %.2f 元 ｜ 一手成本 %s 元\n",
-		it.Candidate.Close.Float(), it.Budget.LotCostFen)
+	pfmt, unit := "%.2f", "股"
+	if it.Candidate.IsETF() {
+		pfmt, unit = "%.3f", "份"
+	}
+	return fmt.Sprintf("【成交口径】收盘 %s 元 ｜ 一手成本 %s 元（最小申报 100 %s）\n",
+		fmt.Sprintf(pfmt, it.Candidate.Close.Float()), it.Budget.LotCostFen, unit)
 }
 
 // dimBlock 按维度取该票专属的证据块。
@@ -115,6 +151,9 @@ func techBlock(it signal.BuyRequest) string {
 
 // valueBlock 估值证据块：明说这就是全部可得数据。
 func valueBlock(it signal.BuyRequest) string {
+	if it.Candidate.IsETF() {
+		return etfValueBlock(it)
+	}
 	c := it.Candidate
 	return fmt.Sprintf(
 		"\n【估值全部可得数据】PE(TTM) %.1f ｜ PB %.2f ｜ 流通市值 %.1f 亿 ｜ 换手率 %.2f%% ｜ 所属行业 %s\n"+
@@ -122,9 +161,30 @@ func valueBlock(it signal.BuyRequest) string {
 		c.PETtm, c.PB, c.CircMvW/10000, c.TurnoverRate, c.Industry)
 }
 
+// etfValueBlock ETF 的"估值"维度：这个维度**没有数据**，如实告诉模型并要求它承认。
+//
+// 为什么不在这里塞替代指标：动量/波动在技术维度已经给过了，把它们换个标题写到估值段
+// 只会诱导模型编出"ETF 分散持股所以估值风险低"这类无据结论。评审的 JSON 契约里有
+// unknown 这一档，本块的作用就是让它成为诚实且唯一正确的答案。
+func etfValueBlock(it signal.BuyRequest) string {
+	return fmt.Sprintf(
+		"\n【估值可得数据】无 —— ETF 是个股的一篮子集合，本系统没有它的 NAV、成分股与盈利数据，"+
+			"个股口径的 PE/PB 对它不成立\n"+
+			"　　↑ 跟踪方向：%s。本维度请如实回答 unknown=true，"+
+			"不得把\"ETF 天生分散\"或白名单身份本身当成估值优势证据。\n", it.Candidate.Industry)
+}
+
 // newsBlock 消息面证据块：价格异常线索 + 这一只票的检索任务。
 func newsBlock(it signal.BuyRequest) string {
 	r, c := it.Rules, it.Candidate
+	if c.IsETF() {
+		return fmt.Sprintf(
+			"\n【价格异常证据（本地算的，仅作辅助线索）】窗口内单日最大跌幅 %+.1f%% ｜ 放量下跌天数 %d ｜ 距窗口最高 %+.1f%%"+
+				"（ETF 无涨跌停板概念，\"近似跌停次数\"一项对它不适用，故省略）\n"+
+				"【本只的检索任务】查 \"%s %s\"：跟踪指数成分调整、份额折算、管理费调整、清盘/扩募公告、成交活跃度变化、跟踪误差。\n"+
+				"　　↑ ETF 不承担个股那种立案调查/退市风险警示/业绩预亏/质押爆仓风险 —— 拿这些去否决 ETF 是评错了对象。\n",
+			r.MaxDropPct, r.VolDownDays, r.OffHighPct, c.Name, shortCode(c.TsCode))
+	}
 	return fmt.Sprintf(
 		"\n【价格异常证据（本地算的，仅作辅助线索）】窗口内近似跌停次数 %d ｜ 单日最大跌幅 %+.1f%% ｜ 放量下跌天数 %d ｜ 距窗口最高 %+.1f%%\n"+
 			"【本只的检索任务】查 \"%s %s 风险公告\"：立案调查、退市风险警示、业绩预亏、监管处罚、质押爆仓。",
@@ -134,6 +194,17 @@ func newsBlock(it signal.BuyRequest) string {
 // sectorBlock 板块与冲击成本证据块。
 func sectorBlock(it signal.BuyRequest) string {
 	c, r := it.Candidate, it.Rules
+	if c.IsETF() {
+		// ETF 没有"板块加权动量"与"流通市值"：本漏斗不排名，也就没算过这两栏，
+		// 塞 0 进去会被读成"板块动量 0.0%（持平）"这种无中生有的结论。
+		return fmt.Sprintf(
+			"\n【跟踪方向】%s —— 白名单内不排名，与同批其他 ETF 没有高低之分，"+
+				"不许拿\"它排第几名\"当理由\n"+
+				"【自身动量】窗口区间动量 %+.1f%%\n"+
+				"【冲击成本】窗口日均成交额 %.0f 元（已按流动性下限筛过）｜ 本次单票上限 %s 元 ｜ 一手成本 %s 元\n"+
+				"　　↑ 场内 ETF 无个股冲击成本问题，但一只日成交不足 2 亿的窄基 ETF 卖出时同样要有让步空间。\n",
+			c.Industry, c.Mom*100, r.AvgAmtYuan, it.Budget.SlotFen, it.Budget.LotCostFen)
+	}
 	return fmt.Sprintf(
 		"\n【板块】行业 %s ｜ 板块20日加权动量 %+.1f%% ｜ 本票区间动量 %+.1f%%（相对板块 %+.1f 个点）\n"+
 			"【冲击成本】窗口日均成交额 %.0f 元 ｜ 本票流通市值 %.1f 亿 ｜ 本次单票上限 %s 元 ｜ 一手成本 %s 元",

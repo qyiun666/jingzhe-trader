@@ -120,6 +120,30 @@ func (r *ScreenRepo) BarCloseSeries(ctx context.Context, dates []string) ([]Clos
 	return rows, nil
 }
 
+// BarsForCodes 读取指定代码集在指定交易日窗口内的日线点（按代码、日期升序）。
+//
+// 为什么不复用 BarCloseSeries：那个读法按日期取全市场（~5500 只 × 20 天），
+// ETF 白名单只有个位数标的，为它们再扫一遍全市场既慢又会让个股截面的内存占用翻倍。
+// 主键是 (ts_code, trade_date)，代码集与日期集双过滤正好走主键。
+func (r *ScreenRepo) BarsForCodes(ctx context.Context, codes, dates []string) ([]ClosePoint, error) {
+	if len(codes) == 0 || len(dates) == 0 {
+		return nil, nil
+	}
+	q := fmt.Sprintf(`SELECT ts_code, trade_date, close, vol_lot, raw_close FROM daily_bar
+		WHERE ts_code IN (%s) AND trade_date IN (%s) ORDER BY ts_code, trade_date`,
+		placeholders(len(codes)), placeholders(len(dates)))
+	args := make([]interface{}, 0, len(codes)+len(dates))
+	for _, c := range codes {
+		args = append(args, c)
+	}
+	args = append(args, dateArgs(dates)...)
+	var rows []ClosePoint
+	if err := r.rdb.SelectContext(ctx, &rows, q, args...); err != nil {
+		return nil, fmt.Errorf("读取 %d 只标的的日线序列（%d 个交易日）失败: %w", len(codes), len(dates), err)
+	}
+	return rows, nil
+}
+
 // placeholders 生成 n 个 `?` 逗号串（日期集合固定为内部读法，无外部输入拼接风险）。
 func placeholders(n int) string {
 	return strings.TrimSuffix(strings.Repeat("?,", n), ",")

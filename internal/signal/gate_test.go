@@ -20,7 +20,7 @@ func TestIndexStateGateDisabled(t *testing.T) {
 	defer st.Close()
 	ctx := context.Background()
 
-	off := NewService(st, &ticket.Ledger{}, store.MarketGate{Enabled: false, Window: 60})
+	off := NewService(st, &ticket.Ledger{}, store.MarketGate{Enabled: false, Window: 60}, nil)
 	info, err := off.indexState(ctx, "20260924")
 	if err != nil {
 		t.Fatalf("门槛关闭时 indexState 不应依赖指数数据: %v", err)
@@ -29,7 +29,7 @@ func TestIndexStateGateDisabled(t *testing.T) {
 		t.Errorf("门槛关闭时不得判出大盘恶化，实际 %+v", info)
 	}
 
-	on := NewService(st, &ticket.Ledger{}, store.MarketGate{Enabled: true, Window: 60})
+	on := NewService(st, &ticket.Ledger{}, store.MarketGate{Enabled: true, Window: 60}, nil)
 	if _, err := on.indexState(ctx, "20260924"); err == nil {
 		t.Errorf("门槛开启且指数无数据时应报错（静默放行才是危险），实际返回 nil")
 	}
