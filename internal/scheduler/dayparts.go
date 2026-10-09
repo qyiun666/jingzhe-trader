@@ -283,7 +283,7 @@ func stopLossTickets(ctx context.Context, rc *observability.RunCtx, d Deps, date
 		if sig == nil {
 			continue
 		}
-		name, err := d.Store.ScreenRepo().StockName(ctx, code)
+		name, err := d.Signal.SellName(ctx, code)
 		if err != nil {
 			return nil, fmt.Errorf("卖出单 %s 取名称失败（stock_basic 未同步？）: %w", code, err)
 		}

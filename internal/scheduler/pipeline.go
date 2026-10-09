@@ -69,6 +69,10 @@ func eveningPipeline(ctx context.Context, rc *observability.RunCtx, d Deps) erro
 		d.raiseWeakTrace(ctx, date, note)
 		observability.S().Infow("弱势试探模式", "date", date, "note", note)
 	}
+	// ETF 补口（弱势试探期专属）：科技类个股一手就超过试探单票上限，光靠个股漏斗
+	// 在弱势期选不出任何"买得起"的科技敞口。白名单 → 流动性两级，不排名，
+	// 与个股候选并入同一批交给同一个 LLM 评审。读不到数只降级，不断链。
+	cands = appendETFCandidates(ctx, rc, d, date, cands, budget)
 	if err := buildTickets(ctx, rc, d, date, cands, rp); err != nil {
 		return fmt.Errorf("④ 买卖决策: %w", err)
 	}

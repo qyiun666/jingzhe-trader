@@ -92,7 +92,7 @@ func BuildRuntime(ctx context.Context, st *store.Store, cfg *config.Config) (*Ru
 		Dataloader: dataloader.New(st, tcli),
 		Freshness:  dataloader.NewFreshnessGate(st, cfg.GetInt("screen.min_bar_rows"), screener.BarWindow()),
 		Screener:   screener.New(st, FilterConfigOf(cfg), cfg.GetString("screen.factor_mode")),
-		Signal:     signal.NewService(st, ledger, scheduler.MarketGateOf(cfg)),
+		Signal:     signal.NewService(st, ledger, scheduler.MarketGateOf(cfg), scheduler.ETFUniverseOf(cfg)),
 		Decider:    decider,
 		Ledger:     ledger,
 		Tickets:    ticket.NewService(st),

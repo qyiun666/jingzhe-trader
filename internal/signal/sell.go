@@ -23,6 +23,8 @@ type HoldingCtx struct {
 	LastDate  string    // 该收盘对应交易日
 	InTopN    bool      // 是否在当日候选池 TopN
 	MarketBad bool      // 大盘恶化（指数收盘低于门槛均线，见 evalMarketBad）
+	// IsETF 持仓是场内 ETF（由 screen.etf_whitelist 认定，见 Service.ETFUniverse）。
+	IsETF bool
 }
 
 // newSell 构造卖出信号骨架。
@@ -90,8 +92,14 @@ func evalTakeProfit(date string, h HoldingCtx, p risk.RiskParams) *model.Signal 
 }
 
 // evalRankOut 规则 4 排名淘汰：持仓未进入当日候选池 TopN。
+//
+// ETF 持仓不受这条规则约束（设计文档 §4，组长批准的豁免口径）：ETF 候选只在
+// 弱势试探期产出，且白名单直通、池内根本不排名。若照个股口径判"跌出榜单就卖"，
+// 则①一旦大盘收复均线恢复开闸，手里 ETF 当晚必被"排名淘汰"清掉；②某只 ETF
+// 当日没通过流动性级也会触发同一张卖单。两者都不是"它变差了"，而是"这条规则
+// 的输入对它不存在"——规则依赖的口径没成立时，正确反应是跳过，不是卖出。
 func evalRankOut(date string, h HoldingCtx) *model.Signal {
-	if h.Pos.TotalQty <= 0 || h.InTopN {
+	if h.Pos.TotalQty <= 0 || h.InTopN || h.IsETF {
 		return nil
 	}
 	return newSell(date, h, RuleRankOut,
