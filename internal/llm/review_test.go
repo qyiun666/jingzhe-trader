@@ -599,21 +599,27 @@ func TestReviewDisabledMeansNoBuy(t *testing.T) {
 	}
 }
 
-// TestReviewOnlyNewsSearches 联网边界：只有消息面那条挂 web_search，
-// 且用的就是配置的 high 档；其余三条证据与决策都不挂。
-func TestReviewOnlyNewsSearches(t *testing.T) {
+// TestReviewNoPromptAttachesSearch 联网边界：现在没有任何一条 prompt 挂 web_search。
+//
+// 这条断言是 2026-10-09 那次事故的护栏。当时的形态是"只有消息面挂检索"，实测：
+// 服务端从不执行这个工具（响应里从来没有检索条目，模型自陈没有联网工具），
+// 而 prompt 声称"你会拿到 web_search 工具"时，20 只批次稳定地把工具调用写成
+// <｜｜DSML｜｜ 标签文本返回 → JSON 解析全批失败 → 当日 20 只候选全部记 LLM_FAILED、零计划。
+// 所以 news 改成"只有价格线索、无公告数据"的口径，工具一律不挂。
+// 真要接检索，得先有一个真的会执行检索的数据源（不是把这个字段加回来）。
+func TestReviewNoPromptAttachesSearch(t *testing.T) {
 	st := testStore(t)
 	srv := newStub(t, allOKBatch(), nil)
 	if _, err := newReviewer(srv.srv.URL, st, true).DecideBatch(context.Background(), batchReq()); err != nil {
 		t.Fatal(err)
 	}
-	for _, m := range []string{markTech, markValue, markSector, markDecide} {
+	for _, m := range []string{markTech, markValue, markNews, markSector, markDecide} {
 		if sizes := srv.sizesOf(m); len(sizes) != 1 || sizes[0] != "" {
-			t.Errorf("%s 不应挂检索，实际 %v", m, sizes)
+			t.Errorf("%s 不应挂检索工具，实际 %v", m, sizes)
 		}
 	}
-	if sizes := srv.sizesOf(markNews); len(sizes) != 1 || sizes[0] != "high" {
-		t.Errorf("消息面检索档=%v，期望 [high]（配置值）", sizes)
+	if n := srv.callsOf(markNews); n != 1 {
+		t.Errorf("消息面应只问一次，实际 %d", n)
 	}
 }
 

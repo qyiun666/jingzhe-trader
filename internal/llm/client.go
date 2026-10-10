@@ -198,7 +198,22 @@ func (c *Client) Complete(ctx context.Context, req Request) (text string, callEr
 			rr.Status, len(rr.Output), rr.Usage.InputTokens, rr.Usage.OutputTokens,
 			rr.Usage.OutputTokensDetails.ReasoningTokens, errNoAnswer)
 	}
+	if looksLikeToolCallLeak(text) {
+		// 挂 tools 时服务端没执行工具，模型把调用写成了正文里的标签文本（2026-10-09 实测：
+		// 20 只候选挂 web_search，三次问全是 <｜｜DSML｜｜ invoke name="web_search"> …）。
+		// 这与"给了正文但不合契约"不同：正文里根本没有结论，重问一次是唯一有区别的动作，
+		// 所以归到 errNoAnswer（可重问），并点名真因，别让上层把它误诊成模型不听话。
+		return "", fmt.Errorf("LLM 把工具调用写成了正文文本，本响应没有结论（tools 未被服务端执行，%w）", errNoAnswer)
+	}
 	return text, nil
+}
+
+// looksLikeToolCallLeak 正文是否是泄漏出来的工具调用标记，而不是给读者的答案。
+//
+// 只认内部标记词，不认尖括号本身 —— 模型的合法答案里也会出现 < 之类的比较符号。
+// 实测泄漏形态：<｜｜DSML｜｜ calls> / <｜｜DSML｜｜ invoke name="web_search">。
+func looksLikeToolCallLeak(s string) bool {
+	return strings.Contains(s, "DSML") || (strings.Contains(s, "<|") && strings.Contains(s, "invoke name="))
 }
 
 // lastMessage 取最后一个 message 条目的全部 text 段。

@@ -189,8 +189,10 @@ func intradayScan(ctx context.Context, rc *observability.RunCtx, d Deps) error {
 		return fmt.Errorf("读取持仓代码失败: %w", err)
 	}
 	if len(holding) == 0 {
-		rc.Degrade("NO_HOLDINGS", "无持仓，盘中扫描空转")
-		return nil
+		// 空仓时这一轮没有任何可判定的对象：按 ErrSkip 退出，不写轨迹。
+		// 用 Degrade 会把每 5 分钟一轮的空转写成 partial，一天 24 行盖掉
+		// 真正需要看出的降级，也会让日报的降级列长期挂着"盘中扫描"。
+		return fmt.Errorf("%w: 无持仓", ErrSkip)
 	}
 	quoted, err := fetchQuotes(ctx, rc, d, holding)
 	if err != nil {

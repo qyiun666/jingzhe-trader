@@ -15,9 +15,10 @@
 - **LLM 决定买什么、买多少，含对已持有标的的加仓**（DeepSeek，4 条证据 prompt + 1 条决策 prompt），
   风控只做硬截断（单票/总仓/持仓数/一手价/金额下限/置信度；加仓不占新名额，额度 = 单票上限 − 现有敞口）。
   五条 prompt 都是**整批一次问**：筛选后的候选一次性发过去，所以一天的调用数恒为 5，与候选数无关。
-  消息面一条走 Responses API 的 web_search 实测查当期风险公告（其余四条刻意不联网）；
-  检索档配置为 high 且一档到底（早先"问不出就降到 low 再问一次"是误诊：真因是请求没传
-  `max_output_tokens`，默认输出预算被 reasoning 吃满，整批 JSON 写到一半就停了）。
+  **五条一律不联网**：2026-10-09 实测这个账号/模型的 `/v1/responses` 从来没执行过 `web_search`
+  （响应里没有任何 `web_search_call`），挂了工具只会让模型把工具调用写成正文标签返回，
+  或者编一句"检索未见风险公告"——后者会进决策，比失败更危险。消息面维度因此改成只看本地算出的
+  价格异常，查不到证据就答 `unknown`（不算加分也不算减分）；`llm.search_context_size` 暂时是无实际的配置项。
   所有 prompt 都禁止模型引用训练记忆里的新闻。模型：deepseek-v4-flash。
 - **MCP 对外接口**（10 工具）：外部 Agent 负责「初始化当日流程 → 读买卖指令 → 人工下单后回执成交 → 校准账本 → 每天查日志」。
 - **进程由外部 Agent 托管**：`nohup` 后台拉起，`/healthz` 探活，挂了重启（不再有 systemd/launchd 单元与独立看门狗）。
@@ -141,7 +142,7 @@ jingzhe -db data/jingzhe.db config set screen.factor_mode momentum         # 回
 4. **干预**：`skip_ticket`（作废指令单）
 5. **查日志**：`get_logs`（失败与降级都在返回的 `trace` 数组里，含 `llm:*` 每只票每条 prompt 的结果）
 
-完整接入手册（启动方式、协议、工具参数、每日工作流、错误处理、安全红线）见根目录 **[`MCP-AGENT-GUIDE.md`](./MCP-AGENT-GUIDE.md)**；接口速查见 `docs/API.md`。
+完整接入手册（启动方式、协议、工具参数、每日工作流、错误处理、安全红线）见根目录 **[`MCP-AGENT-GUIDE.md`](./MCP-AGENT-GUIDE.md)**。
 
 ## 配置
 

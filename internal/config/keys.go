@@ -118,8 +118,9 @@ var KeySpecs = []KeySpec{
 	{Key: "llm.api_key", Type: TypeSecret, Secret: true},
 	{Key: "llm.base_url", Type: TypeString, Default: "https://api.deepseek.com/v1"},
 	{Key: "llm.model", Type: TypeString, Default: "deepseek-v4-flash"},
-	// 只对挂了 web_search 的消息面维度有意义。以前"问不出结果就降档重试"是误诊：
-	// 真因是请求没传 max_output_tokens（见 llm.maxOutputTokens），预算修好后一档到底。
+	// 当前没有任何 prompt 挂检索（2026-10-09 实测 /v1/responses 不执行 web_search，
+	// 见 internal/llm/prompts.go 顶部），所以这个键暂时不落实际；保留是为了
+	// 将来接入真正可用的检索时不用再动装配层与校验。值仍按 low|medium|high 校验。
 	{Key: "llm.search_context_size", Type: TypeString, Default: "high"},
 
 	// ---------- 调度（scheduler.BuildJobs 逐键读取）----------

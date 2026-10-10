@@ -12,6 +12,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -35,6 +36,15 @@ type Window struct {
 	Start string // HH:MM
 	End   string // HH:MM
 }
+
+// ErrSkip 本轮无事可做的哨兵（区别于 Degrade）：任务确实在该轮没有任何可交付的工作
+// 时用它退出 —— 不写 run_trace 行、不触发完成回调、日志按 info 记。
+//
+// 为什么不用 Degrade：盘中扫描是每 5 分钟一轮，空仓时一天会留 24 行 partial。
+// partial 的语义是"做成了但有已知缺失"，日报要逐条点名，那些行既不是缺失也不是故障，
+// 只会把真正的降级淹掉。留痕仍不等于这里可以静默失败 —— ErrSkip 只给"本轮没有工作对象"
+// 用（空仓、非交易日），数据缺、依赖挂仍须按 partial / fail 落库。
+var ErrSkip = errors.New("本轮无事可做")
 
 // JobSpec 任务规格：到点触发（At）或窗口内间隔触发（EveryMinutes + Windows）。
 type JobSpec struct {
@@ -87,6 +97,7 @@ type Scheduler struct {
 	mu           sync.Mutex
 	fired        map[string]bool      // job@date@trigger → 已触发
 	lastInterval map[string]time.Time // 间隔任务最近触发时刻
+	backoffUntil map[string]time.Time // 间隔任务失败后的退避截止时刻（内存态，重启即清）
 	lastTick     time.Time            // 最近一轮调度判定时刻（供 /healthz 探活）
 
 	running bool
@@ -103,6 +114,7 @@ func New(st *store.Store, isTradeDay func(date string) bool, specs []JobSpec) *S
 		isTradeDay:   isTradeDay,
 		fired:        make(map[string]bool),
 		lastInterval: make(map[string]time.Time),
+		backoffUntil: make(map[string]time.Time),
 	}
 }
 
@@ -175,9 +187,14 @@ func (s *Scheduler) Tick(ctx context.Context, now time.Time) []string {
 			status, jerr := s.runJob(ctx, spec, date, trigger)
 			if status != "" {
 				triggered = append(triggered, spec.Name)
-			}
-			if s.onDone != nil && status != "" {
-				s.onDone(spec, date, status, jerr)
+				if spec.EveryMinutes > 0 && status == model.TraceFail {
+					// 间隔任务这轮失败：退避一个 cooldown，别每 5 分钟撞同一堵墙
+					// （到点任务的重试节奏由 shouldSkip 的轨迹冷却承担）。
+					s.markIntervalBackoff(spec.Name, now)
+				}
+				if s.onDone != nil {
+					s.onDone(spec, date, status, jerr)
+				}
 			}
 		}
 	}
@@ -255,6 +272,17 @@ func (s *Scheduler) dueTriggers(spec JobSpec, date string, now time.Time) []stri
 }
 
 // dueInterval 间隔任务的到期判定（盘中监控每 5 分钟）。
+//
+// 刻意不走 shouldSkip：那套判定是为到点任务的「当日补跑」设计的 —— 一天做成一次就够。
+// 间隔任务每一轮都是独立工作（重新取价、重新判止损），做成一轮不等于当日做完。
+// 历史上这里也走 shouldSkip，于是任一轮留下 ok/partial 行就整天不再触发
+// （盘中重启后风控失效的根因，2026-10-09 复盘）：09:30 空仓扫描写成 partial，
+// 当天晚些时候买入的持仓就再也没被扫过。
+//
+// 节流由 lastInterval + EveryMinutes 自己承担；上一轮失败额外按 cooldown 退避
+// （backoffUntil，只在内存里生效），所以重启后立刻恢复判定，不会拖到明天。
+//
+// 调用方 dueTriggers 已持 s.mu，本函数不再加锁。
 func (s *Scheduler) dueInterval(spec JobSpec, date string, now time.Time) []string {
 	inWin := false
 	for _, w := range spec.Windows {
@@ -266,15 +294,24 @@ func (s *Scheduler) dueInterval(spec JobSpec, date string, now time.Time) []stri
 	if !inWin {
 		return nil
 	}
+	period := time.Duration(spec.EveryMinutes) * time.Minute
 	last := s.lastInterval[spec.Name]
-	if !last.IsZero() && now.Sub(last) < time.Duration(spec.EveryMinutes)*time.Minute {
+	if !last.IsZero() && now.Sub(last) < period {
 		return nil
 	}
-	if s.shouldSkip(spec.Name, date) {
+	if until, ok := s.backoffUntil[spec.Name]; ok && now.Before(until) {
 		return nil
 	}
 	s.lastInterval[spec.Name] = now
 	return []string{"interval"}
+}
+
+// markIntervalBackoff 给刚失败的间隔轮次挂退避（时长 = cooldown）。
+// 只有间隔任务用得到：到点任务的重试节奏由 shouldSkip 的轨迹冷却承担。
+func (s *Scheduler) markIntervalBackoff(jobName string, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.backoffUntil[jobName] = at.Add(s.cooldown)
 }
 
 // shouldSkip 判定任务是否应跳过本轮触发（冷却判定，读轨迹表，重启后仍生效）：
@@ -321,6 +358,14 @@ func (s *Scheduler) runJob(ctx context.Context, spec JobSpec, date, trigger stri
 		}()
 		jobErr = spec.Run(ctx, rc)
 	}()
+
+	// 本轮无事可做（哨兵 ErrSkip）：不写轨迹、不报完成，日志按 info 留一句。
+	// 轨迹按 trade_date+subject 幂等覆盖，写了就会把上一轮真正的结果盖掉。
+	if errors.Is(jobErr, ErrSkip) {
+		observability.S().Infow("任务本轮跳过", "job", spec.Name, "date", date,
+			"trigger", trigger, "reason", strings.TrimPrefix(jobErr.Error(), ErrSkip.Error()+": "))
+		return "", nil
+	}
 
 	outcome, detail := model.TraceOK, ""
 	switch {

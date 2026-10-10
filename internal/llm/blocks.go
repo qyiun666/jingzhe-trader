@@ -174,21 +174,26 @@ func etfValueBlock(it signal.BuyRequest) string {
 			"不得把\"ETF 天生分散\"或白名单身份本身当成估值优势证据。\n", it.Candidate.Industry)
 }
 
-// newsBlock 消息面证据块：价格异常线索 + 这一只票的检索任务。
+// newsBlock 消息面证据块：只有本地算出的价格异常线索。
+//
+// 这里刻意不给"检索任务"：系统没有公告/新闻数据源，写一段"去查这只票的风险公告"
+// 只会让模型要么把工具调用写成文本（当日全批解析失败），要么编一句"检索未见风险公告"
+// 当成结论送进决策（2026-10-09 实测，见 prompts.go 的联网边界）。
 func newsBlock(it signal.BuyRequest) string {
 	r, c := it.Rules, it.Candidate
 	if c.IsETF() {
 		return fmt.Sprintf(
-			"\n【价格异常证据（本地算的，仅作辅助线索）】窗口内单日最大跌幅 %+.1f%% ｜ 放量下跌天数 %d ｜ 距窗口最高 %+.1f%%"+
+			"\n【价格异常证据（本地算的，这是本维度唯一可见的证据）】窗口内单日最大跌幅 %+.1f%% ｜ 放量下跌天数 %d ｜ 距窗口最高 %+.1f%%"+
 				"（ETF 无涨跌停板概念，\"近似跌停次数\"一项对它不适用，故省略）\n"+
-				"【本只的检索任务】查 \"%s %s\"：跟踪指数成分调整、份额折算、管理费调整、清盘/扩募公告、成交活跃度变化、跟踪误差。\n"+
-				"　　↑ ETF 不承担个股那种立案调查/退市风险警示/业绩预亏/质押爆仓风险 —— 拿这些去否决 ETF 是评错了对象。\n",
-			r.MaxDropPct, r.VolDownDays, r.OffHighPct, c.Name, shortCode(c.TsCode))
+				"【数据边界】本维度无公告 / 新闻 / 监管数据源 —— 上面三项就是全部。"+
+				"价格无异常请如实答 unknown；ETF 也不承担个股那种立案调查 / 退市风险警示 / 业绩预亏 / 质押爆仓风险。\n",
+			r.MaxDropPct, r.VolDownDays, r.OffHighPct)
 	}
 	return fmt.Sprintf(
-		"\n【价格异常证据（本地算的，仅作辅助线索）】窗口内近似跌停次数 %d ｜ 单日最大跌幅 %+.1f%% ｜ 放量下跌天数 %d ｜ 距窗口最高 %+.1f%%\n"+
-			"【本只的检索任务】查 \"%s %s 风险公告\"：立案调查、退市风险警示、业绩预亏、监管处罚、质押爆仓。",
-		r.LimitDownDays, r.MaxDropPct, r.VolDownDays, r.OffHighPct, c.Name, shortCode(c.TsCode))
+		"\n【价格异常证据（本地算的，这是本维度唯一可见的证据）】窗口内近似跌停次数 %d ｜ 单日最大跌幅 %+.1f%% ｜ 放量下跌天数 %d ｜ 距窗口最高 %+.1f%%\n"+
+			"【数据边界】本维度无公告 / 新闻 / 监管数据源 —— 上面四项就是全部。"+
+			"价格无异常请如实答 unknown，不要声称查过公告。",
+		r.LimitDownDays, r.MaxDropPct, r.VolDownDays, r.OffHighPct)
 }
 
 // sectorBlock 板块与冲击成本证据块。

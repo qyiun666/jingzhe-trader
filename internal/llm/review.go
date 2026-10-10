@@ -426,9 +426,6 @@ func canonCode(ts string) string {
 	return strings.ToUpper(s)
 }
 
-// shortCode 去掉交易所后缀，检索用"名称 + 6 位代码"比带后缀的 ts_code 命中率高。
-func shortCode(ts string) string { return canonCode(ts) }
-
 // decodeResults 把模型回复解进 out（先掐掉 ```json 围栏与前后说明文字）。
 func decodeResults(raw string, out any) error {
 	if err := json.Unmarshal([]byte(extractJSON(raw)), out); err != nil {

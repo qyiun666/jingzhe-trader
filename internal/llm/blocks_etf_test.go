@@ -83,13 +83,19 @@ func TestEtfDimBlocksHonest(t *testing.T) {
 		t.Errorf("板块段不得出现 ETF 没有的两栏，实际:\n%s", s)
 	}
 	n := newsBlock(it)
-	for _, want := range []string{"跟踪指数成分调整", "份额折算", "清盘"} {
+	for _, want := range []string{"价格异常证据", "无公告", "unknown"} {
 		if !strings.Contains(n, want) {
-			t.Errorf("消息面检索任务应换成 ETF 口径，缺 %q，实际:\n%s", want, n)
+			t.Errorf("ETF 消息面段应只给价格线索并声明数据边界，缺 %q，实际:\n%s", want, n)
 		}
 	}
-	// 检索任务清单里不得混进个股风险项（"不承担…质押爆仓"这种否定说明是允许且必要的）。
-	for _, bad := range []string{"查 \"科创50ETF 588000\"：立案调查", "窗口内近似跌停次数 0"} {
+	// 不得再出现"检索任务"（2026-10-09 事故：模型收到检索任务就把工具调用写成正文标签）。
+	for _, bad := range []string{"检索任务", "web_search", "跟踪指数成分调整", "份额折算"} {
+		if strings.Contains(n, bad) {
+			t.Errorf("消息面段不得再布置检索任务（%q），实际:\n%s", bad, n)
+		}
+	}
+	// ETF 段里也不得混进个股口径的跌停计数。
+	for _, bad := range []string{"窗口内近似跌停次数 0"} {
 		if strings.Contains(n, bad) {
 			t.Errorf("消息面不得用个股口径否决 ETF（%q），实际:\n%s", bad, n)
 		}
@@ -115,8 +121,11 @@ func TestStockBlocksUnchanged(t *testing.T) {
 	if v := valueBlock(it); !strings.Contains(v, "PE(TTM) 5.1") {
 		t.Errorf("个股估值段应保持原样，实际:\n%s", v)
 	}
-	if n := newsBlock(it); !strings.Contains(n, "风险公告") {
-		t.Errorf("个股消息面检索任务应保持原样，实际:\n%s", n)
+	// 消息面段是唯一被改动的个股分支：不再布置检索任务，改为声明数据边界（见 newsBlock 注释）。
+	// 其余段落（header/value/tech/sector）必须一个字都没变。
+	if n := newsBlock(it); !strings.Contains(n, "近似跌停次数") || !strings.Contains(n, "无公告") ||
+		strings.Contains(n, "检索任务") {
+		t.Errorf("个股消息面段应为价格线索+数据边界口径，实际:\n%s", n)
 	}
 }
 
