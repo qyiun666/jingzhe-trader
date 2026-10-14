@@ -22,6 +22,7 @@ import (
 // FilterConfig 漏斗参数（全部可配，来源 config screen.* 键）。
 type FilterConfig struct {
 	TopN             int     // 候选池容量
+	BufferN          int     // 卖出规则 4 的排名保留带深度（signal.rank_out_buffer_n）：保留带 = Top(TopN+BufferN)，0 = 与 TopN 等深（旧口径）
 	MinCircMvW       float64 // 流通市值下限（万元）
 	MinTurnoverRate  float64 // 换手率下限（%）
 	PriceLow         float64 // 价格下限（元，剔除仙股）

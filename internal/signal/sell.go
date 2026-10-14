@@ -16,15 +16,26 @@ const (
 	RuleMarketBad    = "market_bad"    // 大盘恶化
 )
 
+// RankOutPolicy 规则 4（排名淘汰）的判定口径，由 service 从 signal.rank_out_* 配置
+// 与当日排名保留带装配（2026-10-14 组长批准的降换手改造）。
+type RankOutPolicy struct {
+	MinHoldDays int // 建仓后 N 个交易日内排名淘汰不触发；0 = 无持有期保护（旧口径）
+	WatchTopN   int // 保留带深度（TopN+buffer）；≤0 时理由文案退回"TopN"字样
+}
+
 // HoldingCtx 单只持仓的卖出规则输入。
 type HoldingCtx struct {
 	Pos       model.Position
 	LastClose model.Fen // 最近可得收盘（停牌股取停牌前收盘，分）
 	LastDate  string    // 该收盘对应交易日
-	InTopN    bool      // 是否在当日候选池 TopN
+	InTopN    bool      // 是否在当日候选池排名保留带内（保留带=TopN 时即旧口径 TopN）
 	MarketBad bool      // 大盘恶化（指数收盘低于门槛均线，见 evalMarketBad）
 	// IsETF 持仓是场内 ETF（由 screen.etf_whitelist 认定，见 Service.ETFUniverse）。
 	IsETF bool
+	// DaysHeld 建仓后已持有的完整交易日数（建仓日不计）；-1 = 持仓无建仓日期，
+	// 此时最小持有期保护不适用（照旧口径可淘汰），而不是无限保护。
+	DaysHeld int
+	RankOut  RankOutPolicy
 }
 
 // newSell 构造卖出信号骨架。
@@ -91,7 +102,12 @@ func evalTakeProfit(date string, h HoldingCtx, p risk.RiskParams) *model.Signal 
 			h.LastClose, trigger, h.Pos.CostPrice, gain, p.TakeProfitPct*100))
 }
 
-// evalRankOut 规则 4 排名淘汰：持仓未进入当日候选池 TopN。
+// evalRankOut 规则 4 排名淘汰：持仓未进入当日候选池排名保留带（TopN+buffer），
+// 且已建仓满最小持有期（signal.rank_out_*，2026-10-14 组长批准）。
+//
+// 持有期只保护"排名换仓"这一条：止损/移动止盈/止盈在它之前独立判定，
+// 建仓未满也不会豁免下跌出清。DaysHeld<0（老同步持仓无建仓日期）不适用保护，
+// 保持旧口径——缺数据不是保护的理由，也不该因此被无限锁仓。
 //
 // ETF 持仓不受这条规则约束（设计文档 §4，组长批准的豁免口径）：ETF 候选只在
 // 弱势试探期产出，且白名单直通、池内根本不排名。若照个股口径判"跌出榜单就卖"，
@@ -102,8 +118,19 @@ func evalRankOut(date string, h HoldingCtx) *model.Signal {
 	if h.Pos.TotalQty <= 0 || h.InTopN || h.IsETF {
 		return nil
 	}
+	if h.RankOut.MinHoldDays > 0 && h.DaysHeld >= 0 && h.DaysHeld < h.RankOut.MinHoldDays {
+		return nil
+	}
+	band := "TopN"
+	if h.RankOut.WatchTopN > 0 {
+		band = fmt.Sprintf("Top%d", h.RankOut.WatchTopN)
+	}
+	held := "持有期未知"
+	if h.DaysHeld >= 0 {
+		held = fmt.Sprintf("已持有 %d 个交易日", h.DaysHeld)
+	}
 	return newSell(date, h, RuleRankOut,
-		fmt.Sprintf("排名淘汰：未进入当日候选池 TopN（持仓成本 %s）", h.Pos.CostPrice))
+		fmt.Sprintf("排名淘汰：未进入当日候选池 %s 保留带（%s，持仓成本 %s）", band, held, h.Pos.CostPrice))
 }
 
 // evalMarketBad 规则 5 大盘恶化：指数收盘跌破门槛均线（MA{gate.Window}）。

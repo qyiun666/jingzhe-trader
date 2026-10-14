@@ -55,7 +55,7 @@ func TestSellNameFallback(t *testing.T) {
 	defer st.Close()
 	ctx := context.Background()
 	s := NewService(st, &ticket.Ledger{}, store.MarketGate{Enabled: false, Window: 60},
-		ETFUniverse{"588000.SH": "科创50ETF"})
+		ETFUniverse{"588000.SH": "科创50ETF"}, RankOutPolicy{})
 
 	if nm, err := s.SellName(ctx, "588000.SH"); err != nil || nm != "科创50ETF" {
 		t.Errorf("白名单内应回落到 ETF 名称，实际 name=%q err=%v", nm, err)
@@ -84,7 +84,7 @@ func TestSellNameFallbackNoName(t *testing.T) {
 	}
 	defer st.Close()
 	s := NewService(st, &ticket.Ledger{}, store.MarketGate{Enabled: false},
-		ETFUniverse{"512480.SH": ""})
+		ETFUniverse{"512480.SH": ""}, RankOutPolicy{})
 	if _, err := s.SellName(context.Background(), "512480.SH"); err == nil {
 		t.Error("无名条目不该被当成有效回落")
 	} else if errors.Is(err, context.Canceled) {

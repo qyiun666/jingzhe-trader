@@ -77,7 +77,7 @@ func TestTradingDayEndToEnd(t *testing.T) {
 		t.Fatalf("生效风控参数疑似读空: 移动止盈=%.3f 最大持仓=%d 总仓上限=%.3f",
 			rp0.TrailingStopPct, rp0.MaxPositions, rp0.MaxTotalPositionPct)
 	}
-	drep, err := rt.Signal.Generate(ctx, date, ask, rp0, rt.Decider)
+	drep, err := rt.Signal.Generate(ctx, date, ask, cand.Watch, rp0, rt.Decider)
 	mustNoErr(t, "Signal.Generate", err)
 	if drep.Approved+drep.Declined+drep.Failed != len(ask) {
 		t.Errorf("LLM 裁决没有覆盖整批候选: 批准%d 否决%d 失败%d，问了 %d 只",

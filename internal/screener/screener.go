@@ -120,6 +120,11 @@ type Report struct {
 	// Shadow 闸门关闭时跑完漏斗得到的候选：只用于展示"若开闸会选到谁"，
 	// 不进决策链（Candidates 保持 nil ⇒ 0 指令）。
 	Shadow []model.Candidate
+	// Watch 排名保留带 = 因子排序前 TopN+BufferN（FilterConfig.BufferN）：
+	// 只喂卖出规则 4 的滞回判定（跌出保留带才淘汰），买入候选仍只取 TopN。
+	// 含 Candidates 全部条目且同序；关闸日漏斗照跑、保留带照常产出，
+	// 但闸门关闭时的卖出口径由调用方决定（本字段不改变"Candidates 为空 ⇒ 0 买单"不变量）。
+	Watch []model.Candidate
 }
 
 // StageStat 漏斗单级进出统计（只写日志，不落库）。
@@ -211,7 +216,8 @@ func (s *Screener) Run(ctx context.Context, tradeDate string, budget Budget) (*R
 	})
 
 	rep.ScoredTotal = len(survivors)
-	scored := s.pickTopN(survivors, in, sectors, tr)
+	scored, watch := s.pickTopN(survivors, in, sectors, tr)
+	rep.Watch = watch
 	if rep.RegimeClosed {
 		rep.Shadow = scored
 		rep.Empty = true // 关闸当日仍是"0 候选"，只是原因明确且带影子清单
@@ -237,8 +243,10 @@ func (s *Screener) filterStage(tr *tracer, slug, name string, pool []model.Stock
 	return out
 }
 
-// pickTopN 因子打分并取前 N 名，组装内存候选（含可解释理由）。
-func (s *Screener) pickTopN(pool []model.StockBasic, in *inputs, sectors []model.SectorStat, tr *tracer) []model.Candidate {
+// pickTopN 因子打分并取前 N 名，组装内存候选（含可解释理由）；
+// 同时多切 BufferN 名产出排名保留带（watch），仅供卖出规则 4 的滞回判定。
+// top 以三下标切片切断后备数组：下游会向候选 append ETF 补口条目，不得写进 watch 视野。
+func (s *Screener) pickTopN(pool []model.StockBasic, in *inputs, sectors []model.SectorStat, tr *tracer) (top, watch []model.Candidate) {
 	scored, raw := s.scorePool(pool, in)
 	sort.SliceStable(scored, func(i, j int) bool {
 		if scored[i].Score != scored[j].Score {
@@ -250,12 +258,20 @@ func (s *Screener) pickTopN(pool []model.StockBasic, in *inputs, sectors []model
 	if topN > len(scored) {
 		topN = len(scored)
 	}
+	buf := s.cfg.BufferN
+	if buf < 0 {
+		buf = 0 // 负值已在装配期拦下（validateEnums）；兜底只回退到无缓冲旧口径
+	}
+	watchN := topN + buf
+	if watchN > len(scored) {
+		watchN = len(scored)
+	}
 	sectorMom := make(map[string]float64, len(sectors))
 	for _, sec := range sectors {
 		sectorMom[sec.Industry] = sec.WMom
 	}
-	out := make([]model.Candidate, 0, topN)
-	for rank, sc := range scored[:topN] {
+	out := make([]model.Candidate, 0, watchN)
+	for rank, sc := range scored[:watchN] {
 		stk := stockOf(pool, sc.Code)
 		out = append(out, model.Candidate{
 			Rank: rank + 1, PoolSize: len(scored),
@@ -271,7 +287,7 @@ func (s *Screener) pickTopN(pool []model.StockBasic, in *inputs, sectors []model
 		drops[reasonRankOut] = rest
 	}
 	tr.emitRaw("topn", "因子排名TopN", len(scored), topN, drops)
-	return out
+	return out[:topN:topN], out
 }
 
 // finish 收尾：每级计数写日志；候选为 0 落一条轨迹（当日日报按降级列出）。

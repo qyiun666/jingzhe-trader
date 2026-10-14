@@ -3,6 +3,7 @@ package signal
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/observability"
@@ -17,10 +18,11 @@ import (
 // 信号不落库：一条流水线内内存传递，唯一落库的结果是 order_ticket；
 // 重跑幂等由"当日同标的同方向活跃指令单"集合保证（配 order_ticket 部分唯一索引）。
 type Service struct {
-	st     *store.Store
-	ledger *ticket.Ledger // 现金/资产的唯一口径（含组合同步的现金锚点）
-	gate   store.MarketGate
-	etf    ETFUniverse // 白名单认定的场内 ETF（豁免规则 4 + 显示名兜底）
+	st      *store.Store
+	ledger  *ticket.Ledger // 现金/资产的唯一口径（含组合同步的现金锚点）
+	gate    store.MarketGate
+	etf     ETFUniverse    // 白名单认定的场内 ETF（豁免规则 4 + 显示名兜底）
+	rankOut RankOutPolicy  // 规则 4 的持有期口径（缓冲带深度按当日保留带在 sellDecisions 里补）
 }
 
 // ETFUniverse 白名单声明的场内 ETF：ts_code → 人工复核过的显示名。
@@ -39,8 +41,12 @@ type ETFUniverse map[string]string
 // etf 传 screen.etf_whitelist 的解析结果（与 ETF 漏斗共用同一份配置，见
 // scheduler.ETFOptionsOf）。按白名单而不是按 etf_enabled 生效：关闸买入不等于
 // 手里没有 ETF，试探期买到的仓位在停闸之后仍要按正确的规则退出。
-func NewService(st *store.Store, ledger *ticket.Ledger, gate store.MarketGate, etf ETFUniverse) *Service {
-	return &Service{st: st, ledger: ledger, gate: gate, etf: etf}
+//
+// rankOut 传 signal.rank_out_* 的解析结果（规则 4 最小持有期）。缓冲带深度不在此
+// 结构里定死——它随当日排名保留带（Generate 的 watch 参数）变化，判定现场补齐。
+func NewService(st *store.Store, ledger *ticket.Ledger, gate store.MarketGate, etf ETFUniverse,
+	rankOut RankOutPolicy) *Service {
+	return &Service{st: st, ledger: ledger, gate: gate, etf: etf, rankOut: rankOut}
 }
 
 // isETF 判定代码是否由白名单声明为场内 ETF。
@@ -97,8 +103,12 @@ type buyProposal struct {
 }
 
 // Generate 执行决策主流程：① 读行情窗口与持仓 → ② 卖出决策（规则）→ ③ 买入决策（LLM）→ ④ 写指令单。
+//
+// cands 是当日 TopN 买入候选；watch 是排名保留带（TopN+buffer，screener.Report.Watch），
+// 只影响卖出规则 4 的滞回判定——传 nil 表示调用方没有保留带口径，退回"以 cands 为
+// 全部保留带"的旧口径。买入决策永远只见 cands，不会把缓冲带外的票当成候选。
 func (s *Service) Generate(ctx context.Context, tradeDate string, cands []model.Candidate,
-	p risk.RiskParams, decider BuyDecider) (*Report, error) {
+	watch []model.Candidate, p risk.RiskParams, decider BuyDecider) (*Report, error) {
 	if decider == nil {
 		decider = NoDecider{}
 	}
@@ -120,7 +130,7 @@ func (s *Service) Generate(ctx context.Context, tradeDate string, cands []model.
 	if err != nil {
 		return nil, err
 	}
-	sells, err := s.sellDecisions(ctx, tradeDate, cands, positions, p, idx, rep)
+	sells, err := s.sellDecisions(ctx, tradeDate, cands, watch, positions, p, idx, rep)
 	if err != nil {
 		return nil, err
 	}
@@ -138,12 +148,27 @@ func (s *Service) Generate(ctx context.Context, tradeDate string, cands []model.
 // sellDecisions 持仓 × 卖出规则：不受板块与候选门槛影响（跌出榜单也只能按规则卖）。
 //
 // 卖出刻意不走 LLM：止损止盈是硬风控，让模型参与"要不要执行止损"就是把风控交给它否决。
-func (s *Service) sellDecisions(ctx context.Context, tradeDate string, cands []model.Candidate,
+//
+// 规则 4 的两个滞回输入在这里装配（其余规则各用各的现算输入）：
+//   - 保留带成员集合：watch 非空时取 watch（TopN+buffer），否则退回 cands 旧口径；
+//   - 持有交易日数：position.first_open_date 到 tradeDate 的完整交易日数，
+//     缺建仓日期记 -1（不适用最小持有期保护，见 evalRankOut）。
+func (s *Service) sellDecisions(ctx context.Context, tradeDate string, cands, watch []model.Candidate,
 	positions []model.Position, p risk.RiskParams, idx indexInfo, rep *Report) ([]model.Signal, error) {
-	inTopN := make(map[string]bool, len(cands))
-	for _, c := range cands {
+	band := cands
+	if len(watch) > 0 {
+		band = watch
+	}
+	inTopN := make(map[string]bool, len(band))
+	for _, c := range band {
 		inTopN[c.TsCode] = true
 	}
+	days, err := s.st.MarketRepo().TradeDateList(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("读取交易日历用于持仓天数判定失败: %w", err)
+	}
+	ro := s.rankOut
+	ro.WatchTopN = len(band)
 	var out []model.Signal
 	for _, pos := range positions {
 		if pos.TotalQty <= 0 {
@@ -153,9 +178,18 @@ func (s *Service) sellDecisions(ctx context.Context, tradeDate string, cands []m
 		if err != nil {
 			return nil, fmt.Errorf("持仓 %s 卖出判定缺少收盘价数据: %w", pos.TsCode, err)
 		}
+		held := tradingDaysHeld(days, pos.FirstOpenDate, tradeDate)
 		h := HoldingCtx{
 			Pos: pos, LastClose: bar.RawClose, LastDate: bar.TradeDate,
 			InTopN: inTopN[pos.TsCode], MarketBad: idx.bad(), IsETF: s.isETF(pos.TsCode),
+			DaysHeld: held, RankOut: ro,
+		}
+		// 持有期保护挡掉了一次本会触发的淘汰：必须留痕（与"禁静默丢弃"同一纪律），
+		// 否则"为什么这只没卖"只能靠翻日历反推。判定条件与 evalRankOut 的保护分支同构。
+		if !h.InTopN && !h.IsETF && ro.MinHoldDays > 0 && held >= 0 && held < ro.MinHoldDays {
+			rep.Notes = append(rep.Notes, fmt.Sprintf(
+				"%s 未进当日排名保留带，但已持有 %d 个交易日 < 最小持有期 %d，本次排名淘汰豁免",
+				pos.TsCode, held, ro.MinHoldDays))
 		}
 		if sig := EvalSell(tradeDate, h, p, idx.close, idx.ma60); sig != nil {
 			nm, e := s.SellName(ctx, pos.TsCode)
@@ -168,6 +202,21 @@ func (s *Service) sellDecisions(ctx context.Context, tradeDate string, cands []m
 		}
 	}
 	return out, nil
+}
+
+// tradingDaysHeld 建仓日之后（不含建仓日）到 tradeDate（含）的交易日数。
+// 建仓当日不计：T+1 规则下当日不可卖，"持有 N 个交易日"从次日算起才是可卖口径的真值。
+// 空建仓日期或晚于判定日（坏数据）返回 -1：调用方按"保护不适用"处理，
+// 缺数据既不解锁淘汰也不无限锁仓。days 必须升序（TradeDateList 契约）。
+func tradingDaysHeld(days []string, openDate, tradeDate string) int {
+	if openDate == "" || openDate > tradeDate {
+		return -1
+	}
+	// countLE：升序日历中 <= x 的交易日根数。
+	countLE := func(x string) int {
+		return sort.Search(len(days), func(i int) bool { return days[i] > x })
+	}
+	return countLE(tradeDate) - countLE(openDate)
 }
 
 // buyDecisions 候选批量 × 证据 → LLM 一次裁决整批。规则不再否决任何候选，只提供证据列。

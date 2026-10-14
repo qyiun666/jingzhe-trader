@@ -93,7 +93,8 @@ func BuildRuntime(ctx context.Context, st *store.Store, cfg *config.Config) (*Ru
 		Dataloader: dataloader.New(st, tcli),
 		Freshness:  dataloader.NewFreshnessGate(st, cfg.GetInt("screen.min_bar_rows"), screener.BarWindow()),
 		Screener:   screener.New(st, FilterConfigOf(cfg), cfg.GetString("screen.factor_mode")),
-		Signal:     signal.NewService(st, ledger, scheduler.MarketGateOf(cfg), scheduler.ETFUniverseOf(cfg)),
+		Signal:     signal.NewService(st, ledger, scheduler.MarketGateOf(cfg), scheduler.ETFUniverseOf(cfg),
+			scheduler.RankOutPolicyOf(cfg)),
 		Decider:    decider,
 		Ledger:     ledger,
 		Tickets:    ticket.NewService(st),
@@ -176,6 +177,7 @@ func (r *Runtime) IsTradeDay(ctx context.Context, date string) bool {
 func FilterConfigOf(cfg *config.Config) screener.FilterConfig {
 	return screener.FilterConfig{
 		TopN:             cfg.GetInt("screen.top_n"),
+		BufferN:          cfg.GetInt("signal.rank_out_buffer_n"),
 		MinCircMvW:       cfg.GetFloat("screen.min_circ_mv_w"),
 		MinTurnoverRate:  cfg.GetFloat("screen.min_turnover_rate"),
 		PriceLow:         cfg.GetFloat("screen.price_low"),
@@ -231,6 +233,14 @@ func validateEnums(cfg *config.Config) error {
 	if single > total {
 		return fmt.Errorf("screen.gate_off_max_single_pct=%g 大于总仓上限 %g（单票不可能超过总仓）",
 			single, total)
+	}
+	// 排名淘汰的持有期/缓冲：0 合法（单独关掉一项保护回到旧口径），负值非法——
+	// 负持有期会把"淘汰前至少等 N 天"翻转成"淘汰可以倒着数"，语义不存在。
+	if v := cfg.GetInt("signal.rank_out_min_hold_days"); v < 0 {
+		return fmt.Errorf("signal.rank_out_min_hold_days=%d 非法（合法 ≥0，0=不设最小持有期）", v)
+	}
+	if v := cfg.GetInt("signal.rank_out_buffer_n"); v < 0 {
+		return fmt.Errorf("signal.rank_out_buffer_n=%d 非法（合法 ≥0，0=保留带与 TopN 等深）", v)
 	}
 	if err := validateETF(cfg); err != nil {
 		return err

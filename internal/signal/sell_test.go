@@ -97,6 +97,77 @@ func TestSellRankOut(t *testing.T) {
 	}
 }
 
+// rankOutHold 构造一只"跌出保留带、持有 DaysHeld 个交易日"的个股持仓。
+func rankOutHold(daysHeld int, ro RankOutPolicy) HoldingCtx {
+	h := holding(model.FromFloat(10), 0, model.FromFloat(10), false, false)
+	h.DaysHeld = daysHeld
+	h.RankOut = ro
+	return h
+}
+
+// TestSellRankOutMinHold 最小持有期（signal.rank_out_min_hold_days，2026-10-14 组长批准）：
+// 持有未满 → 排名淘汰豁免；满 → 照常淘汰；持有期未知（-1，老同步持仓缺日期）→
+// 不适用保护（缺数据不是锁仓理由）；MinHoldDays=0 → 旧口径逐位一致。
+func TestSellRankOutMinHold(t *testing.T) {
+	p := g1()
+	ro := RankOutPolicy{MinHoldDays: 10, WatchTopN: 30}
+	if sig := EvalSell("20260901", rankOutHold(5, ro), p, 0, 0); sig != nil {
+		t.Errorf("持有 5 交易日 < 10，应豁免排名淘汰，实际 %+v", sig)
+	}
+	if sig := EvalSell("20260901", rankOutHold(9, ro), p, 0, 0); sig != nil {
+		t.Errorf("持有 9 交易日 < 10（边界内一格），应豁免，实际 %+v", sig)
+	}
+	sig := EvalSell("20260901", rankOutHold(10, ro), p, 0, 0)
+	if sig == nil || sig.Rule != RuleRankOut {
+		t.Fatalf("持有 10 交易日 ≥ 10，应触发淘汰: %+v", sig)
+	}
+	if !strings.Contains(sig.Reason, "Top30") {
+		t.Errorf("理由应写明保留带深度，实际 %q", sig.Reason)
+	}
+	if sig := EvalSell("20260901", rankOutHold(-1, ro), p, 0, 0); sig == nil || sig.Rule != RuleRankOut {
+		t.Errorf("持有期未知不适用保护，应触发淘汰: %+v", sig)
+	}
+	// 旧口径回归：MinHoldDays=0 时不管持有几天都照淘汰（与开关前逐位一致）。
+	if sig := EvalSell("20260901", rankOutHold(1, RankOutPolicy{}), p, 0, 0); sig == nil || sig.Rule != RuleRankOut {
+		t.Errorf("MinHoldDays=0 应回到旧口径: %+v", sig)
+	}
+}
+
+// TestSellRankOutMinHoldKeepsPriceRules 持有期只挡"排名换仓"：未满持有期不豁免
+// 止损/移动止盈/止盈——建仓次日跌破止损线照样出信号（风控优先原则的回归点）。
+func TestSellRankOutMinHoldKeepsPriceRules(t *testing.T) {
+	p := g1() // 止损线 8%
+	h := rankOutHold(1, RankOutPolicy{MinHoldDays: 10})
+	h.LastClose = model.FromFloat(9.0) // 成本 10，现价 9.0 → 破 9.2 止损线
+	sig := EvalSell("20260901", h, p, 0, 0)
+	if sig == nil || sig.Rule != RuleStopLoss {
+		t.Fatalf("持有期保护不该挡止损，实际 %+v", sig)
+	}
+}
+
+// TestTradingDaysHeld 持有交易日数：建仓日不计；日历缺端点仍按数出来的算；
+// 空建仓日期/晚于判定日返回 -1（保护不适用哨兵）。
+func TestTradingDaysHeld(t *testing.T) {
+	days := []string{"20261008", "20261009", "20261012", "20261013", "20261014"}
+	cases := []struct {
+		open, date string
+		want       int
+	}{
+		{"20261008", "20261008", 0}, // 建仓当日 = 0 个持有交易日（T+1 不可卖口径）
+		{"20261008", "20261009", 1},
+		{"20261008", "20261014", 4}, // 跳过周末非交易日
+		{"20261012", "20261014", 2}, // 真实样本：600704 建仓 10/12 → 10/14 持 2 日
+		{"20261013", "20261015", 1}, // 判定日不在日历：只数日历内的
+		{"", "20261014", -1},         // 缺建仓日期
+		{"20261016", "20261014", -1}, // 坏数据：建仓晚于判定日
+	}
+	for _, c := range cases {
+		if got := tradingDaysHeld(days, c.open, c.date); got != c.want {
+			t.Errorf("tradingDaysHeld(%q→%q)=%d，期望 %d", c.open, c.date, got, c.want)
+		}
+	}
+}
+
 // TestSellMarketBad 规则 5 大盘恶化：指数收盘跌破 MA60 触发。
 func TestSellMarketBad(t *testing.T) {
 	p := g1()

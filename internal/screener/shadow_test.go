@@ -169,6 +169,71 @@ func TestClosedGateAlertIsNotAFault(t *testing.T) {
 	}
 }
 
+// TestRunWatchBufferN 排名保留带（卖出规则 4 滞回口径，2026-10-14 组长批准）：
+// Watch = 因子排序前 TopN+BufferN 且以 Candidates 打头同序；BufferN=0 时与候选等深
+// （旧口径）；池子不足 TopN+BufferN 时钳到池深；候选本身仍只取 TopN，
+// 且向 Candidates append 不得改写 Watch（三下标切片切断后备数组的回归点）。
+func TestRunWatchBufferN(t *testing.T) {
+	ctx := context.Background()
+	st := seedShadow(t) // 12 只入池
+
+	cfg := shadowCfg()
+	cfg.TopN, cfg.BufferN = 5, 3
+	rep, err := New(st, cfg, ModeReversal).Run(ctx, shadowDate, shadowBudget(true))
+	if err != nil {
+		t.Fatalf("跑漏斗失败: %v", err)
+	}
+	if len(rep.Candidates) != 5 || len(rep.Watch) != 8 {
+		t.Fatalf("TopN=5 BufferN=3 应候选 5 / 保留带 8，实际 %d / %d", len(rep.Candidates), len(rep.Watch))
+	}
+	for i := range rep.Candidates {
+		if rep.Watch[i].TsCode != rep.Candidates[i].TsCode {
+			t.Errorf("第 %d 名保留带应与候选同序同码：%s vs %s", i, rep.Watch[i].TsCode, rep.Candidates[i].TsCode)
+		}
+	}
+	if rep.Watch[7].Rank != 8 || rep.Watch[7].PoolSize != shadowCodes {
+		t.Errorf("保留带末位应带真实名次（8/%d），实际 rank=%d pool=%d",
+			shadowCodes, rep.Watch[7].Rank, rep.Watch[7].PoolSize)
+	}
+	grown := append(rep.Candidates, model.Candidate{TsCode: "APPEND.SH"})
+	_ = grown
+	if rep.Watch[4].TsCode != rep.Candidates[4].TsCode || len(rep.Watch) != 8 {
+		t.Errorf("向候选 append 污染了保留带：%d / %s", len(rep.Watch), rep.Watch[4].TsCode)
+	}
+
+	// BufferN=0：保留带与候选等深（旧口径不变量）。
+	cfg.BufferN = 0
+	rep0, err := New(st, cfg, ModeReversal).Run(ctx, shadowDate, shadowBudget(true))
+	if err != nil {
+		t.Fatalf("BufferN=0 跑漏斗失败: %v", err)
+	}
+	if len(rep0.Watch) != len(rep0.Candidates) {
+		t.Errorf("BufferN=0 应等深，实际 %d vs %d", len(rep0.Watch), len(rep0.Candidates))
+	}
+
+	// 缓冲超过池深：钳到 12，不越界。
+	cfg.BufferN = 20
+	repBig, err := New(st, cfg, ModeReversal).Run(ctx, shadowDate, shadowBudget(true))
+	if err != nil {
+		t.Fatalf("BufferN=20 跑漏斗失败: %v", err)
+	}
+	if len(repBig.Watch) != shadowCodes || len(repBig.Candidates) != 5 {
+		t.Errorf("超池缓冲应钳到 %d，实际 watch=%d cand=%d", shadowCodes, len(repBig.Watch), len(repBig.Candidates))
+	}
+
+	// 关闸日：保留带照常产出（调用方决定是否采用），影子与候选口径不变。
+	closed, err := New(st, cfg, ModeReversal).Run(ctx, shadowDate, shadowBudget(false))
+	if err != nil {
+		t.Fatalf("关闸跑漏斗失败: %v", err)
+	}
+	if closed.Candidates != nil {
+		t.Errorf("关闸候选必须仍为 nil，实际 %d 只", len(closed.Candidates))
+	}
+	if len(closed.Watch) != shadowCodes {
+		t.Errorf("关闸保留带应照常（由调用方清零），实际 %d", len(closed.Watch))
+	}
+}
+
 // TestShadowBriefEmptyPool 关闸且下游同样一只选不出时，影子摘要必须明说"需在开闸前排查"，
 // 而不是留一句空话让人以为一切正常。
 func TestShadowBriefEmptyPool(t *testing.T) {

@@ -11,6 +11,7 @@ import (
 	"jingzhe-trader/internal/observability"
 	"jingzhe-trader/internal/risk"
 	"jingzhe-trader/internal/screener"
+	"jingzhe-trader/internal/signal"
 	"jingzhe-trader/internal/store"
 	"jingzhe-trader/internal/ticket"
 )
@@ -29,6 +30,17 @@ func MarketGateOf(cfg ConfigReader) store.MarketGate {
 		enabled = true
 	}
 	return store.MarketGate{Enabled: enabled, Window: w}
+}
+
+// RankOutPolicyOf 卖出规则 4 的最小持有期口径（signal.rank_out_min_hold_days）。
+// 读法与 MarketGateOf 一致：键缺失的旧库或坏值回落到"无保护"的旧口径——
+// 保护是新行为，回落必须朝旧行为一侧倒，不能拿解析失败当"恰好也配了 10 天"。
+func RankOutPolicyOf(cfg ConfigReader) signal.RankOutPolicy {
+	n, err := strconv.Atoi(strings.TrimSpace(cfg.GetString("signal.rank_out_min_hold_days")))
+	if err != nil || n < 0 {
+		n = 0
+	}
+	return signal.RankOutPolicy{MinHoldDays: n}
 }
 
 // eveningPipeline 收盘后整链大方法：一条顺序流水线，任一步失败即整链失败（落 run_trace outcome=fail）。
@@ -55,7 +67,7 @@ func eveningPipeline(ctx context.Context, rc *observability.RunCtx, d Deps) erro
 		return fmt.Errorf("更新持仓期间高点: %w", err)
 	}
 	caps := WeakCapsOf(d.Config)
-	cands, budget, rp, err := screenCandidates(ctx, rc, d, date, rp, caps)
+	cands, watch, budget, rp, err := screenCandidates(ctx, rc, d, date, rp, caps)
 	if err != nil {
 		return fmt.Errorf("③ 选股: %w", err)
 	}
@@ -73,7 +85,7 @@ func eveningPipeline(ctx context.Context, rc *observability.RunCtx, d Deps) erro
 	// 在弱势期选不出任何"买得起"的科技敞口。白名单 → 流动性两级，不排名，
 	// 与个股候选并入同一批交给同一个 LLM 评审。读不到数只降级，不断链。
 	cands = appendETFCandidates(ctx, rc, d, date, cands, budget)
-	if err := buildTickets(ctx, rc, d, date, cands, rp); err != nil {
+	if err := buildTickets(ctx, rc, d, date, cands, watch, rp); err != nil {
 		return fmt.Errorf("④ 买卖决策: %w", err)
 	}
 	return nil
@@ -186,17 +198,21 @@ func gateFreshness(ctx context.Context, d Deps, date string) error {
 	return nil
 }
 
-// screenCandidates 跑选股漏斗（全程内存），返回候选、本轮大盘口径与**生效后的**风控参数
+// screenCandidates 跑选股漏斗（全程内存），返回买入候选（TopN）、排名保留带（TopN+buffer，
+// 仅供卖出规则 4 滞回）、本轮大盘口径与**生效后的**风控参数
 // （弱势收缩发生在 ScreenBudget 内，调用方拿到的 rp 与漏斗用的是同一份）。
+//
+// 关闸日保留带退回 nil：那是"买入停摆"的口径，卖出侧维持既有的淘汰/大盘恶化行为，
+// 不让保留带改动从未生效过的路径。
 func screenCandidates(ctx context.Context, rc *observability.RunCtx, d Deps, date string,
-	rp risk.RiskParams, caps WeakCaps) ([]model.Candidate, screener.Budget, risk.RiskParams, error) {
+	rp risk.RiskParams, caps WeakCaps) (cands, watch []model.Candidate, _ screener.Budget, _ risk.RiskParams, err error) {
 	budget, rp, err := ScreenBudget(ctx, d.Store, d.Ledger, date, rp, MarketGateOf(d.Config), caps)
 	if err != nil {
-		return nil, budget, rp, err
+		return nil, nil, budget, rp, err
 	}
 	rep, err := d.Screener.Run(ctx, date, budget)
 	if err != nil {
-		return nil, budget, rp, err
+		return nil, nil, budget, rp, err
 	}
 	rc.Declare("rows", "candidates", candidateExpect(rep))
 	rc.Actual("candidates", len(rep.Candidates))
@@ -209,7 +225,13 @@ func screenCandidates(ctx context.Context, rc *observability.RunCtx, d Deps, dat
 	if rep.Empty {
 		rc.Degrade("SCREEN_EMPTY", emptyReason(rep))
 	}
-	return rep.Candidates, budget, rp, nil
+	watch = rep.Watch
+	if rep.RegimeClosed {
+		// 关闸日候选为空是"整体退出"口径（规则 5 大盘恶化本就覆盖），
+		// 保留带不参与——不能让缓冲把"停摆退出"变成"部分保留"。
+		watch = nil
+	}
+	return rep.Candidates, watch, budget, rp, nil
 }
 
 // candidateExpect 候选产出物的期望数量。
@@ -371,12 +393,12 @@ func (d Deps) raiseWeakTrace(ctx context.Context, date, detail string) {
 // 买入决策权在 LLM 评审员手里，因此 llm.enabled=false 不是"少一道终审"，而是"当日不可能有买单"——
 // 这一点必须显式告警，否则人会以为流水线跑通了却什么都没买到。
 func buildTickets(ctx context.Context, rc *observability.RunCtx, d Deps, date string,
-	cands []model.Candidate, rp risk.RiskParams) error {
+	cands, watch []model.Candidate, rp risk.RiskParams) error {
 	if !d.Decider.Enabled() {
 		d.raiseU(rc, "LLM_DISABLED", "买入决策未启用，当日不会有任何买单",
 			"llm.enabled=false 或 api_key/model 缺失；风控参数不会替代决策者")
 	}
-	rep, err := d.Signal.Generate(ctx, date, cands, rp, d.Decider)
+	rep, err := d.Signal.Generate(ctx, date, cands, watch, rp, d.Decider)
 	if err != nil {
 		return err
 	}
