@@ -496,3 +496,206 @@ func TestTransitionIllegal(t *testing.T) {
 	}
 	// 流转留痕已改为运行日志（action_log 表本次删除）；"流转是否落库"由上面的回读断言承担。
 }
+
+// TestSyncPortfolioKeepsFirstOpenDate 生产事故回归（agent_issues #12-B）：
+// 券商口径的持仓同步不带建仓日，整列覆盖把既有建仓日擦成空 →
+// signal 算不出持有天数（-1）→ 最小持有期豁免失效 → 每天生成淘汰刚买入持仓的卖出单。
+// 20261015 11:00 与 11:24 两次 sync_portfolio(positions=2) 正是把 600704/601766 擦掉的现场，
+// 这里用同一序列复现：建仓 → 同步校准 → 建仓日必须原地不动。
+func TestSyncPortfolioKeepsFirstOpenDate(t *testing.T) {
+	s, led := openLedger(t)
+	ctx := context.Background()
+	code := "sh600704"
+
+	tk := seedTicketOn(t, s, code, model.DirBuy, 200, model.FromFloat(5.05), "20261012")
+	if _, err := led.ReportFill(ctx, FillRequest{TicketID: tk.ID, Qty: 200, Price: model.FromFloat(5.05)}); err != nil {
+		t.Fatalf("建仓回执失败: %v", err)
+	}
+	if got := mustPos(t, s, ctx, code).FirstOpenDate; got != "20261012" {
+		t.Fatalf("建仓后 first_open_date=%q, 期望 20261012", got)
+	}
+
+	// 10-15 的组合同步：不带建仓日（券商 App 持仓页没有这一列），只校准数量与成本
+	if _, _, err := led.SyncPortfolio(ctx, PortfolioSync{Date: "20261015",
+		Capital: model.FromFloat(0), Cash: model.FromFloat(10163),
+		Items: []PortfolioInput{{TsCode: code, TotalQty: 200, AvailableQty: 200, CostPrice: model.FromFloat(5.07)}},
+		Actor: "mcp-agent"}); err != nil {
+		t.Fatalf("组合同步失败: %v", err)
+	}
+	p := mustPos(t, s, ctx, code)
+	if p.FirstOpenDate != "20261012" {
+		t.Errorf("组合同步把建仓日改成了 %q, 期望仍为 20261012（同步绝不清空建仓日）", p.FirstOpenDate)
+	}
+	if p.TotalQty != 200 || p.CostPrice != model.FromFloat(5.07) {
+		t.Errorf("校准必须照常生效: total=%d cost=%s", int64(p.TotalQty), p.CostPrice)
+	}
+
+	// 再同步一次也不能改变它（每天跑都不复发）
+	if _, _, err := led.SyncPortfolio(ctx, PortfolioSync{Date: "20261016",
+		Capital: model.FromFloat(0), Cash: model.FromFloat(10163),
+		Items: []PortfolioInput{{TsCode: code, TotalQty: 200, AvailableQty: 200, CostPrice: model.FromFloat(4.85)}},
+		Actor: "mcp-agent"}); err != nil {
+		t.Fatalf("二次组合同步失败: %v", err)
+	}
+	if got := mustPos(t, s, ctx, code).FirstOpenDate; got != "20261012" {
+		t.Errorf("二次同步后建仓日=%q, 期望仍为 20261012", got)
+	}
+}
+
+// TestSyncPortfolioOpenDateRules 建仓日的四种情形各一条断言（规则见 syncPositionOpenDate）。
+func TestSyncPortfolioOpenDateRules(t *testing.T) {
+	s, led := openLedger(t)
+	ctx := context.Background()
+
+	// 一、建仓日已丢失（本次事故留下的脏数据）→ 按同步日补齐，保护立刻回来
+	lost := "sh601766"
+	tkLost := seedTicketOn(t, s, lost, model.DirBuy, 100, model.FromFloat(6.39), "20261015")
+	if _, err := led.ReportFill(ctx, FillRequest{TicketID: tkLost.ID, Qty: 100, Price: model.FromFloat(6.39)}); err != nil {
+		t.Fatalf("建仓回执失败: %v", err)
+	}
+	if _, err := s.WriteDB().Exec(`UPDATE position SET first_open_date='' WHERE ts_code=?`, lost); err != nil {
+		t.Fatalf("制造丢失建仓日的脏数据失败: %v", err)
+	}
+	if _, _, err := led.SyncPortfolio(ctx, PortfolioSync{Date: "20261016",
+		Capital: model.FromFloat(0), Cash: model.FromFloat(9000),
+		Items: []PortfolioInput{{TsCode: lost, TotalQty: 100, AvailableQty: 100, CostPrice: model.FromFloat(6.44)}},
+		Actor: "test"}); err != nil {
+		t.Fatalf("组合同步失败: %v", err)
+	}
+	if got := mustPos(t, s, ctx, lost).FirstOpenDate; got != "20261016" {
+		t.Errorf("丢失的建仓日未被补齐: %q, 期望 20261016（按同步日起算，宁可低估持有期）", got)
+	}
+
+	// 二、显式给出建仓日＝人工纠错通道，优先级最高
+	if _, _, err := led.SyncPortfolio(ctx, PortfolioSync{Date: "20261016",
+		Capital: model.FromFloat(0), Cash: model.FromFloat(9000),
+		Items: []PortfolioInput{{TsCode: lost, TotalQty: 100, AvailableQty: 100,
+			CostPrice: model.FromFloat(6.44), FirstOpenDate: "20261015"}},
+		Actor: "test"}); err != nil {
+		t.Fatalf("纠错同步失败: %v", err)
+	}
+	if got := mustPos(t, s, ctx, lost).FirstOpenDate; got != "20261015" {
+		t.Errorf("显式建仓日没生效: %q, 期望 20261015", got)
+	}
+
+	// 三、清仓行（total_qty=0）留着上一轮的建仓日：重开仓必须起算新日期，不沿用旧日期
+	reopened := "sh600908"
+	if err := s.TradeRepo().UpsertPosition(ctx, model.Position{
+		TsCode: reopened, TotalQty: 0, CostPrice: model.FromFloat(6), HighPrice: model.FromFloat(6),
+		FirstOpenDate: "20261008",
+	}); err != nil {
+		t.Fatalf("播种清仓行失败: %v", err)
+	}
+	if _, _, err := led.SyncPortfolio(ctx, PortfolioSync{Date: "20261016",
+		Capital: model.FromFloat(0), Cash: model.FromFloat(9000),
+		Items: []PortfolioInput{{TsCode: reopened, TotalQty: 100, AvailableQty: 0, CostPrice: model.FromFloat(6.1)}},
+		Actor: "test"}); err != nil {
+		t.Fatalf("重开仓同步失败: %v", err)
+	}
+	if got := mustPos(t, s, ctx, reopened).FirstOpenDate; got != "20261016" {
+		t.Errorf("清仓后重开的建仓日=%q, 期望 20261016（上一轮的 20261008 属于已结束的持仓）", got)
+	}
+
+	// 四、券商同步回来一只不持仓的票：建仓日原样保留，既不清空也不重新盖章
+	if _, _, err := led.SyncPortfolio(ctx, PortfolioSync{Date: "20261019",
+		Capital: model.FromFloat(0), Cash: model.FromFloat(9000),
+		Items: []PortfolioInput{{TsCode: reopened, TotalQty: 0, CostPrice: model.FromFloat(6.1)}},
+		Actor: "test"}); err != nil {
+		t.Fatalf("零持仓同步失败: %v", err)
+	}
+	if got := mustPos(t, s, ctx, reopened).FirstOpenDate; got != "20261016" {
+		t.Errorf("不持仓同步改动了建仓日: %q, 期望仍为 20261016", got)
+	}
+}
+
+// TestSyncPortfolioRejectsMalformedOpenDate 建仓日格式非法必须整次同步拒绝，且账本零改动。
+//
+// 为什么这条值得单独守：持有天数按字符串比较算出，"2026-10-12" 比任何 YYYYMMDD 都小，
+// 会被算成"已持有几百天"，最小持有期保护反向失效——错格式的日期比没有日期更坏。
+func TestSyncPortfolioRejectsMalformedOpenDate(t *testing.T) {
+	s, led := openLedger(t)
+	ctx := context.Background()
+	code := "sh600020"
+	if _, _, err := led.SyncPortfolio(ctx, PortfolioSync{Date: "20261016",
+		Capital: model.FromFloat(20000), Cash: model.FromFloat(15000),
+		Items: []PortfolioInput{{TsCode: code, TotalQty: 100, AvailableQty: 100, CostPrice: model.FromFloat(10)}},
+		Actor: "test"}); err != nil {
+		t.Fatalf("播种同步失败: %v", err)
+	}
+	before := mustPos(t, s, ctx, code)
+
+	for _, bad := range []string{"2026-10-12", "2026101", "202610120", "20261X12", "10-12-2026"} {
+		if _, _, err := led.SyncPortfolio(ctx, PortfolioSync{Date: "20261017",
+			Capital: model.FromFloat(30000), Cash: model.FromFloat(18000),
+			Items: []PortfolioInput{{TsCode: code, TotalQty: 999, AvailableQty: 999,
+				CostPrice: model.FromFloat(11), FirstOpenDate: bad}},
+			Actor: "test"}); err == nil {
+			t.Errorf("非法建仓日 %q 应被拒绝", bad)
+		}
+	}
+	// 拒绝必须发生在动本金/现金锚点/持仓之前：三处都还是第一次同步的值
+	if after := mustPos(t, s, ctx, code); after != before {
+		t.Errorf("被拒绝的同步改动了持仓行: before=%+v after=%+v", before, after)
+	}
+	all, err := s.ConfigRepo().GetAll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if all["account.initial_capital"] != "20000" {
+		t.Errorf("本金被被拒绝的同步改成了 %s, 期望 20000", all["account.initial_capital"])
+	}
+	if all["account.cash_anchor"] != "1500000" {
+		t.Errorf("现金锚点被被拒绝的同步改成了 %s, 期望 1500000（分）", all["account.cash_anchor"])
+	}
+}
+
+// TestReportFillNeverLosesOpenDate 回执链路对建仓日同样只能保住或显式新开：
+// 部分卖出、全部卖出、清仓后重开，三条路径各断言一次。
+func TestReportFillNeverLosesOpenDate(t *testing.T) {
+	s, led := openLedger(t)
+	ctx := context.Background()
+	code := "sh600021"
+
+	buy := seedTicketOn(t, s, code, model.DirBuy, 500, model.FromFloat(10), "20261012")
+	if _, err := led.ReportFill(ctx, FillRequest{TicketID: buy.ID, Qty: 500, Price: model.FromFloat(10)}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 部分卖出：建仓日不动
+	sell1 := seedTicketOn(t, s, code, model.DirSell, 200, model.FromFloat(11), "20261013")
+	if _, err := led.ReportFill(ctx, FillRequest{TicketID: sell1.ID, Qty: 200, Price: model.FromFloat(11)}); err != nil {
+		t.Fatal(err)
+	}
+	p := mustPos(t, s, ctx, code)
+	if p.FirstOpenDate != "20261012" || p.TotalQty != 300 {
+		t.Fatalf("部分卖出后 total=%d 建仓日=%q, 期望 300/20261012", int64(p.TotalQty), p.FirstOpenDate)
+	}
+
+	// 全部卖出：行留在库里（0 股），建仓日不碍事
+	sell2 := seedTicketOn(t, s, code, model.DirSell, 300, model.FromFloat(11), "20261014")
+	if _, err := led.ReportFill(ctx, FillRequest{TicketID: sell2.ID, Qty: 300, Price: model.FromFloat(11)}); err != nil {
+		t.Fatal(err)
+	}
+	if p = mustPos(t, s, ctx, code); p.TotalQty != 0 {
+		t.Fatalf("清仓后 total=%d, 期望 0", int64(p.TotalQty))
+	}
+
+	// 清仓后重开：建仓日必须是新的一天，不能沿用上一轮
+	buy2 := seedTicketOn(t, s, code, model.DirBuy, 400, model.FromFloat(12), "20261020")
+	if _, err := led.ReportFill(ctx, FillRequest{TicketID: buy2.ID, Qty: 400, Price: model.FromFloat(12)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustPos(t, s, ctx, code).FirstOpenDate; got != "20261020" {
+		t.Errorf("重开仓后建仓日=%q, 期望 20261020", got)
+	}
+}
+
+// mustPos 读持仓（测试辅助）。
+func mustPos(t *testing.T, s *store.Store, ctx context.Context, code string) model.Position {
+	t.Helper()
+	p, err := s.TradeRepo().GetPosition(ctx, code)
+	if err != nil {
+		t.Fatalf("读持仓 %s 失败: %v", code, err)
+	}
+	return p
+}

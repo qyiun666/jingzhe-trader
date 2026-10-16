@@ -193,13 +193,22 @@ func (r *TradeRepo) UpsertPosition(ctx context.Context, p model.Position) error 
 
 // UpsertPositionTx 事务内写入/更新持仓。回执链路的持仓变更必须与成交写回同事务，
 // 因此读写库上那一份实现抽出来复用，避免两处列清单漂开。
+//
+// first_open_date 是唯一「只写不擦」的列：调用方传空串表示「我不知道建仓日」，
+// 不是「把已存的建仓日清掉」。券商口径的同步（sync_portfolio / init）本来就没有
+// 建仓日这个字段，整列覆盖会把持有期保护（signal.rank_out_min_hold_days）的依据
+// 直接抹掉——系统随后把持有期算成 -1（未知），排名淘汰的最小持有期豁免失效，
+// 每天生成一张刚建仓就卖的错误指令单（agent_issues #12-B）。
+//
+// 因此这里让空值退回库里既有值；要改建成仓日（清仓后重开、人工纠错）必须显式给值。
 func UpsertPositionTx(ctx context.Context, tx *sqlx.Tx, p model.Position) error {
 	const q = `INSERT INTO position (ts_code, total_qty, today_bought, cost_price, high_price, first_open_date)
 		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(ts_code) DO UPDATE SET
 			total_qty=excluded.total_qty, today_bought=excluded.today_bought,
 			cost_price=excluded.cost_price, high_price=excluded.high_price,
-			first_open_date=excluded.first_open_date`
+			first_open_date=COALESCE(NULLIF(excluded.first_open_date, ''),
+			                          NULLIF(position.first_open_date, ''), '')`
 	if _, err := tx.ExecContext(ctx, q,
 		p.TsCode, int64(p.TotalQty), int64(p.TodayBought), int64(p.CostPrice),
 		int64(p.HighPrice), p.FirstOpenDate,

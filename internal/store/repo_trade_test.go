@@ -105,6 +105,57 @@ func TestRaiseHighPriceMonotonic(t *testing.T) {
 	}
 }
 
+// TestUpsertPositionFirstOpenDateMonotonic first_open_date 只写不擦：空值表示"不知道建仓日"，
+// 绝不允许把库里既有的日期清掉（agent_issues #12-B：组合同步整列覆盖 → 持有期算成未知 →
+// 最小持有期保护失效 → 每天生成淘汰刚买入持仓的错误卖出单）。改日期必须显式给新值。
+func TestUpsertPositionFirstOpenDateMonotonic(t *testing.T) {
+	s := openStoreForTest(t)
+	defer s.Close()
+	ctx := context.Background()
+	code := "600704.SH"
+
+	write := func(total model.Qty, openDate string) {
+		t.Helper()
+		if err := s.TradeRepo().UpsertPosition(ctx, model.Position{
+			TsCode: code, TotalQty: total, CostPrice: model.FromFloat(5),
+			HighPrice: model.FromFloat(5), FirstOpenDate: openDate,
+		}); err != nil {
+			t.Fatalf("写持仓失败: %v", err)
+		}
+	}
+
+	write(200, "20261012")
+	if got := mustPosition(t, s, code).FirstOpenDate; got != "20261012" {
+		t.Fatalf("首次写入建仓日=%q, 期望 20261012", got)
+	}
+	// 空建仓日的同步（券商口径）不得擦掉既有日期，其余列照常更新
+	write(300, "")
+	p := mustPosition(t, s, code)
+	if p.FirstOpenDate != "20261012" {
+		t.Errorf("空值覆盖后建仓日=%q, 期望仍为 20261012", p.FirstOpenDate)
+	}
+	if p.TotalQty != 300 {
+		t.Errorf("其余列应照常更新: total=%d, 期望 300", int64(p.TotalQty))
+	}
+	// 显式给新值才改（清仓后重开、人工纠错走的都是这条路）
+	write(100, "20261015")
+	if got := mustPosition(t, s, code).FirstOpenDate; got != "20261015" {
+		t.Errorf("显式改建仓日失败: %q, 期望 20261015", got)
+	}
+	// 库里是 NULL 的历史行：读出来是空串，写空值不报错也不改变
+	if _, err := s.WriteDB().Exec(`UPDATE position SET first_open_date=NULL WHERE ts_code=?`, code); err != nil {
+		t.Fatalf("构造 NULL 建仓日失败: %v", err)
+	}
+	write(100, "")
+	if got := mustPosition(t, s, code).FirstOpenDate; got != "" {
+		t.Errorf("NULL 行写空值后=%q, 期望空串", got)
+	}
+	write(100, "20261016")
+	if got := mustPosition(t, s, code).FirstOpenDate; got != "20261016" {
+		t.Errorf("NULL 行显式补日期失败: %q", got)
+	}
+}
+
 // mustPosition 读取持仓（测试辅助）。
 func mustPosition(t *testing.T, s *Store, code string) model.Position {
 	t.Helper()

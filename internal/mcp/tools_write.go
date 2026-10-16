@@ -122,7 +122,9 @@ func (s *Server) registerWriteTools() {
 			"没有成交单支撑，必须同时给出券商口径的可用现金，系统把它落成现金锚点，锚点当日及之前的成交" +
 			"不再重复扣减现金（不给就会把持仓成本双算成可用资金）。initial_capital_yuan 为本金=期初总资产" +
 			"（含持仓成本），首次写入，已配置且数值不同时拒绝覆盖，响应里 capital_rejected=true" +
-			"（验收 #14），持仓与现金照常同步。价格为元，数量为股。",
+			"（验收 #14），持仓与现金照常同步。价格为元，数量为股。建仓日 first_open_date 是持有期" +
+			"保护的依据，券商口径没有这一列：不传则保留账本既有建仓日（同步绝不清空它），" +
+			"只在人工纠错或首次接入确知真实建仓日时才显式传 YYYYMMDD。",
 		InputSchema: objSchema(map[string]interface{}{
 			"date":                 dateProp,
 			"initial_capital_yuan": numProp("本金 = 期初总资产（元），0=不改本金"),
@@ -137,12 +139,13 @@ func (s *Server) registerWriteTools() {
 			items := make([]ticket.PortfolioInput, 0, len(rows))
 			for _, r := range rows {
 				items = append(items, ticket.PortfolioInput{
-					TsCode:       argStr(r, "ts_code", ""),
-					TotalQty:     model.Qty(argInt(r, "total_qty", 0)),
-					AvailableQty: model.Qty(argInt(r, "available_qty", 0)),
-					TodayBought:  model.Qty(argInt(r, "today_bought", 0)),
-					CostPrice:    model.FromFloat(argFloat(r, "cost_price", 0)),
-					HighPrice:    model.FromFloat(argFloat(r, "high_price", 0)),
+					TsCode:        argStr(r, "ts_code", ""),
+					TotalQty:      model.Qty(argInt(r, "total_qty", 0)),
+					AvailableQty:  model.Qty(argInt(r, "available_qty", 0)),
+					TodayBought:   model.Qty(argInt(r, "today_bought", 0)),
+					CostPrice:     model.FromFloat(argFloat(r, "cost_price", 0)),
+					HighPrice:     model.FromFloat(argFloat(r, "high_price", 0)),
+					FirstOpenDate: argStr(r, "first_open_date", ""),
 				})
 			}
 			n, rejected, err := s.deps.Ledger.SyncPortfolio(ctx, ticket.PortfolioSync{
@@ -223,6 +226,8 @@ func positionsSchema() map[string]interface{} {
 			"today_bought":  numProp("当日买入（股）"),
 			"cost_price":    numProp("成本价（元）"),
 			"high_price":    numProp("持仓期最高价（元），移动止盈基准"),
+			"first_open_date": strProp("建仓日 YYYYMMDD，可选。不传＝保留账本既有建仓日（组合同步绝不清空它，" +
+				"清仓后重开则按本次同步日期起算）；仅在人工纠错或首次接入确知真实建仓日时显式传"),
 		}, []string{"ts_code", "total_qty"}),
 	}
 }

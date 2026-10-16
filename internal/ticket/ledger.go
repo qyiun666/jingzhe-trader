@@ -121,7 +121,10 @@ func (l *Ledger) applyPosition(ctx context.Context, tx *sqlx.Tx, t model.OrderTi
 		"SELECT ts_code, total_qty, today_bought, cost_price, high_price, COALESCE(first_open_date,'') AS first_open_date FROM position WHERE ts_code=?",
 		t.TsCode)
 	if err != nil || pos.TotalQty <= 0 {
-		pos = model.Position{TsCode: t.TsCode} // 新建仓（读不到行或残留的清仓行）
+		// 读不到行，或行还在但上一轮已清仓：按新开仓处理，建仓日取本笔成交日。
+		// 清仓行留着旧建仓日不碍事——重开时这里会显式写新日期，覆盖是有意的
+		// （旧日期属于上一轮仓，沿用它会低估持有期保护）。
+		pos = model.Position{TsCode: t.TsCode}
 	}
 	switch t.Direction {
 	case model.DirBuy:
@@ -238,6 +241,10 @@ type PortfolioInput struct {
 	TodayBought  model.Qty
 	CostPrice    model.Fen
 	HighPrice    model.Fen
+	// FirstOpenDate 建仓日 YYYYMMDD，可选。券商 App 的持仓页没有这一列，
+	// 平时留空即可（留空＝不改动既有建仓日，见 syncPositionOpenDate）；
+	// 需要人工纠错或首次接入就知道真实建仓日时才显式给出。
+	FirstOpenDate string
 }
 
 // PortfolioSync 一次组合同步的全部输入（口径以券商为准）。
@@ -254,7 +261,8 @@ type PortfolioSync struct {
 //   - Cash 必须 >0：校准进来的持仓没有成交单支撑，只有同时给出当时的可用现金，
 //     现金推算才不会把这笔持仓成本再算成可用资金（原缺陷：同步持仓后总资产虚增一份成本）；
 //   - 本金已非零 → 拒绝覆盖，返回 rejected=true（验收 #14），持仓与现金照常同步；
-//   - Items 为空 = 只校准资金口径（本金 + 现金锚点），不动任何持仓行。
+//   - Items 为空 = 只校准资金口径（本金 + 现金锚点），不动任何持仓行；
+//   - 建仓日不因同步而丢失：见 syncPositionOpenDate。
 //
 // 返回同步的持仓行数与"本金是否被拒绝覆盖"。
 func (l *Ledger) SyncPortfolio(ctx context.Context, in PortfolioSync) (int, bool, error) {
@@ -266,11 +274,24 @@ func (l *Ledger) SyncPortfolio(ctx context.Context, in PortfolioSync) (int, bool
 	if actor == "" {
 		actor = "manual"
 	}
+	// 建仓日先整体校验，再动本金/现金锚点：格式错的日期比没有日期更坏（持有期会被算成
+	// 天文数字，最小持有期保护反向失效），不能让它落成"半只持仓已同步、半只被拒绝"。
+	for _, it := range in.Items {
+		if _, err := normalizeOpenDate(it.FirstOpenDate); err != nil {
+			return 0, false, fmt.Errorf("组合同步失败: %w", err)
+		}
+	}
 	rejected, err := l.applyCapital(ctx, in.Date, in.Capital, actor)
 	if err != nil {
 		return 0, rejected, err
 	}
 	if err := l.applyCashAnchor(ctx, in.Date, in.Cash, actor); err != nil {
+		return 0, rejected, err
+	}
+	// 建仓日的判定基准：库里现有的那一行。同步一次读一遍，不在循环里逐只查。
+	// 只取 ts_code → 行；清仓行（total_qty=0）也在，用来区分"重开仓"和"继续持有"。
+	prev, err := l.currentPositions(ctx)
+	if err != nil {
 		return 0, rejected, err
 	}
 	n := 0
@@ -284,6 +305,17 @@ func (l *Ledger) SyncPortfolio(ctx context.Context, in PortfolioSync) (int, bool
 			TodayBought: it.TodayBought,
 			CostPrice:   it.CostPrice,
 			HighPrice:   it.HighPrice,
+		}
+		// 券商口径没有建仓日，这一列必须由账本自己定：留空覆盖会把持有期保护的
+		// 依据抹掉（agent_issues #12-B），所以按"继续持有则原样保留、新开仓才盖章"处理。
+		openDate, recovered := syncPositionOpenDate(in.Date, it, prev[it.TsCode])
+		pos.FirstOpenDate = openDate
+		if recovered {
+			// 建仓日原本缺失、由同步日补齐：这条必须响，因为它是"持有期保护刚刚被恢复"
+			// 的信号，也是上一轮建仓日被谁擦掉的线索。
+			observability.S().Warnw("组合同步补齐缺失的建仓日", "ts_code", it.TsCode,
+				"sync_date", in.Date, "first_open_date", openDate,
+				"detail", "该持仓原先没有建仓日，按同步日起算持有期（宁可低估，也不放行排名淘汰）")
 		}
 		// 库里只有 total 与 today 两个量：券商只给了可卖量时按差额反推今日买入量，
 		// 两个都给时以今日买入量为准（可卖量此后一律由 total − today 现算）。
@@ -302,6 +334,69 @@ func (l *Ledger) SyncPortfolio(ctx context.Context, in PortfolioSync) (int, bool
 		"positions", n, "cash_anchor_yuan", in.Cash.Float(),
 		"capital_rejected", rejected)
 	return n, rejected, nil
+}
+
+// currentPositions 读一遍现有持仓，按代码索引。清仓行（total_qty=0）保留在结果里：
+// 判断"这次同步是继续持有还是清仓后重开"必须看得见那行 0 股记录。
+func (l *Ledger) currentPositions(ctx context.Context) (map[string]model.Position, error) {
+	rows, err := l.st.TradeRepo().ListPositions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]model.Position, len(rows))
+	for _, p := range rows {
+		out[p.TsCode] = p
+	}
+	return out, nil
+}
+
+// syncPositionOpenDate 定组合同步要写入的建仓日，返回（建仓日，是否为补齐的缺失值）。
+//
+// 建仓日是持有期保护（signal.rank_out_min_hold_days）的唯一依据：擦掉它，系统就把
+// "刚建仓"算成"持有期未知"，每天生成一张淘汰刚买的票的错误卖出单（agent_issues #12-B）。
+// 券商持仓页没有这一列，所以同步时它只能由账本自己定，规则按"能保住就保住"排：
+//
+//   - 显式给了 → 以它为准（人工纠错与首次接入的唯一入口）；
+//   - 券商说这只不持仓了（total_qty=0）→ 原样保留既有值，别把上一轮的日期猜成新日期；
+//   - 继续持有且已有建仓日 → 原样保留，同步不改变建仓日；
+//   - 继续持有但建仓日已丢失 → 按同步日补齐：把持有期估短（保护更强）远好过估成未知
+//     （没有保护）；价格型退出（止损/止盈/移动止盈）不看这一列，不受影响；
+//   - 新开仓或清仓后重开 → 建仓就是同步日，上一轮仓的旧日期随那一轮一起作废。
+func syncPositionOpenDate(syncDate string, it PortfolioInput, prev model.Position) (string, bool) {
+	if v := strings.TrimSpace(it.FirstOpenDate); v != "" {
+		return v, false
+	}
+	if it.TotalQty <= 0 {
+		return prev.FirstOpenDate, false
+	}
+	if prev.TotalQty > 0 {
+		if prev.FirstOpenDate != "" {
+			return prev.FirstOpenDate, false
+		}
+		return syncDate, true
+	}
+	return syncDate, false
+}
+
+// normalizeOpenDate 校验建仓日格式（YYYYMMDD 八位数字），返回规范化后的值。
+//
+// 只在这一处校验，因为持有期判定是字符串比较（signal.tradingDaysHeld）：
+// "2026-10-12" 这类带分隔符的日期比任何 YYYYMMDD 都小，会被算成"持有几百天"，
+// 于是最小持有期保护反向失效——那是一条比缺日期更坏的错数据。
+func normalizeOpenDate(v string) (string, error) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "", nil
+	}
+	if len(v) != 8 {
+		return "", fmt.Errorf("建仓日 %q 不是 YYYYMMDD 八位数字", v)
+	}
+	for _, r := range v {
+		if r < '0' || r > '9' {
+			return "", fmt.Errorf("建仓日 %q 含非数字字符", v)
+		}
+	}
+	return v, nil
 }
 
 // applyCapital 本金 write-once（config account.initial_capital）。

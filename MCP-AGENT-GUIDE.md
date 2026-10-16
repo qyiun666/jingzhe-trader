@@ -248,12 +248,19 @@ Authorization: Bearer <token>
 必须先用它把存量持仓、本金和可用资金灌进账本，否则卖出规则与仓位上限全部算错。
 命令行侧有等价入口：`jingzhe init -capital … -hold 代码:股数:成本`（同一个实现，只是不用起服务）。
 - 参数：
-  - `positions`（必填，数组）：每项 `{ts_code, total_qty, available_qty?, today_bought?, cost_price?, high_price?}`
+  - `positions`（必填，数组）：每项 `{ts_code, total_qty, available_qty?, today_bought?, cost_price?, high_price?, first_open_date?}`
     （数量=股，价格=元。库里只存 `total_qty` 与 `today_bought`，可卖量一律按 `total_qty − today_bought` 现算：
     给了 `today_bought` 就用它；只给 `available_qty` 时按差额反推出 `today_bought`）
     - **`ts_code` 与 `total_qty` 每一项都必须给**，服务端按 schema 的 `required` 强制校验，漏传直接拒绝
       并指明第几项缺哪个字段。以前漏 `total_qty` 会按 0 记账，等于把一次拼错的调用变成"这只票清仓了"，
       响应还是成功。**显式传 `total_qty: 0` 依然合法**（券商那边确实卖光了），要挡的是"没给这个键"。
+    - `first_open_date?`（string，`YYYYMMDD`）：**建仓日，平时不要传**。它是持有天数与
+      「建仓未满 N 个交易日不因排名淘汰卖出」保护的唯一依据。券商持仓页没有这一列，
+      所以**不传＝保留账本既有建仓日**——组合同步永远不会清空它（20261015 事故：整列覆盖
+      把两只刚建仓的票算成"持有期未知"，此后每天生成一张误判卖出单）。
+      只有两种情况才显式传：人工纠错（账本日期与券商实际成交日不符）、首次接入就知道真实建仓日。
+      新开仓与清仓后重开由系统按本次 `date` 起算，不需要你给；格式不是 8 位数字直接整次同步拒绝
+      （`2026-10-12` 这种带分隔符的日期会被算成"已持有几百天"，保护反向失效，比没有日期更坏）。
   - `available_cash_yuan`（**必填**，number）：券商口径的可用资金（元）。校准进来的持仓没有成交单支撑，
     系统把它落成**现金锚点**：锚点当日及之前的成交不再重复扣减现金，之后的成交才动现金。
     不给这个参数直接报错——否则那笔持仓成本会被算两遍（一遍在持仓、一遍在可用资金），账户虚增。

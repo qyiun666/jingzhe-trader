@@ -267,6 +267,79 @@ func positionQty(t *testing.T, ts *httptest.Server, code string) int64 {
 	return -1
 }
 
+// positionOpenDate 走 MCP get_positions 读某只票的建仓日（外部 agent 看到的同一份口径）。
+// 账本里没有这只票返回 ""。
+func positionOpenDate(t *testing.T, ts *httptest.Server, code string) string {
+	t.Helper()
+	res := mcpCall(t, ts, "testtoken", "tools/call", map[string]interface{}{
+		"name": "get_positions", "arguments": map[string]interface{}{}})
+	out, _ := res["result"].(map[string]interface{})
+	if out == nil || out["isError"] == true {
+		t.Fatalf("get_positions 调用失败: %v", res)
+	}
+	var p struct {
+		Positions []struct {
+			TsCode        string `json:"TsCode"`
+			FirstOpenDate string `json:"FirstOpenDate"`
+		} `json:"positions"`
+	}
+	if err := json.Unmarshal([]byte(toolText(out)), &p); err != nil {
+		t.Fatalf("解析 get_positions 失败: %v（原文 %s）", err, toolText(out))
+	}
+	for _, x := range p.Positions {
+		if x.TsCode == code {
+			return x.FirstOpenDate
+		}
+	}
+	return ""
+}
+
+// TestField_SyncPortfolioOpenDateChannel 建仓日穿过 MCP 参数层的两个通道：
+// first_open_date 显式给出＝人工纠错（必须落库），不给＝保留既有值（事故通道必须被挡住）。
+// schema 里没有这个属性时 argStr 只会读到空值，所以这条用例同时是"入参真的接上了"的守卫。
+func TestField_SyncPortfolioOpenDateChannel(t *testing.T) {
+	ts, cleanup := newTestServerForFields(t)
+	defer cleanup()
+	code := "600704.SH"
+
+	mcpCallOK(t, ts, "sync_portfolio", map[string]interface{}{
+		"date": "20261015", "initial_capital_yuan": 20000.0, "available_cash_yuan": 10163.18,
+		"positions": []map[string]interface{}{
+			{"ts_code": code, "total_qty": 200, "available_qty": 200, "cost_price": 5.07,
+				"first_open_date": "20261012"},
+		},
+	})
+	if got := positionOpenDate(t, ts, code); got != "20261012" {
+		t.Fatalf("显式建仓日未落库: %q, 期望 20261012", got)
+	}
+
+	// 日常同步不带建仓日：数量照常校准，建仓日必须原地不动
+	mcpCallOK(t, ts, "sync_portfolio", map[string]interface{}{
+		"date": "20261016", "available_cash_yuan": 10163.18,
+		"positions": []map[string]interface{}{
+			{"ts_code": code, "total_qty": 300, "available_qty": 300, "cost_price": 5.03},
+		},
+	})
+	if got := positionOpenDate(t, ts, code); got != "20261012" {
+		t.Errorf("不带建仓日的同步把它改成了 %q, 期望仍为 20261012", got)
+	}
+	if got := positionQty(t, ts, code); got != 300 {
+		t.Errorf("校准未生效: total_qty=%d, 期望 300", got)
+	}
+
+	// 错格式必须拒绝：它会把持有期算成天文数字，比没有建仓日更坏
+	mcpCallErr(t, ts, "sync_portfolio", map[string]interface{}{
+		"date": "20261017", "available_cash_yuan": 10163.18,
+		"positions": []map[string]interface{}{
+			{"ts_code": code, "total_qty": 300, "available_qty": 300, "cost_price": 5.03,
+				"first_open_date": "2026-10-12"},
+		},
+	})
+	if got := positionOpenDate(t, ts, code); got != "20261012" {
+		t.Errorf("被拒绝的同步改动了建仓日: %q", got)
+	}
+}
+
 // ============================================================================
 // 3. 金额单位往返验证：元→分存储
 // ============================================================================
