@@ -27,6 +27,9 @@ var (
 	// ErrPriceSanity 价格防呆：入参价格超出 A 股合理区间，或与同一只票的参考价差出一个
 	// 数量级（量纲写错）。组合同步与成交回执都在**动账本之前**拒绝整次调用（agent_issues #12-A）。
 	ErrPriceSanity = errors.New("价格超出合理区间或与参考价严重偏离")
+	// ErrCostMissing 有持仓却不给成本价：0 成本会把止损线算成 0 而永不触发，
+	// 是比量纲错更隐蔽的静默失效（单位传错至少还有 M3 误报能暴露）。
+	ErrCostMissing = errors.New("持仓缺成本价")
 )
 
 // Service 指令单服务：生成 + 单一状态机。

@@ -123,7 +123,8 @@ func (s *Server) registerWriteTools() {
 			"没有成交单支撑，必须同时给出券商口径的可用现金，系统把它落成现金锚点，锚点当日及之前的成交" +
 			"不再重复扣减现金（不给就会把持仓成本双算成可用资金）。initial_capital_yuan 为本金=期初总资产" +
 			"（含持仓成本），首次写入，已配置且数值不同时拒绝覆盖，响应里 capital_rejected=true" +
-			"（验收 #14），持仓与现金照常同步。价格为元，数量为股。建仓日 first_open_date 是持有期" +
+			"（验收 #14），持仓与现金照常同步。价格为元，数量为股；**有持仓（total_qty>0）的每一项都必须给 " +
+			"cost_price**，缺了会整次拒绝而不是静默落 0 成本。建仓日 first_open_date 是持有期" +
 			"保护的依据，券商口径没有这一列：不传则保留账本既有建仓日（同步绝不清空它），" +
 			"只在人工纠错或首次接入确知真实建仓日时才显式传 YYYYMMDD。",
 		InputSchema: objSchema(map[string]interface{}{
@@ -225,8 +226,9 @@ func positionsSchema() map[string]interface{} {
 			"total_qty":     numProp("总持仓（股）"),
 			"available_qty": numProp("可卖数量（股），缺省按 total_qty − today_bought 推算"),
 			"today_bought":  numProp("当日买入（股）"),
-			"cost_price": numProp("成本价（元，不是分）。区间 0.01–10000 元，且与该票最近收盘价相差不得超过 8 倍；" +
-				"越界整次同步被拒（ErrPriceSanity），一行持仓都不写"),
+			"cost_price": numProp("成本价（元，不是分）。**total_qty>0 时必填**：缺了会落 0 成本，" +
+				"止损线被算成 0 而永不触发（整次同步被拒，ErrCostMissing）；已卖光的行（total_qty=0）可以不给了。" +
+				"区间 0.01–10000 元，且与该票最近收盘价相差不得超过 8 倍；越界整次同步被拒（ErrPriceSanity），一行持仓都不写"),
 			"high_price": numProp("持仓期最高价（元），移动止盈基准；同样受成本价那套区间与倍数校验"),
 			"first_open_date": strProp("建仓日 YYYYMMDD，可选。不传＝保留账本既有建仓日（组合同步绝不清空它，" +
 				"清仓后重开则按本次同步日期起算）；仅在人工纠错或首次接入确知真实建仓日时显式传"),

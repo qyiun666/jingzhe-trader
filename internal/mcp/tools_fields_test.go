@@ -348,6 +348,47 @@ func TestField_SyncPortfolioOpenDateChannel(t *testing.T) {
 	}
 }
 
+// TestField_SyncPortfolioCostRequiredForHoldings 有持仓却不给成本价必须整次被拒（组长 20261016 定：
+// cost_price 必填）。缺成本会落成 0 成本，止损线跟着算成 0、永不下穿——那是比量纲错更隐蔽的静默失效。
+// 但已卖光的那一行（total_qty=0）不给成本仍然合法：它没有持仓也没有止损可抹，硬要成本只会逼调用方编数。
+func TestField_SyncPortfolioCostRequiredForHoldings(t *testing.T) {
+	ts, st, cleanup := newTestServerWithStore(t)
+	defer cleanup()
+	const code = "600704.SH"
+
+	res := mcpCall(t, ts, "testtoken", "tools/call", map[string]interface{}{
+		"name": "sync_portfolio",
+		"arguments": map[string]interface{}{
+			"date": "20261016", "available_cash_yuan": 10163.18, "initial_capital_yuan": 20000.0,
+			"positions": []interface{}{map[string]interface{}{"ts_code": code, "total_qty": 200.0}},
+		}})
+	out, _ := res["result"].(map[string]interface{})
+	if out == nil || out["isError"] != true {
+		t.Fatalf("持有 200 股却不给 cost_price 竟然被接受: %v", res)
+	}
+	if txt := toolText(out); !strings.Contains(txt, "cost_price") || !strings.Contains(txt, "止损") {
+		t.Errorf("拒绝信息没点名 cost_price 与后果: %s", txt)
+	}
+	if got := positionQty(t, ts, code); got != -1 {
+		t.Errorf("被拒的调用写出了持仓: total_qty=%d", got)
+	}
+	// 资金口径同样不许被写到：拒绝必须发生在 applyCapital/applyCashAnchor 之前
+	raw, err := config.NewRepo(st).RawAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw["account.initial_capital"] != "" || raw["account.cash_anchor"] != "" {
+		t.Errorf("被拒的调用动了资金口径: capital=%q anchor=%q",
+			raw["account.initial_capital"], raw["account.cash_anchor"])
+	}
+
+	// 已卖光的行不给成本是合法的（文档里"显式传 total_qty:0 依然合法"那条不能被弄坏）
+	mcpCallOK(t, ts, "sync_portfolio", map[string]interface{}{
+		"date": "20261016", "available_cash_yuan": 10163.18,
+		"positions": []interface{}{map[string]interface{}{"ts_code": code, "total_qty": 0.0}},
+	})
+}
+
 // TestField_SyncPortfolioPriceSanity 价格防呆必须从 MCP 出口报成业务错误，并且被拒的调用
 // 一行持仓都不留（agent_issues #12-A：成本 5.07 元被传成 507 → 止损线 466 元 → 误发 M3 紧急邮件）。
 // 507 元本身落在 0.01–10000 元的绝对区间里，所以这里同时验证"与最近收盘一比"那道闸生效。

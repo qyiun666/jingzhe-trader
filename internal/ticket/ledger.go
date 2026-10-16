@@ -275,7 +275,8 @@ type PortfolioSync struct {
 //     现金推算才不会把这笔持仓成本再算成可用资金（原缺陷：同步持仓后总资产虚增一份成本）；
 //   - 本金已非零 → 拒绝覆盖，返回 rejected=true（验收 #14），持仓与现金照常同步；
 //   - Items 为空 = 只校准资金口径（本金 + 现金锚点），不动任何持仓行；
-//   - 建仓日不因同步而丢失：见 syncPositionOpenDate。
+//   - 建仓日不因同步而丢失：见 syncPositionOpenDate；
+//   - 价格入参过不了防呆就整次拒绝（本金/锚点/持仓都不动）：见 checkPortfolioPrices。
 //
 // 返回同步的持仓行数与"本金是否被拒绝覆盖"。
 func (l *Ledger) SyncPortfolio(ctx context.Context, in PortfolioSync) (int, bool, error) {
@@ -449,17 +450,28 @@ func (l *Ledger) fillPriceRef(ctx context.Context, t model.OrderTicket) (model.F
 	return ref, ref > 0
 }
 
-// checkPortfolioPrices 组合同步入参的价格防呆（agent_issues #12-A 的残留项）。
+// checkPortfolioPrices 组合同步入参的价格防呆（agent_issues #12-A 的残留项 + 组长定的必填口径）。
 //
-// 两道闸缺一不可：
+// 三道闸，任一不过即**整次同步被拒**，持仓/本金/现金锚点一行都不动：
+//   - 有持仓（total_qty>0）必须有 cost_price：0 成本把止损线算成 0，价格型退出保护静默消失；
+//     已卖光的行（total_qty=0）不要求，免得逼调用方编一个没人核对的成本写进闭合行；
 //   - 绝对区间（0.01~10000 元）挡数量级离谱的值：0、负数、万元级；
 //   - 相对参照挡"5.07 元写成 507 元"——507 元本身是合法价格，绝对区间放它过去，
 //     只有跟同一只票的最近收盘一比才露馅（差 100 倍）。这正是 10-15 实际发生的那次。
 //
-// 任一价格越界即整次同步拒绝，持仓/本金/现金锚点一行都不动；错误里带参照价与倍数，
-// 调用方照它与券商记录对一次单位就能定位。
+// 错误里带参照价与倍数，调用方照它与券商记录对一次单位就能定位。
 func (l *Ledger) checkPortfolioPrices(ctx context.Context, date string, items []PortfolioInput) error {
 	for _, it := range items {
+		// 有持仓就必须给成本：缺了就落 0 成本，止损线被算成 0×(1−8%)=0，永不下穿——
+		// 这只票从此没有价格型退出保护。它比量纲传错更隐蔽：单位错至少还有 M3 误报能暴露，
+		// 0 成本是静默失效（组长 20261016 定：cost_price 必填）。
+		// 条件必填而不是无条件：券商已卖光的那一行（total_qty=0）不算持仓、不算止损，
+		// 硬要它带成本价只会逼调用方随手编一个没人核对过的数字写进已闭合的行。
+		if it.TotalQty > 0 && it.CostPrice <= 0 {
+			return fmt.Errorf("组合同步失败: %w: %s 持有 %d 股却没有 cost_price（元）；"+
+				"0 成本会把止损线算成 0 而永不触发，请取券商持仓页的实际成本价重试",
+				ErrCostMissing, it.TsCode, int64(it.TotalQty))
+		}
 		costLabel := fmt.Sprintf("cost_price(%s)", it.TsCode)
 		highLabel := fmt.Sprintf("high_price(%s)", it.TsCode)
 		ref := l.priceReference(ctx, it.TsCode, date)

@@ -788,6 +788,63 @@ func TestReportFillRejectsUnitErrorPrice(t *testing.T) {
 	}
 }
 
+// TestSyncPortfolioRequiresCostForHoldings 有持仓必须给成本（组长 20261016 定 cost_price 必填）：
+// 缺了会落 0 成本，止损线被算成 0×(1−8%)=0，永不下穿——价格型退出保护静默消失，
+// 比量纲传错更隐蔽（单位错至少还有 M3 误报能暴露）。已卖光的行（total_qty=0）不给成本必须放行：
+// 它既没持仓也没止损，硬要成本只会逼调用方往闭合行里编一个没人核对过的数字。
+func TestSyncPortfolioRequiresCostForHoldings(t *testing.T) {
+	s, led := openLedger(t)
+	ctx := context.Background()
+
+	if _, _, err := led.SyncPortfolio(ctx, PortfolioSync{Date: "20261016",
+		Capital: model.FromFloat(20000), Cash: model.FromFloat(9000),
+		Items: []PortfolioInput{{TsCode: "sh600040", TotalQty: 200, AvailableQty: 200}},
+		Actor: "test"}); !errors.Is(err, ErrCostMissing) {
+		t.Fatalf("持有 200 股却不给成本应返回 ErrCostMissing, 实际: %v", err)
+	}
+	// 成本给成负数同样是"没有可用成本"，一起挡在写库之前
+	if _, _, err := led.SyncPortfolio(ctx, PortfolioSync{Date: "20261016",
+		Capital: model.FromFloat(20000), Cash: model.FromFloat(9000),
+		Items: []PortfolioInput{{TsCode: "sh600040", TotalQty: 200, CostPrice: model.FromFloat(-1)}},
+		Actor: "test"}); !errors.Is(err, ErrCostMissing) {
+		t.Errorf("负成本应返回 ErrCostMissing, 实际: %v", err)
+	}
+	ps, err := s.TradeRepo().ListPositions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ps) != 0 {
+		t.Errorf("被拒绝的同步写出了 %d 行持仓", len(ps))
+	}
+	raw, err := s.ConfigRepo().GetAll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw["account.initial_capital"] != "" {
+		t.Errorf("被拒绝的同步动了本金: %s", raw["account.initial_capital"])
+	}
+
+	// 一、给了成本的持仓照常通过
+	if n, _, err := led.SyncPortfolio(ctx, PortfolioSync{Date: "20261016",
+		Capital: model.FromFloat(20000), Cash: model.FromFloat(9000),
+		Items: []PortfolioInput{{TsCode: "sh600040", TotalQty: 200, AvailableQty: 200, CostPrice: model.FromFloat(5.07)}},
+		Actor: "test"}); err != nil || n != 1 {
+		t.Fatalf("合法成本被拒或计数错: n=%d err=%v", n, err)
+	}
+	// 二、券商报已卖光（total_qty=0）不给成本必须放行
+	if n, _, err := led.SyncPortfolio(ctx, PortfolioSync{Date: "20261016",
+		Capital: model.FromFloat(0), Cash: model.FromFloat(9000),
+		Items: []PortfolioInput{{TsCode: "sh600040", TotalQty: 0}},
+		Actor: "test"}); err != nil || n != 1 {
+		t.Errorf("已卖光的行不该被成本必填挡住: n=%d err=%v", n, err)
+	}
+	// 三、只校准资金口径（Items 为空）不受这条影响
+	if n, _, err := led.SyncPortfolio(ctx, PortfolioSync{Date: "20261016",
+		Capital: model.FromFloat(0), Cash: model.FromFloat(9500), Actor: "test"}); err != nil || n != 0 {
+		t.Errorf("空 Items 只校准资金: n=%d err=%v", n, err)
+	}
+}
+
 // mustPos 读持仓（测试辅助）。
 func mustPos(t *testing.T, s *store.Store, ctx context.Context, code string) model.Position {
 	t.Helper()
