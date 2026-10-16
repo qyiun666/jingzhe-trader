@@ -2,6 +2,8 @@ package ticket
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -71,6 +73,17 @@ func (l *Ledger) ReportFill(ctx context.Context, req FillRequest) (FillResult, e
 	}
 	if req.TsCode != "" && req.TsCode != t.TsCode {
 		return FillResult{}, fmt.Errorf("回执失败: 代码不匹配 (单据 %s vs 回执 %s)", t.TsCode, req.TsCode)
+	}
+	// 价格量纲防呆（agent_issues #12-A）：把 6.39 元回报成 639（分当元用是反的，
+	// 元当分传进来才是 100 倍放大），持仓成本与止损线会一起写坏，之后每轮扫描都判
+	// "已跌破止损"并误发 M3 紧急邮件。放在幂等判定之后：已登记过的回执仍走原路返回。
+	if err := req.Price.CheckTradePriceRange("成交价"); err != nil {
+		return FillResult{}, fmt.Errorf("回执失败: %w: %v", ErrPriceSanity, err)
+	}
+	if ref, ok := l.fillPriceRef(ctx, t); ok {
+		if err := req.Price.CheckPriceAgainstRef(ref, "成交价"); err != nil {
+			return FillResult{}, fmt.Errorf("回执失败: %w: %v", ErrPriceSanity, err)
+		}
 	}
 	isBuy := t.Direction == model.DirBuy
 	amount := req.Price.Mul(req.Qty)
@@ -274,8 +287,12 @@ func (l *Ledger) SyncPortfolio(ctx context.Context, in PortfolioSync) (int, bool
 	if actor == "" {
 		actor = "manual"
 	}
-	// 建仓日先整体校验，再动本金/现金锚点：格式错的日期比没有日期更坏（持有期会被算成
+	// 建仓日与价格量纲都先整体校验，再动本金/现金锚点（两道防呆各见其函数注释）：
+	// 格式错的日期比没有日期更坏（持有期会被算成
 	// 天文数字，最小持有期保护反向失效），不能让它落成"半只持仓已同步、半只被拒绝"。
+	if err := l.checkPortfolioPrices(ctx, in.Date, in.Items); err != nil {
+		return 0, false, err
+	}
 	for _, it := range in.Items {
 		if _, err := normalizeOpenDate(it.FirstOpenDate); err != nil {
 			return 0, false, fmt.Errorf("组合同步失败: %w", err)
@@ -397,6 +414,68 @@ func normalizeOpenDate(v string) (string, error) {
 		}
 	}
 	return v, nil
+}
+
+// priceReference 取某只票在 date（含）之前最近一根日线的未复权收盘价，作为量纲参照。
+//
+// 拿不到就返回 0（新股/停牌已久/该票尚未同步日线，或读库失败）：相对校验跳过，
+// 绝对区间仍然生效。防呆不该把"紧急纠错通道"变成"因为参照缺失而彻底用不了"，
+// 但读库失败必须留 warn——那说明日线链路本身有问题。
+func (l *Ledger) priceReference(ctx context.Context, tsCode, date string) model.Fen {
+	if tsCode == "" {
+		return 0
+	}
+	b, err := l.st.ScreenRepo().LatestBarAt(ctx, tsCode, date)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			observability.S().Warnw("价格防呆缺少参照收盘价，本次只做绝对区间校验",
+				"ts_code", tsCode, "date", date, "err", err.Error())
+		}
+		return 0
+	}
+	if b.RawClose > 0 {
+		return b.RawClose
+	}
+	return b.Close
+}
+
+// fillPriceRef 成交回执的价格参照：优先用本单的参考价（系统给这笔交易的口径），
+// 没有参考价时退回该票最近一根可用收盘。两者都拿不到 → ok=false，跳过相对校验。
+func (l *Ledger) fillPriceRef(ctx context.Context, t model.OrderTicket) (model.Fen, bool) {
+	if t.RefPrice > 0 {
+		return t.RefPrice, true
+	}
+	ref := l.priceReference(ctx, t.TsCode, t.TradeDate)
+	return ref, ref > 0
+}
+
+// checkPortfolioPrices 组合同步入参的价格防呆（agent_issues #12-A 的残留项）。
+//
+// 两道闸缺一不可：
+//   - 绝对区间（0.01~10000 元）挡数量级离谱的值：0、负数、万元级；
+//   - 相对参照挡"5.07 元写成 507 元"——507 元本身是合法价格，绝对区间放它过去，
+//     只有跟同一只票的最近收盘一比才露馅（差 100 倍）。这正是 10-15 实际发生的那次。
+//
+// 任一价格越界即整次同步拒绝，持仓/本金/现金锚点一行都不动；错误里带参照价与倍数，
+// 调用方照它与券商记录对一次单位就能定位。
+func (l *Ledger) checkPortfolioPrices(ctx context.Context, date string, items []PortfolioInput) error {
+	for _, it := range items {
+		costLabel := fmt.Sprintf("cost_price(%s)", it.TsCode)
+		highLabel := fmt.Sprintf("high_price(%s)", it.TsCode)
+		ref := l.priceReference(ctx, it.TsCode, date)
+		for _, p := range []struct {
+			label string
+			value model.Fen
+		}{{costLabel, it.CostPrice}, {highLabel, it.HighPrice}} {
+			if err := p.value.CheckTradePriceRange(p.label); err != nil {
+				return fmt.Errorf("组合同步失败: %w: %v", ErrPriceSanity, err)
+			}
+			if err := p.value.CheckPriceAgainstRef(ref, p.label); err != nil {
+				return fmt.Errorf("组合同步失败: %w: %v", ErrPriceSanity, err)
+			}
+		}
+	}
+	return nil
 }
 
 // applyCapital 本金 write-once（config account.initial_capital）。

@@ -24,6 +24,9 @@ var (
 	ErrIllegalTransition = errors.New("非法指令单状态转移")
 	ErrTicketNotFound    = errors.New("指令单不存在")
 	ErrRequiredField     = errors.New("指令单必填字段缺失")
+	// ErrPriceSanity 价格防呆：入参价格超出 A 股合理区间，或与同一只票的参考价差出一个
+	// 数量级（量纲写错）。组合同步与成交回执都在**动账本之前**拒绝整次调用（agent_issues #12-A）。
+	ErrPriceSanity = errors.New("价格超出合理区间或与参考价严重偏离")
 )
 
 // Service 指令单服务：生成 + 单一状态机。

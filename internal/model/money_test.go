@@ -98,3 +98,44 @@ func TestFenLargeNoOverflow(t *testing.T) {
 		t.Fatalf("大额乘法溢出")
 	}
 }
+
+// TestCheckTradePriceRange 绝对区间：0 表示"未给出"必须放过（同步常常只给成本不给高点），
+// 区间外一律拒绝。用例里的 507 元是 20261015 事故的真实错值（5.07 元被当成分传成 507）。
+func TestCheckTradePriceRange(t *testing.T) {
+	// 0（含被四舍五入成 0 的极小值）＝"这一项没给"，必须放过：sync_portfolio 的
+	// high_price 平时就是省略的，把它当错值拒会让整次同步失败。
+	ok := []Fen{0, FromFloat(0.001), MinTradePriceFen, FromFloat(4.85), FromFloat(1700), MaxTradePriceFen}
+	for _, v := range ok {
+		if err := v.CheckTradePriceRange("cost_price"); err != nil {
+			t.Errorf("%s 元本应合法却被拒: %v", v, err)
+		}
+	}
+	bad := []Fen{-1, FromFloat(10000.01), FromFloat(50700)}
+	for _, v := range bad {
+		if err := v.CheckTradePriceRange("cost_price"); err == nil {
+			t.Errorf("%s 元应被区间校验拒绝", v)
+		}
+	}
+}
+
+// TestCheckPriceAgainstRef 相对参照：这道闸专门负责绝对区间放过去的那种错值——
+// 507 元是合法价格，但与 4.85 元的收盘差 100 倍，一比就露馅（agent_issues #12-A）。
+func TestCheckPriceAgainstRef(t *testing.T) {
+	ref := FromFloat(4.85)
+	// 真实行情允许的距离：成本远高于现价（高位接盘）、远低于现价（低位起家）都在 8 倍内
+	for _, v := range []Fen{FromFloat(5.07), FromFloat(4.85), FromFloat(1.0), FromFloat(30), FromFloat(0)} {
+		if err := v.CheckPriceAgainstRef(ref, "cost_price"); err != nil {
+			t.Errorf("%s 元对参考价 %s 元本应通过: %v", v, ref, err)
+		}
+	}
+	// 一个数量级以上的偏离＝量纲错，不是行情
+	for _, v := range []Fen{FromFloat(507), FromFloat(48500), FromFloat(0.59), FromFloat(-5)} {
+		if err := v.CheckPriceAgainstRef(ref, "cost_price"); err == nil {
+			t.Errorf("%s 元对参考价 %s 元应被拒（超出 %d 倍）", v, ref, PriceRefMaxRatio)
+		}
+	}
+	// 没有参考价就不臆断：交给绝对区间兜底
+	if err := FromFloat(507).CheckPriceAgainstRef(0, "cost_price"); err != nil {
+		t.Errorf("ref=0 应跳过相对校验, 实际: %v", err)
+	}
+}

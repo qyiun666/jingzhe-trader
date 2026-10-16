@@ -57,9 +57,10 @@ func (s *Server) registerWriteTools() {
 			"ts_code":   strProp("证券代码（无 ticket_id 时按当日活跃单匹配）"),
 			"date":      dateProp,
 			"qty":       numProp("实际成交量（股）"),
-			"price":     numProp("实际成交价（元）"),
-			"note":      strProp("备注"),
-			"actor":     actorProp,
+			"price": numProp("实际成交价（元，不是分）。合理区间 0.01–10000 元，且与本单参考价相差不得超过 8 倍，" +
+				"越界整次回执被拒（ErrPriceSanity），不记账"),
+			"note":  strProp("备注"),
+			"actor": actorProp,
 		}, []string{"qty", "price"}),
 		Handler: func(ctx context.Context, a map[string]interface{}) (interface{}, error) {
 			date := argStr(a, "date", today())
@@ -224,8 +225,9 @@ func positionsSchema() map[string]interface{} {
 			"total_qty":     numProp("总持仓（股）"),
 			"available_qty": numProp("可卖数量（股），缺省按 total_qty − today_bought 推算"),
 			"today_bought":  numProp("当日买入（股）"),
-			"cost_price":    numProp("成本价（元）"),
-			"high_price":    numProp("持仓期最高价（元），移动止盈基准"),
+			"cost_price": numProp("成本价（元，不是分）。区间 0.01–10000 元，且与该票最近收盘价相差不得超过 8 倍；" +
+				"越界整次同步被拒（ErrPriceSanity），一行持仓都不写"),
+			"high_price": numProp("持仓期最高价（元），移动止盈基准；同样受成本价那套区间与倍数校验"),
 			"first_open_date": strProp("建仓日 YYYYMMDD，可选。不传＝保留账本既有建仓日（组合同步绝不清空它，" +
 				"清仓后重开则按本次同步日期起算）；仅在人工纠错或首次接入确知真实建仓日时显式传"),
 		}, []string{"ts_code", "total_qty"}),

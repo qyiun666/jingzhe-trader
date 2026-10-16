@@ -5,6 +5,7 @@
 package model
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -69,6 +70,54 @@ func (f Fen) String() string {
 
 // IsZero 判断是否为零金额。
 func (f Fen) IsZero() bool { return f == 0 }
+
+// A 股价格的合理区间（分）：0.01 元 ~ 10000 元。
+//
+// 下限取到最小面值之下仍留余量（0.2 元面值的 *ST 折算后也在 1 分以上）；上限留出一个
+// 数量级——千元级只有极少数票。它挡的是数量级写错的价格，不是"太贵的好股票"。
+const (
+	MinTradePriceFen Fen = 1
+	MaxTradePriceFen Fen = 1000000
+)
+
+// PriceRefMaxRatio 价格相对参考价的允许偏离倍数（两侧对称：不超过 ref×，不低于 ref÷）。
+//
+// 取 8 而不是 2：真实持仓的成本可以离现价很远（高位接盘后被腰斩、低位建仓后翻几倍），
+// 但**没有**离到 8 倍以上——那是量纲错误的特征，不是行情的特征。
+const PriceRefMaxRatio = 8
+
+// CheckTradePriceRange 校验价格在 A 股合理区间内。0 视为"未给出"，由调用方决定默认值。
+//
+// 对外入参的量纲约定是"元"（库里存"分"），换算点错一次就是 100 倍：
+// agent_issues #12-A（20261015）里 5.07 元的成本被写成 507，止损线随之被算成 466 元，
+// 系统每次都判"已跌破止损"，直接误发 M3 紧急邮件惊扰用户。
+func (f Fen) CheckTradePriceRange(label string) error {
+	if f == 0 {
+		return nil
+	}
+	if f < MinTradePriceFen || f > MaxTradePriceFen {
+		return fmt.Errorf("%s=%s 元超出 A 股合理价格区间（%s~%s 元）",
+			label, f, MinTradePriceFen, MaxTradePriceFen)
+	}
+	return nil
+}
+
+// CheckPriceAgainstRef 校验价格与参考价（同一只票最近可用收盘价 / 指令单参考价）没有差出
+// 一个数量级。ref<=0（没有可用参考价）时跳过——没有基准就不做臆断，区间校验仍然生效。
+//
+// 这道闸比绝对区间更关键：0.01~10000 元挡不住"5.07 元写成 507 元"（507 元本身是合法价格），
+// 而它相对 4.85 元的收盘差了 100 倍，在这里必须被拦下。
+func (f Fen) CheckPriceAgainstRef(ref Fen, label string) error {
+	if f == 0 || ref <= 0 {
+		return nil
+	}
+	hi, lo := ref*Fen(PriceRefMaxRatio), ref/Fen(PriceRefMaxRatio)
+	if f > hi || f < lo {
+		return fmt.Errorf("%s=%s 元与参考价 %s 元相差超过 %d 倍（疑似把\"分\"当\"元\"或反之），"+
+			"请先与券商成交记录核对单位", label, f, ref, PriceRefMaxRatio)
+	}
+	return nil
+}
 
 // LotShares A 股一手 = 100 股（整手约束的唯一出处）。
 const LotShares = 100

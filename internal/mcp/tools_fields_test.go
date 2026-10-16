@@ -21,6 +21,14 @@ import (
 // newTestServerForFields 复用 smoke_test 的脚手架，构造带最小依赖的测试服务
 func newTestServerForFields(t *testing.T) (*httptest.Server, func()) {
 	t.Helper()
+	ts, _, cleanup := newTestServerWithStore(t)
+	return ts, cleanup
+}
+
+// newTestServerWithStore 与 newTestServerForFields 同一套装配，另外把测试库交给用例：
+// 需要直接种日线（价格防呆的参考价来自 daily_bar）的场景没有它就无法搭前置数据。
+func newTestServerWithStore(t *testing.T) (*httptest.Server, *store.Store, func()) {
+	t.Helper()
 	t.Setenv("JZ_TUSHARE_TOKEN", "dummy")
 	t.Setenv("JZ_SERVER_API_TOKEN", "testtoken")
 
@@ -44,7 +52,7 @@ func newTestServerForFields(t *testing.T) (*httptest.Server, func()) {
 		t.Fatalf("构造 MCP 服务失败：%v", err)
 	}
 	ts := httptest.NewServer(srv.Handler())
-	return ts, func() { ts.Close(); st.Close() }
+	return ts, st, func() { ts.Close(); st.Close() }
 }
 
 // ============================================================================
@@ -337,6 +345,37 @@ func TestField_SyncPortfolioOpenDateChannel(t *testing.T) {
 	})
 	if got := positionOpenDate(t, ts, code); got != "20261012" {
 		t.Errorf("被拒绝的同步改动了建仓日: %q", got)
+	}
+}
+
+// TestField_SyncPortfolioPriceSanity 价格防呆必须从 MCP 出口报成业务错误，并且被拒的调用
+// 一行持仓都不留（agent_issues #12-A：成本 5.07 元被传成 507 → 止损线 466 元 → 误发 M3 紧急邮件）。
+// 507 元本身落在 0.01–10000 元的绝对区间里，所以这里同时验证"与最近收盘一比"那道闸生效。
+func TestField_SyncPortfolioPriceSanity(t *testing.T) {
+	ts, st, cleanup := newTestServerWithStore(t)
+	defer cleanup()
+	code := "600704.SH"
+	if err := st.MarketRepo().UpsertBar(context.Background(), model.Bar{
+		TsCode: code, TradeDate: "20261015", Close: model.FromFloat(4.85), RawClose: model.FromFloat(4.85),
+	}); err != nil {
+		t.Fatalf("种参照日线失败: %v", err)
+	}
+
+	mcpCallErr(t, ts, "sync_portfolio", map[string]interface{}{
+		"date": "20261015", "initial_capital_yuan": 20000.0, "available_cash_yuan": 10163.18,
+		"positions": []map[string]interface{}{{"ts_code": code, "total_qty": 200, "cost_price": 507}},
+	})
+	if got := positionQty(t, ts, code); got != -1 {
+		t.Errorf("被拒绝的同步写出了持仓: total_qty=%d", got)
+	}
+
+	// 正确量纲必须过得去：防呆挡的是量纲错，不是真实数据
+	mcpCallOK(t, ts, "sync_portfolio", map[string]interface{}{
+		"date": "20261015", "initial_capital_yuan": 20000.0, "available_cash_yuan": 10163.18,
+		"positions": []map[string]interface{}{{"ts_code": code, "total_qty": 200, "cost_price": 5.07}},
+	})
+	if got := positionQty(t, ts, code); got != 200 {
+		t.Errorf("正确量纲的同步未落库: total_qty=%d, 期望 200", got)
 	}
 }
 

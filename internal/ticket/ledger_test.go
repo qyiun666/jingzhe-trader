@@ -690,6 +690,104 @@ func TestReportFillNeverLosesOpenDate(t *testing.T) {
 	}
 }
 
+// TestSyncPortfolioRejectsUnitErrorPrice 复现 20261015 的量纲事故（agent_issues #12-A）：
+// 券商口径 5.07 元的成本被传成 507。成本一旦被写进 position，止损线就变成 507×0.92≈466 元，
+// 之后每轮扫描都判"已跌破止损"，直接误发 M3 紧急邮件惊扰用户。
+// 防呆必须落在动账本之前：持仓行、本金、现金锚点一处都不许留下痕迹。
+func TestSyncPortfolioRejectsUnitErrorPrice(t *testing.T) {
+	s, led := openLedger(t)
+	ctx := context.Background()
+	code := "sh600704"
+	seedBar(t, s, code, "20261015", model.FromFloat(4.85)) // 参照：最近未复权收盘
+
+	// 100 倍量纲错：507 元本身是"合法价格"，只有跟参考价一比才露馅
+	_, _, err := led.SyncPortfolio(ctx, PortfolioSync{Date: "20261015",
+		Capital: model.FromFloat(20000), Cash: model.FromFloat(10163),
+		Items: []PortfolioInput{{TsCode: code, TotalQty: 200, AvailableQty: 200, CostPrice: model.FromFloat(507)}},
+		Actor: "test"})
+	if !errors.Is(err, ErrPriceSanity) {
+		t.Fatalf("成本放大 100 倍应整次拒绝并返回 ErrPriceSanity, 实际: %v", err)
+	}
+	// 同一只票的正常口径必须过得去（防呆不能挡真实数据）
+	if _, _, err := led.SyncPortfolio(ctx, PortfolioSync{Date: "20261015",
+		Capital: model.FromFloat(20000), Cash: model.FromFloat(10163),
+		Items: []PortfolioInput{{TsCode: code, TotalQty: 200, AvailableQty: 200, CostPrice: model.FromFloat(5.07)}},
+		Actor: "test"}); err != nil {
+		t.Fatalf("5.07 元（正确量纲）被误拒: %v", err)
+	}
+	if got := mustPos(t, s, ctx, code).CostPrice; got != model.FromFloat(5.07) {
+		t.Errorf("成本=%s, 期望 5.07", got)
+	}
+}
+
+// TestSyncPortfolioRejectsOutOfRangePrices 绝对区间这道闸：没有参考价时它独自生效。
+func TestSyncPortfolioRejectsOutOfRangePrices(t *testing.T) {
+	s, led := openLedger(t)
+	ctx := context.Background()
+
+	cases := []struct {
+		name  string
+		items []PortfolioInput
+	}{
+		// 无日线（参考价缺失）也要挡住的万元级成本
+		{"成本万元级", []PortfolioInput{{TsCode: "sh600030", TotalQty: 100, CostPrice: model.FromFloat(20000)}}},
+		// 高点被写成 5.07 元对应的"分"值 507 → 与成本相差百倍：库里没这只票的日线，
+		// 507 元落在绝对区间内，但 high_price 与 cost_price 的比在这里不互查，
+		// 所以这条用的是真正越界的 50700 元
+		{"高点越界", []PortfolioInput{{TsCode: "sh600031", TotalQty: 100, CostPrice: model.FromFloat(5.07),
+			HighPrice: model.FromFloat(50700)}}},
+	}
+	for _, c := range cases {
+		_, _, err := led.SyncPortfolio(ctx, PortfolioSync{Date: "20261015",
+			Capital: model.FromFloat(20000), Cash: model.FromFloat(10163), Items: c.items, Actor: "test"})
+		if !errors.Is(err, ErrPriceSanity) {
+			t.Errorf("%s: 应返回 ErrPriceSanity, 实际: %v", c.name, err)
+		}
+	}
+	// 全都被拒 → 账本一处没写：持仓空、本金与现金锚点都没落
+	ps, err := s.TradeRepo().ListPositions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ps) != 0 {
+		t.Errorf("被拒绝的同步写出了 %d 行持仓", len(ps))
+	}
+	raw, err := s.ConfigRepo().GetAll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw["account.initial_capital"] != "" || raw["account.cash_anchor"] != "" {
+		t.Errorf("被拒绝的同步动了资金口径: capital=%q anchor=%q",
+			raw["account.initial_capital"], raw["account.cash_anchor"])
+	}
+}
+
+// TestReportFillRejectsUnitErrorPrice 成交回执同样把量纲错挡在记账之前：
+// 单据参考价 5.05 元，回报 505 元＝100 倍错，指令单必须留在 issued、持仓不产生。
+func TestReportFillRejectsUnitErrorPrice(t *testing.T) {
+	s, led := openLedger(t)
+	ctx := context.Background()
+	tk := seedTicket(t, s, "sh600032", model.DirBuy, 200, model.FromFloat(5.05))
+
+	if _, err := led.ReportFill(ctx, FillRequest{TicketID: tk.ID, Qty: 200, Price: model.FromFloat(505)}); !errors.Is(err, ErrPriceSanity) {
+		t.Fatalf("回报价放大 100 倍应返回 ErrPriceSanity, 实际: %v", err)
+	}
+	after, err := s.TradeRepo().GetTicket(ctx, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != model.TicketIssued || after.HasFill() {
+		t.Errorf("被拒绝的回执动了指令单: status=%s fill=%v", after.Status, after.HasFill())
+	}
+	if _, err := s.TradeRepo().GetPosition(ctx, tk.TsCode); err == nil {
+		t.Errorf("被拒绝的回执写出了持仓")
+	}
+	// 正确量纲照常成交
+	if _, err := led.ReportFill(ctx, FillRequest{TicketID: tk.ID, Qty: 200, Price: model.FromFloat(5.07)}); err != nil {
+		t.Fatalf("5.07 元（正确量纲）被误拒: %v", err)
+	}
+}
+
 // mustPos 读持仓（测试辅助）。
 func mustPos(t *testing.T, s *store.Store, ctx context.Context, code string) model.Position {
 	t.Helper()
