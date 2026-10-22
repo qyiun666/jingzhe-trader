@@ -8,6 +8,7 @@ import (
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/risk"
 	"jingzhe-trader/internal/screener"
+	"jingzhe-trader/internal/signal"
 	"jingzhe-trader/internal/store"
 )
 
@@ -112,6 +113,32 @@ func TestGateOffCapsOf(t *testing.T) {
 		if total != c.wantTotal || single != c.wantSingle {
 			t.Errorf("%s: 期望 total=%.2f single=%.2f，实际 %.2f/%.2f",
 				c.name, c.wantTotal, c.wantSingle, total, single)
+		}
+	}
+}
+
+// TestWeakExitPolicyOf 弱势减仓配置的解析口径：老库缺键 → 启用 + 3% + 50%；
+// 坏值/越界回落到默认档（保护性规则宁可保守，不因配置写坏把减仓变成清仓）。
+func TestWeakExitPolicyOf(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  fakeConfig
+		want signal.WeakExitPolicy
+	}{
+		{"老库缺键", fakeConfig{}, signal.WeakExitPolicy{Enabled: true, DropPct: 0.03, ReducePct: 0.5}},
+		{"自定义", fakeConfig{
+			"signal.weak_exit_enabled": "false", "signal.weak_exit_drop_pct": "0.05",
+			"signal.weak_exit_reduce_pct": "0.3",
+		}, signal.WeakExitPolicy{Enabled: false, DropPct: 0.05, ReducePct: 0.3}},
+		{"坏值回落", fakeConfig{
+			"signal.weak_exit_enabled": "abc", "signal.weak_exit_drop_pct": "0.5",
+			"signal.weak_exit_reduce_pct": "1.0",
+		}, signal.WeakExitPolicy{Enabled: true, DropPct: 0.03, ReducePct: 0.5}},
+	}
+	for _, c := range cases {
+		got := WeakExitPolicyOf(c.cfg)
+		if got != c.want {
+			t.Errorf("%s: 期望 %+v，实际 %+v", c.name, c.want, got)
 		}
 	}
 }

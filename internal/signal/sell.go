@@ -7,14 +7,23 @@ import (
 	"jingzhe-trader/internal/risk"
 )
 
-// 五条卖出规则的 rule 取值（验收 #5：各有独立单测）。
+// 六条卖出规则的 rule 取值（验收 #5：各有独立单测）。
 const (
 	RuleStopLoss     = "stop_loss"     // 止损
 	RuleTrailingStop = "trailing_stop" // 移动止盈
 	RuleTakeProfit   = "take_profit"   // 止盈
 	RuleRankOut      = "rank_out"      // 排名淘汰
-	RuleMarketBad    = "market_bad"    // 大盘恶化
+	RuleMarketBad    = "market_bad"    // 大盘恶化（仅 gate=true）
+	RuleWeakExit     = "weak_exit"     // 弱势期减仓（仅 gate=false）
 )
+
+// WeakExitPolicy 弱势期减仓口径（signal.weak_exit_*）。只减不清：
+// ReducePct 必须 <1，减仓数量向下取整到 100 股整手，不足一手则整条规则跳过。
+type WeakExitPolicy struct {
+	Enabled   bool
+	DropPct   float64 // 触发所需的 5 日跌幅（正数，如 0.03）
+	ReducePct float64 // 卖出比例（0,1）
+}
 
 // RankOutPolicy 规则 4（排名淘汰）的判定口径，由 service 从 signal.rank_out_* 配置
 // 与当日排名保留带装配（2026-10-14 组长批准的降换手改造）。
@@ -34,7 +43,14 @@ type HoldingCtx struct {
 	// 否则一次数据故障/估值全灭就会把满持有期的持仓全部当成跌出榜单卖掉。
 	// 关闸日（gate=true 且指数在均线下方）没有 band，由规则 5 负责退出。
 	NoBand    bool // 无有效保留带：规则 4 本轮不适用
-	MarketBad bool // 大盘恶化（指数收盘低于门槛均线，见 evalMarketBad）
+	MarketBad bool // 大盘恶化（指数收盘低于门槛均线，见 evalMarketBad；仅 gate=true 置位）
+	// IndexBelowMA 指数收盘低于门槛均线。与 MarketBad 分开：gate=false 时规则 5 停用，
+	// 但这个事实仍要喂给弱势减仓规则（它同样要求指数在均线下方）。
+	IndexBelowMA bool
+	// IndexRet5 指数最近 5 个交易日涨跌幅（小数，负数=下跌）；仅在弱势减仓启用时读取。
+	IndexRet5 float64
+	// WeakExit 本次运行的弱势减仓策略；gate=true 时由调用方置零（规则 5 接管退出）。
+	WeakExit WeakExitPolicy
 	// IsETF 持仓是场内 ETF（由 screen.etf_whitelist 认定，见 Service.ETFUniverse）。
 	IsETF bool
 	// DaysHeld 建仓后已持有的完整交易日数（建仓日不计）；-1 = 持仓无建仓日期，
@@ -159,14 +175,69 @@ func evalMarketBad(date string, h HoldingCtx, indexClose, indexMA60 model.Fen) *
 		fmt.Sprintf("大盘恶化：指数收盘 %s 元跌破 MA60 %s 元", fmtYuan(indexClose), fmtYuan(indexMA60)))
 }
 
+// evalWeakExit 规则 6 弱势期减仓：仅在 gate=false 时由调用方启用。
+//
+// 触发：指数收盘在门槛均线下方，且最近 5 个交易日跌幅达到阈值。
+// 动作：只减不清——卖出 ReducePct 并向下取整到 100 股整手；可减不足一手则跳过，
+// 100 股仓位继续只由止损/移动止盈/止盈管理（清掉它反而把"减仓"变成"清仓"）。
+//
+// 这条规则排在规则 4 之后：排名淘汰是"这只票变差了"，弱势减仓是"整个市场在阴跌"，
+// 同日同票只能出一张单，先由更具体的个股理由接管。
+func evalWeakExit(date string, h HoldingCtx) *model.Signal {
+	if !weakExitTriggered(h) {
+		return nil
+	}
+	qty := weakExitQty(h.Pos, h.WeakExit.ReducePct)
+	if qty <= 0 {
+		return nil
+	}
+	sig := newSell(date, h, RuleWeakExit,
+		fmt.Sprintf("弱势减仓：指数 5 日跌幅 %.1f%%（≥%.1f%%）且收盘在均线下方，减仓 %d 股（持仓 %d 股，只减不清）",
+			-h.IndexRet5*100, h.WeakExit.DropPct*100, int64(qty), int64(h.Pos.TotalQty)))
+	sig.Qty = qty
+	return sig
+}
+
+// weakExitTriggered 弱势减仓的触发条件（不含"能否减出一手"的数量判定）。
+// 单独拆出来供调用方区分"跌幅没到"与"跌幅到了但 100 股减不出"——
+// 后者在日志里必须可见，否则像是规则没跑。
+func weakExitTriggered(h HoldingCtx) bool {
+	w := h.WeakExit
+	if !w.Enabled || w.DropPct <= 0 || w.ReducePct <= 0 || w.ReducePct >= 1 {
+		return false
+	}
+	if h.Pos.TotalQty <= 0 || h.LastClose <= 0 || !h.IndexBelowMA {
+		return false
+	}
+	return h.IndexRet5 <= -w.DropPct
+}
+
 // fmtYuan 分 → 元展示串。
 func fmtYuan(f model.Fen) string { return fmt.Sprintf("%.2f", float64(f)/100) }
 
-// EvalSell 按优先级评估五条卖出规则，返回首个触发的信号（未触发返回 nil）：
-// 止损 > 移动止盈 > 止盈 > 排名淘汰 > 大盘恶化。
+// weakExitQty 弱势减仓数量：按总持仓比例向下取整到 100 股整手，再受 T+1 可卖量约束。
+// 取整后不足一手返回 0（调用方跳过整条规则）。
+func weakExitQty(pos model.Position, reducePct float64) model.Qty {
+	if pos.TotalQty <= 0 || reducePct <= 0 || reducePct >= 1 {
+		return 0
+	}
+	qty := model.Qty(float64(pos.TotalQty) * reducePct)
+	qty = model.Qty(int64(qty) / model.LotShares * model.LotShares)
+	if avail := pos.Available(); qty > avail {
+		qty = model.Qty(int64(avail) / model.LotShares * model.LotShares)
+	}
+	if qty < model.LotShares {
+		return 0
+	}
+	return qty
+}
+
+// EvalSell 按优先级评估六条卖出规则，返回首个触发的信号（未触发返回 nil）：
+// 止损 > 移动止盈 > 止盈 > 排名淘汰 > 大盘恶化 > 弱势期减仓。
 //
 // 这是 16:30 收盘后的一次性卖出判定：排名淘汰与大盘恶化都是日频重平衡概念，
 // 只有在这一刻才有完整口径（当日 TopN 候选与指数收盘）。
+// 大盘恶化与弱势减仓互斥：前者只在 gate=true 生效，后者只在 gate=false 启用。
 func EvalSell(date string, h HoldingCtx, p risk.RiskParams, indexClose, indexMA60 model.Fen) *model.Signal {
 	for _, sig := range []*model.Signal{
 		evalStopLoss(date, h, p),
@@ -174,6 +245,7 @@ func EvalSell(date string, h HoldingCtx, p risk.RiskParams, indexClose, indexMA6
 		evalTakeProfit(date, h, p),
 		evalRankOut(date, h),
 		evalMarketBad(date, h, indexClose, indexMA60),
+		evalWeakExit(date, h),
 	} {
 		if sig != nil {
 			return sig

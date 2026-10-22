@@ -94,7 +94,7 @@ func BuildRuntime(ctx context.Context, st *store.Store, cfg *config.Config) (*Ru
 		Freshness:  dataloader.NewFreshnessGate(st, cfg.GetInt("screen.min_bar_rows"), screener.BarWindow()),
 		Screener:   screener.New(st, FilterConfigOf(cfg), cfg.GetString("screen.factor_mode")),
 		Signal: signal.NewService(st, ledger, scheduler.MarketGateOf(cfg), scheduler.ETFUniverseOf(cfg),
-			scheduler.RankOutPolicyOf(cfg)),
+			scheduler.RankOutPolicyOf(cfg)).WithWeakExit(scheduler.WeakExitPolicyOf(cfg)),
 		Decider:    decider,
 		Ledger:     ledger,
 		Tickets:    ticket.NewService(st),
@@ -186,6 +186,7 @@ func FilterConfigOf(cfg *config.Config) screener.FilterConfig {
 		MinSectorMembers: cfg.GetInt("screen.min_sector_members"),
 		PETtmMax:         cfg.GetFloat("screen.pe_ttm_max"),
 		PBMax:            cfg.GetFloat("screen.pb_max"),
+		MaxPerIndustry:   cfg.GetInt("screen.max_per_industry"),
 	}
 }
 
@@ -250,6 +251,33 @@ func validateEnums(cfg *config.Config) error {
 	if v := cfg.GetInt("signal.rank_out_buffer_n"); v < 0 {
 		return fmt.Errorf("signal.rank_out_buffer_n=%d 非法（合法 ≥0，0=保留带与 TopN 等深）", v)
 	}
+	// 弱势减仓：只减不清是硬语义，reduce_pct 必须严格小于 1；跌幅阈值 0 会让
+	// 任何一天的小跌都触发减仓，也不是有效配置。只校验显式配置过的键，
+	// 局部构造的 Config（测试/CLI 片段）缺键时保留 KeySpec 默认档。
+	if raw := strings.TrimSpace(cfg.GetString("signal.weak_exit_enabled")); raw != "" {
+		if _, err := strconv.ParseBool(raw); err != nil {
+			return fmt.Errorf("signal.weak_exit_enabled=%q 非法（合法 true|false）", raw)
+		}
+	}
+	if raw := strings.TrimSpace(cfg.GetString("signal.weak_exit_drop_pct")); raw != "" {
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil || v <= 0 || v > 0.2 {
+			return fmt.Errorf("signal.weak_exit_drop_pct=%q 非法（合法 0<v≤0.2）", raw)
+		}
+	}
+	if raw := strings.TrimSpace(cfg.GetString("signal.weak_exit_reduce_pct")); raw != "" {
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil || v <= 0 || v >= 1 {
+			return fmt.Errorf("signal.weak_exit_reduce_pct=%q 非法（合法 0<v<1，只减不清）", raw)
+		}
+	}
+	// 行业集中度：0=关闭，上限 10（再高对 20 只的候选池等于没限）。
+	if raw := strings.TrimSpace(cfg.GetString("screen.max_per_industry")); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 0 || v > 10 {
+			return fmt.Errorf("screen.max_per_industry=%q 非法（合法 0..10，0=关闭）", raw)
+		}
+	}
 	if err := validateETF(cfg); err != nil {
 		return err
 	}
@@ -305,6 +333,14 @@ func RiskParamsOf(r *Runtime) func(ctx context.Context, date string) (risk.RiskP
 				return risk.RiskParams{}, fmt.Errorf("risk.trailing_arm_pct=%q 非法（合法 0..0.5，0=旧口径）", raw)
 			}
 			p.TrailingArmPct = arm
+		}
+		// 买入侧行业上限复用 screen.max_per_industry：默认 2（配置 3 只候选上限
+		// 不会让账户同行业持有 3 只），0=关闭，配置收紧到 1 时跟随收紧。
+		// 键缺失（局部构造的 Config）时保留 DefaultParams 的 2，不静默关闭。
+		if raw := strings.TrimSpace(r.Config.GetString("screen.max_per_industry")); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil {
+				p.MaxPerIndustry = risk.BuyIndustryCap(n)
+			}
 		}
 		return p, nil
 	}

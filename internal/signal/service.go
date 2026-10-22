@@ -18,11 +18,12 @@ import (
 // 信号不落库：一条流水线内内存传递，唯一落库的结果是 order_ticket；
 // 重跑幂等由"当日同标的同方向活跃指令单"集合保证（配 order_ticket 部分唯一索引）。
 type Service struct {
-	st      *store.Store
-	ledger  *ticket.Ledger // 现金/资产的唯一口径（含组合同步的现金锚点）
-	gate    store.MarketGate
-	etf     ETFUniverse   // 白名单认定的场内 ETF（豁免规则 4 + 显示名兜底）
-	rankOut RankOutPolicy // 规则 4 的持有期口径（缓冲带深度按当日保留带在 sellDecisions 里补）
+	st       *store.Store
+	ledger   *ticket.Ledger // 现金/资产的唯一口径（含组合同步的现金锚点）
+	gate     store.MarketGate
+	etf      ETFUniverse   // 白名单认定的场内 ETF（豁免规则 4 + 显示名兜底）
+	rankOut  RankOutPolicy // 规则 4 的持有期口径（缓冲带深度按当日保留带在 sellDecisions 里补）
+	weakExit WeakExitPolicy
 }
 
 // ETFUniverse 白名单声明的场内 ETF：ts_code → 人工复核过的显示名。
@@ -47,6 +48,19 @@ type ETFUniverse map[string]string
 func NewService(st *store.Store, ledger *ticket.Ledger, gate store.MarketGate, etf ETFUniverse,
 	rankOut RankOutPolicy) *Service {
 	return &Service{st: st, ledger: ledger, gate: gate, etf: etf, rankOut: rankOut}
+}
+
+// WithWeakExit 注入弱势期减仓口径（signal.weak_exit_*）。未注入 = 关闭，
+// 保持既有行为；gate=true 时 indexState 与 sellDecisions 都会忽略它（规则 5 接管）。
+func (s *Service) WithWeakExit(p WeakExitPolicy) *Service {
+	s.weakExit = p
+	return s
+}
+
+// weakExitActive 本轮是否启用弱势减仓：只在人为关闭大盘门槛（gate=false）时成立。
+// 门槛开启时弱势的退出方式是规则 5，两条规则不能同时出单。
+func (s *Service) weakExitActive() bool {
+	return !s.gate.Enabled && s.weakExit.Enabled
 }
 
 // isETF 判定代码是否由白名单声明为场内 ETF。
@@ -98,12 +112,17 @@ type Report struct {
 	// 规则 4 的"未进榜"以 band 存在为前提；空 band 时本轮不判定排名淘汰，
 	// 关闸日交给规则 5。调用方据此落 RANK_BAND_EMPTY 降级，避免把"无榜"读成"跌出"。
 	RankBandEmpty bool
+	// BuyReviewSkipped 本轮跳过了 LLM 买入评审（满仓且候选均已持有），
+	// 只跑了卖出规则。调用方据此落 LLM_SKIPPED_NO_SLOT，避免把"没问"读成"评审失败"。
+	BuyReviewSkipped bool
 }
 
 // buyProposal 一条待落地买入：决策信号 + 模型要求的金额（风控负责截断成整手股数）。
 type buyProposal struct {
-	sig  model.Signal
-	want model.Fen
+	sig      model.Signal
+	want     model.Fen
+	industry string
+	isETF    bool
 }
 
 // Generate 执行决策主流程：① 读行情窗口与持仓 → ② 卖出决策（规则）→ ③ 买入决策（LLM）→ ④ 写指令单。
@@ -116,6 +135,21 @@ func (s *Service) Generate(ctx context.Context, tradeDate string, cands []model.
 	if decider == nil {
 		decider = NoDecider{}
 	}
+	return s.generate(ctx, tradeDate, cands, watch, p, decider, false, "")
+}
+
+// GenerateWithoutBuy 满仓短路：只跑卖出规则，不问 LLM 买入评审。
+//
+// 触发前提由调用方判定（无新仓名额且候选全部已持有）。这里不复算仓位，
+// 但必须保持"没有决策者时不允许产生买单"的同一条不变量——跳过就是真的不买，
+// 而不是退化成规则买入。note 原样写进 Report.Notes，供上层落 LLM_SKIPPED_NO_SLOT。
+func (s *Service) GenerateWithoutBuy(ctx context.Context, tradeDate string, cands []model.Candidate,
+	watch []model.Candidate, p risk.RiskParams, note string) (*Report, error) {
+	return s.generate(ctx, tradeDate, cands, watch, p, NoDecider{}, true, note)
+}
+
+func (s *Service) generate(ctx context.Context, tradeDate string, cands []model.Candidate,
+	watch []model.Candidate, p risk.RiskParams, decider BuyDecider, skipBuy bool, note string) (*Report, error) {
 	rep := &Report{TradeDate: tradeDate, Candidates: len(cands)}
 	series, err := s.barSeries(ctx, tradeDate, seriesCodes(cands, watch))
 	if err != nil {
@@ -130,6 +164,9 @@ func (s *Service) Generate(ctx context.Context, tradeDate string, cands []model.
 		return nil, err
 	}
 	state := accountStateOf(positions, cash)
+	if err := s.attachHeldIndustries(ctx, positions, &state, rep); err != nil {
+		return nil, err
+	}
 	idx, err := s.indexState(ctx, tradeDate)
 	if err != nil {
 		return nil, err
@@ -138,9 +175,17 @@ func (s *Service) Generate(ctx context.Context, tradeDate string, cands []model.
 	if err != nil {
 		return nil, err
 	}
-	buys, err := s.buyDecisions(ctx, tradeDate, cands, series, positions, state, p, decider, rep)
-	if err != nil {
-		return nil, err
+	var buys []buyProposal
+	if skipBuy {
+		rep.BuyReviewSkipped = true
+		if note != "" {
+			rep.Notes = append(rep.Notes, note)
+		}
+	} else {
+		buys, err = s.buyDecisions(ctx, tradeDate, cands, series, positions, state, p, decider, rep)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := s.writeTickets(ctx, tradeDate, buys, sells, state, p, rep); err != nil {
 		return nil, err
@@ -177,6 +222,19 @@ func (s *Service) sellDecisions(ctx context.Context, tradeDate string, cands, wa
 		rep.RankBandEmpty = true
 		rep.Notes = append(rep.Notes, "RANK_BAND_EMPTY 当日无有效个股排名保留带（候选池为空或仅 ETF），规则4本轮不适用（无榜≠跌出榜）")
 	}
+	if idx.weakExitNote != "" {
+		rep.Notes = append(rep.Notes, idx.weakExitNote)
+	}
+	weakExit := WeakExitPolicy{}
+	if s.weakExitActive() {
+		weakExit = s.weakExit
+	}
+	// 规则 5 的入参只在 gate=true 时给：gate=false 时指数仍可能被弱势减仓读取，
+	// 但"大盘恶化清仓"这条规则必须停用，否则试探仓会被当晚清光。
+	marketClose, marketMA := idx.close, idx.ma60
+	if !s.gate.Enabled {
+		marketClose, marketMA = 0, 0
+	}
 	days, err := s.st.MarketRepo().TradeDateList(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("读取交易日历用于持仓天数判定失败: %w", err)
@@ -195,8 +253,12 @@ func (s *Service) sellDecisions(ctx context.Context, tradeDate string, cands, wa
 		held := tradingDaysHeld(days, pos.FirstOpenDate, tradeDate)
 		h := HoldingCtx{
 			Pos: pos, LastClose: bar.RawClose, LastDate: bar.TradeDate,
-			InTopN: inTopN[pos.TsCode], NoBand: noBand, MarketBad: idx.bad(), IsETF: s.isETF(pos.TsCode),
-			DaysHeld: held, RankOut: ro,
+			InTopN: inTopN[pos.TsCode], NoBand: noBand,
+			// 规则 5 只在 gate=true 生效；gate=false 时指数读数只喂给弱势减仓，
+			// 否则"门槛关了但规则 5 还在清仓"就是左右互搏。
+			MarketBad:    s.gate.Enabled && idx.bad(),
+			IndexBelowMA: idx.bad(), IndexRet5: idx.ret5, WeakExit: weakExit,
+			IsETF: s.isETF(pos.TsCode), DaysHeld: held, RankOut: ro,
 		}
 		// 持有期保护挡掉了一次本会触发的淘汰：必须留痕（与"禁静默丢弃"同一纪律），
 		// 否则"为什么这只没卖"只能靠翻日历反推。判定条件与 evalRankOut 的保护分支同构。
@@ -207,7 +269,7 @@ func (s *Service) sellDecisions(ctx context.Context, tradeDate string, cands, wa
 				"%s 未进当日排名保留带，但已持有 %d 个交易日 < 最小持有期 %d，本次排名淘汰豁免",
 				pos.TsCode, held, ro.MinHoldDays))
 		}
-		if sig := EvalSell(tradeDate, h, p, idx.close, idx.ma60); sig != nil {
+		if sig := EvalSell(tradeDate, h, p, marketClose, marketMA); sig != nil {
 			nm, e := s.SellName(ctx, pos.TsCode)
 			if e != nil {
 				return nil, fmt.Errorf("卖出信号 %s 取名称失败: %w", pos.TsCode, e)
@@ -215,6 +277,12 @@ func (s *Service) sellDecisions(ctx context.Context, tradeDate string, cands, wa
 			sig.Name = nm
 			out = append(out, *sig)
 			rep.SellSignals++
+		} else if weakExitTriggered(h) && weakExitQty(h.Pos, h.WeakExit.ReducePct) <= 0 {
+			// 条件已满足但减不出一手：必须留痕，否则"10-22 指数 -3.1% 却没减仓"
+			// 会被误读成规则没跑。
+			rep.Notes = append(rep.Notes, fmt.Sprintf(
+				"WEAK_EXIT_SKIP %s 可减数量不足 100 股（持仓 %d、可卖 %d），弱势减仓跳过（仍由止损/移动止盈/止盈管理）",
+				pos.TsCode, int64(pos.TotalQty), int64(pos.Available())))
 		}
 	}
 	return out, nil
@@ -309,7 +377,9 @@ func (s *Service) pendingBuy(it BuyRequest, d BuyDecision, total model.Fen, rep 
 			Direction: model.DirBuy, Rule: DecideRuleName,
 			Confidence: d.Confidence, RefPrice: it.Candidate.Close, Reason: d.Reason,
 		},
-		want: model.FromFloat(total.Float() * clampWeight(d.WeightPct)),
+		want:     model.FromFloat(total.Float() * clampWeight(d.WeightPct)),
+		industry: it.Candidate.Industry,
+		isETF:    it.Candidate.IsETF(),
 	}, "", true
 }
 
@@ -380,7 +450,9 @@ func (s *Service) writeBuys(ctx context.Context, svc *ticket.Service, buys []buy
 	intents := make([]risk.BuyIntent, 0, len(buys))
 	for _, pr := range buys {
 		intents = append(intents, risk.BuyIntent{
-			TsCode: pr.sig.TsCode, Name: pr.sig.Name, RefPrice: pr.sig.RefPrice,
+			TsCode: pr.sig.TsCode, Name: pr.sig.Name,
+			Industry: pr.industry, IsETF: pr.isETF,
+			RefPrice:   pr.sig.RefPrice,
 			Confidence: pr.sig.Confidence, WantFen: pr.want,
 		})
 	}
@@ -394,6 +466,9 @@ func (s *Service) writeBuys(ctx context.Context, svc *ticket.Service, buys []buy
 				"rule", dec.RejectRule, "msg", dec.RejectMsg)
 			continue
 		}
+		if dec.Note != "" {
+			rep.Notes = append(rep.Notes, dec.Note)
+		}
 		if _, err := s.createOnce(ctx, svc, sig, dec.Qty, existing, p, days, rep); err != nil {
 			return err
 		}
@@ -401,7 +476,8 @@ func (s *Service) writeBuys(ctx context.Context, svc *ticket.Service, buys []buy
 	return nil
 }
 
-// writeSells 卖出决策 → 指令单（数量 = 可卖量，T+1 当日买入不可卖）。
+// writeSells 卖出决策 → 指令单（数量 = 可卖量，T+1 当日买入不可卖；
+// 弱势减仓等"只减不清"规则用信号上的指定股数，仍受可卖量截断）。
 func (s *Service) writeSells(ctx context.Context, svc *ticket.Service, sells []model.Signal,
 	existing map[ticketKey]bool, p risk.RiskParams, days []string, rep *Report) error {
 	for _, sig := range sells {
@@ -409,10 +485,14 @@ func (s *Service) writeSells(ctx context.Context, svc *ticket.Service, sells []m
 		if err != nil {
 			return fmt.Errorf("读取持仓 %s 失败: %w", sig.TsCode, err)
 		}
-		if pos.Available() <= 0 {
+		qty := pos.Available()
+		if sig.Qty > 0 && sig.Qty < qty {
+			qty = sig.Qty
+		}
+		if qty <= 0 {
 			continue // 当日买入不可卖：决策保留到次日
 		}
-		if _, err := s.createOnce(ctx, svc, sig, pos.Available(), existing, p, days, rep); err != nil {
+		if _, err := s.createOnce(ctx, svc, sig, qty, existing, p, days, rep); err != nil {
 			return err
 		}
 	}
@@ -507,18 +587,54 @@ func seriesCodes(cands, watch []model.Candidate) []string {
 type indexInfo struct {
 	close model.Fen
 	ma60  model.Fen // 门槛均线（字段名沿用历史；窗口可配置后实际为 MA{gate.Window}）
+	// ret5 最近 5 个交易日涨跌幅（小数，负数=下跌），仅弱势减仓启用时读取。
+	ret5 float64
+	// weakExitNote 弱势减仓的数据降级说明（读不到指数/历史不足）。非空时写进
+	// Report.Notes：保护性规则本轮没跑成必须可见，不能与"跌幅未达阈值"混为一谈。
+	weakExitNote string
 }
 
 // bad 大盘恶化判定：指数收盘跌破门槛均线。
-func (i indexInfo) bad() bool { return i.close < i.ma60 }
+func (i indexInfo) bad() bool { return i.close > 0 && i.ma60 > 0 && i.close < i.ma60 }
 
-// indexState 读大盘指数。门槛关闭时不读：返回零值（bad()=false，规则 5 自然停用），
-// 判据不参与判定时把"指数数据不可读"升级成整链失败，等于修一个停摆换来另一个停摆。
-// 门槛开启时读不到、或均线凑不满窗口根数，都是错误：
-// 拿不到基准时把"大盘恶化"判成"没恶化"，等于这条卖出规则今天没跑却没人知道。
+// indexState 读大盘指数。
+//
+//   - 门槛开启：读不到/均线凑不满窗口根数都是错误——拿不到基准把"大盘恶化"判成
+//     "没恶化"，等于这条卖出规则今天没跑却没人知道。
+//   - 门槛关闭且弱势减仓未启用：不读（返回零值，规则 5 自然停用）。
+//   - 门槛关闭且弱势减仓启用：best-effort 读取。读不到或 5 日历史不足时只记
+//     weakExitNote 并让规则本轮不触发，不把整条卖出链掐掉——止损/移动止盈/止盈
+//     仍必须在当日跑完。
 func (s *Service) indexState(ctx context.Context, tradeDate string) (indexInfo, error) {
 	if !s.gate.Enabled {
-		return indexInfo{}, nil
+		if !s.weakExit.Enabled {
+			return indexInfo{}, nil
+		}
+		window := s.gate.Window
+		if window < 1 || window > store.MarketMAWindow {
+			window = store.MarketMAWindow
+		}
+		idx, err := s.st.ScreenRepo().LatestMarketIndex(ctx, tradeDate, window)
+		if err != nil {
+			return indexInfo{weakExitNote: fmt.Sprintf(
+				"WEAK_EXIT_DATA_MISSING 弱势减仓指数读取失败，本轮不触发：%v", err)}, nil
+		}
+		if idx.MA <= 0 {
+			return indexInfo{weakExitNote: fmt.Sprintf(
+				"WEAK_EXIT_DATA_MISSING 指数 %s 在 %s 前不足 %d 根日线，均线不可算，本轮弱势减仓不触发",
+				store.MarketIndex, tradeDate, window)}, nil
+		}
+		ret5, ok, err := s.st.ScreenRepo().IndexReturnPct(ctx, tradeDate, 5)
+		if err != nil {
+			return indexInfo{close: idx.Close, ma60: idx.MA, weakExitNote: fmt.Sprintf(
+				"WEAK_EXIT_DATA_MISSING 弱势减仓 5 日跌幅读取失败，本轮不触发：%v", err)}, nil
+		}
+		if !ok {
+			return indexInfo{close: idx.Close, ma60: idx.MA, weakExitNote: fmt.Sprintf(
+				"WEAK_EXIT_DATA_MISSING 指数 %s 不足 6 根日线，5 日跌幅不可算，本轮弱势减仓不触发",
+				store.MarketIndex)}, nil
+		}
+		return indexInfo{close: idx.Close, ma60: idx.MA, ret5: ret5}, nil
 	}
 	idx, err := s.st.ScreenRepo().LatestMarketIndex(ctx, tradeDate, s.gate.Window)
 	if err != nil {
@@ -535,6 +651,40 @@ func (s *Service) indexState(ctx context.Context, tradeDate string) (indexInfo, 
 // 决策侧只调用不重算 —— 否则锚点口径会在两处漂移。
 func (s *Service) cashFen(ctx context.Context) (model.Fen, error) {
 	return s.ledger.Cash(ctx)
+}
+
+// attachHeldIndustries 补持仓行业：组合同行业上限需要知道已持有标的属于哪个行业，
+// 而 Position 只有代码。单次批量查 stock_basic；查无此码按行业未知处理——
+// 降级放行而不是阻断卖出/买入链，并写进 Report.Notes 让人能查到为什么没限住。
+// 查询本身失败仍上抛：那是数据层故障，和"某只票没有行业"不是一回事。
+func (s *Service) attachHeldIndustries(ctx context.Context, positions []model.Position,
+	state *risk.AccountState, rep *Report) error {
+	state.HeldIndustry = make(map[string]string, len(positions))
+	codes := make([]string, 0, len(positions))
+	for _, pos := range positions {
+		if pos.TotalQty > 0 {
+			codes = append(codes, pos.TsCode)
+		}
+	}
+	if len(codes) == 0 {
+		return nil
+	}
+	briefs, err := s.st.ScreenRepo().StockBriefs(ctx, codes)
+	if err != nil {
+		return fmt.Errorf("读取持仓行业用于行业上限判定失败: %w", err)
+	}
+	for _, pos := range positions {
+		if pos.TotalQty <= 0 {
+			continue
+		}
+		ind := briefs[pos.TsCode].Industry
+		state.HeldIndustry[pos.TsCode] = ind
+		if ind == "" && !s.isETF(pos.TsCode) {
+			rep.Notes = append(rep.Notes, fmt.Sprintf(
+				"持仓 %s 行业未知（stock_basic 无行业），行业上限仅按已知行业计数（降级放行）", pos.TsCode))
+		}
+	}
+	return nil
 }
 
 // accountStateOf 批次风控的账户状态快照（纯函数；市值按成本口径，保守值）。

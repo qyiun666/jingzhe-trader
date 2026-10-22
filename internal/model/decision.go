@@ -22,7 +22,10 @@ type Signal struct {
 	Rule       string // 决策来源（买入 llm_review / 卖出为止损止盈等规则名）
 	Confidence float64
 	RefPrice   Fen // 分
-	Reason     string
+	// Qty 卖出的指定数量（0 = 由执行层按可卖量全出）。
+	// 只有"只减不清"的规则（弱势期减仓）会给出具体股数，其余卖出仍按清仓口径。
+	Qty    Qty
+	Reason string
 }
 
 // 品种类别：选股漏斗与决策链按它区分个股与场内 ETF。

@@ -270,3 +270,24 @@ func (r *ScreenRepo) LatestMarketIndex(ctx context.Context, beforeInclusive stri
 	d.Window = window
 	return d, nil
 }
+
+// IndexReturnPct 指数最近一根收盘相对 days 个交易日前的涨跌幅（小数，负数=下跌）。
+//
+// 弱势减仓的"5 日跌幅"口径：用交易日取数而不是自然日，跨周末才不会把 5 日算成
+// 3 个交易日。历史不足 days+1 根时 ok=false（不是错误）：调用方只会在"无法判定"
+// 时不触发减仓，而不是拿一段残缺序列当跌幅。
+func (r *ScreenRepo) IndexReturnPct(ctx context.Context, beforeInclusive string, days int) (float64, bool, error) {
+	if days <= 0 {
+		return 0, false, nil
+	}
+	var closes []float64
+	const q = `SELECT close FROM daily_bar WHERE ts_code = ? AND trade_date <= ?
+		ORDER BY trade_date DESC LIMIT ?`
+	if err := r.rdb.SelectContext(ctx, &closes, q, MarketIndex, beforeInclusive, days+1); err != nil {
+		return 0, false, fmt.Errorf("读取大盘指数 %s 最近 %d 日收盘失败: %w", MarketIndex, days+1, err)
+	}
+	if len(closes) < days+1 || closes[days] <= 0 || closes[0] <= 0 {
+		return 0, false, nil
+	}
+	return closes[0]/closes[days] - 1, true, nil
+}

@@ -33,6 +33,9 @@ type FilterConfig struct {
 	MinListDays      int     // 上市天数下限（新股剔除）
 	SectorTopK       int     // 板块强弱保留前 K 个行业
 	MinSectorMembers int     // 行业成员数下限（不足则该行业不参与排名）
+	// MaxPerIndustry 因子 TopN 每行业最多几只（0=关闭）。保留带按同一上限选，
+	// 保证"候选一定是保留带成员"——否则买入当晚就可能因排名在半带外被规则 4 淘汰。
+	MaxPerIndustry int
 }
 
 // 漏斗各级淘汰原因（统一文案，只出现在日志与告警正文）。
@@ -50,6 +53,7 @@ const (
 	reasonBadPE          = "亏损或PE超标"
 	reasonBadPB          = "PB超标"
 	reasonRankOut        = "排名不足TopN"
+	reasonIndustryCap    = "行业集中度超限"
 	reasonMarketRegime   = "大盘跌破%s，当日关闭买入漏斗" // %s 由 Report.RegimeMALabel() 填充
 	reasonSectorNoRank   = "板块动量数据不足"
 	minSectorDataMembers = 10 // 板块内可算动量的成员不足则放弃该板块排名

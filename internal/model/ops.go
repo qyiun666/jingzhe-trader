@@ -13,7 +13,7 @@ const (
 //
 // Subject 是"这件事"的稳定标识，前缀区分来源，同一 subject 当日重复写入即覆盖：
 //
-//	job:<任务名> / mail:<邮件类型> / alert:<告警码> / llm:<标的>:<prompt_key> / screen:topn
+//	job:<任务名> / mail:<邮件类型> / alert:<告警码> / llm:<标的>:<prompt_key> / screen:topn / portfolio:snapshot
 //
 // 每个字段的读者：TradeDate=当日轨迹查询与保留窗口；Subject=完成判定与去重判定；
 // Outcome=调度器 shouldSkip 与 MCP/selfcheck 的唯一判据；Detail=失败时给人看的那一句；
@@ -39,6 +39,21 @@ func TraceLLM(tsCode, promptKey string) string { return "llm:" + tsCode + ":" + 
 // 这是"选股过程不落库"的唯一例外：归因需要当时 TopN 的 score/factors 才能
 // 回答"高分候选后来是否真的更好"，而决策留痕只有裁决、没有候选截面。
 func TraceScreenTopN() string { return "screen:topn" }
+
+// TracePortfolioSnapshot 每日组合快照的 subject（一天一行，重跑覆盖）。
+// M5 的组合 5/10/20 日涨跌只从这些快照现算；不建资产曲线表、不加邮件通道。
+func TracePortfolioSnapshot() string { return "portfolio:snapshot" }
+
+// PortfolioSnapshot 每日组合快照（run_trace.detail 的 JSON 载荷）。
+// 资产为当日收盘口径；指数收盘用于计算相对 000300 的超额。
+type PortfolioSnapshot struct {
+	TradeDate      string `json:"trade_date"`
+	TotalAssetFen  int64  `json:"total_asset_fen"`
+	CashFen        int64  `json:"cash_fen"`
+	MarketValueFen int64  `json:"market_value_fen"`
+	PositionCount  int    `json:"position_count"`
+	IndexCloseFen  int64  `json:"index_close_fen"` // 000300.SH 当日收盘（分）；缺失为 0
+}
 
 // ScreenSnapshot 每日候选快照（run_trace.detail 的 JSON 载荷）。
 // 只存归因用得到的字段：代码、评分、因子、行业与当日资金口径；

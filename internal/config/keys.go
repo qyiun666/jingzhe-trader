@@ -113,6 +113,21 @@ var KeySpecs = []KeySpec{
 	// 0 合法（单独关闭该项保护 = 回到旧口径），负值装配期拒绝。
 	{Key: "signal.rank_out_min_hold_days", Type: TypeInt, Default: "10"},
 	{Key: "signal.rank_out_buffer_n", Type: TypeInt, Default: "10"},
+	// ---------- 弱势期市场退出线（signal.weak_exit_*）----------
+	// 只在 screen.gate_enabled=false 时生效：闸门关着就不会有规则 5（大盘恶化），
+	// 弱势期的退出只能靠 8% 止损；但阴跌不是一次跌穿止损线，而是每天 -0.5% 磨下去。
+	// 触发条件 = 指数收盘 < MA{gate_ma_window} 且 5 日跌幅 ≥ drop_pct；动作只减不清，
+	// 卖出 reduce_pct（向下取整到 100 股整手），可减不足一手则跳过（100 股仓位仍只由
+	// 止损/移动止盈/止盈管理）。gate=true 时规则 5 原样生效，本组键不参与。
+	{Key: "signal.weak_exit_enabled", Type: TypeBool, Default: "true"},
+	{Key: "signal.weak_exit_drop_pct", Type: TypeFloat, Default: "0.03"},
+	{Key: "signal.weak_exit_reduce_pct", Type: TypeFloat, Default: "0.5"},
+	// ---------- 行业集中度上限 ----------
+	// 候选侧：因子 TopN 每个行业最多 N 只；0=关闭。买入侧复用同一键：
+	// 组合同行业最多 min(2, N) 只（默认 2），弱势档再收紧到 1 只。
+	// 依据：弱势行情下同行业个股高度同涨同跌，20261008 的 20 只候选里电子/半导体
+	// 占 7 只，分散度是名义上的；候选与持仓两层同时限，才能挡住"换一只同行业票"。
+	{Key: "screen.max_per_industry", Type: TypeInt, Default: "3"},
 	// ---------- 场内科技 ETF 补口（只在弱势试探期启用）----------
 	// 立项依据不是"ETF 更稳"（实测 ETF 日σ 2.29% ≈ 个股中位 2.19%，4 年最大回撤
 	// −44%~−61%，它不是防御资产），而是**一手成本**：科技股一手中位 5200 元，

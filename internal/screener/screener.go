@@ -313,8 +313,24 @@ func (s *Screener) pickTopN(pool []model.StockBasic, in *inputs, sectors []model
 	for _, sec := range sectors {
 		sectorMom[sec.Industry] = sec.WMom
 	}
-	out := make([]model.Candidate, 0, watchN)
-	for rank, sc := range scored[:watchN] {
+	// 行业上限只作用于候选（TopN）；保留带仍是原口径的排名前缀 Top(N+buffer)，
+	// 不因行业上限缩水——否则会把"候选更分散"顺手变成"卖出规则 4 更早淘汰"。
+	// 候选可能被上限挤到 TopN 名次之外，故保留带深度至少覆盖最后一名候选，
+	// 保证"候选一定是保留带成员"这条不变量。
+	industryOf := make(map[string]string, len(pool))
+	for _, stk := range pool {
+		industryOf[stk.TsCode] = stk.Industry
+	}
+	picked, ranks, capDrops := cappedRank(scored, industryOf, s.cfg.MaxPerIndustry, topN)
+	depth := watchN
+	if len(ranks) > 0 && ranks[len(ranks)-1] > depth {
+		depth = ranks[len(ranks)-1]
+	}
+	if depth > len(scored) {
+		depth = len(scored)
+	}
+	out := make([]model.Candidate, 0, depth)
+	for rank, sc := range scored[:depth] {
 		stk := stockOf(pool, sc.Code)
 		out = append(out, model.Candidate{
 			Rank: rank + 1, PoolSize: len(scored),
@@ -325,12 +341,47 @@ func (s *Screener) pickTopN(pool []model.StockBasic, in *inputs, sectors []model
 			Reason: BuildReason(sc.Factors, s.w, sc.Score, stk),
 		})
 	}
+	top = make([]model.Candidate, 0, len(picked))
+	for i := range picked {
+		top = append(top, out[ranks[i]-1])
+	}
 	drops := map[string]int{}
-	if rest := len(scored) - topN; rest > 0 {
+	if capDrops > 0 {
+		drops[reasonIndustryCap] = capDrops
+	}
+	if rest := len(scored) - len(top) - capDrops; rest > 0 {
 		drops[reasonRankOut] = rest
 	}
-	tr.emitRaw("topn", "因子排名TopN", len(scored), topN, drops)
-	return out[:topN:topN], out
+	tr.emitRaw("topn", "因子排名TopN", len(scored), len(top), drops)
+	return top, out
+}
+
+// cappedRank 按分数序（已排序）取至多 stop 只，每行业最多 limit 只；limit<=0 关闭上限。
+// 返回被选中的分数项、它们原始排名（1-based，保留名次空洞）与因行业上限跳过的只数。
+//
+// 行业为空视为未知：不参与计数、直接放行（漏斗的板块级已剔除无行业归属，
+// 这里只兜 ETF/脏数据；未知不是"这个行业超限了"）。
+func cappedRank(scored []Scored, industryOf map[string]string, limit, stop int) (picked []Scored, ranks []int, capDrops int) {
+	if stop <= 0 {
+		return nil, nil, 0
+	}
+	counts := make(map[string]int)
+	for i, sc := range scored {
+		if len(picked) >= stop {
+			break
+		}
+		ind := strings.TrimSpace(industryOf[sc.Code])
+		if limit > 0 && ind != "" && counts[ind] >= limit {
+			capDrops++
+			continue
+		}
+		if ind != "" {
+			counts[ind]++
+		}
+		picked = append(picked, sc)
+		ranks = append(ranks, i+1)
+	}
+	return picked, ranks, capDrops
 }
 
 // finish 收尾：每级计数写日志；候选为 0 落一条轨迹（当日日报按降级列出）。

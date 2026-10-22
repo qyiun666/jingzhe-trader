@@ -5,6 +5,7 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -377,10 +378,18 @@ func sendDailyReport(ctx context.Context, rc *observability.RunCtx, d Deps, date
 	if err != nil {
 		return fmt.Errorf("任务清单读取失败，日报不能装作今天没有失败: %w", err)
 	}
-	brief, err := accountBriefOf(d, ctx, date)
+	ast, err := d.Ledger.Assets(ctx, date)
 	if err != nil {
 		return fmt.Errorf("账户摘要读取失败: %w", err)
 	}
+	// 先落当日组合快照，再算 5/10/20 日表现：快照是历史比较的唯一数据源，不建资产曲线表。
+	// 写失败只降级告警，不掐日报——日报仍有当日资产与任务状态可看。
+	todaySnap, snapErr := writePortfolioSnapshot(ctx, d, date, ast)
+	if snapErr != nil {
+		d.raiseW(rc, "PORTFOLIO_SNAPSHOT_FAILED", "组合快照写入失败", snapErr.Error())
+	}
+	extra += portfolioPerformanceSection(ctx, d, date, todaySnap)
+	brief := notify.Brief{CashYuan: float64(ast.Cash) / 100, TotalYuan: float64(ast.TotalAsset) / 100}
 	subject, body := notify.RenderM5(date, block+extra, okJobs, degJobs, failJobs, brief, tradeConclusion(ctx, d, date))
 	if err := d.Mail.Send(ctx, date, model.MailM5, subject, body); err != nil {
 		// warning 而非 urgent：任务本身已 fail，调度器统一落 JOB_FAILED urgent 发 M6；
@@ -390,6 +399,93 @@ func sendDailyReport(ctx context.Context, rc *observability.RunCtx, d Deps, date
 	}
 	rc.Actual("daily_m5", 1) // 发出去才算交付（入队即 Actual 是 [D1] 的假绿）
 	return nil
+}
+
+// writePortfolioSnapshot 落当日组合快照（run_trace subject=portfolio:snapshot）。
+// 指数收盘缺失时仍写资产部分（IndexCloseFen=0），后续表现计算会跳过该点。
+func writePortfolioSnapshot(ctx context.Context, d Deps, date string, ast model.Assets) (model.PortfolioSnapshot, error) {
+	snap := model.PortfolioSnapshot{
+		TradeDate:      date,
+		TotalAssetFen:  int64(ast.TotalAsset),
+		CashFen:        int64(ast.Cash),
+		MarketValueFen: int64(ast.MarketValue),
+		PositionCount:  ast.PositionCount,
+	}
+	if bar, err := d.Store.ScreenRepo().LatestBarAt(ctx, store.MarketIndex, date); err != nil {
+		observability.S().Warnw("组合快照缺少 000300 收盘", "date", date, "err", err.Error())
+	} else {
+		snap.IndexCloseFen = int64(bar.Close)
+	}
+	detail, err := json.Marshal(snap)
+	if err != nil {
+		return snap, fmt.Errorf("序列化组合快照失败: %w", err)
+	}
+	if err := d.Store.TraceRepo().Write(ctx, model.RunTrace{
+		TradeDate: date, Subject: model.TracePortfolioSnapshot(), Outcome: model.TraceOK,
+		Detail: string(detail), At: time.Now().UTC().Format(time.RFC3339),
+	}); err != nil {
+		return snap, fmt.Errorf("写入组合快照失败: %w", err)
+	}
+	return snap, nil
+}
+
+// portfolioPerformanceSection 组合 5/10/20 个交易日涨跌 vs 000300。
+// 数据源只有 portfolio:snapshot；历史不足（缺快照或指数收盘）就跳过该档，不补造数据。
+// 口径为总资产（含现金）变动，期间有出入金会失真——当前账户没有出入金记录，接受此近似。
+func portfolioPerformanceSection(ctx context.Context, d Deps, date string, today model.PortfolioSnapshot) string {
+	if today.TotalAssetFen <= 0 || today.IndexCloseFen <= 0 {
+		return ""
+	}
+	dates, err := d.Store.MarketRepo().TradeDateList(ctx)
+	if err != nil {
+		observability.S().Warnw("组合表现读取交易日失败", "date", date, "err", err.Error())
+		return ""
+	}
+	pos := sort.SearchStrings(dates, date)
+	if pos >= len(dates) || dates[pos] != date {
+		observability.S().Warnw("组合表现：当日不在交易日列表", "date", date)
+		return ""
+	}
+	var lines []string
+	for _, h := range []int{5, 10, 20} {
+		if pos-h < 0 {
+			continue
+		}
+		oldDate := dates[pos-h]
+		old, ok := readPortfolioSnapshot(ctx, d, oldDate)
+		if !ok || old.TotalAssetFen <= 0 || old.IndexCloseFen <= 0 {
+			continue
+		}
+		portRet := (float64(today.TotalAssetFen)/float64(old.TotalAssetFen) - 1) * 100
+		indexRet := (float64(today.IndexCloseFen)/float64(old.IndexCloseFen) - 1) * 100
+		lines = append(lines, fmt.Sprintf("%d日：组合 %+.2f%% vs 000300 %+.2f%%（超额 %+.2f pct）",
+			h, portRet, indexRet, portRet-indexRet))
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "\n【组合表现 vs 000300】\n  " + strings.Join(lines, "\n  ") + "\n"
+}
+
+// readPortfolioSnapshot 读指定交易日的组合快照；没有或解析失败返回 false。
+func readPortfolioSnapshot(ctx context.Context, d Deps, date string) (model.PortfolioSnapshot, bool) {
+	traces, err := d.Store.TraceRepo().List(ctx, date)
+	if err != nil {
+		observability.S().Warnw("读取组合快照失败", "date", date, "err", err.Error())
+		return model.PortfolioSnapshot{}, false
+	}
+	for _, tr := range traces {
+		if tr.Subject != model.TracePortfolioSnapshot() {
+			continue
+		}
+		var snap model.PortfolioSnapshot
+		if err := json.Unmarshal([]byte(tr.Detail), &snap); err != nil {
+			observability.S().Warnw("组合快照解析失败", "date", date, "err", err.Error())
+			return model.PortfolioSnapshot{}, false
+		}
+		return snap, true
+	}
+	return model.PortfolioSnapshot{}, false
 }
 
 // reportExtraSections 日报追加两段：当前持仓、次日计划（= 待买卖表未执行单）。
@@ -426,6 +522,7 @@ func reportExtraSections(ctx context.Context, d Deps, date string) (string, erro
 	}
 	// 候选归因：只读 run_trace/daily_bar，失败不影响日报本身（诊断缺一段不能把日报掐掉）。
 	b.WriteString("\n【候选归因】\n")
+	b.WriteString("  " + candidateIndustryLine(ctx, d.Store, date) + "\n")
 	for _, h := range []int{5, 10} {
 		line, aerr := attribution.SummaryLine(ctx, d.Store, date, 20, h)
 		if aerr != nil {
@@ -436,6 +533,57 @@ func reportExtraSections(ctx context.Context, d Deps, date string) (string, erro
 		b.WriteString("  " + line + "\n")
 	}
 	return b.String(), nil
+}
+
+// candidateIndustryLine 日报候选段的行业分布：读当日 screen:topn 快照的前 20 只，
+// 各行业只数降序。只读已落库的快照（不做第二次选股），缺快照时明说"无"而不是留空。
+func candidateIndustryLine(ctx context.Context, st *store.Store, date string) string {
+	snaps, err := st.TraceRepo().ListScreenTopN(ctx, date, date)
+	if err != nil {
+		observability.S().Warnw("日报候选行业分布读取失败", "date", date, "err", err.Error())
+		return "候选行业分布：读取失败（见日志）"
+	}
+	snap, ok := snaps[date]
+	if !ok {
+		return "候选行业分布：当日无候选快照"
+	}
+	n := len(snap.Candidates)
+	if n > 20 {
+		n = 20
+	}
+	if n == 0 {
+		return "候选行业分布：当日 0 只"
+	}
+	counts := make(map[string]int, n)
+	for _, c := range snap.Candidates[:n] {
+		ind := strings.TrimSpace(c.Industry)
+		if c.Kind == model.KindETF {
+			ind = "ETF"
+		}
+		if ind == "" {
+			ind = "未知"
+		}
+		counts[ind]++
+	}
+	type kv struct {
+		name string
+		n    int
+	}
+	list := make([]kv, 0, len(counts))
+	for k, v := range counts {
+		list = append(list, kv{k, v})
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].n != list[j].n {
+			return list[i].n > list[j].n
+		}
+		return list[i].name < list[j].name
+	})
+	parts := make([]string, 0, len(list))
+	for _, it := range list {
+		parts = append(parts, fmt.Sprintf("%s%d", it.name, it.n))
+	}
+	return fmt.Sprintf("候选行业分布（前 %d 只）：%s", n, strings.Join(parts, "、"))
 }
 
 // applyRetention 保留清理 + WAL checkpoint（放在日报之后：清理失败不影响当日通知）。

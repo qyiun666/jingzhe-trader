@@ -93,6 +93,87 @@ func TestBatchRejectionWithExistingPositions(t *testing.T) {
 	}
 }
 
+// TestIndustryCapDefaultAllowsTwo 默认档同行业最多 2 只：第 3 只开新仓被行业上限拒绝，
+// 前两只照常通过；已持有同行业 1 只时，只允许再加 1 只。
+func TestIndustryCapDefaultAllowsTwo(t *testing.T) {
+	p := g1Params(100000) // MaxPerIndustry=2
+	if p.MaxPerIndustry != 2 {
+		t.Fatalf("默认档行业上限=%d，期望 2", p.MaxPerIndustry)
+	}
+	m := NewManager(p)
+	intents := []BuyIntent{
+		{TsCode: "a", Industry: "电子", RefPrice: model.FromFloat(10), Confidence: 0.9, WantFen: model.FromFloat(10000)},
+		{TsCode: "b", Industry: "电子", RefPrice: model.FromFloat(10), Confidence: 0.9, WantFen: model.FromFloat(10000)},
+		{TsCode: "c", Industry: "电子", RefPrice: model.FromFloat(10), Confidence: 0.9, WantFen: model.FromFloat(10000)},
+	}
+	got := m.CheckBatch(intents, batchState(100000, 100000, 0, 0))
+	if !got[0].Approved || !got[1].Approved {
+		t.Fatalf("同行业前两只应通过: %+v %+v", got[0], got[1])
+	}
+	if got[2].Approved || got[2].RejectRule != RuleIndustryCap {
+		t.Fatalf("同行业第 3 只应被行业上限拒绝: %+v", got[2])
+	}
+
+	// 已持有 1 只电子：还能开第 2 只，第 3 只拒绝。
+	st := batchState(100000, 90000, 10000, 1, "held")
+	st.HeldIndustry = map[string]string{"held": "电子"}
+	intents = []BuyIntent{
+		{TsCode: "d", Industry: "电子", RefPrice: model.FromFloat(10), Confidence: 0.9, WantFen: model.FromFloat(10000)},
+		{TsCode: "e", Industry: "电子", RefPrice: model.FromFloat(10), Confidence: 0.9, WantFen: model.FromFloat(10000)},
+	}
+	got = m.CheckBatch(intents, st)
+	if !got[0].Approved {
+		t.Fatalf("已有 1 只同行业时第 2 只应通过: %+v", got[0])
+	}
+	if got[1].Approved || got[1].RejectRule != RuleIndustryCap {
+		t.Fatalf("已有 2 只同行业时第 3 只应拒绝: %+v", got[1])
+	}
+}
+
+// TestIndustryCapWeakAndUnknown 弱势档同行业最多 1 只；行业未知降级放行并留 Note；
+// ETF 不占个股行业名额。
+func TestIndustryCapWeakAndUnknown(t *testing.T) {
+	weak := WeakParams(g1Params(100000), 0.20, 0.10)
+	if weak.MaxPerIndustry != 1 {
+		t.Fatalf("弱势档行业上限=%d，期望 1", weak.MaxPerIndustry)
+	}
+	m := NewManager(weak)
+	intents := []BuyIntent{
+		{TsCode: "a", Industry: "电子", RefPrice: model.FromFloat(10), Confidence: 0.9, WantFen: model.FromFloat(5000)},
+		{TsCode: "b", Industry: "电子", RefPrice: model.FromFloat(10), Confidence: 0.9, WantFen: model.FromFloat(5000)},
+	}
+	got := m.CheckBatch(intents, batchState(100000, 100000, 0, 0))
+	if !got[0].Approved {
+		t.Fatalf("弱势档同行业第 1 只应通过: %+v", got[0])
+	}
+	if got[1].Approved || got[1].RejectRule != RuleIndustryCap {
+		t.Fatalf("弱势档同行业第 2 只应拒绝: %+v", got[1])
+	}
+
+	// 行业未知：两只都放行，且各自带 Note（不静默阻断）。
+	m = NewManager(g1Params(100000))
+	got = m.CheckBatch([]BuyIntent{
+		{TsCode: "x", RefPrice: model.FromFloat(10), Confidence: 0.9, WantFen: model.FromFloat(10000)},
+		{TsCode: "y", RefPrice: model.FromFloat(10), Confidence: 0.9, WantFen: model.FromFloat(10000)},
+	}, batchState(100000, 100000, 0, 0))
+	if !got[0].Approved || !got[1].Approved {
+		t.Fatalf("行业未知应降级放行: %+v %+v", got[0], got[1])
+	}
+	if !strings.Contains(got[0].Note, "行业未知") {
+		t.Errorf("行业未知应留 Note，实际 %+v", got[0])
+	}
+
+	// ETF 不占行业名额：同一行业已满 2 只时，ETF 候选仍可通过。
+	st := batchState(100000, 80000, 20000, 2, "h1", "h2")
+	st.HeldIndustry = map[string]string{"h1": "电子", "h2": "电子"}
+	got = NewManager(g1Params(100000)).CheckBatch([]BuyIntent{
+		{TsCode: "588000.SH", Industry: "电子", IsETF: true, RefPrice: model.FromFloat(1), Confidence: 0.9, WantFen: model.FromFloat(5000)},
+	}, st)
+	if !got[0].Approved {
+		t.Fatalf("ETF 不应受个股行业上限约束: %+v", got[0])
+	}
+}
+
 // TestCheckBatchAllRules 每条否决规则逐一验证（100% 留痕的字段取值契约）。
 func TestCheckBatchAllRules(t *testing.T) {
 	p := g1Params(100000)

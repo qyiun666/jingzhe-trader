@@ -46,6 +46,27 @@ func RankOutPolicyOf(cfg ConfigReader) signal.RankOutPolicy {
 	return signal.RankOutPolicy{MinHoldDays: n}
 }
 
+// WeakExitPolicyOf 弱势期减仓口径（signal.weak_exit_*）。
+//
+// 与 MarketGateOf 同一条兜底纪律：键缺失/坏值回落到 KeySpec 默认档，装配期
+// validateEnums 已把非法配置拦在启动之外；这里只服务"旧库没有新键"的场景。
+// 组合根与 CLI 手工试跑共用这一份，手工复现不会与到点自动跑出两个口径。
+func WeakExitPolicyOf(cfg ConfigReader) signal.WeakExitPolicy {
+	enabled, err := strconv.ParseBool(strings.TrimSpace(cfg.GetString("signal.weak_exit_enabled")))
+	if err != nil {
+		enabled = true
+	}
+	drop, err := strconv.ParseFloat(strings.TrimSpace(cfg.GetString("signal.weak_exit_drop_pct")), 64)
+	if err != nil || drop <= 0 || drop > 0.2 {
+		drop = 0.03
+	}
+	reduce, err := strconv.ParseFloat(strings.TrimSpace(cfg.GetString("signal.weak_exit_reduce_pct")), 64)
+	if err != nil || reduce <= 0 || reduce >= 1 {
+		reduce = 0.5
+	}
+	return signal.WeakExitPolicy{Enabled: enabled, DropPct: drop, ReducePct: reduce}
+}
+
 // eveningPipeline 收盘后整链大方法：一条顺序流水线，任一步失败即整链失败（落 run_trace outcome=fail）。
 //
 // ① 行情同步 → ② 新鲜度门禁 → ③ 选股漏斗 → ④ 买卖决策 → ⑤ 写待买卖表。
@@ -446,19 +467,62 @@ func (d Deps) raiseWeakTrace(ctx context.Context, date, detail string) {
 	}
 }
 
+// shouldSkipBuyReview 满仓短路判定：没有新仓名额且候选全部已持有 → 不值得花
+// LLM 评审费。任一候选未持有（可能是加仓，也可能是换仓对象）都必须照常评审，
+// 不能因为"持仓数满了"就把决策权跳过去——那会把加仓/换仓也一起静默取消。
+func shouldSkipBuyReview(cands []model.Candidate, positions []model.Position, maxPositions int) bool {
+	if len(cands) == 0 || maxPositions <= 0 {
+		return false
+	}
+	held := make(map[string]bool, len(positions))
+	count := 0
+	for _, p := range positions {
+		if p.TotalQty <= 0 {
+			continue
+		}
+		held[p.TsCode] = true
+		count++
+	}
+	if count < maxPositions {
+		return false
+	}
+	for _, c := range cands {
+		if !held[c.TsCode] {
+			return false
+		}
+	}
+	return true
+}
+
 // buildTickets 由候选与持仓生成买卖决策并写入待买卖表（drafted，等 17:00 发邮件）。
 //
 // 买入决策权在 LLM 评审员手里，因此 llm.enabled=false 不是"少一道终审"，而是"当日不可能有买单"——
 // 这一点必须显式告警，否则人会以为流水线跑通了却什么都没买到。
 func buildTickets(ctx context.Context, rc *observability.RunCtx, d Deps, date string,
 	cands, watch []model.Candidate, rp risk.RiskParams) error {
-	if !d.Decider.Enabled() {
+	positions, err := d.Store.TradeRepo().ListPositions(ctx)
+	if err != nil {
+		return fmt.Errorf("读取持仓用于满仓短路判定失败: %w", err)
+	}
+	skipBuy := shouldSkipBuyReview(cands, positions, rp.MaxPositions)
+	if !skipBuy && !d.Decider.Enabled() {
 		d.raiseU(rc, "LLM_DISABLED", "买入决策未启用，当日不会有任何买单",
 			"llm.enabled=false 或 api_key/model 缺失；风控参数不会替代决策者")
 	}
-	rep, err := d.Signal.Generate(ctx, date, cands, watch, rp, d.Decider)
+	var rep *signal.Report
+	if skipBuy {
+		note := fmt.Sprintf("LLM_SKIPPED_NO_SLOT 持仓数已达上限 %d 且候选均已持有，跳过 LLM 买入评审，本轮只执行卖出规则",
+			rp.MaxPositions)
+		rep, err = d.Signal.GenerateWithoutBuy(ctx, date, cands, watch, rp, note)
+	} else {
+		rep, err = d.Signal.Generate(ctx, date, cands, watch, rp, d.Decider)
+	}
 	if err != nil {
 		return err
+	}
+	if rep.BuyReviewSkipped {
+		rc.Degrade("LLM_SKIPPED_NO_SLOT", fmt.Sprintf(
+			"持仓已满（%d 只）且候选均已持有，跳过 LLM 买入评审，只跑卖出规则", rp.MaxPositions))
 	}
 	// 空 band 是"无榜"不是"跌出"：本轮规则 4 不判定，关闸日由规则 5 兜底。
 	// 单独落一条降级，避免"当天没卖"与"规则没跑"在 run_trace 里看起来一样。
@@ -486,8 +550,9 @@ func buildTickets(ctx context.Context, rc *observability.RunCtx, d Deps, date st
 		rc.Degrade("ALL_REJECTED", fmt.Sprintf("否决 %d 条", rep.Rejected))
 	}
 	// 有候选却 0 指令：候选非空说明漏斗正常，是"评审全否/风控全拒"这类要交代的结论。
+	// 满仓短路时"没评审"是已知结论，不能再走这条降级去暗示评审过程跑过。
 	// 单列一条降级让日报/计划邮件能引用（不重复：ALL_REJECTED 已覆盖"有决策被全拒"）。
-	if len(cands) > 0 && rep.Tickets == 0 && rep.Rejected == 0 {
+	if len(cands) > 0 && rep.Tickets == 0 && rep.Rejected == 0 && !rep.BuyReviewSkipped {
 		rc.Degrade("NO_TICKET_FROM_CANDIDATES",
 			fmt.Sprintf("有 %d 只候选但当日 0 指令（模型否决 %d、未问出 %d）",
 				len(cands), rep.Declined, rep.Failed))

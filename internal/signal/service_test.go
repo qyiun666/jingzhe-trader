@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"jingzhe-trader/internal/market"
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/risk"
 	"jingzhe-trader/internal/store"
@@ -142,6 +143,83 @@ func TestSellDecisionsNonEmptyBandStillRankOut(t *testing.T) {
 	}
 }
 
+// setPositionQty 改写测试持仓数量（弱势减仓的整手取整需要 ≥200 股才减得出一手）。
+func setPositionQty(t *testing.T, st *store.Store, qty model.Qty) {
+	t.Helper()
+	if err := st.TradeRepo().UpsertPosition(context.Background(), model.Position{
+		TsCode: "600000.SH", TotalQty: qty,
+		CostPrice: 1000, HighPrice: 1000, FirstOpenDate: "20260901",
+	}); err != nil {
+		t.Fatalf("改写持仓失败: %v", err)
+	}
+}
+
+// runSellDecisionsWithWeakExit 以指定弱势减仓策略跑一次 sellDecisions。
+func runSellDecisionsWithWeakExit(t *testing.T, st *store.Store, gate store.MarketGate,
+	policy WeakExitPolicy, idx indexInfo) ([]model.Signal, *Report) {
+	t.Helper()
+	s := NewService(st, &ticket.Ledger{}, gate, nil, RankOutPolicy{MinHoldDays: 10}).
+		WithWeakExit(policy)
+	positions, err := st.TradeRepo().ListPositions(context.Background())
+	if err != nil {
+		t.Fatalf("读持仓失败: %v", err)
+	}
+	rep := &Report{}
+	sells, err := s.sellDecisions(context.Background(), "20261021", nil, nil, positions,
+		risk.DefaultParams(model.FromFloat(100000)), idx, rep)
+	if err != nil {
+		t.Fatalf("sellDecisions 失败: %v", err)
+	}
+	return sells, rep
+}
+
+// TestSellDecisionsWeakExitGateOff 弱势减仓只在 gate=false 生效：200 股减 100、
+// 100 股不足一手不卖、5 日跌幅不足不卖。
+func TestSellDecisionsWeakExitGateOff(t *testing.T) {
+	policy := WeakExitPolicy{Enabled: true, DropPct: 0.03, ReducePct: 0.5}
+	idx := indexInfo{close: model.FromFloat(3000), ma60: model.FromFloat(3100), ret5: -0.05}
+
+	st := sellFixture(t)
+	setPositionQty(t, st, 200)
+	sells, _ := runSellDecisionsWithWeakExit(t, st, store.MarketGate{Enabled: false, Window: 60}, policy, idx)
+	if len(sells) != 1 || sells[0].Rule != RuleWeakExit || sells[0].Qty != 100 {
+		t.Fatalf("200 股 gate=false + 5 日 -5%% 应减 100 股，实际 %+v", sells)
+	}
+
+	st = sellFixture(t)
+	setPositionQty(t, st, 100)
+	sells, rep := runSellDecisionsWithWeakExit(t, st, store.MarketGate{Enabled: false, Window: 60}, policy, idx)
+	if len(sells) != 0 {
+		t.Fatalf("100 股不足一手不应触发弱势减仓，实际 %+v", sells)
+	}
+	if !strings.Contains(strings.Join(rep.Notes, "\n"), "WEAK_EXIT_SKIP") {
+		t.Errorf("条件满足但减不出一手时必须留 WEAK_EXIT_SKIP，notes=%v", rep.Notes)
+	}
+
+	st = sellFixture(t)
+	setPositionQty(t, st, 200)
+	idx2 := idx
+	idx2.ret5 = -0.02
+	sells, _ = runSellDecisionsWithWeakExit(t, st, store.MarketGate{Enabled: false, Window: 60}, policy, idx2)
+	if len(sells) != 0 {
+		t.Fatalf("5 日 -2%% 未达阈值不应触发，实际 %+v", sells)
+	}
+}
+
+// TestSellDecisionsWeakExitGateOnKeepsRule5 gate=true 时弱势减仓不参与：
+// 同样指数在均线下方 + 5 日 -5%，仍走原规则 5（大盘恶化）。
+func TestSellDecisionsWeakExitGateOnKeepsRule5(t *testing.T) {
+	st := sellFixture(t)
+	setPositionQty(t, st, 200)
+	policy := WeakExitPolicy{Enabled: true, DropPct: 0.03, ReducePct: 0.5}
+	idx := indexInfo{close: model.FromFloat(3000), ma60: model.FromFloat(3100), ret5: -0.05}
+	sells, _ := runSellDecisionsWithWeakExit(t, st, store.MarketGate{Enabled: true, Window: 60}, policy, idx)
+
+	if len(sells) != 1 || sells[0].Rule != RuleMarketBad || sells[0].Qty != 0 {
+		t.Fatalf("gate=true 应仍走规则 5 且全出，实际 %+v", sells)
+	}
+}
+
 // TestSeriesCodes 候选与保留带的代码并集：去重、去空，顺序保持先候选后保留带。
 func TestSeriesCodes(t *testing.T) {
 	cands := []model.Candidate{{TsCode: "A"}, {TsCode: "B"}, {TsCode: ""}}
@@ -202,5 +280,83 @@ func TestBudgetOfCarriesTradeCost(t *testing.T) {
 	}
 	if b.MinAmountFen <= b.SlotFen/2 {
 		t.Errorf("弱势档单笔下限 %s 应高于单票上限的一半 %s", b.MinAmountFen, b.SlotFen/2)
+	}
+}
+
+// TestGenerateWeakExitWritesReducedTicket 弱势减仓落单数量：200 股在 gate=false
+// + 指数 5 日 -5% 时只卖 100 股（不是清仓），指令单数量与信号一致。
+func TestGenerateWeakExitWritesReducedTicket(t *testing.T) {
+	st := sellFixture(t)
+	ctx := context.Background()
+	if err := st.TradeRepo().UpsertPosition(ctx, model.Position{
+		TsCode: "600000.SH", TotalQty: 200,
+		CostPrice: 1000, HighPrice: 1000, FirstOpenDate: "20260901",
+	}); err != nil {
+		t.Fatalf("写 200 股持仓失败: %v", err)
+	}
+	for i, d := range []string{"20261009", "20261012", "20261013", "20261014", "20261015", "20261016"} {
+		if err := st.MarketRepo().UpsertBar(ctx, model.Bar{
+			TsCode: store.MarketIndex, TradeDate: d,
+			Close: model.Fen(10000 - i*100),
+		}); err != nil {
+			t.Fatalf("写指数日线失败: %v", err)
+		}
+	}
+	// 指令单有效期需要判定日之后的交易日。
+	for _, d := range []string{"20261022", "20261023"} {
+		if err := st.MarketRepo().UpsertCal(ctx, store.CalRow{CalDate: d, IsOpen: true}); err != nil {
+			t.Fatalf("补交易日历失败: %v", err)
+		}
+	}
+	led := ticket.NewLedger(st, market.CostParams{}, model.FromFloat(100000))
+	s := NewService(st, led, store.MarketGate{Enabled: false, Window: 3}, nil, RankOutPolicy{}).
+		WithWeakExit(WeakExitPolicy{Enabled: true, DropPct: 0.03, ReducePct: 0.5})
+
+	rep, err := s.Generate(ctx, "20261021", nil, nil, risk.DefaultParams(model.FromFloat(100000)), NoDecider{})
+	if err != nil {
+		t.Fatalf("Generate 失败: %v", err)
+	}
+	if rep.SellSignals != 1 || rep.Tickets != 1 {
+		t.Fatalf("应产生 1 张弱势减仓卖单，实际 sell=%d tickets=%d notes=%v",
+			rep.SellSignals, rep.Tickets, rep.Notes)
+	}
+	tks, err := st.TradeRepo().ListTickets(ctx, "20261021", "")
+	if err != nil || len(tks) != 1 {
+		t.Fatalf("读取指令单失败或数量不对: %v %+v", err, tks)
+	}
+	if tks[0].Direction != model.DirSell || tks[0].Qty != 100 {
+		t.Fatalf("弱势减仓应只卖 100 股，实际 %+v", tks[0])
+	}
+	if !strings.Contains(tks[0].Reason, "弱势减仓") {
+		t.Errorf("指令单理由应写明弱势减仓: %q", tks[0].Reason)
+	}
+}
+
+// TestGenerateWithoutBuySkipsReview 满仓短路：GenerateWithoutBuy 不产生买单，
+// 只保留卖出链路，并把 LLM_SKIPPED_NO_SLOT 说明写进 Report。
+func TestGenerateWithoutBuySkipsReview(t *testing.T) {
+	st := sellFixture(t)
+	led := ticket.NewLedger(st, market.CostParams{}, model.FromFloat(100000))
+	s := NewService(st, led, store.MarketGate{Enabled: false}, nil, RankOutPolicy{MinHoldDays: 10})
+	cands := []model.Candidate{{TsCode: "600000.SH", Close: 1000}}
+
+	rep, err := s.GenerateWithoutBuy(context.Background(), "20261021", cands, cands,
+		risk.DefaultParams(model.FromFloat(100000)),
+		"LLM_SKIPPED_NO_SLOT 测试：满仓且候选均已持有")
+	if err != nil {
+		t.Fatalf("GenerateWithoutBuy 失败: %v", err)
+	}
+	if !rep.BuyReviewSkipped {
+		t.Error("满仓短路必须置 BuyReviewSkipped=true")
+	}
+	if rep.Approved != 0 || rep.Tickets != 0 {
+		t.Errorf("短路不得产生买单，实际 approved=%d tickets=%d", rep.Approved, rep.Tickets)
+	}
+	notes := strings.Join(rep.Notes, "\n")
+	if !strings.Contains(notes, "LLM_SKIPPED_NO_SLOT") {
+		t.Errorf("缺少短路说明，notes=%v", rep.Notes)
+	}
+	if !strings.Contains(notes, "行业未知") {
+		t.Errorf("持仓行业缺失应降级留痕，notes=%v", rep.Notes)
 	}
 }

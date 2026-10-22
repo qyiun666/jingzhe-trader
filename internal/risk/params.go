@@ -28,7 +28,10 @@ type RiskParams struct {
 	MinSingleAmountFen  model.Fen // 单笔金额下限（分，见 MinAmountFloor 的小资金收口）
 	MinAmountRatio      float64   // 单笔下限占单票上限的比例（默认 0.5；弱势试探提高到 0.75）
 	MinConfidence       float64   // 决策置信度下限（模型自报值）
-	TotalAsset          model.Fen // 总资产（分；用于持仓数自适应与金额核算）
+	// MaxPerIndustry 组合同行业持仓只数上限（0=关闭）。默认档 2，弱势档 1；
+	// 只约束"开新仓"，已持有标的加仓不占新名额。行业未知时降级放行。
+	MaxPerIndustry int
+	TotalAsset     model.Fen // 总资产（分；用于持仓数自适应与金额核算）
 }
 
 // SingleCapFen 单票实际可下单的上限（分）：单票上限与单笔金额上限取严。
@@ -75,6 +78,7 @@ const (
 	baseMaxSingleAmountPct  = 1.0  // 单笔金额上限（占总资产）
 	baseMinConfidence       = 0.55 // 决策置信度下限
 	baseMinAmountRatio      = 0.5  // 单笔下限 = 单票上限 × 该比例（与绝对下限取小）
+	baseMaxPerIndustry      = 2    // 组合同行业持仓上限（默认档）
 )
 
 // 默认单笔金额下限：5000 元（保费率 ≤0.1%；小资金账户由 MinAmountFloor 自动缩放）。
@@ -122,7 +126,27 @@ func WeakParams(p RiskParams, maxTotalPct, maxSinglePct float64) RiskParams {
 	// 仓位上限收缩后，单笔下限按新单票上限重新取比例：不提高比例的话，
 	// 试探档会允许 600 元级交易，双边成本占比接近 2%。
 	p.MinAmountRatio = WeakMinAmountRatio
+	// 弱势档同行业最多 1 只：行业相关性在下跌市里被放大，2 只同行业等于一只
+	// 双倍仓位。0=关闭时保持关闭（不替用户推翻显式配置）。
+	if p.MaxPerIndustry > 0 && p.MaxPerIndustry > 1 {
+		p.MaxPerIndustry = 1
+	}
 	return p
+}
+
+// BuyIndustryCap 由候选侧每行业上限推导买入侧组合上限：min(默认档 2, 配置值)。
+//
+// 两层的默认值不同是刻意的：候选池需要行业分散到 3 只才不至于把强势行业一刀切，
+// 而账户只有 2 个持仓名额，同行业持有 2 只已经是集中度上限。配置把候选侧收紧到
+// 0/1 时，买入侧跟随收紧（0=关闭）；配得比 2 宽也只放宽到 2。
+func BuyIndustryCap(candidateCap int) int {
+	if candidateCap <= 0 {
+		return 0
+	}
+	if candidateCap > baseMaxPerIndustry {
+		return baseMaxPerIndustry
+	}
+	return candidateCap
 }
 
 // DefaultParams 给定总资产，输出生效风控参数：固定基准 → 持仓数自适应 → 物理熔断收口。
@@ -142,6 +166,7 @@ func DefaultParams(totalAsset model.Fen) RiskParams {
 		MinConfidence:       baseMinConfidence,
 		MinSingleAmountFen:  DefaultMinSingleAmountFen,
 		MinAmountRatio:      baseMinAmountRatio,
+		MaxPerIndustry:      baseMaxPerIndustry,
 		TotalAsset:          totalAsset,
 	}
 

@@ -26,8 +26,22 @@ func TestDefaultParamsBaseline(t *testing.T) {
 	if p.MaxPositions != 2 {
 		t.Errorf("MaxPositions=%d, 期望 2", p.MaxPositions)
 	}
+	if p.MaxPerIndustry != 2 {
+		t.Errorf("MaxPerIndustry=%d, 期望 2", p.MaxPerIndustry)
+	}
 	if !p.AllowNewPosition {
 		t.Errorf("AllowNewPosition=%v, 期望 true", p.AllowNewPosition)
+	}
+}
+
+// TestBuyIndustryCap 买入侧行业上限由候选侧配置推导：0=关闭，1 跟随收紧，
+// 2 及以上封顶 2（账户只有 2 个持仓名额，同行业 3 只没有意义）。
+func TestBuyIndustryCap(t *testing.T) {
+	cases := map[int]int{0: 0, 1: 1, 2: 2, 3: 2, 10: 2}
+	for in, want := range cases {
+		if got := BuyIndustryCap(in); got != want {
+			t.Errorf("BuyIndustryCap(%d)=%d，期望 %d", in, got, want)
+		}
 	}
 }
 
@@ -138,6 +152,15 @@ func TestWeakParamsShrinksOnly(t *testing.T) {
 		t.Errorf("WeakParams 不应改动仓位以外的风控字段")
 	}
 	assertEqF(t, "弱势", "MinAmountRatio", p.MinAmountRatio, WeakMinAmountRatio)
+	if p.MaxPerIndustry != 1 {
+		t.Errorf("弱势档同行业上限=%d，期望 1", p.MaxPerIndustry)
+	}
+	// 显式关闭行业上限（0）时弱势档不擅自打开。
+	off := base
+	off.MaxPerIndustry = 0
+	if got := WeakParams(off, 0.20, 0.10).MaxPerIndustry; got != 0 {
+		t.Errorf("行业上限显式关闭时弱势档仍应为 0，实际 %d", got)
+	}
 }
 
 // TestWeakParamsRaisesMinAmountFloor 弱势档的最小交易额必须高于旧口径（单票上限的一半）：

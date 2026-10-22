@@ -52,6 +52,39 @@ func TestLatestMarketIndexWindowParameter(t *testing.T) {
 	}
 }
 
+// TestIndexReturnPct 指数 5 日涨跌幅：按交易日取最近 6 根收盘，负数=下跌；
+// 不足 6 根时 ok=false（不是错误），不能拿残缺序列当跌幅。
+func TestIndexReturnPct(t *testing.T) {
+	s := openStoreForTest(t)
+	defer s.Close()
+	ctx := context.Background()
+
+	days := []string{"20261009", "20261012", "20261013", "20261014", "20261015", "20261016"}
+	closes := []model.Fen{10000, 9900, 9800, 9700, 9600, 9500} // 5 日 -5%
+	for i, d := range days {
+		if err := s.MarketRepo().UpsertBar(ctx, model.Bar{
+			TsCode: MarketIndex, TradeDate: d, Close: closes[i]}); err != nil {
+			t.Fatalf("插入指数日线失败: %v", err)
+		}
+	}
+	ret, ok, err := s.ScreenRepo().IndexReturnPct(ctx, "20261016", 5)
+	if err != nil || !ok {
+		t.Fatalf("读取失败: ok=%v err=%v", ok, err)
+	}
+	if diff := ret - (-0.05); diff > 1e-9 || diff < -1e-9 {
+		t.Errorf("5 日涨跌幅=%.6f，期望 -0.05", ret)
+	}
+	// 窗口截断：只用 <= 截止日的日线。
+	ret, ok, err = s.ScreenRepo().IndexReturnPct(ctx, "20261014", 5)
+	if err != nil || ok {
+		t.Errorf("20261014 之前只有 4 根（20261009/12/13/14），应 ok=false，实际 ok=%v err=%v", ok, err)
+	}
+	// days<=0 不是"全历史"，而是不判定。
+	if _, ok, err := s.ScreenRepo().IndexReturnPct(ctx, "20261016", 0); err != nil || ok {
+		t.Errorf("days=0 应返回 ok=false，实际 ok=%v err=%v", ok, err)
+	}
+}
+
 // TestNextTradeDates 归因前瞻窗口按交易日取，不受周末/节假日影响；
 // 日历走完时返回已有的那些，调用方据此判"待到期"。
 func TestNextTradeDates(t *testing.T) {

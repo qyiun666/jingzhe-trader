@@ -63,6 +63,59 @@ func TestValidateEnumsWeakCaps(t *testing.T) {
 	}
 }
 
+// TestValidateEnumsBatch2 第 2 批新增键：行业上限 0..10；弱势减仓的跌幅阈值
+// 必须为正、减仓比例必须严格小于 1（只减不清）。只校验显式配置过的键，
+// 局部构造 Config 缺键时沿用 KeySpec 默认档。
+func TestValidateEnumsBatch2(t *testing.T) {
+	base := func(key, value string) *config.Config {
+		vals := map[string]config.ConfigValue{
+			"llm.search_context_size":        {Key: "llm.search_context_size", Value: "high"},
+			"screen.factor_mode":             {Key: "screen.factor_mode", Value: "reversal"},
+			"screen.gate_ma_window":          {Key: "screen.gate_ma_window", Value: "60"},
+			"screen.gate_off_max_total_pct":  {Key: "screen.gate_off_max_total_pct", Value: "0.20"},
+			"screen.gate_off_max_single_pct": {Key: "screen.gate_off_max_single_pct", Value: "0.10"},
+		}
+		vals[key] = config.ConfigValue{Key: key, Value: value}
+		return &config.Config{Values: vals}
+	}
+
+	for _, v := range []string{"0", "3", "10"} {
+		if err := validateEnums(base("screen.max_per_industry", v)); err != nil {
+			t.Errorf("max_per_industry=%q 应放行，实际 %v", v, err)
+		}
+	}
+	for _, v := range []string{"-1", "11", "abc"} {
+		if err := validateEnums(base("screen.max_per_industry", v)); err == nil {
+			t.Errorf("max_per_industry=%q 非法却放行", v)
+		}
+	}
+	for _, v := range []string{"true", "false"} {
+		if err := validateEnums(base("signal.weak_exit_enabled", v)); err != nil {
+			t.Errorf("weak_exit_enabled=%q 应放行，实际 %v", v, err)
+		}
+	}
+	for _, v := range []string{"0.03", "0.2"} {
+		if err := validateEnums(base("signal.weak_exit_drop_pct", v)); err != nil {
+			t.Errorf("weak_exit_drop_pct=%q 应放行，实际 %v", v, err)
+		}
+	}
+	for _, v := range []string{"0", "-0.01", "0.21", "abc"} {
+		if err := validateEnums(base("signal.weak_exit_drop_pct", v)); err == nil {
+			t.Errorf("weak_exit_drop_pct=%q 非法却放行", v)
+		}
+	}
+	for _, v := range []string{"0.1", "0.5", "0.99"} {
+		if err := validateEnums(base("signal.weak_exit_reduce_pct", v)); err != nil {
+			t.Errorf("weak_exit_reduce_pct=%q 应放行，实际 %v", v, err)
+		}
+	}
+	for _, v := range []string{"0", "1", "1.1", "abc"} {
+		if err := validateEnums(base("signal.weak_exit_reduce_pct", v)); err == nil {
+			t.Errorf("weak_exit_reduce_pct=%q 非法却放行（只减不清）", v)
+		}
+	}
+}
+
 // TestValidateEnumsTrailingArm 移动止盈激活线：0（旧口径）到 0.5 放行，
 // 越界或不可解析拒绝启动。激活线配错会让 5% 回撤线重新变成实际止损，
 // 与 8% 止损口径冲突，必须在启动时拦下。
