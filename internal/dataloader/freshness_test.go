@@ -397,3 +397,40 @@ func TestFreshness_WindowComplete(t *testing.T) {
 		t.Errorf("窗口齐全时 WindowOK 应通过: %s", item.Detail)
 	}
 }
+
+// TestFreshness_CoverageIncludesHoldings 持仓不在候选池（退市/手工同步/非 L 状态）时
+// 也必须纳入覆盖检查；缺线是阻断项，不能被候选池的 50 只容差放过。
+func TestFreshness_CoverageIncludesHoldings(t *testing.T) {
+	st := openTestStore(t)
+	rc := st.MarketRepo()
+	ctx := context.Background()
+	tradeDate := "20260901"
+	_ = rc.UpsertCal(ctx, store.CalRow{CalDate: tradeDate, IsOpen: true})
+	if err := st.TradeRepo().UpsertPosition(ctx, model.Position{
+		TsCode: "600999.SH", TotalQty: 100, CostPrice: model.FromFloat(10), FirstOpenDate: "20260801",
+	}); err != nil {
+		t.Fatalf("落持仓失败: %v", err)
+	}
+
+	gate := NewFreshnessGate(st, testMinBarRows, 0)
+	rep, err := gate.Check(ctx, tradeDate)
+	if err != nil {
+		t.Fatalf("Check 失败: %v", err)
+	}
+	c, ok := findItem(rep, "MissingCodes")
+	if !ok || c.OK || c.Code != CodeCoverageGap || !c.Blocking {
+		t.Fatalf("持仓缺线应阻断, 实际 ok=%v OK=%v Code=%q Blocking=%v Detail=%s",
+			ok, c.OK, c.Code, c.Blocking, c.Detail)
+	}
+
+	// 补上持仓当日日线后，持仓覆盖应放行（候选池仍为空）
+	_ = rc.UpsertBar(ctx, mkBar("600999.SH", tradeDate))
+	rep2, err := gate.Check(ctx, tradeDate)
+	if err != nil {
+		t.Fatalf("补线后 Check 失败: %v", err)
+	}
+	c2, _ := findItem(rep2, "MissingCodes")
+	if !c2.OK {
+		t.Fatalf("补线后持仓覆盖应通过, 实际 Code=%q Detail=%s", c2.Code, c2.Detail)
+	}
+}

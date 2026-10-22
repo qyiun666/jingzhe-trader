@@ -93,7 +93,7 @@ func BuildRuntime(ctx context.Context, st *store.Store, cfg *config.Config) (*Ru
 		Dataloader: dataloader.New(st, tcli),
 		Freshness:  dataloader.NewFreshnessGate(st, cfg.GetInt("screen.min_bar_rows"), screener.BarWindow()),
 		Screener:   screener.New(st, FilterConfigOf(cfg), cfg.GetString("screen.factor_mode")),
-		Signal:     signal.NewService(st, ledger, scheduler.MarketGateOf(cfg), scheduler.ETFUniverseOf(cfg),
+		Signal: signal.NewService(st, ledger, scheduler.MarketGateOf(cfg), scheduler.ETFUniverseOf(cfg),
 			scheduler.RankOutPolicyOf(cfg)),
 		Decider:    decider,
 		Ledger:     ledger,
@@ -234,6 +234,14 @@ func validateEnums(cfg *config.Config) error {
 		return fmt.Errorf("screen.gate_off_max_single_pct=%g 大于总仓上限 %g（单票不可能超过总仓）",
 			single, total)
 	}
+	// 移动止盈激活线：0 合法（回到旧口径），越界拒绝启动。用原始串解析而不是
+	// GetFloat，避免手工构造的局部 Config 缺键时被当成 0 静默放行。
+	if raw := strings.TrimSpace(cfg.GetString("risk.trailing_arm_pct")); raw != "" {
+		arm, err := strconv.ParseFloat(raw, 64)
+		if err != nil || arm < 0 || arm > 0.5 {
+			return fmt.Errorf("risk.trailing_arm_pct=%q 非法（合法 0..0.5，0=旧口径）", raw)
+		}
+	}
 	// 排名淘汰的持有期/缓冲：0 合法（单独关掉一项保护回到旧口径），负值非法——
 	// 负持有期会把"淘汰前至少等 N 天"翻转成"淘汰可以倒着数"，语义不存在。
 	if v := cfg.GetInt("signal.rank_out_min_hold_days"); v < 0 {
@@ -288,6 +296,15 @@ func RiskParamsOf(r *Runtime) func(ctx context.Context, date string) (risk.RiskP
 		p := risk.DefaultParams(ast.TotalAsset)
 		if tp := r.Config.GetFloat("risk.take_profit_pct"); tp > 0 {
 			p.TakeProfitPct = tp
+		}
+		// 键缺失时保留 DefaultParams 的默认值；显式写 0 才回滚旧口径。
+		// 与 validateEnums 同一判据：原始串解析失败/越界一律报错，不静默用 0。
+		if raw := strings.TrimSpace(r.Config.GetString("risk.trailing_arm_pct")); raw != "" {
+			arm, err := strconv.ParseFloat(raw, 64)
+			if err != nil || arm < 0 || arm > 0.5 {
+				return risk.RiskParams{}, fmt.Errorf("risk.trailing_arm_pct=%q 非法（合法 0..0.5，0=旧口径）", raw)
+			}
+			p.TrailingArmPct = arm
 		}
 		return p, nil
 	}

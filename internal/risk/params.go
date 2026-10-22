@@ -21,6 +21,7 @@ type RiskParams struct {
 	MaxPositions        int       // 最大持仓数（自适应）
 	StopLossPct         float64   // 止损
 	TrailingStopPct     float64   // 移动止盈回撤
+	TrailingArmPct      float64   // 移动止盈激活线：高点≥成本×(1+arm) 才启用；0=旧口径
 	TakeProfitPct       float64   // 止盈
 	AllowNewPosition    bool      // 是否允许开新仓
 	MaxSingleAmountPct  float64   // 单笔金额上限（占总资产）
@@ -63,6 +64,7 @@ const (
 	baseMaxPositionPct      = 0.40 // 单票上限
 	baseStopLossPct         = 0.08 // 止损
 	baseTrailingStopPct     = 0.05 // 移动止盈回撤
+	baseTrailingArmPct      = 0.06 // 移动止盈激活线（高点至少 +6% 才启用）
 	baseTakeProfitPct       = 0.15 // 止盈
 	baseMaxSingleAmountPct  = 1.0  // 单笔金额上限（占总资产）
 	baseMinConfidence       = 0.55 // 决策置信度下限
@@ -119,6 +121,7 @@ func DefaultParams(totalAsset model.Fen) RiskParams {
 		MaxPositionPct:      baseMaxPositionPct,
 		StopLossPct:         baseStopLossPct,
 		TrailingStopPct:     baseTrailingStopPct,
+		TrailingArmPct:      baseTrailingArmPct,
 		TakeProfitPct:       baseTakeProfitPct,
 		AllowNewPosition:    true,
 		MaxSingleAmountPct:  baseMaxSingleAmountPct,

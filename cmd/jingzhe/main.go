@@ -5,7 +5,7 @@
 //
 // 用法:
 //
-//	jingzhe [-db data/jingzhe.db]                   启动常驻服务（默认子命令 serve）
+//	jingzhe [-db /home/qodercli/work/jingzhe-db/jingzhe.db]   启动常驻服务（默认子命令 serve）
 //	jingzhe serve [-db ...] [-addr :8080]           启动常驻服务：调度器 + MCP 接口
 //	jingzhe jobs  [-db ...] [-date 20260901]        演练当日时间线（dry-run，不真正执行）
 //	jingzhe config <dump|get KEY|set KEY VALUE>     查看/修改 config_kv（凭据默认掩码）
@@ -40,7 +40,7 @@ import (
 )
 
 func main() {
-	dbPath := flag.String("db", "data/jingzhe.db", "SQLite 数据库路径")
+	dbPath := flag.String("db", "/home/qodercli/work/jingzhe-db/jingzhe.db", "SQLite 数据库路径")
 	flag.Parse()
 
 	args := flag.Args()
@@ -91,7 +91,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "用法: jingzhe [-db data/jingzhe.db] [子命令]")
+	fmt.Fprintln(os.Stderr, "用法: jingzhe [-db /home/qodercli/work/jingzhe-db/jingzhe.db] [子命令]")
 	fmt.Fprintln(os.Stderr, "子命令:")
 	fmt.Fprintln(os.Stderr, "  serve  [-addr :8080]                       常驻服务：调度器 + MCP 接口（默认）")
 	fmt.Fprintln(os.Stderr, "  jobs   [-date 20260901]                    演练当日时间线（dry-run，不执行）")

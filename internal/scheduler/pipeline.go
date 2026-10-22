@@ -2,6 +2,8 @@ package scheduler
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -106,6 +108,12 @@ func raiseHighWatermarks(ctx context.Context, d Deps, date string) error {
 		}
 		bar, err := d.Store.ScreenRepo().LatestBarAt(ctx, p.TsCode, date)
 		if err != nil {
+			// 无日线由 Assets 按成本价回退并留痕；这里不能把整条收盘流水线掐掉。
+			if errors.Is(err, sql.ErrNoRows) {
+				observability.S().Warnw("持仓无可用日线，跳过期间高点更新",
+					"ts_code", p.TsCode, "date", date)
+				continue
+			}
 			return fmt.Errorf("读取持仓 %s 收盘价失败: %w", p.TsCode, err)
 		}
 		if err := d.Store.TradeRepo().RaiseHighPrice(ctx, p.TsCode, bar.RawClose); err != nil {
@@ -401,6 +409,11 @@ func buildTickets(ctx context.Context, rc *observability.RunCtx, d Deps, date st
 	rep, err := d.Signal.Generate(ctx, date, cands, watch, rp, d.Decider)
 	if err != nil {
 		return err
+	}
+	// 空 band 是"无榜"不是"跌出"：本轮规则 4 不判定，关闸日由规则 5 兜底。
+	// 单独落一条降级，避免"当天没卖"与"规则没跑"在 run_trace 里看起来一样。
+	if rep.RankBandEmpty {
+		rc.Degrade("RANK_BAND_EMPTY", "当日无有效个股排名保留带（空池/仅 ETF），规则4本轮不适用")
 	}
 	rc.Declare("rows", "pending_tickets", 0) // 期望 0：评审后决定都不买是正常结果，不是缺产出
 	rc.Actual("pending_tickets", rep.Tickets)

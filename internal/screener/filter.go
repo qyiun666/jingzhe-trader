@@ -14,6 +14,8 @@
 package screener
 
 import (
+	"time"
+
 	"jingzhe-trader/internal/market"
 
 	"jingzhe-trader/internal/model"
@@ -132,31 +134,23 @@ func hasValuation(s model.StockBasic, tradeDate string) bool {
 	return s.ValDate == tradeDate
 }
 
-// listDaysBetween 计算上市天数（listDate/tradeDate 均为 YYYYMMDD；解析失败返回 -1）。
+// listDaysBetween 计算上市自然日数（listDate/tradeDate 均为 YYYYMMDD；解析失败返回 -1）。
+//
+// 以前用 YYYYMMDD 整数相减再按 y*365+m*30+d 换算，遇到"日/月借位"会把月份
+// 字段吃掉：上市 20260125、交易日 20260210 只差 16 天，却算成 85 天；跨年
+// 借位更夸张（20251220→20260301 实际 71 天，算成 2781 天）。60 日新股门槛
+// 因此会被绕过。时间差交给 time.Parse 处理，不再手写日历。
 func listDaysBetween(listDate, tradeDate string) int {
-	if len(listDate) != 8 || len(tradeDate) != 8 {
+	ld, err := time.Parse("20060102", listDate)
+	if err != nil {
 		return -1
 	}
-	ld, td := 0, 0
-	for i := 0; i < 8; i++ {
-		if listDate[i] < '0' || listDate[i] > '9' || tradeDate[i] < '0' || tradeDate[i] > '9' {
-			return -1
-		}
-	}
-	for i := 0; i < 8; i++ {
-		ld = ld*10 + int(listDate[i]-'0')
-		td = td*10 + int(tradeDate[i]-'0')
-	}
-	if td < ld {
+	td, err := time.Parse("20060102", tradeDate)
+	if err != nil {
 		return -1
 	}
-	return approxDaysDiff(td - ld) // 粗略自然日差（足够 60 日门槛判断）
-}
-
-// approxDaysDiff 将 YYYYMMDD 差值粗略换算为自然日数（±3 天内误差可接受）。
-func approxDaysDiff(raw int) int {
-	y := raw / 10000
-	m := (raw / 100) % 100
-	d := raw % 100
-	return y*365 + m*30 + d
+	if td.Before(ld) {
+		return -1
+	}
+	return int(td.Sub(ld).Hours() / 24)
 }

@@ -37,6 +37,10 @@ type Window struct {
 	End   string // HH:MM
 }
 
+// ErrJobRunning 任务已在执行（手工触发与到点触发撞车）。RunNamed 返回它，
+// 调度 Tick 只记日志并跳过本轮，不重复扣 LLM/行情成本。
+var ErrJobRunning = errors.New("任务正在运行")
+
 // ErrSkip 本轮无事可做的哨兵（区别于 Degrade）：任务确实在该轮没有任何可交付的工作
 // 时用它退出 —— 不写 run_trace 行、不触发完成回调、日志按 info 记。
 //
@@ -53,7 +57,10 @@ type JobSpec struct {
 	EveryMinutes int      // >0 表示窗口内每 N 分钟触发
 	Windows      []Window // 间隔触发窗口（EveryMinutes>0 时生效）
 	TradeDayOnly bool     // 是否仅交易日运行
-	Run          func(ctx context.Context, rc *observability.RunCtx) error
+	// Timeout 单次执行上限；0 = 不额外限制。外部调用（LLM 600s、SMTP 无上限）
+	// 任何一处挂死都会卡住同步的 Tick，从而停掉后续所有任务；按任务类型设上限。
+	Timeout time.Duration
+	Run     func(ctx context.Context, rc *observability.RunCtx) error
 }
 
 // dueToday 判断 now 是否落在间隔窗口内（纯函数）。
@@ -98,6 +105,7 @@ type Scheduler struct {
 	fired        map[string]bool      // job@date@trigger → 已触发
 	lastInterval map[string]time.Time // 间隔任务最近触发时刻
 	backoffUntil map[string]time.Time // 间隔任务失败后的退避截止时刻（内存态，重启即清）
+	runningJobs  map[string]bool      // 正在执行的任务（per-job single-flight）
 	lastTick     time.Time            // 最近一轮调度判定时刻（供 /healthz 探活）
 
 	running bool
@@ -115,6 +123,7 @@ func New(st *store.Store, isTradeDay func(date string) bool, specs []JobSpec) *S
 		fired:        make(map[string]bool),
 		lastInterval: make(map[string]time.Time),
 		backoffUntil: make(map[string]time.Time),
+		runningJobs:  make(map[string]bool),
 	}
 }
 
@@ -184,7 +193,7 @@ func (s *Scheduler) Tick(ctx context.Context, now time.Time) []string {
 			continue
 		}
 		for _, trigger := range s.dueTriggers(spec, date, now) {
-			status, jerr := s.runJob(ctx, spec, date, trigger)
+			status, jerr := s.runJob(ctx, spec, date, trigger, false)
 			if status != "" {
 				triggered = append(triggered, spec.Name)
 				if spec.EveryMinutes > 0 && status == model.TraceFail {
@@ -220,7 +229,7 @@ func (s *Scheduler) RunNamed(ctx context.Context, name, date, trigger string) er
 		if spec.Name != name {
 			continue
 		}
-		_, err := s.runJob(ctx, spec, date, trigger)
+		_, err := s.runJob(ctx, spec, date, trigger, true)
 		return err
 	}
 	return fmt.Errorf("未知任务 %s（可选：%s）", name, strings.Join(s.JobNames(), ", "))
@@ -262,6 +271,9 @@ func (s *Scheduler) dueTriggers(spec JobSpec, date string, now time.Time) []stri
 		if s.fired[key] {
 			continue
 		}
+		if s.runningJobs[spec.Name] {
+			continue // 手工补跑正在执行：不标记 fired，等它结束后按轨迹补跑语义再判
+		}
 		if s.shouldSkip(spec.Name, date) {
 			continue // 冷却中：不标记 fired，冷却到期自动重试（补跑语义）
 		}
@@ -294,6 +306,9 @@ func (s *Scheduler) dueInterval(spec JobSpec, date string, now time.Time) []stri
 	if !inWin {
 		return nil
 	}
+	if s.runningJobs[spec.Name] {
+		return nil // 上一轮还没跑完，不叠跑；不更新 lastInterval，结束后下一轮立即恢复
+	}
 	period := time.Duration(spec.EveryMinutes) * time.Minute
 	last := s.lastInterval[spec.Name]
 	if !last.IsZero() && now.Sub(last) < period {
@@ -312,6 +327,24 @@ func (s *Scheduler) markIntervalBackoff(jobName string, at time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.backoffUntil[jobName] = at.Add(s.cooldown)
+}
+
+// beginJob 尝试占用任务执行权；返回 false 表示同一任务已在运行。
+func (s *Scheduler) beginJob(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.runningJobs[name] {
+		return false
+	}
+	s.runningJobs[name] = true
+	return true
+}
+
+// endJob 释放任务执行权。
+func (s *Scheduler) endJob(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.runningJobs, name)
 }
 
 // shouldSkip 判定任务是否应跳过本轮触发（冷却判定，读轨迹表，重启后仍生效）：
@@ -341,13 +374,34 @@ func (s *Scheduler) shouldSkip(jobName, date string) bool {
 //
 // 不写"开始"行：进程中途死掉就是没有行，而缺行正是自检 [D1] 要抓的信号。
 // 不记尝试次数：重试策略只有 cooldown 一个配置项，从来没有次数上限判定。
-func (s *Scheduler) runJob(ctx context.Context, spec JobSpec, date, trigger string) (string, error) {
+func (s *Scheduler) runJob(ctx context.Context, spec JobSpec, date, trigger string, manual bool) (string, error) {
 	if s.dryRun {
 		observability.S().Infow("[dry-run] 任务触发", "job", spec.Name, "date", date, "trigger", trigger)
 		return model.TraceOK, nil
 	}
+	// per-job single-flight：到点触发与手工补跑撞车时只允许一个实例执行。
+	// 手工调用返回 ErrJobRunning 让调用方知道没跑；调度 Tick 静默跳过本轮。
+	if !s.beginJob(spec.Name) {
+		observability.S().Infow("任务已在运行，跳过重复触发",
+			"job", spec.Name, "date", date, "trigger", trigger, "manual", manual)
+		if manual {
+			return "", ErrJobRunning
+		}
+		return "", nil
+	}
+	defer s.endJob(spec.Name)
 
-	rc := observability.NewRunCtx(ctx, spec.Name, date)
+	// 任务级 deadline：外部调用（LLM 单次 600s、SMTP 无上限）任一处挂死都会
+	// 卡住同步的 Tick，后面所有任务（含盘中止损扫描）跟着停。超时按 fail 落轨迹，
+	// 由 onDone 触发 JOB_FAILED 告警，不静默。
+	jobCtx := ctx
+	if spec.Timeout > 0 {
+		var cancel context.CancelFunc
+		jobCtx, cancel = context.WithTimeout(ctx, spec.Timeout)
+		defer cancel()
+	}
+
+	rc := observability.NewRunCtx(jobCtx, spec.Name, date)
 	var jobErr error
 	func() {
 		defer func() {
@@ -356,8 +410,11 @@ func (s *Scheduler) runJob(ctx context.Context, spec JobSpec, date, trigger stri
 				observability.S().Errorw("任务 panic 已隔离", "job", spec.Name, "panic", fmt.Sprint(p))
 			}
 		}()
-		jobErr = spec.Run(ctx, rc)
+		jobErr = spec.Run(jobCtx, rc)
 	}()
+	if errors.Is(jobErr, context.DeadlineExceeded) && spec.Timeout > 0 {
+		jobErr = fmt.Errorf("任务超时（上限 %s）: %w", spec.Timeout, jobErr)
+	}
 
 	// 本轮无事可做（哨兵 ErrSkip）：不写轨迹、不报完成，日志按 info 留一句。
 	// 轨迹按 trade_date+subject 幂等覆盖，写了就会把上一轮真正的结果盖掉。

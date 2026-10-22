@@ -62,3 +62,29 @@ func TestValidateEnumsWeakCaps(t *testing.T) {
 		}
 	}
 }
+
+// TestValidateEnumsTrailingArm 移动止盈激活线：0（旧口径）到 0.5 放行，
+// 越界或不可解析拒绝启动。激活线配错会让 5% 回撤线重新变成实际止损，
+// 与 8% 止损口径冲突，必须在启动时拦下。
+func TestValidateEnumsTrailingArm(t *testing.T) {
+	base := func(arm string) *config.Config {
+		return &config.Config{Values: map[string]config.ConfigValue{
+			"llm.search_context_size":        {Key: "llm.search_context_size", Value: "high"},
+			"screen.factor_mode":             {Key: "screen.factor_mode", Value: "reversal"},
+			"screen.gate_ma_window":          {Key: "screen.gate_ma_window", Value: "60"},
+			"screen.gate_off_max_total_pct":  {Key: "screen.gate_off_max_total_pct", Value: "0.20"},
+			"screen.gate_off_max_single_pct": {Key: "screen.gate_off_max_single_pct", Value: "0.10"},
+			"risk.trailing_arm_pct":          {Key: "risk.trailing_arm_pct", Value: arm},
+		}}
+	}
+	for _, ok := range []string{"0", "0.06", "0.5"} {
+		if err := validateEnums(base(ok)); err != nil {
+			t.Errorf("arm=%q 应放行，实际拒绝: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"-0.1", "0.51", "abc"} {
+		if err := validateEnums(base(bad)); err == nil {
+			t.Errorf("arm=%q 非法却放行了", bad)
+		}
+	}
+}

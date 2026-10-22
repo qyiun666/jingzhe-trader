@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -168,6 +169,84 @@ func TestRunJobPersistsArtifacts(t *testing.T) {
 	}
 	if last.Outcome != string(model.TracePartial) {
 		t.Errorf("状态应为 degraded，实际 %s", last.Outcome)
+	}
+}
+
+// TestRunJobTimeout 任务级 deadline：挂住的任务必须在 Timeout 后按 fail 落轨迹，
+// 不能拖住同步的 Tick（10-22 的 LLM 600s 单次上限会放大成整条调度停摆）。
+func TestRunJobTimeout(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(t.TempDir() + "/timeout.db")
+	if err != nil {
+		t.Fatalf("打开测试库失败: %v", err)
+	}
+	defer st.Close()
+
+	s := New(st, func(string) bool { return true }, []JobSpec{{
+		Name:    "slow",
+		Timeout: 50 * time.Millisecond,
+		Run: func(ctx context.Context, _ *observability.RunCtx) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}})
+	start := time.Now()
+	err = s.RunNamed(ctx, "slow", "20260901", "manual")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("期望 DeadlineExceeded，实际 %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("超时任务耗时 %s，deadline 未生效", elapsed)
+	}
+	traces, _ := st.TraceRepo().List(ctx, "20260901")
+	var last model.RunTrace
+	for _, tr := range traces {
+		if tr.Subject == "job:slow" {
+			last = tr
+		}
+	}
+	if last.Outcome != string(model.TraceFail) || !strings.Contains(last.Detail, "超时") {
+		t.Errorf("超时应落 fail 且 detail 点名超时，实际 outcome=%q detail=%q", last.Outcome, last.Detail)
+	}
+}
+
+// TestRunJobSingleFlight 同一任务手工触发撞车时只允许一个实例执行：
+// 第二次 RunNamed 返回 ErrJobRunning，不重复跑、不重复写轨迹。
+func TestRunJobSingleFlight(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(t.TempDir() + "/single.db")
+	if err != nil {
+		t.Fatalf("打开测试库失败: %v", err)
+	}
+	defer st.Close()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var runs int32
+	s := New(st, func(string) bool { return true }, []JobSpec{{
+		Name:    "probe",
+		Timeout: 5 * time.Second,
+		Run: func(ctx context.Context, _ *observability.RunCtx) error {
+			atomic.AddInt32(&runs, 1)
+			close(started)
+			<-release
+			return nil
+		},
+	}})
+
+	done := make(chan error, 1)
+	go func() { done <- s.RunNamed(ctx, "probe", "20260901", "manual") }()
+	<-started
+
+	if err := s.RunNamed(ctx, "probe", "20260901", "manual"); !errors.Is(err, ErrJobRunning) {
+		t.Fatalf("并发手工触发应返回 ErrJobRunning，实际 %v", err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("首个任务应成功: %v", err)
+	}
+	if got := atomic.LoadInt32(&runs); got != 1 {
+		t.Errorf("任务实际执行 %d 次，期望 1（single-flight）", got)
 	}
 }
 

@@ -68,6 +68,67 @@ func TestSellTrailingStop(t *testing.T) {
 	}
 }
 
+// TestSellTrailingStopArm 移动止盈必须先"涨够"才武装（risk.trailing_arm_pct）：
+// 高点未达成本×(1+arm) 时，下跌只走 8% 止损，不再被 5% 回撤线提前砍掉。
+func TestSellTrailingStopArm(t *testing.T) {
+	p := g1() // TrailingStopPct=0.05、TrailingArmPct=0.06
+	// 高=成本、现价 -5%：移动止盈未武装；8% 止损线 9.20 未破 → 不卖
+	if sig := EvalSell("20261022", holding(model.FromFloat(10), model.FromFloat(10), model.FromFloat(9.5), true, false), p, 0, 0); sig != nil {
+		t.Fatalf("高点未达成本×1.06，移动止盈不应触发，实际 %+v", sig)
+	}
+	// 高=成本×1.10、自高点回撤 5% → 触发移动止盈
+	sig := EvalSell("20261022", holding(model.FromFloat(10), model.FromFloat(11), model.FromFloat(10.45), true, false), p, 0, 0)
+	if sig == nil || sig.Rule != RuleTrailingStop {
+		t.Fatalf("高点已过激活线且回撤 5%%，应触发移动止盈，实际 %+v", sig)
+	}
+	// 高=成本×1.02、现价成本 -6%：未武装，8% 止损线 9.20 未破 → 不卖（交给止损规则）
+	if sig := EvalSell("20261022", holding(model.FromFloat(10), model.FromFloat(10.2), model.FromFloat(9.4), true, false), p, 0, 0); sig != nil {
+		t.Fatalf("高点未过激活线、止损线未破，不应卖出，实际 %+v", sig)
+	}
+	// 高=成本×1.02、跌破 8% 止损 → 走止损，不是移动止盈
+	sig = EvalSell("20261022", holding(model.FromFloat(10), model.FromFloat(10.2), model.FromFloat(9.1), true, false), p, 0, 0)
+	if sig == nil || sig.Rule != RuleStopLoss {
+		t.Fatalf("跌破 8%% 止损线应走止损，实际 %+v", sig)
+	}
+}
+
+// TestTrailingStopReplay20261022 用 10-22 600704 的真实数据回放：
+// 成本/期间高 5.07、收盘 4.81。旧口径 highGate=5.07×0.95=4.8165 会触发
+// "移动止盈"（当天实际就是这样卖出的）；新口径高点未达 5.07×1.06=5.3742，
+// 8% 止损线 4.6644 未破，持有 8 个交易日 <10 日排名淘汰豁免 → 不应出卖单。
+func TestTrailingStopReplay20261022(t *testing.T) {
+	p := risk.DefaultParams(model.FromFloat(11800))
+	h := HoldingCtx{
+		Pos:       model.Position{TsCode: "600704.SH", TotalQty: 200, CostPrice: 507, HighPrice: 507},
+		LastClose: 481, LastDate: "20261022", InTopN: false,
+		DaysHeld: 8, RankOut: RankOutPolicy{MinHoldDays: 10, WatchTopN: 30},
+	}
+	if sig := EvalSell("20261022", h, p, 0, 0); sig != nil {
+		t.Fatalf("新激活线下 600704 不应卖出（旧口径会在 4.8165 触发移动止盈），实际 %+v", sig)
+	}
+}
+
+// TestSellRankOutNoBand 空 band 是"无榜"不是"跌出榜"：规则 4 跳过；
+// 关闸日（指数在均线下方）仍由规则 5 退出；有 band 时旧口径回归。
+func TestSellRankOutNoBand(t *testing.T) {
+	p := g1()
+	ro := RankOutPolicy{MinHoldDays: 10, WatchTopN: 30}
+	h := rankOutHold(30, ro)
+	h.NoBand = true
+
+	if sig := EvalSell("20261021", h, p, 0, 0); sig != nil {
+		t.Fatalf("空 band 且非关闸日不应排名淘汰，实际 %+v", sig)
+	}
+	sig := EvalSell("20261021", h, p, model.FromFloat(3000), model.FromFloat(3100))
+	if sig == nil || sig.Rule != RuleMarketBad {
+		t.Fatalf("空 band 时关闸日仍应由规则 5 退出，实际 %+v", sig)
+	}
+	h.NoBand = false
+	if sig := EvalSell("20261021", h, p, 0, 0); sig == nil || sig.Rule != RuleRankOut {
+		t.Fatalf("有 band 时持仓跌出榜应照旧排名淘汰，实际 %+v", sig)
+	}
+}
+
 // TestSellTakeProfit 规则 3 止盈：收盘达到止盈线触发。
 func TestSellTakeProfit(t *testing.T) {
 	p := g1()
@@ -155,9 +216,9 @@ func TestTradingDaysHeld(t *testing.T) {
 	}{
 		{"20261008", "20261008", 0}, // 建仓当日 = 0 个持有交易日（T+1 不可卖口径）
 		{"20261008", "20261009", 1},
-		{"20261008", "20261014", 4}, // 跳过周末非交易日
-		{"20261012", "20261014", 2}, // 真实样本：600704 建仓 10/12 → 10/14 持 2 日
-		{"20261013", "20261015", 1}, // 判定日不在日历：只数日历内的
+		{"20261008", "20261014", 4},  // 跳过周末非交易日
+		{"20261012", "20261014", 2},  // 真实样本：600704 建仓 10/12 → 10/14 持 2 日
+		{"20261013", "20261015", 1},  // 判定日不在日历：只数日历内的
 		{"", "20261014", -1},         // 缺建仓日期
 		{"20261016", "20261014", -1}, // 坏数据：建仓晚于判定日
 	}

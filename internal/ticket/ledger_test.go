@@ -379,6 +379,47 @@ func TestAssetsMarketValue(t *testing.T) {
 	}
 }
 
+// TestAssetsFallbackCostWhenNoBar 持仓在 ≤tradeDate 完全无日线（长期停牌超过保留窗、
+// 退市、手输代码、未同步 ETF）时，资产读取不得整链硬失败：按成本价回退并落
+// alert:ASSET_NO_BAR 轨迹（agent_issues #3 残余口径）。
+func TestAssetsFallbackCostWhenNoBar(t *testing.T) {
+	s, led := openLedger(t)
+	ctx := context.Background()
+	tk := seedTicket(t, s, "sz000008", model.DirBuy, 300, model.FromFloat(7))
+	if _, err := led.ReportFill(ctx, FillRequest{TicketID: tk.ID, Qty: 300, Price: model.FromFloat(7)}); err != nil {
+		t.Fatalf("回执失败: %v", err)
+	}
+	pos := mustPos(t, s, ctx, tk.TsCode)
+	// 不写任何日线
+	sn, err := led.Assets(ctx, "20260901")
+	if err != nil {
+		t.Fatalf("无日线持仓不应硬失败: %v", err)
+	}
+	want := pos.CostPrice.Mul(pos.TotalQty)
+	if sn.MarketValue != want {
+		t.Errorf("market_value=%s, 期望成本价回退 %s", sn.MarketValue, want)
+	}
+	if sn.PositionCount != 1 {
+		t.Errorf("position_count=%d, 期望 1", sn.PositionCount)
+	}
+	traces, err := s.TraceRepo().List(ctx, "20260901")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, tr := range traces {
+		if tr.Subject == "alert:ASSET_NO_BAR:"+tk.TsCode {
+			found = true
+			if tr.Outcome != model.TracePartial {
+				t.Errorf("回退轨迹 outcome=%s, 期望 partial", tr.Outcome)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("缺少 alert:ASSET_NO_BAR:%s 轨迹", tk.TsCode)
+	}
+}
+
 // TestInitialCapitalWriteOnce 对应验收 #14：第二次 sync_portfolio 不覆盖本金，有 action_log 拒绝记录。
 func TestInitialCapitalWriteOnce(t *testing.T) {
 	s, led := openLedger(t)
@@ -842,6 +883,137 @@ func TestSyncPortfolioRequiresCostForHoldings(t *testing.T) {
 	if n, _, err := led.SyncPortfolio(ctx, PortfolioSync{Date: "20261016",
 		Capital: model.FromFloat(0), Cash: model.FromFloat(9500), Actor: "test"}); err != nil || n != 0 {
 		t.Errorf("空 Items 只校准资金: n=%d err=%v", n, err)
+	}
+}
+
+// TestReportFillConcurrentSameLedger 同一账本两路并发回执：
+// 进程级锁必须把"判重→提交"整段串行化，最终只允许一笔成交、持仓只加一次。
+func TestReportFillConcurrentSameLedger(t *testing.T) {
+	s, led := openLedger(t)
+	ctx := context.Background()
+	tk := seedTicket(t, s, "sh600010", model.DirBuy, 900, model.FromFloat(10))
+	req := FillRequest{TicketID: tk.ID, TsCode: tk.TsCode, Qty: 900, Price: model.FromFloat(10), Actor: "test"}
+
+	type outcome struct {
+		res FillResult
+		err error
+	}
+	start := make(chan struct{})
+	ch := make(chan outcome, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-start
+			r, err := led.ReportFill(ctx, req)
+			ch <- outcome{res: r, err: err}
+		}()
+	}
+	close(start)
+
+	first, dup := 0, 0
+	for i := 0; i < 2; i++ {
+		o := <-ch
+		if o.err != nil {
+			t.Fatalf("并发回执出现错误: %v", o.err)
+		}
+		if o.res.Duplicate {
+			dup++
+		} else {
+			first++
+		}
+	}
+	if first != 1 || dup != 1 {
+		t.Fatalf("并发回执 first=%d duplicate=%d, 期望 1/1", first, dup)
+	}
+	pos := mustPos(t, s, ctx, tk.TsCode)
+	if pos.TotalQty != 900 {
+		t.Errorf("持仓=%d, 期望 900（并发回执只加一次）", int64(pos.TotalQty))
+	}
+	fills, err := s.TradeRepo().CountFilled(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fills != 1 {
+		t.Errorf("已登记回执数=%d, 期望 1", fills)
+	}
+}
+
+// TestReportFillConcurrentAcrossLedgers 两个 Ledger 实例共用同一库（模拟常驻服务与 CLI
+// 两个进程）：进程内锁互不可见，必须由 RecordFillTx 的 reported_at 守卫兜底。
+func TestReportFillConcurrentAcrossLedgers(t *testing.T) {
+	s, led1 := openLedger(t)
+	led2 := NewLedger(s, testCost(), model.FromFloat(10000))
+	ctx := context.Background()
+	tk := seedTicket(t, s, "sh600012", model.DirBuy, 700, model.FromFloat(11))
+	req := FillRequest{TicketID: tk.ID, TsCode: tk.TsCode, Qty: 700, Price: model.FromFloat(11), Actor: "test"}
+
+	type outcome struct {
+		res FillResult
+		err error
+	}
+	start := make(chan struct{})
+	ch := make(chan outcome, 2)
+	for _, led := range []*Ledger{led1, led2} {
+		go func(l *Ledger) {
+			<-start
+			r, err := l.ReportFill(ctx, req)
+			ch <- outcome{res: r, err: err}
+		}(led)
+	}
+	close(start)
+
+	first, dup := 0, 0
+	for i := 0; i < 2; i++ {
+		o := <-ch
+		if o.err != nil {
+			t.Fatalf("跨实例并发回执出现错误: %v", o.err)
+		}
+		if o.res.Duplicate {
+			dup++
+		} else {
+			first++
+		}
+	}
+	if first != 1 || dup != 1 {
+		t.Fatalf("跨实例回执 first=%d duplicate=%d, 期望 1/1", first, dup)
+	}
+	pos := mustPos(t, s, ctx, tk.TsCode)
+	if pos.TotalQty != 700 {
+		t.Errorf("持仓=%d, 期望 700（跨实例也只加一次）", int64(pos.TotalQty))
+	}
+}
+
+// TestReportFillConcurrentWithSyncPortfolio 回执与组合同步并发：
+// 两种合法顺序（回执先/同步先）最终持仓只能是 100 或 200，绝不允许叠成 300。
+func TestReportFillConcurrentWithSyncPortfolio(t *testing.T) {
+	s, led := openLedger(t)
+	ctx := context.Background()
+	tk := seedTicket(t, s, "sh600013", model.DirBuy, 100, model.FromFloat(10))
+	errs := make(chan error, 2)
+	start := make(chan struct{})
+
+	go func() {
+		<-start
+		_, err := led.ReportFill(ctx, FillRequest{TicketID: tk.ID, TsCode: tk.TsCode, Qty: 100, Price: model.FromFloat(10), Actor: "test"})
+		errs <- err
+	}()
+	go func() {
+		<-start
+		_, _, err := led.SyncPortfolio(ctx, PortfolioSync{
+			Date: "20260901", Capital: model.FromFloat(10000), Cash: model.FromFloat(5000),
+			Items: []PortfolioInput{{TsCode: tk.TsCode, TotalQty: 100, AvailableQty: 100, CostPrice: model.FromFloat(10)}},
+			Actor: "test",
+		})
+		errs <- err
+	}()
+	close(start)
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("并发操作失败: %v", err)
+		}
+	}
+	pos := mustPos(t, s, ctx, tk.TsCode)
+	if pos.TotalQty != 100 && pos.TotalQty != 200 {
+		t.Errorf("并发回执+组合同步后持仓=%d, 期望 100（同步后行）或 200（回执在同步后）", int64(pos.TotalQty))
 	}
 }
 

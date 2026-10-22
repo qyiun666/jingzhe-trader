@@ -21,8 +21,8 @@ type Service struct {
 	st      *store.Store
 	ledger  *ticket.Ledger // 现金/资产的唯一口径（含组合同步的现金锚点）
 	gate    store.MarketGate
-	etf     ETFUniverse    // 白名单认定的场内 ETF（豁免规则 4 + 显示名兜底）
-	rankOut RankOutPolicy  // 规则 4 的持有期口径（缓冲带深度按当日保留带在 sellDecisions 里补）
+	etf     ETFUniverse   // 白名单认定的场内 ETF（豁免规则 4 + 显示名兜底）
+	rankOut RankOutPolicy // 规则 4 的持有期口径（缓冲带深度按当日保留带在 sellDecisions 里补）
 }
 
 // ETFUniverse 白名单声明的场内 ETF：ts_code → 人工复核过的显示名。
@@ -94,6 +94,10 @@ type Report struct {
 	Rejections  []Rejection
 	Notes       []string
 	Empty       bool // 候选池为空（选股阶段已告警，此处不重复）
+	// RankBandEmpty 当日没有有效的个股排名保留带（候选池为空，或 band 里只有 ETF）。
+	// 规则 4 的"未进榜"以 band 存在为前提；空 band 时本轮不判定排名淘汰，
+	// 关闸日交给规则 5。调用方据此落 RANK_BAND_EMPTY 降级，避免把"无榜"读成"跌出"。
+	RankBandEmpty bool
 }
 
 // buyProposal 一条待落地买入：决策信号 + 模型要求的金额（风控负责截断成整手股数）。
@@ -161,14 +165,24 @@ func (s *Service) sellDecisions(ctx context.Context, tradeDate string, cands, wa
 	}
 	inTopN := make(map[string]bool, len(band))
 	for _, c := range band {
+		if c.IsETF() {
+			// ETF 候选不排名，不能充当个股的 band；把 ETF 放进 inTopN 会让
+			// "当日只有 ETF 候选"看起来像"个股都在榜外"，从而误触发规则 4。
+			continue
+		}
 		inTopN[c.TsCode] = true
+	}
+	noBand := len(inTopN) == 0
+	if noBand && len(positions) > 0 {
+		rep.RankBandEmpty = true
+		rep.Notes = append(rep.Notes, "RANK_BAND_EMPTY 当日无有效个股排名保留带（候选池为空或仅 ETF），规则4本轮不适用（无榜≠跌出榜）")
 	}
 	days, err := s.st.MarketRepo().TradeDateList(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("读取交易日历用于持仓天数判定失败: %w", err)
 	}
 	ro := s.rankOut
-	ro.WatchTopN = len(band)
+	ro.WatchTopN = len(inTopN)
 	var out []model.Signal
 	for _, pos := range positions {
 		if pos.TotalQty <= 0 {
@@ -181,12 +195,14 @@ func (s *Service) sellDecisions(ctx context.Context, tradeDate string, cands, wa
 		held := tradingDaysHeld(days, pos.FirstOpenDate, tradeDate)
 		h := HoldingCtx{
 			Pos: pos, LastClose: bar.RawClose, LastDate: bar.TradeDate,
-			InTopN: inTopN[pos.TsCode], MarketBad: idx.bad(), IsETF: s.isETF(pos.TsCode),
+			InTopN: inTopN[pos.TsCode], NoBand: noBand, MarketBad: idx.bad(), IsETF: s.isETF(pos.TsCode),
 			DaysHeld: held, RankOut: ro,
 		}
 		// 持有期保护挡掉了一次本会触发的淘汰：必须留痕（与"禁静默丢弃"同一纪律），
 		// 否则"为什么这只没卖"只能靠翻日历反推。判定条件与 evalRankOut 的保护分支同构。
-		if !h.InTopN && !h.IsETF && ro.MinHoldDays > 0 && held >= 0 && held < ro.MinHoldDays {
+		// 空 band 时没有"未进榜"这回事（规则 4 整体不适用），不写这条豁免说明，
+		// 否则会和 RANK_BAND_EMPTY 一起让人误以为规则 4 跑过、只是被保护了。
+		if !noBand && !h.InTopN && !h.IsETF && ro.MinHoldDays > 0 && held >= 0 && held < ro.MinHoldDays {
 			rep.Notes = append(rep.Notes, fmt.Sprintf(
 				"%s 未进当日排名保留带，但已持有 %d 个交易日 < 最小持有期 %d，本次排名淘汰豁免",
 				pos.TsCode, held, ro.MinHoldDays))

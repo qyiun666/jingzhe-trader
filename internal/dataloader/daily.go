@@ -285,7 +285,16 @@ func (d *Dataloader) syncOneDay(ctx context.Context, rc *store.MarketRepo, date 
 			date, len(noAdj), strings.Join(firstN(noAdj, 5), ","))
 	}
 	if err := rc.SaveValuation(ctx, date, dbs); err != nil {
-		return err
+		if errors.Is(err, store.ErrValuationSparse) {
+			// 保留旧估值截面，不让残缺截面进入当日决策；门禁会因 val_date 不是当日
+			// 而显式失败，这比"全员 PE=0 → 0 候选"更容易归因（agent_issues #13）。
+			observability.S().Warnw("估值截面覆盖不足，跳过写入并保留旧值",
+				"date", date, "err", err.Error())
+			d.raiseAlert(ctx, "VALUATION_SKIPPED",
+				fmt.Sprintf("估值截面覆盖不足，%s 保留旧值", date), err.Error())
+		} else {
+			return err
+		}
 	}
 	if err := rc.SaveSuspended(ctx, date, susp); err != nil {
 		return err

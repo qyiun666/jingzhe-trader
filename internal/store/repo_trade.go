@@ -2,11 +2,16 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jmoiron/sqlx"
 	"jingzhe-trader/internal/model"
 )
+
+// ErrFillAlreadyRecorded 指令单已被回执（或已被并发流转出可回执状态）。
+// 事务内 UPDATE 影响 0 行时返回，调用方据此把"重复回执"与"真失败"分开处理。
+var ErrFillAlreadyRecorded = errors.New("指令单已登记回执或已不可回执")
 
 // TradeRepo 交易域仓储：order_ticket（指令单，含成交回执）/ position（持仓）。
 //
@@ -60,14 +65,28 @@ func (r *TradeRepo) UpdateTicketStatus(ctx context.Context, id int64, status mod
 }
 
 // RecordFillTx 事务内把成交回执写回指令单行并置为终态。
-// 调用方须先确认该行尚无回执（HasFill），否则视为重复回执直接返回。
+//
+// 守卫必须写在 UPDATE 的 WHERE 里，不能只靠调用方在事务外 HasFill：
+// 两个并发回执可以同时读到"未回执"，然后先后提交，第二笔会把持仓再加一次。
+// 这里以 reported_at 为空 + 状态仍可回执作为单次写令牌，影响 0 行即返回
+// ErrFillAlreadyRecorded，由事务回滚保证账本不被第二笔改动。
 func RecordFillTx(ctx context.Context, tx *sqlx.Tx, f model.OrderTicket, status model.TicketStatus) error {
 	const q = `UPDATE order_ticket SET status=?, fill_qty=?, fill_price=?, total_cost=?,
-		reported_by=?, reported_at=?, note=? WHERE id=?`
-	if _, err := tx.ExecContext(ctx, q,
+		reported_by=?, reported_at=?, note=?
+		WHERE id=? AND (reported_at IS NULL OR reported_at='')
+		  AND status IN ('drafted','issued')`
+	res, err := tx.ExecContext(ctx, q,
 		string(status), int64(f.FillQty), int64(f.FillPrice), int64(f.TotalCost),
-		f.ReportedBy, f.ReportedAt, f.Note, f.ID); err != nil {
+		f.ReportedBy, f.ReportedAt, f.Note, f.ID)
+	if err != nil {
 		return fmt.Errorf("写入指令单 %d 的成交回执失败: %w", f.ID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("统计指令单 %d 回执影响行数失败: %w", f.ID, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("%w: ticket_id=%d", ErrFillAlreadyRecorded, f.ID)
 	}
 	return nil
 }

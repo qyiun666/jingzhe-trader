@@ -18,6 +18,7 @@ func TestDefaultParamsBaseline(t *testing.T) {
 	assertEqF(t, "基准", "MaxPositionPct", p.MaxPositionPct, 0.40)
 	assertEqF(t, "基准", "StopLossPct", p.StopLossPct, 0.08)
 	assertEqF(t, "基准", "TrailingStopPct", p.TrailingStopPct, 0.05)
+	assertEqF(t, "基准", "TrailingArmPct", p.TrailingArmPct, 0.06)
 	assertEqF(t, "基准", "TakeProfitPct", p.TakeProfitPct, 0.15)
 	assertEqF(t, "基准", "MinConfidence", p.MinConfidence, 0.55)
 	assertEqF(t, "基准", "MaxSingleAmountPct", p.MaxSingleAmountPct, 1.0)
@@ -85,6 +86,9 @@ func TestDefaultParamsStopLossNonZero(t *testing.T) {
 	if p.TrailingStopPct <= 0 || p.TrailingStopPct >= 1 {
 		t.Errorf("TrailingStopPct=%.3f 不在 (0,1)", p.TrailingStopPct)
 	}
+	if p.TrailingArmPct < 0 || p.TrailingArmPct > 0.5 {
+		t.Errorf("TrailingArmPct=%.3f 不在 [0,0.5]", p.TrailingArmPct)
+	}
 	if p.MaxPositions <= 0 {
 		t.Errorf("MaxPositions=%d 必须为正", p.MaxPositions)
 	}
@@ -128,6 +132,7 @@ func TestWeakParamsShrinksOnly(t *testing.T) {
 	// 只动仓位上限：止损/止盈/持仓数/置信度原样保留
 	p = WeakParams(base, 0.20, 0.10)
 	if p.StopLossPct != base.StopLossPct || p.TakeProfitPct != base.TakeProfitPct ||
+		p.TrailingArmPct != base.TrailingArmPct ||
 		p.MaxPositions != base.MaxPositions || p.MinConfidence != base.MinConfidence {
 		t.Errorf("WeakParams 不应改动仓位以外的风控字段")
 	}

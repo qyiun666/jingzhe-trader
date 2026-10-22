@@ -2,7 +2,7 @@
 # 使用: make build / make test / make itest / make vet / make db-check / make jobs
 
 BINARY_DIR := bin
-DB ?= data/jingzhe.db
+DB ?= /home/qodercli/work/jingzhe-db/jingzhe.db
 
 .PHONY: all build test itest vet fmt jingzhe db-check jobs clean
 

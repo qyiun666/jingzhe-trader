@@ -160,11 +160,63 @@ func (r *MarketRepo) UpsertBar(ctx context.Context, b model.Bar) error {
 
 // ===================== 估值截面 / 停牌集合 =====================
 
+// ErrValuationSparse 估值截面空/覆盖不足：本次不得覆盖已有截面。
+//
+// 触发条件（命中任一即跳过）：
+//   - 返回 0 行；
+//   - 返回行数 < 在市股票数的一半；
+//   - 有效估值行（PE 与 PB 都非 0）< 返回行数的一半。
+//
+// 为什么不能照写：daily_basic 在 16:30 可能尚未发布（agent_issues #13），
+// 旧实现会把全表 PE/PB 覆盖成空值、val_date 盖成当日，估值筛把整池筛光，
+// 且 18:00 自检只数 val_date 行数，看不出来。宁保留旧截面并在门禁上显式失败，
+// 也不拿一份残缺截面做当日决策。
+var ErrValuationSparse = errors.New("估值截面为空或覆盖不足")
+
+// minValuationSample 阈值生效的最小样本量。生产市场约 5,500 只，远高于它；
+// 单测/全新库的十几行夹具不启用比例阈值，否则"用 3 只股票造 val_date"
+// 这类测试会被当成生产残缺截面。空截面判定不受此下限影响。
+const minValuationSample = 100
+
+// checkValuationCoverage 判断一批估值截面是否足以覆盖现有市场。
+// listed 为 stock_basic 中 list_status='L' 的行数；为 0 时（尚未同步股票清单）
+// 跳过行数覆盖检查，仍检查有效值比例。
+func checkValuationCoverage(rows []model.Valuation, listed int) error {
+	if len(rows) == 0 {
+		return fmt.Errorf("%w: 返回 0 行", ErrValuationSparse)
+	}
+	if listed >= minValuationSample && len(rows)*2 < listed {
+		return fmt.Errorf("%w: 返回 %d 行 < 在市 %d 只的 50%%", ErrValuationSparse, len(rows), listed)
+	}
+	if len(rows) < minValuationSample {
+		return nil
+	}
+	valid := 0
+	for _, v := range rows {
+		if v.PETtm != 0 && v.PB != 0 {
+			valid++
+		}
+	}
+	if valid*2 < len(rows) {
+		return fmt.Errorf("%w: 有效 PE/PB %d/%d 行 < 50%%", ErrValuationSparse, valid, len(rows))
+	}
+	return nil
+}
+
 // SaveValuation 把某交易日的估值截面盖到 stock_basic 的估值列上（一次同步一个整批）。
 //
 // 只 UPDATE 不 INSERT：不在 stock_basic 里的代码不属于可投 universe（未上市/已摘牌），
 // 给它建一行没有读者。整个截面一个事务，避免"一半新一半旧"的截面被选股读到。
+// 写入前先过 checkValuationCoverage：残缺截面整批跳过，已有估值保持原样。
 func (r *MarketRepo) SaveValuation(ctx context.Context, tradeDate string, rows []model.Valuation) error {
+	var listed int
+	if err := r.rdb.GetContext(ctx, &listed,
+		`SELECT COUNT(*) FROM stock_basic WHERE list_status = 'L'`); err != nil {
+		return fmt.Errorf("读取在市股票数失败: %w", err)
+	}
+	if err := checkValuationCoverage(rows, listed); err != nil {
+		return err
+	}
 	const q = `UPDATE stock_basic SET val_date=?, turnover_rate=?, pe_ttm=?, pb=?, circ_mv_w=?
 		WHERE ts_code=?`
 	return WithTx(ctx, r.wdb, func(tx *sqlx.Tx) error {

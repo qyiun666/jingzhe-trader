@@ -205,9 +205,15 @@ func (g *FreshnessGate) checkCoverage(ctx context.Context, tradeDate string) Che
 	if err != nil {
 		return failItem("MissingCodes", CodeCoverageGap, fmt.Sprintf("读取候选池失败: %v", err))
 	}
-	if len(cand) == 0 {
-		// 候选池为空（尚未同步股票基础信息）：视为无覆盖需求，跳过
-		return okItem("MissingCodes", "候选池为空，无覆盖需求")
+	// 持仓也必须纳入覆盖：候选池只含 list_status='L'，退市/长期停牌/手工同步的
+	// 标的可能不在其中，而它们照样要读日线算市值与止损参考。只查候选池时，
+	// 这类持仓缺线会拖到 Assets/高点更新才以硬失败暴露（agent_issues #3 残余）。
+	hold, err := g.store.TradeRepo().HoldingCodes(ctx)
+	if err != nil {
+		return failItem("MissingCodes", CodeCoverageGap, fmt.Sprintf("读取持仓代码失败: %v", err))
+	}
+	if len(cand) == 0 && len(hold) == 0 {
+		return okItem("MissingCodes", "候选池与持仓均为空，无覆盖需求")
 	}
 	// 排除当日停牌股
 	susp, err := g.store.MarketRepo().SuspendedCodes(ctx, tradeDate)
@@ -218,11 +224,41 @@ func (g *FreshnessGate) checkCoverage(ctx context.Context, tradeDate string) Che
 	for _, s := range susp {
 		excluded[s] = struct{}{}
 	}
-	expected := make([]string, 0, len(cand)-len(susp))
-	for _, c := range cand {
-		if _, ok := excluded[c]; !ok {
-			expected = append(expected, c)
+	expected := make([]string, 0, len(cand)+len(hold)-len(susp))
+	seen := make(map[string]struct{}, len(cand)+len(hold))
+	add := func(code string) {
+		if _, ok := excluded[code]; ok {
+			return
 		}
+		if _, ok := seen[code]; ok {
+			return
+		}
+		seen[code] = struct{}{}
+		expected = append(expected, code)
+	}
+	for _, c := range cand {
+		add(c)
+	}
+	// 持仓单独判定：候选缺口有 50 只容差，持仓没有——少一根就是某个真实仓位
+	// 算不出市值/止损参考，不能用"新股噪声"的理由放过。
+	holdExpected := make([]string, 0, len(hold))
+	for _, c := range hold {
+		if _, ok := excluded[c]; !ok {
+			holdExpected = append(holdExpected, c)
+		}
+	}
+	if len(holdExpected) > 0 {
+		holdCovered, err := g.store.MarketRepo().BarCoverage(ctx, tradeDate, holdExpected)
+		if err != nil {
+			return failItem("MissingCodes", CodeCoverageGap, fmt.Sprintf("统计持仓覆盖失败: %v", err))
+		}
+		if holdCovered < len(holdExpected) {
+			return failItem("MissingCodes", CodeCoverageGap,
+				fmt.Sprintf("持仓覆盖 %d/%d，有持仓缺当日日线（候选覆盖未计入）", holdCovered, len(holdExpected)))
+		}
+	}
+	for _, c := range hold {
+		add(c)
 	}
 
 	covered, err := g.store.MarketRepo().BarCoverage(ctx, tradeDate, expected)
@@ -231,9 +267,11 @@ func (g *FreshnessGate) checkCoverage(ctx context.Context, tradeDate string) Che
 	}
 	gap := len(expected) - covered
 	if gap <= 0 {
-		return okItem("MissingCodes", fmt.Sprintf("覆盖 %d/%d（已排除停牌 %d 只）", covered, len(expected), len(susp)))
+		return okItem("MissingCodes", fmt.Sprintf("覆盖 %d/%d（候选 %d + 持仓 %d，已排除停牌 %d 只）",
+			covered, len(expected), len(cand), len(hold), len(susp)))
 	}
 	// 极小缺口（噪声/新股/数据抖动）仅告警不阻断；显著缺口才视为数据缺失（真·未同步）。
+	// 容差按候选数算：持仓已在上面单独要求全绿，不应把容差放大。
 	tol := coverageTolerance(len(cand))
 	if gap <= tol {
 		return warnItem("MissingCodes", CodeCoverageGap,

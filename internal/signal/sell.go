@@ -29,7 +29,12 @@ type HoldingCtx struct {
 	LastClose model.Fen // 最近可得收盘（停牌股取停牌前收盘，分）
 	LastDate  string    // 该收盘对应交易日
 	InTopN    bool      // 是否在当日候选池排名保留带内（保留带=TopN 时即旧口径 TopN）
-	MarketBad bool      // 大盘恶化（指数收盘低于门槛均线，见 evalMarketBad）
+	// NoBand 当日没有有效的个股排名保留带（候选池为空，或 band 里只有 ETF）。
+	// 规则 4 的"未进榜"以 band 存在为前提；空 band 是"不知道"，不是"跌出"，
+	// 否则一次数据故障/估值全灭就会把满持有期的持仓全部当成跌出榜单卖掉。
+	// 关闸日（gate=true 且指数在均线下方）没有 band，由规则 5 负责退出。
+	NoBand    bool // 无有效保留带：规则 4 本轮不适用
+	MarketBad bool // 大盘恶化（指数收盘低于门槛均线，见 evalMarketBad）
 	// IsETF 持仓是场内 ETF（由 screen.etf_whitelist 认定，见 Service.ETFUniverse）。
 	IsETF bool
 	// DaysHeld 建仓后已持有的完整交易日数（建仓日不计）；-1 = 持仓无建仓日期，
@@ -77,8 +82,12 @@ func evalTrailingStop(date string, h HoldingCtx, p risk.RiskParams) *model.Signa
 	if h.LastClose > highGate {
 		return nil
 	}
-	// 仅对已盈利的仓位做移动止盈（亏损仓位走止损规则）
-	if h.Pos.HighPrice < h.Pos.CostPrice {
+	// 移动止盈只在"已经涨够"之后才武装：期间高点必须达到 成本×(1+arm)。
+	// 建仓首日 high 就是成本，若没有这一步，5% 回撤线会先于 8% 止损线触发，
+	// 把止损收紧成 5%（20261022 600704：成本/高点 5.07，现价 4.81 被"移动止盈"卖出）。
+	// arm=0 退回旧口径（成本线即武装），保留 A/B 与回滚能力。
+	armGate := model.Fen(float64(h.Pos.CostPrice) * (1 + p.TrailingArmPct))
+	if h.Pos.HighPrice < armGate {
 		return nil
 	}
 	drawdown := (float64(h.Pos.HighPrice-h.LastClose) / float64(h.Pos.HighPrice)) * 100
@@ -109,13 +118,16 @@ func evalTakeProfit(date string, h HoldingCtx, p risk.RiskParams) *model.Signal 
 // 建仓未满也不会豁免下跌出清。DaysHeld<0（老同步持仓无建仓日期）不适用保护，
 // 保持旧口径——缺数据不是保护的理由，也不该因此被无限锁仓。
 //
+// NoBand=true 是"当天根本没有有效的个股排名带"（空候选池/band 里只有 ETF），
+// 与"在榜但没进榜"是两件事：前者规则输入不存在，正确反应是跳过，不是卖出。
+//
 // ETF 持仓不受这条规则约束（设计文档 §4，组长批准的豁免口径）：ETF 候选只在
 // 弱势试探期产出，且白名单直通、池内根本不排名。若照个股口径判"跌出榜单就卖"，
 // 则①一旦大盘收复均线恢复开闸，手里 ETF 当晚必被"排名淘汰"清掉；②某只 ETF
 // 当日没通过流动性级也会触发同一张卖单。两者都不是"它变差了"，而是"这条规则
 // 的输入对它不存在"——规则依赖的口径没成立时，正确反应是跳过，不是卖出。
 func evalRankOut(date string, h HoldingCtx) *model.Signal {
-	if h.Pos.TotalQty <= 0 || h.InTopN || h.IsETF {
+	if h.Pos.TotalQty <= 0 || h.InTopN || h.IsETF || h.NoBand {
 		return nil
 	}
 	if h.RankOut.MinHoldDays > 0 && h.DaysHeld >= 0 && h.DaysHeld < h.RankOut.MinHoldDays {

@@ -51,6 +51,9 @@ data/.stversions/
 /data/
 /data.bak*/
 
+# Qoder 协作运行期产物（会话/技能镜像，机器相关，不入库）
+/.qoder-*
+
 # Log files
 logs/
 *.log

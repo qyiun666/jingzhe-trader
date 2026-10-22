@@ -103,30 +103,45 @@ func (d Deps) raiseU(rc *observability.RunCtx, code, title, content string) {
 // JobEveningPipeline 收盘后一条流水线任务名（调度器注册名，日报引用其结论时用）。
 const JobEveningPipeline = "evening_pipeline"
 
+// 任务级执行上限（组长 20261023 第 0 批定：盘中 2min / 管线 30min / 日报 10min）。
+// 早盘与 17:00 发信同属短任务，统一 10min。超时按 fail 落轨迹并触发 JOB_FAILED。
+const (
+	jobTimeoutMorning  = 10 * time.Minute
+	jobTimeoutIntraday = 2 * time.Minute
+	jobTimeoutPipeline = 30 * time.Minute
+	jobTimeoutMail     = 10 * time.Minute
+	jobTimeoutReport   = 10 * time.Minute
+)
+
 // BuildJobs 构建 5 个触发点。顺序即同一时刻的执行次序。
 func BuildJobs(d Deps) []JobSpec {
 	return []JobSpec{
 		{
 			Name: "morning_plan", At: d.at("scheduler.morning"), TradeDayOnly: true,
-			Run: func(ctx context.Context, rc *observability.RunCtx) error { return morningPlan(ctx, rc, d) },
+			Timeout: jobTimeoutMorning,
+			Run:     func(ctx context.Context, rc *observability.RunCtx) error { return morningPlan(ctx, rc, d) },
 		},
 		{
 			Name: "intraday_scan", EveryMinutes: 5,
 			Windows:      []Window{{Start: "09:30", End: "11:30"}, {Start: "13:00", End: "15:00"}},
 			TradeDayOnly: true,
+			Timeout:      jobTimeoutIntraday,
 			Run:          func(ctx context.Context, rc *observability.RunCtx) error { return intradayScan(ctx, rc, d) },
 		},
 		{
 			Name: JobEveningPipeline, At: d.at("scheduler.pipeline"), TradeDayOnly: true,
-			Run: func(ctx context.Context, rc *observability.RunCtx) error { return eveningPipeline(ctx, rc, d) },
+			Timeout: jobTimeoutPipeline,
+			Run:     func(ctx context.Context, rc *observability.RunCtx) error { return eveningPipeline(ctx, rc, d) },
 		},
 		{
 			Name: "mail_pending", At: d.at("scheduler.mail_pending"), TradeDayOnly: true,
-			Run: func(ctx context.Context, rc *observability.RunCtx) error { return mailPending(ctx, rc, d) },
+			Timeout: jobTimeoutMail,
+			Run:     func(ctx context.Context, rc *observability.RunCtx) error { return mailPending(ctx, rc, d) },
 		},
 		{
 			Name: "daily_report", At: d.at("scheduler.report"), TradeDayOnly: true,
-			Run: func(ctx context.Context, rc *observability.RunCtx) error { return dailyReport(ctx, rc, d) },
+			Timeout: jobTimeoutReport,
+			Run:     func(ctx context.Context, rc *observability.RunCtx) error { return dailyReport(ctx, rc, d) },
 		},
 	}
 }

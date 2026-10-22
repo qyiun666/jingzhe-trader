@@ -60,6 +60,11 @@ var KeySpecs = []KeySpec{
 	// 仓位上限 / 持仓数 / 止损 / 置信度门槛由 risk.DefaultParams 给出固定基准，
 	// 不作为配置键暴露；这里只留确实生效、需要人工调整的止盈线。
 	{Key: "risk.take_profit_pct", Type: TypeFloat, Default: "0.15", RefuseZero: true},
+	// 移动止盈激活线：期间高点 ≥ 成本×(1+arm) 才启用回撤止盈，未激活时下跌只走 8% 止损。
+	// 建仓首日 high==cost，旧口径下 5% 回撤线会先于 8% 止损触发，实际把止损收紧成 5%
+	// （20261022 600704：成本/高点 5.07、现价 4.81 被"移动止盈"卖出）。
+	// 0 合法 = 回到旧口径（成本线即武装）；装配期校验 0..0.5。
+	{Key: "risk.trailing_arm_pct", Type: TypeFloat, Default: "0.06"},
 
 	// ---------- 交易成本 ----------
 	{Key: "cost.commission_rate", Type: TypeFloat, Default: "0.00025"},

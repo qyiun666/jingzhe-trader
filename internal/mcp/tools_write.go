@@ -3,10 +3,25 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/ticket"
 )
+
+// manualJobTimeout 手工任务的服务端上限（任务自身的 JobSpec.Timeout 更短时以它为准）。
+// 取 30min 覆盖收盘流水线最坏情况；它不继承 HTTP 请求的取消信号。
+const manualJobTimeout = 30 * time.Minute
+
+// runManualJob 执行手工补跑，但把作业生命周期与 HTTP 客户端解耦：
+// 10-21 的 trigger_task 在客户端 30s 断开时把 context canceled 传进流水线，
+// 半途失败并覆盖了原 trace；这里用 WithoutCancel 只保留请求值，不继承取消，
+// 由服务端 30min deadline 和任务级 Timeout 收口。客户端超时后以 run_trace 为准。
+func (s *Server) runManualJob(ctx context.Context, task, date string) error {
+	jobCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), manualJobTimeout)
+	defer cancel()
+	return s.deps.Jobs.RunNamed(jobCtx, task, date, "manual")
+}
 
 // jobEveningPipeline 收盘后一条流水线任务名（与 scheduler.BuildJobs 注册名一致）。
 const jobEveningPipeline = "evening_pipeline"
@@ -43,7 +58,7 @@ func (s *Server) registerWriteTools() {
 			}
 			// 与到点触发走同一条流水线（含行情回补、门禁、选股、决策、写单），
 			// 不在这里另拼一套"选股+信号"——那会跑出一套与调度器不同的当日结果。
-			if err := s.deps.Jobs.RunNamed(ctx, jobEveningPipeline, date, "manual"); err != nil {
+			if err := s.runManualJob(ctx, jobEveningPipeline, date); err != nil {
 				return nil, fmt.Errorf("补跑收盘流水线失败: %w", err)
 			}
 			return map[string]interface{}{"date": date, "fresh": rep.Fresh, "already_ran": false, "ran": jobEveningPipeline}, nil
@@ -209,7 +224,7 @@ func (s *Server) registerWriteTools() {
 			date := argStr(a, "date", today())
 			task := argStr(a, "task", "")
 			jobs := s.deps.Jobs.JobNames()
-			if err := s.deps.Jobs.RunNamed(ctx, task, date, "manual"); err != nil {
+			if err := s.runManualJob(ctx, task, date); err != nil {
 				return nil, err
 			}
 			return map[string]interface{}{"task": task, "date": date, "ok": true, "jobs": jobs}, nil

@@ -48,16 +48,31 @@ func (l *loginAuth) Next(fromServer []byte, more bool) ([]byte, error) {
 	}
 }
 
+// smtpIOTimeout 单封邮件从连接到 QUIT 的绝对上限（附录 A）。
+// 只给 Dial 设超时不够：TLS 握手后 Auth/Rcpt/Data/Quit 任何一步都可能
+// 被对端挂住，而 Mailer 是同步调用、调度 Tick 也是同步的 —— 一次挂起的
+// 发信会停掉后续所有任务（包括盘中止损扫描）。
+var smtpIOTimeout = 90 * time.Second
+
+// smtpTLSConfig 客户端 TLS 配置（测试可替换以信任自签证书；生产保持默认校验）。
+var smtpTLSConfig = func(host string) *tls.Config {
+	return &tls.Config{ServerName: host}
+}
+
 // Send 通过隐式 TLS SMTP 发送纯文本邮件。绝对超时 90s（附录 A）。
 func (c SMTPConfig) Send(to []string, subject, body string) error {
 	if err := c.validate(to); err != nil {
 		return err
 	}
 
-	dialer := &net.Dialer{Timeout: 90 * time.Second}
-	conn, err := tls.DialWithDialer(dialer, "tcp", c.Address(), &tls.Config{ServerName: c.Host})
+	dialer := &net.Dialer{Timeout: smtpIOTimeout}
+	conn, err := tls.DialWithDialer(dialer, "tcp", c.Address(), smtpTLSConfig(c.Host))
 	if err != nil {
 		return fmt.Errorf("连接 SMTP %s 失败: %w", c.Address(), err)
+	}
+	if err := conn.SetDeadline(time.Now().Add(smtpIOTimeout)); err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("设置 SMTP 会话截止时间失败: %w", err)
 	}
 	client, err := smtp.NewClient(conn, c.Host)
 	if err != nil {

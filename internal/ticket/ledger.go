@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -28,6 +29,13 @@ type Ledger struct {
 	st             *store.Store
 	cost           market.CostParams
 	initialCapital model.Fen // 进程内已知的本金（config account.initial_capital 生效值）
+
+	// mu 串行化账本写操作（ReportFill / SyncPortfolio / SettleT1），并把读操作
+	// （Assets / Cash）挡在写事务之外。单写池只保证 SQL 串行执行，不保证
+	// "先读 HasFill 再写" 这个跨语句判定原子；两个并发回执都可能在对方提交前
+	// 读到未回执状态。进程内用这把锁，跨进程（CLI 与常驻服务）由
+	// RecordFillTx 的 reported_at 守卫兜底。
+	mu sync.RWMutex
 }
 
 // NewLedger 构造账本。initialCapital 为 config 中 account.initial_capital 的生效值（分）。
@@ -60,6 +68,10 @@ func (l *Ledger) ReportFill(ctx context.Context, req FillRequest) (FillResult, e
 	if req.Qty <= 0 || req.Price <= 0 {
 		return FillResult{}, fmt.Errorf("回执失败: 成交量/价非法 (qty=%d price=%d)", req.Qty, int64(req.Price))
 	}
+	// 从幂等判定到成交/持仓提交全程串行：否则两个并发回执都能在对方提交前
+	// 通过 HasFill，第二个 applyPosition 会把同一笔数量再加一遍。
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	t, err := l.st.TradeRepo().GetTicket(ctx, req.TicketID)
 	if err != nil {
 		return FillResult{}, fmt.Errorf("%w: ticket_id=%d: %v", ErrTicketNotFound, req.TicketID, err)
@@ -117,6 +129,19 @@ func (l *Ledger) ReportFill(ctx context.Context, req FillRequest) (FillResult, e
 		return nil
 	})
 	if err != nil {
+		// 守卫命中：另一个进程（CLI/备用实例）已先提交这笔回执。
+		// 同进程并发已被 mu 串行化，这里只可能是跨进程竞争；重读一次，
+		// 若确已有回执就按幂等返回，否则说明票据被并发流转成了终态。
+		if errors.Is(err, store.ErrFillAlreadyRecorded) {
+			t2, gerr := l.st.TradeRepo().GetTicket(ctx, req.TicketID)
+			if gerr != nil {
+				return FillResult{}, gerr
+			}
+			if t2.HasFill() {
+				return FillResult{Fill: t2.FillView(), Duplicate: true}, nil
+			}
+			return FillResult{}, fmt.Errorf("回执失败: 指令单 %d 已被并发流转（status=%s），本次未记账", t2.ID, t2.Status)
+		}
 		return FillResult{}, err // 账本失败上抛，禁止降级继续（§11.1）
 	}
 	// 成交事实已在指令单行上（reported_* 与 fill_* 列），此处只留一行日志，不再另入库。
@@ -171,6 +196,8 @@ func (l *Ledger) applyPosition(ctx context.Context, tx *sqlx.Tx, t model.OrderTi
 // 判据是成交日而不是"有没有 today_bought"：当天补跑一次 morning_plan，
 // 或按历史日期补跑，都会把当天刚买的股票解锁成可卖 —— 那是直接绕过 T+1。
 func (l *Ledger) SettleT1(ctx context.Context, date string) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	positions, err := l.st.TradeRepo().ListPositions(ctx)
 	if err != nil {
 		return 0, err
@@ -213,6 +240,14 @@ const (
 //
 // 不做截断，负值即真实透支信号（正常情况下风控的现金核算会先于透支拦截）。
 func (l *Ledger) Cash(ctx context.Context) (model.Fen, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.cashLocked(ctx)
+}
+
+// cashLocked 与 Cash 同实现，调用方须已持有读锁（Assets 要一次性读持仓+现金，
+// 不能在中途被写了持仓的组合同步插进来）。
+func (l *Ledger) cashLocked(ctx context.Context) (model.Fen, error) {
 	raw, err := config.NewRepo(l.st).RawAll(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("读取现金锚点失败: %w", err)
@@ -284,6 +319,10 @@ func (l *Ledger) SyncPortfolio(ctx context.Context, in PortfolioSync) (int, bool
 		return 0, false, fmt.Errorf("组合同步失败: 必须给出券商口径的可用现金，" +
 			"否则校准进来的持仓成本会被双算成可用资金")
 	}
+	// 与回执互斥：组合同步会整行覆盖持仓，和成交回执并发时后写的一方必须
+	// 看到前一笔的提交结果，否则会出现"回执已扣仓、同步又覆盖回旧数量"。
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	actor := in.Actor
 	if actor == "" {
 		actor = "manual"
