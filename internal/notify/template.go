@@ -85,29 +85,6 @@ func render(subject string, b Brief, sections []string) (string, string) {
 	return subject, body.String()
 }
 
-// RenderM1 M1 次日指令邮件（有票：明细；无票：原因说明）。
-func RenderM1(lines []TicketLine, b Brief, noTicketReason string) (string, string) {
-	subject := fmt.Sprintf("[惊蛰][指令] 次日操作 %d 笔", len(lines))
-	if len(lines) == 0 {
-		subject = "[惊蛰][指令] 今日无指令"
-	}
-	var sections []string
-	if len(lines) == 0 {
-		sections = append(sections, "今日无指令。原因："+noTicketReason)
-	} else {
-		var sb strings.Builder
-		sb.WriteString("== 明日指令（请人工在券商 App 执行，有效期见下）==\n")
-		for i, l := range lines {
-			fmt.Fprintf(&sb, "%d. %s %s（%s）%d 股，参考价 %.2f 元，有效期至 %s\n   回执话术：「%s %s %d 股，指令单已回执」\n   理由：%s",
-				i+1, l.TsCode, l.Name, l.DirLabel, l.Qty, l.Price, l.ValidUntil,
-				l.TsCode, l.DirLabel, l.Qty, l.Reason)
-			sb.WriteString("\n")
-		}
-		sections = append(sections, sb.String())
-	}
-	return render(subject, b, sections)
-}
-
 // RenderM2 M2 盘前提醒（当日计划：待执行指令 + 持仓 + 昨日结论 + 条件单速填参数）。
 // conclusion 是"最近一次收盘流水线给当天留下了什么"的人话结论（可为空串，则整段不渲染）。
 // tickets 是当日待执行指令单（可为空，则参数块段不渲染）。

@@ -167,7 +167,7 @@ func mustPosition(t *testing.T, s *Store, code string) model.Position {
 }
 
 // TestListActiveUnexpiredCrossDay 跨日取"活跃且未过期"的单：昨晚生成的单
-//（trade_date=昨）在今天早上必须能被查到，而按当天 trade_date 过滤会漏掉它（历史缺陷）；
+// （trade_date=昨）在今天早上必须能被查到，而按当天 trade_date 过滤会漏掉它（历史缺陷）；
 // 已过期 / 已成交的单都不许出现。
 func TestListActiveUnexpiredCrossDay(t *testing.T) {
 	s := openStoreForTest(t)

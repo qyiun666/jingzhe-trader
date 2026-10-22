@@ -116,6 +116,11 @@ var errTransport = errors.New("llm 传输层失败")
 // 与传输层同属"这次什么都没给"，允许重问；与"给了但不合契约"是两回事。
 var errNoAnswer = errors.New("llm 没有给出答案")
 
+// errPermanent 标记重问也不会有别的结局的失败：鉴权/参数错误（4xx）、
+// 服务端明确返回 error、status 非 completed（预算耗尽/被截断）。
+// 只有这类错误不重试 —— 对 4xx 连问三次既花钱又拖长整条决策链。
+var errPermanent = errors.New("llm 永久性失败")
+
 // Complete 发起一次补全，返回最终 message 正文。
 //
 // v4-flash 会先吐若干 reasoning / web_search_call 条目，答案只在其后的 message 里；
@@ -123,7 +128,7 @@ var errNoAnswer = errors.New("llm 没有给出答案")
 // 每次调用（成与败）都记一行日志：token 用量与 status 是判断"截断还是没答"的唯一依据。
 func (c *Client) Complete(ctx context.Context, req Request) (text string, callErr error) {
 	if !c.Enabled() {
-		return "", fmt.Errorf("llm 客户端未配置（api_key/model 缺失）")
+		return "", fmt.Errorf("llm 客户端未配置（api_key/model 缺失）（%w）", errPermanent)
 	}
 	body := responseReq{
 		Model: c.model, Input: req.User, Instructions: req.System,
@@ -150,11 +155,11 @@ func (c *Client) Complete(ctx context.Context, req Request) (text string, callEr
 
 	reqBody, err := json.Marshal(body)
 	if err != nil {
-		return "", fmt.Errorf("序列化 LLM 请求失败: %w", err)
+		return "", fmt.Errorf("序列化 LLM 请求失败: %w（%w）", err, errPermanent)
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/responses", bytes.NewReader(reqBody))
 	if err != nil {
-		return "", fmt.Errorf("构建 LLM 请求失败: %w", err)
+		return "", fmt.Errorf("构建 LLM 请求失败: %w（%w）", err, errPermanent)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
@@ -168,27 +173,30 @@ func (c *Client) Complete(ctx context.Context, req Request) (text string, callEr
 	if err != nil {
 		return "", fmt.Errorf("读取 LLM 响应失败: %w（%w）", err, errTransport)
 	}
-	if err := json.Unmarshal(raw, &rr); err != nil {
-		return "", fmt.Errorf("解析 LLM 响应失败（http %d）: %w（%w）", resp.StatusCode, err, errTransport)
-	}
-	// 状态码先判：5xx 是"这次请求没成"，属传输层，可原样重问一次；
+	// 状态码先判、再解 JSON：4xx 的错误体经常不是 Responses 协议（网关 HTML/纯文本），
+	// 先解会把"鉴权失败/参数错"误诊成传输层抖动，进而连问三次。
+	// 5xx 是"这次请求没成"，属传输层，可原样重问一次；
 	// 服务端错误体里的 message 只是给人看的补充，不改变可不可重试的分类。
 	if resp.StatusCode != http.StatusOK {
 		if resp.StatusCode >= http.StatusInternalServerError {
 			return "", fmt.Errorf("LLM http 状态 %d: %s（%w）",
 				resp.StatusCode, truncate(string(raw), 300), errTransport)
 		}
-		return "", fmt.Errorf("LLM http 状态 %d: %s", resp.StatusCode, truncate(string(raw), 300))
+		return "", fmt.Errorf("LLM http 状态 %d: %s（%w）",
+			resp.StatusCode, truncate(string(raw), 300), errPermanent)
+	}
+	if err := json.Unmarshal(raw, &rr); err != nil {
+		return "", fmt.Errorf("解析 LLM 响应失败（http %d）: %w（%w）", resp.StatusCode, err, errTransport)
 	}
 	if rr.Error != nil && rr.Error.Message != "" {
-		return "", fmt.Errorf("LLM 返回错误: %s", rr.Error.Message)
+		return "", fmt.Errorf("LLM 返回错误: %s（%w）", rr.Error.Message, errPermanent)
 	}
 	// status 不是 completed 就是"这一问没答完"，直接点名原因；
 	// 让它落到下面的"无正文/不可解析"会把输出预算问题误诊成模型不听话。
 	if rr.Status != "" && rr.Status != "completed" {
-		return "", fmt.Errorf("LLM 输出未完成 status=%s（in=%d out=%d reasoning=%d，预算 %d）",
+		return "", fmt.Errorf("LLM 输出未完成 status=%s（in=%d out=%d reasoning=%d，预算 %d）（%w）",
 			rr.Status, rr.Usage.InputTokens, rr.Usage.OutputTokens,
-			rr.Usage.OutputTokensDetails.ReasoningTokens, maxOutputTokens)
+			rr.Usage.OutputTokensDetails.ReasoningTokens, maxOutputTokens, errPermanent)
 	}
 	text = lastMessage(rr.Output)
 	if text == "" {

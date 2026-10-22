@@ -58,7 +58,8 @@ func TestCompleteNormalJSONNotFlaggedAsLeak(t *testing.T) {
 // TestDecisionPromptReadsUnknownAsNoVeto 组长 seq=141 追加的两条决策口径，同夜随 P0/P1/P2 上线：
 // ① news=unknown 不许被读成反对意见（只说"不加分不减分"不够，保守读法仍会把整维恒等于否决）；
 // ② ETF 的否决依据里不能再要求"当期 ETF 层面公告"—— 摘掉检索后这个前提永久够不着，
-//    留着等于把 ETF 真实有的技术形态与流动性证据一起废掉。
+//
+//	留着等于把 ETF 真实有的技术形态与流动性证据一起废掉。
 func TestDecisionPromptReadsUnknownAsNoVeto(t *testing.T) {
 	for _, want := range []string{"不构成不买的理由", "缺的是正证据，不是减分", "只凭其余维度"} {
 		if !strings.Contains(decisionSystem, want) {
@@ -74,6 +75,11 @@ func TestDecisionPromptReadsUnknownAsNoVeto(t *testing.T) {
 	// 反向护栏：negative 仍是硬信号，对称规则不能被写成"unknown 与 negative 一样处理"。
 	if !strings.Contains(decisionSystem, "它答 negative 表示价格形态已经异常") {
 		t.Error("negative 优先处理的口径不得被对称规则稀释")
+	}
+	// 成本口径：审批前必须换算成本，覆盖不了双边成本的单子不许批。
+	if !strings.Contains(decisionSystem, "交易成本是硬成本") ||
+		!strings.Contains(decisionSystem, "覆盖不了成本的也不要批") {
+		t.Error("决策 prompt 缺少交易成本/最低净收益约束")
 	}
 }
 

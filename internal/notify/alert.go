@@ -41,6 +41,19 @@ func (a *AlertService) WithClock(f func() time.Time) *AlertService {
 // 原来 agent_alert 的 level / source 两列没有读者参与判定（只有 urgent 这一条分支在代码里），
 // 故折进 Detail 文本保留出处，不再占列。
 func (a *AlertService) Raise(ctx context.Context, tradeDate, source string, level model.AlertLevel, code, title, content string) error {
+	return a.raise(ctx, tradeDate, source, level, code, title, content, true)
+}
+
+// RaiseUrgentTraceOnly 只落 urgent 告警轨迹、不发 M6。
+//
+// 用于已经有专属邮件通道的事件：盘中卖出触发会发 M3，若同时再走 urgent 的 M6，
+// 同一笔卖单会到两封内容重复的邮件。轨迹仍按 alert:<code> 刷新，日报/自检看得见。
+func (a *AlertService) RaiseUrgentTraceOnly(ctx context.Context, tradeDate, source, code, title, content string) error {
+	return a.raise(ctx, tradeDate, source, model.AlertUrgent, code, title, content, false)
+}
+
+func (a *AlertService) raise(ctx context.Context, tradeDate, source string, level model.AlertLevel,
+	code, title, content string, mailAllowed bool) error {
 	if !level.Valid() {
 		return fmt.Errorf("非法告警级别: %q", level)
 	}
@@ -61,8 +74,8 @@ func (a *AlertService) Raise(ctx context.Context, tradeDate, source string, leve
 	// JOB_FAILED 这类反复触发的 code 每轮都 raise 一次，原来就会每轮发一封 M6，
 	// 收件箱被同一件事刷爆，而轨迹行按 (trade_date, subject) 覆盖成一封都看不出来。
 	// 轨迹照常刷新（保留最新原因与时间），只是不再重复投递。
-	mailIt := true
-	if level == model.AlertUrgent {
+	mailIt := mailAllowed
+	if level == model.AlertUrgent && mailAllowed {
 		last, err := a.st.TraceRepo().LastAt(ctx, subject, tradeDate)
 		if err != nil {
 			return err
@@ -79,11 +92,7 @@ func (a *AlertService) Raise(ctx context.Context, tradeDate, source string, leve
 	}
 	observability.S().Infow("告警已落轨迹", "code", code, "level", string(level), "date", tradeDate, "title", title)
 
-	if level == model.AlertUrgent {
-		if !mailIt {
-			observability.S().Infow("urgent 告警当日已投递过该 code，跳过重复发信", "code", code, "date", tradeDate)
-			return nil
-		}
+	if level == model.AlertUrgent && mailIt {
 		// urgent 立即发信（M6），每个 code 当天一封；发送失败显式返回，绝不静默
 		mSubject, mBody := RenderM6(string(level), code, title, content)
 		if a.mail != nil {

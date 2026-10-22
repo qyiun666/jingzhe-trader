@@ -60,6 +60,12 @@ type BuyBudget struct {
 	ExistingFen model.Fen
 	// AddRoomFen 该票还能加多少（单票上限 − 现有敞口，分）；新仓为 0（无限制语义）。
 	AddRoomFen model.Fen
+	// MinAmountFen 生效的单笔金额下限：低于它的买入会被风控以 min_amount 否决。
+	MinAmountFen model.Fen
+	// RoundTripCostFen 按单票上限估算的双边交易成本（分）。
+	RoundTripCostFen model.Fen
+	// MinNetReturnFen 最低净收益门槛（当前口径 = 2×双边成本）：覆盖不了它的交易不值得做。
+	MinNetReturnFen model.Fen
 }
 
 // BuyDecision 模型的裁决。

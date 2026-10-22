@@ -117,7 +117,7 @@ func (s *Service) Generate(ctx context.Context, tradeDate string, cands []model.
 		decider = NoDecider{}
 	}
 	rep := &Report{TradeDate: tradeDate, Candidates: len(cands)}
-	series, err := s.barSeries(ctx, tradeDate)
+	series, err := s.barSeries(ctx, tradeDate, seriesCodes(cands, watch))
 	if err != nil {
 		return nil, err
 	}
@@ -317,10 +317,15 @@ func (s *Service) pendingBuy(it BuyRequest, d BuyDecision, total model.Fen, rep 
 // 还剩几个持仓名额，以及（若已持有该代码）现有敞口与还能加多少。
 // 模型只在这些数之内表达意愿，越界由 Manager 斩掉。
 func budgetOf(state risk.AccountState, p risk.RiskParams, code string, price model.Fen) BuyBudget {
+	slot := p.SingleCapFen()
+	cost := risk.RoundTripCostFen(slot)
 	b := BuyBudget{
-		CashFen: state.Cash, SlotFen: p.SingleCapFen(),
+		CashFen: state.Cash, SlotFen: slot,
 		LotCostFen: price.Mul(model.LotShares),
 		Positions:  state.PositionCount, MaxPos: p.MaxPositions,
+		MinAmountFen:     p.MinAmountFloor(),
+		RoundTripCostFen: cost,
+		MinNetReturnFen:  cost * 2,
 	}
 	if held, ok := state.HeldMV[code]; ok {
 		room := p.SingleCapFen() - held
@@ -449,17 +454,24 @@ func (s *Service) activeKeys(ctx context.Context, tradeDate string) (map[ticketK
 	return out, nil
 }
 
-// barSeries 因子窗口内的收盘、成交量与未复权收盘序列（按代码）。
-func (s *Service) barSeries(ctx context.Context, tradeDate string) (map[string]BarSeries, error) {
+// barSeries 因子窗口内只读候选与保留带标的的收盘、成交量与未复权收盘序列。
+//
+// 这里曾经用 BarCloseSeries 按日期读全市场（约 5500 只 × 20 天），但买入决策只消费
+// cands、卖出规则只用 LatestBarAt 读单只持仓——全市场序列读完即丢。改成按代码集
+// 读取后，SQL 走 (ts_code, trade_date) 主键，行数从十万级降到最多 (TopN+BufferN)×20。
+func (s *Service) barSeries(ctx context.Context, tradeDate string, codes []string) (map[string]BarSeries, error) {
+	if len(codes) == 0 {
+		return nil, nil
+	}
 	dates, err := s.st.ScreenRepo().WindowDates(ctx, tradeDate, screener.BarWindow())
 	if err != nil {
 		return nil, err
 	}
-	pts, err := s.st.ScreenRepo().BarCloseSeries(ctx, dates)
+	pts, err := s.st.ScreenRepo().BarsForCodes(ctx, codes, dates)
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]BarSeries, len(dates))
+	out := make(map[string]BarSeries, len(codes))
 	for _, p := range pts {
 		bs := out[p.TsCode]
 		bs.Closes = append(bs.Closes, p.Close)
@@ -468,6 +480,27 @@ func (s *Service) barSeries(ctx context.Context, tradeDate string) (map[string]B
 		out[p.TsCode] = bs
 	}
 	return out, nil
+}
+
+// seriesCodes 候选 + 排名保留带的代码并集（去重、去空）。
+//
+// 保留带只参与规则 4 的成员判定，本不需要日线；一并读入是为了让信号层的"窗口标的"
+// 与"排名标的"是同一个集合，避免以后加指标时两处各读一份、口径漂移。
+func seriesCodes(cands, watch []model.Candidate) []string {
+	out := make([]string, 0, len(cands)+len(watch))
+	seen := make(map[string]bool, len(cands)+len(watch))
+	add := func(list []model.Candidate) {
+		for _, c := range list {
+			if c.TsCode == "" || seen[c.TsCode] {
+				continue
+			}
+			seen[c.TsCode] = true
+			out = append(out, c.TsCode)
+		}
+	}
+	add(cands)
+	add(watch)
+	return out
 }
 
 // indexInfo 大盘指数状态（收盘与均线同为分；均线按门槛窗口由读取层现算）。

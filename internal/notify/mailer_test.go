@@ -133,6 +133,33 @@ func TestAlertUrgentMailsOncePerCodePerDay(t *testing.T) {
 	}
 }
 
+// TestAlertUrgentTraceOnlySkipsMail 已有专属邮件通道的事件（盘中卖出发 M3）只落轨迹，
+// 不再额外发 M6 —— 否则同一笔卖单会到两封内容重复的邮件。
+func TestAlertUrgentTraceOnlySkipsMail(t *testing.T) {
+	m, st, sent := newTestMailer(t, "traceonly.db")
+	ctx := t.Context()
+	const date = "20260904"
+	const code = "INTRADAY_SELL:600519.SH:" + date
+
+	a := NewAlertService(st, m)
+	if err := a.RaiseUrgentTraceOnly(ctx, date, "scheduler", code, "盘中卖出触发", "跌破止损"); err != nil {
+		t.Fatalf("RaiseUrgentTraceOnly 失败: %v", err)
+	}
+	if *sent != 0 {
+		t.Errorf("trace-only 告警发了 %d 封 M6，期望 0（卖单详情由 M3 负责）", *sent)
+	}
+	rows, err := st.TraceRepo().List(ctx, date)
+	if err != nil {
+		t.Fatalf("读轨迹失败: %v", err)
+	}
+	for _, r := range rows {
+		if r.Subject == model.TraceAlert(code) && r.Outcome == model.TraceFail {
+			return
+		}
+	}
+	t.Errorf("trace-only 告警未落 alert 轨迹，当日 %d 行里没有 %s", len(rows), code)
+}
+
 // TestAlertNonUrgentStillUsesHourWindow 非 urgent 的 1 小时窗口不能被这次改动带偏。
 func TestAlertNonUrgentStillUsesHourWindow(t *testing.T) {
 	m, st, sent := newTestMailer(t, "warn.db")

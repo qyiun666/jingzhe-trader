@@ -49,6 +49,7 @@ type stubServer struct {
 	srv     *httptest.Server
 	replies map[string][]string
 	fails   map[string]int // 标记 → 还剩多少次返回 500（nil = 从不失败）
+	status  map[string]int // 标记 → 固定返回的 HTTP 状态（如 401；优先于 fails）
 
 	mu    sync.Mutex
 	calls []stubCall
@@ -76,6 +77,7 @@ func newStub(t *testing.T, replies map[string][]string, failTimes map[string]int
 		if failLeft > 0 {
 			s.fails[marker] = failLeft - 1
 		}
+		status := s.status[marker]
 		list := s.replies[marker]
 		reply := list[len(list)-1]
 		if asked < len(list) {
@@ -83,6 +85,11 @@ func newStub(t *testing.T, replies map[string][]string, failTimes map[string]int
 		}
 		s.mu.Unlock()
 
+		if status != 0 && status != http.StatusOK {
+			w.WriteHeader(status)
+			fmt.Fprint(w, `{"error":{"message":"永久性错误"}}`)
+			return
+		}
 		if failLeft > 0 {
 			w.WriteHeader(http.StatusInternalServerError)
 			fmt.Fprint(w, `{"error":{"message":"上游 500"}}`)
@@ -558,6 +565,125 @@ func TestReviewTransportFailureIsRetriedOnce(t *testing.T) {
 	}
 }
 
+// TestReviewPermanentHTTPErrorNotRetried 4xx 是永久性错误：鉴权/参数错了，
+// 同一问连问三次只会多花钱、拖长决策链。只允许问一次，并按"评审失败"处理整批。
+func TestReviewPermanentHTTPErrorNotRetried(t *testing.T) {
+	st := testStore(t)
+	srv := newStub(t, allOKBatch(), nil)
+	srv.status = map[string]int{markTech: http.StatusUnauthorized}
+
+	got, err := newReviewer(srv.srv.URL, st, true).DecideBatch(context.Background(), batchReq())
+	if err != nil {
+		t.Fatalf("模型侧的永久错误不应中断流程: %v", err)
+	}
+	if n := srv.callsOf(markTech); n != 1 {
+		t.Errorf("401 不应重试，tech 实际问了 %d 次", n)
+	}
+	for _, code := range []string{codeA, codeB} {
+		if d := got[code]; !d.Failed || d.Approve {
+			t.Errorf("%s 应记为评审失败（证据不全不批），实际 %+v", code, d)
+		}
+		if _, found := rowOf(t, st, code, KeyDecision); found {
+			t.Errorf("证据不全时 %s 不应产生决策行", code)
+		}
+		if mustRow(t, st, code, KeyTech).Status != model.TraceFail {
+			t.Errorf("%s 的 tech 失败行必须落库（当天重跑会重试）", code)
+		}
+	}
+}
+
+// TestReviewEvidenceRunsInParallel 四条证据必须并行：串行时整轮耗时是四问之和，
+// 并行后约等于最慢的一条。用"四条证据请求必须同时在途"的栅栏证明：任何一条
+// 被串行挡住都到不齐，栅栏超时即失败。
+func TestReviewEvidenceRunsInParallel(t *testing.T) {
+	st := testStore(t)
+	replies := allOKBatch()
+	var (
+		mu             sync.Mutex
+		inFlight, peak int
+		arrived        sync.WaitGroup
+		releaseOnce    sync.Once
+	)
+	arrived.Add(len(EvidencePrompts))
+	release := make(chan struct{})
+	go func() {
+		arrived.Wait()
+		releaseOnce.Do(func() { close(release) })
+	}()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req responseReq
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Errorf("请求体不是合法 JSON: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		marker := matchMarker(req.Instructions)
+		if marker == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if marker != markDecide {
+			mu.Lock()
+			inFlight++
+			if inFlight > peak {
+				peak = inFlight
+			}
+			mu.Unlock()
+			arrived.Done()
+			select {
+			case <-release:
+			case <-time.After(time.Second):
+				t.Errorf("证据请求未同时到达：四条证据存在串行")
+			}
+			mu.Lock()
+			inFlight--
+			mu.Unlock()
+		}
+		list := replies[marker]
+		fmt.Fprintf(w, `{"status":"completed","output":[{"type":"message","content":[{"type":"text","text":%q}]}]}`,
+			list[len(list)-1])
+	}))
+	defer srv.Close()
+
+	if _, err := newReviewer(srv.URL, st, true).DecideBatch(context.Background(), batchReq()); err != nil {
+		t.Fatalf("并行评审失败: %v", err)
+	}
+	if peak != len(EvidencePrompts) {
+		t.Errorf("四条证据应同时在途，实际峰值并发 %d", peak)
+	}
+}
+
+// TestReviewDeadlineBoundsRun 整轮 deadline 必须把"模型挂死"收口：
+// 服务端一直不回，评审也要在全局时限附近结束，并把全部候选记失败（证据不全不批）。
+func TestReviewDeadlineBoundsRun(t *testing.T) {
+	st := testStore(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 比全局 deadline 更晚才回：客户端必须先自己到期收口。
+		// 不用 <-r.Context().Done()：HTTP/1.1 下服务端不读连接时收不到断开事件，
+		// handler 会卡到 Server.Close，测试反而测不出 deadline。
+		time.Sleep(800 * time.Millisecond)
+	}))
+	defer srv.Close()
+
+	r := newReviewer(srv.URL, st, true).WithTimeouts(300*time.Millisecond, 200*time.Millisecond)
+	start := time.Now()
+	got, err := r.DecideBatch(context.Background(), batchReq())
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("超时应翻译成评审失败，而不是链路错误: %v", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("全局 deadline 未生效，耗时 %s", elapsed)
+	}
+	for _, code := range []string{codeA, codeB} {
+		if d := got[code]; !d.Failed || d.Approve {
+			t.Errorf("%s 在超时后应记为评审失败: %+v", code, d)
+		}
+	}
+}
+
 // TestReviewShortCodeMatches 模型常把 "600001.SH" 写成 "600001"：按 6 位代码认，不能算漏答。
 func TestReviewShortCodeMatches(t *testing.T) {
 	st := testStore(t)
@@ -653,5 +779,20 @@ func TestHoldingBlockShownForHeldCandidate(t *testing.T) {
 	fresh := item(codeB, "乙")
 	if strings.Contains(headerBlock(fresh), "【已持有】") {
 		t.Errorf("新仓候选不应渲染持仓块:\n%s", headerBlock(fresh))
+	}
+}
+
+// TestBatchMoneyShowsTradeCost 决策正文必须给出双边成本、最低净收益与单笔下限：
+// 模型看不到这三个数，就会批出 600 元级、被佣金吃光的单子。
+func TestBatchMoneyShowsTradeCost(t *testing.T) {
+	it := item(codeA, "甲")
+	it.Budget.MinAmountFen = model.FromFloat(750)
+	it.Budget.RoundTripCostFen = model.FromFloat(11.22)
+	it.Budget.MinNetReturnFen = model.FromFloat(22.44)
+	got := batchMoney([]signal.BuyRequest{it})
+	for _, want := range []string{"【交易成本】", "双边成本约", "11.22", "22.44", "750.00", "风控直接否决"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("交易成本段缺少 %q：\n%s", want, got)
+		}
 	}
 }

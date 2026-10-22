@@ -94,13 +94,14 @@ func (a AlertLevel) Valid() bool {
 
 // ===================== 邮件类型 MailType =====================
 
-// MailType 五类邮件：M1 次日指令 / M2 盘前提醒 / M3 盘中紧急 / M5 日报 / M6 异常告警。
+// MailType 四类邮件：M2 盘前提醒 / M3 盘中紧急 / M5 日报 / M6 异常告警。
 //
+// 原 M1「次日指令」已删（2026-10-23，组长定）：内容与 M5 的【次日计划】重复；
+// 17:00 的 IssueAll 下发动作保留，只取消单独发信。
 // 原 M4「档位变更立即发」已删（2026-09-04，随目标档位状态机一并下线）。
 type MailType string
 
 const (
-	MailM1 MailType = "M1"
 	MailM2 MailType = "M2"
 	MailM3 MailType = "M3"
 	MailM5 MailType = "M5"
@@ -109,13 +110,13 @@ const (
 
 // OnceDaily 该类型当天只该送达一封。
 //
-// M1/M2/M5 各绑定一个固定的当日时刻（17:00 待买卖 / 09:00 计划 / 18:00 日报），
+// M2/M5 各绑定一个固定的当日时刻（09:00 计划 / 18:00 日报），
 // 同一天重跑这个任务不该再发第二封 —— `trigger_task` 手工补跑一次就多一封，
 // 是收件箱被刷爆的成因。M3（盘中止损，每轮内容随本轮新单变化）与
 // M6（告警，一天可有多条不同 code）不在此列：它们重复是有信息量的。
 func (t MailType) OnceDaily() bool {
 	switch t {
-	case MailM1, MailM2, MailM5:
+	case MailM2, MailM5:
 		return true
 	}
 	return false

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"jingzhe-trader/internal/attribution"
 	"jingzhe-trader/internal/market"
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/notify"
@@ -300,7 +301,8 @@ func stopLossTickets(ctx context.Context, rc *observability.RunCtx, d Deps, date
 			Qty: int64(tk.Qty), Price: float64(tk.RefPrice) / 100,
 			ValidUntil: tk.ValidUntil, Reason: tk.Reason,
 		})
-		d.raiseU(rc, "INTRADAY_SELL:"+code+":"+date, "盘中卖出触发", sig.Reason)
+		// 只落轨迹不发 M6：本轮卖单会由 notifySell 发 M3，双发就是同一件事两封邮件。
+		d.raiseUTrace(rc, "INTRADAY_SELL:"+code+":"+date, "盘中卖出触发", sig.Reason)
 	}
 	return out, nil
 }
@@ -320,32 +322,17 @@ func notifySell(ctx context.Context, rc *observability.RunCtx, d Deps, date stri
 	return nil
 }
 
-// mailPending 17:00：下发指令单，读待买卖表发邮件；表为空则不发。
+// mailPending 17:00：下发指令单（drafted→issued）。
+//
+// M1 已取消（2026-10-23 组长定）：其内容与 18:00 M5 的【次日计划】+ 条件单参数重复。
+// IssueAll 仍必须执行——次日盘前 M2 的条件单参数与"已下发"状态都依赖它。
 func mailPending(ctx context.Context, rc *observability.RunCtx, d Deps) error {
 	date := rc.TradeDate()
 	issued, err := d.Tickets.IssueAll(ctx, date)
 	if err != nil {
 		return fmt.Errorf("指令单下发失败: %w", err)
 	}
-	lines, err := pendingTicketLines(ctx, d, date)
-	if err != nil {
-		return err
-	}
-	if len(lines) == 0 {
-		rc.Degrade("NO_PENDING_TICKET", fmt.Sprintf("待买卖表为空（本轮下发 %d 张），不发信", issued))
-		return nil
-	}
-	rc.Declare("mail", "pending_m1", -1)
-	brief, err := accountBriefOf(d, ctx, date)
-	if err != nil {
-		return fmt.Errorf("账户摘要读取失败: %w", err)
-	}
-	subject, body := notify.RenderM1(lines, brief, "")
-	if err := d.Mail.Send(ctx, date, model.MailM1, subject, body); err != nil {
-		d.raiseW(rc, "MAIL_NOT_SENT", "待买卖邮件发送失败", err.Error())
-		return fmt.Errorf("待买卖邮件(M1)发送失败: %w", err)
-	}
-	rc.Actual("pending_m1", 1)
+	observability.S().Infow("指令单下发完成（M1 已并入 M5，不发信）", "date", date, "issued", issued)
 	return nil
 }
 
@@ -436,6 +423,17 @@ func reportExtraSections(ctx context.Context, d Deps, date string) (string, erro
 		for _, ln := range strings.Split(notify.CondOrderBlock(l), "\n") {
 			b.WriteString("  " + ln + "\n")
 		}
+	}
+	// 候选归因：只读 run_trace/daily_bar，失败不影响日报本身（诊断缺一段不能把日报掐掉）。
+	b.WriteString("\n【候选归因】\n")
+	for _, h := range []int{5, 10} {
+		line, aerr := attribution.SummaryLine(ctx, d.Store, date, 20, h)
+		if aerr != nil {
+			observability.S().Warnw("日报归因不可用", "date", date, "horizon", h, "err", aerr.Error())
+			b.WriteString(fmt.Sprintf("  %d日：归因不可用（见日志）\n", h))
+			continue
+		}
+		b.WriteString("  " + line + "\n")
 	}
 	return b.String(), nil
 }

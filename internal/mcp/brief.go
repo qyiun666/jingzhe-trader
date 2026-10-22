@@ -2,7 +2,9 @@ package mcp
 
 import (
 	"context"
+	"time"
 
+	"jingzhe-trader/internal/market"
 	"jingzhe-trader/internal/model"
 )
 
@@ -36,14 +38,15 @@ func (s *Server) buildBrief(ctx context.Context, date string) (map[string]interf
 	if err != nil {
 		return nil, err
 	}
-	pending := 0
-	for _, t := range tks {
-		if t.Status == model.TicketDrafted || t.Status == model.TicketIssued {
-			pending++
-		}
+	// 待办按"活跃且未过期"取，不按 trade_date 过滤：前一晚生成、有效期到今日的单
+	// 仍是要执行的工作，按今天查会显示 0（2026-10-23 组长指出）。
+	now := time.Now().In(market.Loc).Format(time.RFC3339)
+	acts, err := s.deps.Store.TradeRepo().ListActiveUnexpired(ctx, now)
+	if err != nil {
+		return nil, err
 	}
 	out["tickets_total"] = len(tks)
-	out["tickets_pending"] = pending
+	out["tickets_pending"] = len(acts)
 	out["positions"] = len(pos)
 	if ran, e := s.deps.Store.TraceRepo().HasSucceeded(ctx, model.TraceJob(jobEveningPipeline), date); e == nil {
 		out["pipeline_done"] = ran

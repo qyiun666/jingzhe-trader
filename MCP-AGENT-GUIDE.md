@@ -40,7 +40,7 @@ mkdir -p logs
 nohup ./bin/jingzhe -db data/jingzhe.db serve -addr :8080 >> logs/jingzhe.log 2>&1 &
 ```
 
-- `-db`　SQLite 数据库路径（默认 `data/jingzhe.db`）
+- `-db`　SQLite 数据库路径（默认 `/home/qodercli/work/jingzhe-db/jingzhe.db`）
 - `serve`　常驻子命令；省略子命令时默认就是 serve
 - `-addr`　监听地址（默认 `:8080`，即全部网卡）。只在可信内网暴露，令牌必须非空
 
@@ -239,9 +239,11 @@ Authorization: Bearer <token>
 - 参数：`task`（必填）、`date?`
 - 与到点触发走同一条 `run_trace` 记账路径（outcome 为 ok/fail），返回 `jobs` 字段列出全部可选名。
 - 注意：这只是**即时补跑**；每日自动时刻表由 `scheduler.*` 配置键决定（见第 5.2 节）。
-- **补跑不会重复发通知**：M1（待买卖）/ M2（计划）/ M5（日报）当日各只投一封，已投递成功过再补跑
-  `morning_plan` / `mail_pending` / `daily_report`，只会在服务日志留一行"跳过重复发送"，任务照常算完成。
-  `intraday_scan` 每轮最多一封 M3（内容随本轮新单变化），不受此限；urgent 告警（M6）**同一个 code 当天也只发一封**，
+- **补跑不会重复发通知**：M2（计划）/ M5（日报）当日各只投一封，已投递成功过再补跑
+  `morning_plan` / `daily_report`，只会在服务日志留一行"跳过重复发送"，任务照常算完成。
+  M1 已取消：`mail_pending` 仍执行 IssueAll 下发，但不再发信（次日指令并入 M5）。
+  `intraday_scan` 每轮最多一封 M3（内容随本轮新单变化），不受此限；盘中卖出的 `alert:INTRADAY_SELL`
+  只落轨迹、不再额外发 M6。其他 urgent 告警（M6）**同一个 code 当天也只发一封**，
   但轨迹行每次都会刷新——所以想知道"这件事今天砸了几次"要看 `get_logs` 的 `detail`，不能数邮件。
 
 ### 3.9 sync_portfolio（首次接入与纠错，必读）

@@ -32,7 +32,9 @@ import (
 //
 // 明确不入库的数据：
 //   - 选股过程产物（候选、信号、漏斗计数）：选股是一条顺序流水线，中间结果在内存里交给
-//     决策环节，每级进出数写日志。落库的结果只有指令单。
+//     决策环节，每级进出数写日志。落库的结果只有指令单。**例外**：每日候选快照
+//     （代码/评分/因子/行业）落 run_trace 的 screen:topn 一行，供事后归因——
+//     没有当时的 score/factors，就无法回答"高分候选后来是否真的更好"。
 //   - 过程状态（任务尝试次数、耗时、产出物明细、降级清单、告警已读标记）：并入 run_trace
 //     的 outcome + detail 两列，一次写覆盖一行。
 //   - 邮件发件队列：发信同步一次，结果写一行 run_trace。不再跨进程补发 —— 那是为
@@ -212,8 +214,8 @@ type TableColumns struct {
 // 锁死：镜像漂移本身就是测试失败，不靠人肉同步两份真相。
 var SchemaColumns = []TableColumns{
 	{"config_kv", []ColumnSpec{
-		{"key", ""},                                // PRIMARY KEY，缺了必须重建
-		{"value", ""},                              // NOT NULL 无默认，空表才可能补，不赌
+		{"key", ""},   // PRIMARY KEY，缺了必须重建
+		{"value", ""}, // NOT NULL 无默认，空表才可能补，不赌
 	}},
 	{"trade_cal", []ColumnSpec{
 		{"cal_date", ""},

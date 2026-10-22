@@ -26,6 +26,7 @@ type RiskParams struct {
 	AllowNewPosition    bool      // 是否允许开新仓
 	MaxSingleAmountPct  float64   // 单笔金额上限（占总资产）
 	MinSingleAmountFen  model.Fen // 单笔金额下限（分，见 MinAmountFloor 的小资金收口）
+	MinAmountRatio      float64   // 单笔下限占单票上限的比例（默认 0.5；弱势试探提高到 0.75）
 	MinConfidence       float64   // 决策置信度下限（模型自报值）
 	TotalAsset          model.Fen // 总资产（分；用于持仓数自适应与金额核算）
 }
@@ -43,10 +44,15 @@ func (p RiskParams) SingleCapFen() model.Fen {
 //
 // 5000 元这个绝对值的唯一用途是让最低 5 元佣金不吃掉 0.1% 本金；但两万元级别的账户
 // 单票上限本身就不到一万元，按绝对下限会把每一个候选都判成"金额过小"而全数否决。
-// 因此取"绝对下限"与"单票上限的一半"的较小值：大账户仍受 5000 元约束，小账户自动缩放。
+// 因此取"绝对下限"与"单票上限 × MinAmountRatio"的较小值：大账户仍受 5000 元约束，
+// 小账户自动缩放；弱势试探档把比例从 0.5 提到 0.75，避免 600 元级的单子被佣金吃光。
 func (p RiskParams) MinAmountFloor() model.Fen {
-	if half := p.SingleCapFen() / 2; half > 0 && half < p.MinSingleAmountFen {
-		return half
+	ratio := p.MinAmountRatio
+	if ratio <= 0 || ratio > 1 {
+		ratio = baseMinAmountRatio // 坏值/旧构造回落到基准，不静默放行
+	}
+	if byRatio := pctOf(p.SingleCapFen(), ratio); byRatio > 0 && byRatio < p.MinSingleAmountFen {
+		return byRatio
 	}
 	return p.MinSingleAmountFen
 }
@@ -68,6 +74,7 @@ const (
 	baseTakeProfitPct       = 0.15 // 止盈
 	baseMaxSingleAmountPct  = 1.0  // 单笔金额上限（占总资产）
 	baseMinConfidence       = 0.55 // 决策置信度下限
+	baseMinAmountRatio      = 0.5  // 单笔下限 = 单票上限 × 该比例（与绝对下限取小）
 )
 
 // 默认单笔金额下限：5000 元（保费率 ≤0.1%；小资金账户由 MinAmountFloor 自动缩放）。
@@ -79,6 +86,10 @@ const DefaultMinSingleAmountFen = model.Fen(5000 * 100)
 const (
 	WeakMaxTotalPctDefault  = 0.20
 	WeakMaxSinglePctDefault = 0.10
+	// WeakMinAmountRatio 弱势档单笔下限占单票上限的比例（默认档 0.5）。
+	// 弱势单票约 1200 元，600 元的单子双边佣金+印花税 ≈ 10.7 元（1.8%），
+	// 提到 0.75 后单笔至少约 900 元，成本占比降到约 1.2%。
+	WeakMinAmountRatio = 0.75
 )
 
 // WeakParams 把风控参数收缩到弱势试探口径：只收紧、永不放宽——
@@ -108,6 +119,9 @@ func WeakParams(p RiskParams, maxTotalPct, maxSinglePct float64) RiskParams {
 	if p.MaxPositionPct > maxSinglePct {
 		p.MaxPositionPct = maxSinglePct
 	}
+	// 仓位上限收缩后，单笔下限按新单票上限重新取比例：不提高比例的话，
+	// 试探档会允许 600 元级交易，双边成本占比接近 2%。
+	p.MinAmountRatio = WeakMinAmountRatio
 	return p
 }
 
@@ -127,6 +141,7 @@ func DefaultParams(totalAsset model.Fen) RiskParams {
 		MaxSingleAmountPct:  baseMaxSingleAmountPct,
 		MinConfidence:       baseMinConfidence,
 		MinSingleAmountFen:  DefaultMinSingleAmountFen,
+		MinAmountRatio:      baseMinAmountRatio,
 		TotalAsset:          totalAsset,
 	}
 

@@ -22,6 +22,13 @@ const momentumBars = 20
 // 缺口由 SyncDaily 按日补拉（每天一次调用即全市场，代价远低于逐只拉）。
 const syncBackfillMargin = 5
 
+// valuationCoverageWarn 估值截面覆盖率告警线。
+//
+// 正常情况下 daily_basic 一次覆盖全部在市股（实测 99%+）；低于 80% 说明同步链路
+// 出了问题，此时估值筛选不是在"选股"，而是在按数据缺口随机剔人——必须显式降级，
+// 让人先查数据再解释候选为什么变少。
+const valuationCoverageWarn = 0.8
+
 // Screener 选股器：一条顺序流水线，产出内存候选，不写任何表。
 type Screener struct {
 	st  *store.Store
@@ -110,6 +117,15 @@ type Report struct {
 	Empty       bool
 	Notes       []string
 
+	// ValuationCovered/Total 当日估值截面覆盖（val_date == 选股日 的股票数 / 在市股票数）。
+	// 估值缺失是数据链问题，不是"估值差"：覆盖率低时 PE/PB 筛选会大面积误杀，
+	// 与"确实没有便宜票"看起来一模一样，必须把两个口径分开留痕。
+	ValuationCovered  int
+	ValuationTotal    int
+	ValuationCoverage float64
+	// ValuationSparse 覆盖率低于阈值：调用方据此落降级告警（先查估值同步）。
+	ValuationSparse bool
+
 	// RegimeClosed 大盘闸门关闭（指数在门槛均线下方）。判定这一件事原先只有一处依据
 	// ——遍历 Stages 找 slug=regime 且 Out==0，闸门一旦改成不清零池子那个依据就没了，
 	// 故由漏斗自己落一个旗标，下游（告警文案、产出物期望）只读它。
@@ -161,7 +177,8 @@ func (in *inputs) price(tsCode string) model.Fen {
 	return model.Fen(int64(r[len(r)-1] + 0.5))
 }
 
-// Run 执行选股流水线：板块强弱排名 → 资格 → 大盘门槛 → 板块 → 可用资金 → 流动性 → 估值 → 因子排名 TopN。
+// Run 执行选股流水线：板块强弱排名 → 资格 → 大盘门槛 → 板块 → 估值完整性 → 可用资金
+// → 流动性 → 估值 → 因子排名 TopN。
 // 数据全部读自本地缓存，本函数不触网；任何过程都不写库，只有候选为空时落一条告警。
 //
 // 大盘闸门关闭时各级照常执行，产出落在 Report.Shadow，Candidates 保持 nil ——
@@ -172,6 +189,7 @@ func (s *Screener) Run(ctx context.Context, tradeDate string, budget Budget) (*R
 		return nil, err
 	}
 	rep := &Report{TradeDate: tradeDate}
+	s.valuationCoverage(rep, in.stocks, tradeDate)
 
 	sectors := rankSectors(in, s.cfg)
 	rep.Sectors = sectors
@@ -196,22 +214,22 @@ func (s *Screener) Run(ctx context.Context, tradeDate string, budget Budget) (*R
 	survivors = s.filterStage(tr, "sector", "板块强弱TopK", survivors, func(stk model.StockBasic) (bool, string) {
 		return sectorGateStage(stk.Industry, hot)
 	})
-	survivors = s.filterStage(tr, "budget", "可用资金(一手≤预算)", survivors, func(stk model.StockBasic) (bool, string) {
+	// 估值缺失单列一级：它不是"估值贵/便宜"，也不是"流动性差"。以前这三个筛选级
+	// 各自先查一遍 val_date，同一只票在哪一级被发现就记成哪一级的淘汰原因，
+	// 于是"估值没同步"会被读成"流动性不足"。先在这级统一剔掉，后面各级只做本业。
+	survivors = s.filterStage(tr, "valdata", "估值数据完整性", survivors, func(stk model.StockBasic) (bool, string) {
 		if !hasValuation(stk, tradeDate) {
 			return false, reasonNoValuation
 		}
+		return true, ""
+	})
+	survivors = s.filterStage(tr, "budget", "可用资金(一手≤预算)", survivors, func(stk model.StockBasic) (bool, string) {
 		return affordableStage(in.price(stk.TsCode), budget.perSlot())
 	})
 	survivors = s.filterStage(tr, "liq", "流动性(市值/换手)", survivors, func(stk model.StockBasic) (bool, string) {
-		if !hasValuation(stk, tradeDate) {
-			return false, reasonNoValuation
-		}
 		return liquidityStage(stk, s.cfg)
 	})
 	survivors = s.filterStage(tr, "val", "估值(价格/PE/PB)", survivors, func(stk model.StockBasic) (bool, string) {
-		if !hasValuation(stk, tradeDate) {
-			return false, reasonNoValuation
-		}
 		return valuationStage(stk, in.price(stk.TsCode), s.cfg)
 	})
 
@@ -226,6 +244,31 @@ func (s *Screener) Run(ctx context.Context, tradeDate string, budget Budget) (*R
 	rep.Candidates = scored
 	rep.Empty = len(rep.Candidates) == 0
 	return rep, s.finish(ctx, tradeDate, rep)
+}
+
+// valuationCoverage 统计当日估值截面覆盖并写进 Notes；覆盖率过低置 Sparse。
+//
+// 读侧覆盖率而不是"同步后有没有报错"：同步可能只写了一半就失败，接口却返回成功；
+// 只有把 val_date == 选股日 的股票数数出来，才知道今天到底有多少票参与了估值筛选。
+func (s *Screener) valuationCoverage(rep *Report, stocks []model.StockBasic, tradeDate string) {
+	rep.ValuationTotal = len(stocks)
+	for _, stk := range stocks {
+		if hasValuation(stk, tradeDate) {
+			rep.ValuationCovered++
+		}
+	}
+	if rep.ValuationTotal == 0 {
+		return
+	}
+	rep.ValuationCoverage = float64(rep.ValuationCovered) / float64(rep.ValuationTotal)
+	rep.Notes = append(rep.Notes, fmt.Sprintf("估值截面覆盖 %d/%d（%.1f%%）",
+		rep.ValuationCovered, rep.ValuationTotal, rep.ValuationCoverage*100))
+	if rep.ValuationCoverage < valuationCoverageWarn {
+		rep.ValuationSparse = true
+		rep.Notes = append(rep.Notes, fmt.Sprintf(
+			"估值截面覆盖不足（%.1f%% < %.0f%%）：PE/PB 筛选会大面积误杀，先查估值同步",
+			rep.ValuationCoverage*100, valuationCoverageWarn*100))
+	}
 }
 
 // filterStage 通用一级筛选：逐只判定，计入 tracer。

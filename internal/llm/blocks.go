@@ -222,9 +222,14 @@ func batchMoney(items []signal.BuyRequest) string {
 	b := items[0].Budget
 	return fmt.Sprintf(
 		"【账户口径】可用现金 %s 元 ｜ 单票上限 %s 元 ｜ 当前持仓 %d/%d 只（最多还能开 %d 只）\n"+
+			"【交易成本】按单票上限 %s 元估算，双边成本约 %s 元"+
+			"（佣金双边各最低 5 元/笔 + 卖出印花税 0.1%% + 过户费 0.001%%）；"+
+			"净收益至少覆盖 2×成本（约 %s 元）才值得下单；"+
+			"单笔投入低于 %s 元会被风控直接否决。\n"+
 			"【本批候选】%d 只，一次裁决全部门户：weight_pct 是拟投入占总资产的比例，"+
 			"全批投入之和不要超过可用现金。\n",
-		b.CashFen, b.SlotFen, b.Positions, b.MaxPos, slotsLeft(b), len(items))
+		b.CashFen, b.SlotFen, b.Positions, b.MaxPos, slotsLeft(b),
+		b.SlotFen, b.RoundTripCostFen, b.MinNetReturnFen, b.MinAmountFen, len(items))
 }
 
 // slotsLeft 还能开几只新仓（负数按 0 表达：超仓时不该给模型看负名额）。

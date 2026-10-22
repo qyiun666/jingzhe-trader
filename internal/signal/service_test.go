@@ -141,3 +141,66 @@ func TestSellDecisionsNonEmptyBandStillRankOut(t *testing.T) {
 		t.Error("有正常个股 band 时不该置 RankBandEmpty")
 	}
 }
+
+// TestSeriesCodes 候选与保留带的代码并集：去重、去空，顺序保持先候选后保留带。
+func TestSeriesCodes(t *testing.T) {
+	cands := []model.Candidate{{TsCode: "A"}, {TsCode: "B"}, {TsCode: ""}}
+	watch := []model.Candidate{{TsCode: "B"}, {TsCode: "C"}, {TsCode: "C"}}
+	got := seriesCodes(cands, watch)
+	if strings.Join(got, ",") != "A,B,C" {
+		t.Errorf("代码并集=%v，期望 [A B C]", got)
+	}
+}
+
+// TestBarSeriesReadsOnlyRequestedCodes 信号层不再按日期读全市场：
+// 只回给定代码的日线，未请求的票即使同一天有日线也不得出现在结果里。
+// 这是 P2-2 的回归锁——读法退回 BarCloseSeries 时，这条会因多出 600999.SH 而红。
+func TestBarSeriesReadsOnlyRequestedCodes(t *testing.T) {
+	st := sellFixture(t)
+	ctx := context.Background()
+	if err := st.MarketRepo().UpsertBar(ctx, model.Bar{
+		TsCode: "600999.SH", TradeDate: "20261021",
+		Close: 2000, VolLot: 1, RawClose: 2000,
+	}); err != nil {
+		t.Fatalf("写未请求标的日线失败: %v", err)
+	}
+	s := NewService(st, &ticket.Ledger{}, store.MarketGate{}, nil, RankOutPolicy{})
+	got, err := s.barSeries(ctx, "20261021", []string{"600000.SH"})
+	if err != nil {
+		t.Fatalf("barSeries 失败: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("只请求 1 只，实际返回 %d 只: %v", len(got), got)
+	}
+	if len(got["600000.SH"].Closes) == 0 {
+		t.Error("请求标的的日线不应为空")
+	}
+	if _, ok := got["600999.SH"]; ok {
+		t.Error("未请求标的混进了窗口序列（读法退回了全市场扫描）")
+	}
+}
+
+// TestBudgetOfCarriesTradeCost 决策预算必须带上成本口径：模型在 prompt 里看到的
+// 双边成本、最低净收益与单笔下限，必须与风控实际执行的是同一组数。
+func TestBudgetOfCarriesTradeCost(t *testing.T) {
+	p := risk.WeakParams(risk.DefaultParams(model.FromFloat(10000)), 0.20, 0.10)
+	state := risk.AccountState{
+		TotalAsset: model.FromFloat(10000), Cash: model.FromFloat(10000),
+	}
+	b := budgetOf(state, p, "600000.SH", model.FromFloat(10))
+	if b.SlotFen != p.SingleCapFen() {
+		t.Errorf("SlotFen=%s，期望单票上限 %s", b.SlotFen, p.SingleCapFen())
+	}
+	if b.MinAmountFen != p.MinAmountFloor() {
+		t.Errorf("MinAmountFen=%s，期望风控生效下限 %s", b.MinAmountFen, p.MinAmountFloor())
+	}
+	if want := risk.RoundTripCostFen(b.SlotFen); b.RoundTripCostFen != want {
+		t.Errorf("RoundTripCostFen=%s，期望按单票上限估算 %s", b.RoundTripCostFen, want)
+	}
+	if b.MinNetReturnFen != b.RoundTripCostFen*2 {
+		t.Errorf("MinNetReturnFen=%s，期望 2×双边成本 %s", b.MinNetReturnFen, b.RoundTripCostFen*2)
+	}
+	if b.MinAmountFen <= b.SlotFen/2 {
+		t.Errorf("弱势档单笔下限 %s 应高于单票上限的一半 %s", b.MinAmountFen, b.SlotFen/2)
+	}
+}

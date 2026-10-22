@@ -60,7 +60,7 @@ func TestSMTPFailureIsVisible(t *testing.T) {
 	broken := app.MailConfigOf(cfg)
 	broken.To = nil // 收件人为空
 	mail := notify.NewMailer(st, broken)
-	err := mail.Send(ctx, date, model.MailM1, "[集成测试] 空收件人", "body")
+	err := mail.Send(ctx, date, model.MailM3, "[集成测试] 空收件人", "body")
 	if err == nil {
 		t.Fatal("空收件人时 Send 返回了 nil，邮件失败不可见")
 	}
@@ -71,7 +71,7 @@ func TestSMTPFailureIsVisible(t *testing.T) {
 	mustNoErr(t, "读轨迹", terr)
 	var failRow bool
 	for _, tr := range traces {
-		if tr.Subject == model.TraceMail(model.MailM1) && tr.Outcome == model.TraceFail {
+		if tr.Subject == model.TraceMail(model.MailM3) && tr.Outcome == model.TraceFail {
 			failRow = true
 		}
 	}

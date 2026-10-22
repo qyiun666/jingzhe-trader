@@ -3,8 +3,10 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"jingzhe-trader/internal/model"
@@ -40,16 +42,34 @@ type Reviewer struct {
 	enabled bool
 	now     func() time.Time
 	backoff time.Duration // 重试退避基数（生产 2s；测试注入毫秒级，不等真秒）
+	// deadline 整轮评审（四条证据 + 决策）的总时限；promptTimeout 是单条 prompt
+	// （含其内部重试）的时限。二者都必须小于调度器给 evening_pipeline 的 30 分钟，
+	// 否则 4 条并行证据里只要有一条挂死，就会拖到任务级超时，连失败行都来不及落。
+	deadline      time.Duration
+	promptTimeout time.Duration
 }
+
+// 评审时限：全局 12 分钟、单 prompt 10 分钟。
+//
+// 为什么是这两个数：单次 HTTP 上限 600s（见 NewClient），四条证据并行后整轮耗时
+// 约等于最慢的一条；留 2 分钟给决策 prompt 与落库。全局 12 分钟远小于任务级
+// 30 分钟，保证"评审自己失败"先于"任务被外部掐死"发生。
+const (
+	defaultReviewDeadline = 12 * time.Minute
+	defaultPromptTimeout  = 10 * time.Minute
+	traceWriteTimeout     = 5 * time.Second
+)
 
 // NewReviewer 构造决策者。enabled 由调用方从配置传入；key/model 缺失时自动视为关闭。
 func NewReviewer(client *Client, st *store.Store, enabled bool) *Reviewer {
 	return &Reviewer{
-		client:  client,
-		st:      st,
-		enabled: enabled && client.Enabled(),
-		now:     time.Now,
-		backoff: defaultRetryBackoff,
+		client:        client,
+		st:            st,
+		enabled:       enabled && client.Enabled(),
+		now:           time.Now,
+		backoff:       defaultRetryBackoff,
+		deadline:      defaultReviewDeadline,
+		promptTimeout: defaultPromptTimeout,
 	}
 }
 
@@ -68,6 +88,18 @@ func (r *Reviewer) WithClock(f func() time.Time) *Reviewer {
 // WithRetryBackoff 注入退避基数（测试用；传 0 表示重问前不等待）。
 func (r *Reviewer) WithRetryBackoff(d time.Duration) *Reviewer {
 	r.backoff = d
+	return r
+}
+
+// WithTimeouts 注入整轮与单 prompt 时限（测试用；非正值保持默认）。
+// 单 prompt 时限不得超过整轮时限：否则内层永远等不到自己的超时，外层先取消。
+func (r *Reviewer) WithTimeouts(deadline, prompt time.Duration) *Reviewer {
+	if deadline > 0 {
+		r.deadline = deadline
+	}
+	if prompt > 0 && prompt <= r.deadline {
+		r.promptTimeout = prompt
+	}
 	return r
 }
 
@@ -111,9 +143,26 @@ func (r *Reviewer) DecideBatch(ctx context.Context, req signal.BatchRequest) (ma
 		}
 		return out, nil
 	}
+	// 整轮 deadline：四条证据并行 + 一次决策，任何一条挂死都必须在 12 分钟内收口。
+	// 调用方（evening_pipeline）另有 30 分钟任务级超时，这里先到期才能把失败行落库、
+	// 把 LLM_FAILED 降级写进当日轨迹，而不是整条任务被外部掐死。
+	if r.deadline > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, r.deadline)
+		defer cancel()
+	}
 	conclusions, broken, err := r.reviewEvidence(ctx, req)
 	if err != nil {
 		return nil, err
+	}
+	// 整轮 deadline 已到：即便四条证据恰好都答完了，也没有时间再问决策。
+	// 把全部候选按"评审失败"收口，而不是拿一个已过期的 ctx 去调下一次模型。
+	if ctx.Err() != nil {
+		for _, it := range req.Items {
+			if _, bad := broken[it.Candidate.TsCode]; !bad {
+				broken[it.Candidate.TsCode] = "评审超时，未进入决策"
+			}
+		}
 	}
 	ready := make([]signal.BuyRequest, 0, len(req.Items))
 	for _, it := range req.Items {
@@ -131,25 +180,89 @@ func (r *Reviewer) DecideBatch(ctx context.Context, req signal.BatchRequest) (ma
 	return out, nil
 }
 
-// reviewEvidence 四条证据各问一次（整批），返回每只票的结论行与问坏的票（→ 原因）。
+// reviewEvidence 四条证据并行各问一次（整批），返回每只票的结论行与问坏的票（→ 原因）。
+//
+// 并行是这轮改动的核心：四条证据彼此独立、都只读同一批候选，串行时整轮耗时是四问之和
+// （单问实测可达数分钟），并行后约等于最慢的一条。这里没有引入 errgroup 依赖，
+// 用 WaitGroup 达到同样语义，但**不因第一条失败取消其余三条**：每条 prompt 的失败行
+// 都要落库，已答好的证据也要留给当日重跑复用；DB 错误在全部结束后按固定顺序返回。
 func (r *Reviewer) reviewEvidence(ctx context.Context, req signal.BatchRequest) (map[string][]string, map[string]string, error) {
+	type outcome struct {
+		spec PromptSpec
+		got  map[string]evidenceRow
+	}
+	outs := make([]outcome, len(EvidencePrompts))
+	errs := make([]error, len(EvidencePrompts))
+	var wg sync.WaitGroup
+	for i := range EvidencePrompts {
+		p := EvidencePrompts[i]
+		wg.Add(1)
+		go func(i int, p PromptSpec) {
+			defer wg.Done()
+			pctx := ctx
+			if r.promptTimeout > 0 {
+				var cancel context.CancelFunc
+				pctx, cancel = context.WithTimeout(ctx, r.promptTimeout)
+				defer cancel()
+			}
+			started := time.Now()
+			got, err := r.askEvidence(pctx, askAsk{date: req.TradeDate, spec: p, items: req.Items})
+			outs[i] = outcome{spec: p, got: got}
+			errs[i] = err
+			fields := []any{"prompt", p.Key, "date", req.TradeDate, "codes", len(req.Items),
+				"answered", len(got), "secs", time.Since(started).Seconds()}
+			if err != nil {
+				observability.S().Errorw("证据 prompt 链路失败", append(fields, "err", err.Error())...)
+			} else {
+				observability.S().Infow("证据 prompt 完成", fields...)
+			}
+		}(i, p)
+	}
+	wg.Wait()
+	// 单 prompt 超时与整轮 deadline 都按"评审没问出来"处理，不当作链路故障：
+	// 否则一次超时会被翻译成整条 evening_pipeline 失败，反而没有"证据不全不批"的收口。
+	// 只有非上下文类的 DB 错误才上抛。
+	ctxFailed := ctx.Err() != nil
+	for _, err := range errs {
+		if err != nil && isCtxErr(err) {
+			ctxFailed = true
+		}
+	}
+	if ctxFailed {
+		for i, err := range errs {
+			if err == nil {
+				continue
+			}
+			for _, it := range req.Items {
+				code := it.Candidate.TsCode
+				if _, answered := outs[i].got[code]; answered {
+					continue
+				}
+				_ = r.markFailed(ctx, askAsk{date: req.TradeDate, spec: outs[i].spec},
+					code, "评审超时，未获得证据")
+			}
+		}
+	} else {
+		for _, err := range errs {
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+	}
+
 	lines := make(map[string][]string, len(req.Items))
 	broken := make(map[string]string)
-	for _, p := range EvidencePrompts {
-		got, err := r.askEvidence(ctx, askAsk{date: req.TradeDate, spec: p, items: req.Items})
-		if err != nil {
-			return nil, nil, err
-		}
+	for _, o := range outs {
 		for _, it := range req.Items {
 			code := it.Candidate.TsCode
-			row, ok := got[code]
+			row, ok := o.got[code]
 			if !ok {
 				if _, bad := broken[code]; !bad {
-					broken[code] = fmt.Sprintf("%s评审未问出结果", p.Title)
+					broken[code] = fmt.Sprintf("%s评审未问出结果", o.spec.Title)
 				}
 				continue
 			}
-			lines[code] = append(lines[code], conclusionLine(p, row))
+			lines[code] = append(lines[code], conclusionLine(o.spec, row))
 		}
 	}
 	return lines, broken, nil
@@ -160,6 +273,16 @@ func (r *Reviewer) reviewEvidence(ctx context.Context, req signal.BatchRequest) 
 // 模型没答、答崩了、答漏了都只反映在"返回的 map 里少这几个标的"，不当 error：
 // 上层据此把这些票标成 Failed，其余答好的照常进决策。只有写库失败才是链路 error。
 func (r *Reviewer) askEvidence(ctx context.Context, a askAsk) (map[string]evidenceRow, error) {
+	if ctx.Err() != nil {
+		// 全局/单 prompt deadline 已到：不再读缓存（用已取消的 ctx 读库会返回链路错误，
+		// 把一次超时误诊成数据库故障），直接给本批每个标的记失败行。
+		for _, it := range a.items {
+			if err := r.markFailed(ctx, a, it.Candidate.TsCode, "评审超时，未获得证据"); err != nil {
+				return nil, err
+			}
+		}
+		return nil, nil
+	}
 	out := make(map[string]evidenceRow, len(a.items))
 	var pending []signal.BuyRequest
 	for _, it := range a.items {
@@ -304,13 +427,32 @@ func (r *Reviewer) ask(ctx context.Context, a askAsk, decode func(string) error)
 			System: a.spec.System, User: a.user, Search: a.spec.Search})
 		if cerr != nil {
 			lastErr = cerr
-			continue
-		}
-		if lastErr = decode(raw); lastErr == nil {
+		} else if lastErr = decode(raw); lastErr == nil {
 			return nil
+		}
+		if !retryable(lastErr) {
+			observability.S().Warnw("prompt 失败不可重试，停止重问",
+				"prompt", a.spec.Key, "date", a.date, "attempt", attempt,
+				"codes", len(a.items), "err", clip(lastErr.Error(), 200))
+			return r.quoteFailure(ctx, a, lastErr)
 		}
 	}
 	return r.quoteFailure(ctx, a, lastErr)
+}
+
+// retryable 判断这次失败再问一遍是否有意义。
+//
+// 可重问：传输层抖动（连不上/5xx/响应体不是 JSON）、空答案与工具调用泄漏
+// （errNoAnswer）、模型给了正文但 JSON 半截（decode 失败，未包 errPermanent）。
+// 不重问：4xx 鉴权/参数错误、服务端明确 error、status 非 completed —— 这些换个时间
+// 问同一问也是同一结局，连问三次只会拖长决策链并多花钱。
+func retryable(err error) bool {
+	return err != nil && !errors.Is(err, errPermanent)
+}
+
+// isCtxErr 超时/取消是"评审没问出来"，不是数据库或链路故障。
+func isCtxErr(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
 }
 
 // pauseBeforeRetry 重试前退避（backoff × 第几次），ctx 取消时把错误交回调用方记失败行。
@@ -339,8 +481,14 @@ func (r *Reviewer) quoteFailure(ctx context.Context, a askAsk, cause error) erro
 }
 
 // markFailed 给一只票的一条 prompt 记失败行（当天重跑会重试它）。
+//
+// 写失败行用脱离取消的上下文：超时/全局 deadline 触发时 ctx 已经 Done，
+// 直接拿它写库会连"失败行"都落不下去，当日轨迹里就只剩一片空白。
+// 5 秒足够一条 SQLite 写入，又不会在库被锁时拖住收尾。
 func (r *Reviewer) markFailed(ctx context.Context, a askAsk, code, why string) error {
-	return r.save(ctx, model.LLMCall{TradeDate: a.date, TsCode: code, PromptKey: a.spec.Key,
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), traceWriteTimeout)
+	defer cancel()
+	return r.save(wctx, model.LLMCall{TradeDate: a.date, TsCode: code, PromptKey: a.spec.Key,
 		Rationale: "未质证"}, clip(why, 300))
 }
 

@@ -12,6 +12,7 @@ import (
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/observability"
 	"jingzhe-trader/internal/store"
+	"jingzhe-trader/internal/ticket"
 )
 
 // TestLivenessAccessors 探活访问器的初始契约：/healthz 完全依赖这三个值判断调度是否停摆。
@@ -280,5 +281,38 @@ func TestRunJobFailureNotMaskedAsDegraded(t *testing.T) {
 	}
 	if got := last.Outcome; got != string(model.TraceFail) {
 		t.Errorf("有错误时应记 failed，实际 %s", got)
+	}
+}
+
+// TestMailPendingIssuesWithoutMail M1 取消后 mail_pending 只做 IssueAll：
+// 即便 Deps.Mail 为 nil 也必须成功，且指令单要变成 issued（次日 M2 依赖这个状态）。
+func TestMailPendingIssuesWithoutMail(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(t.TempDir() + "/mail_pending.db")
+	if err != nil {
+		t.Fatalf("打开测试库失败: %v", err)
+	}
+	defer st.Close()
+
+	id, err := st.TradeRepo().InsertTicket(ctx, model.OrderTicket{
+		TradeDate: "20261023", TsCode: "600519.SH", Name: "测试股", Direction: model.DirBuy,
+		Qty: 100, RefPrice: model.FromFloat(10), Reason: "测试",
+		Status: model.TicketDrafted, ValidUntil: "2026-10-23T15:00:00+08:00",
+	})
+	if err != nil {
+		t.Fatalf("插入指令单失败: %v", err)
+	}
+
+	d := Deps{Store: st, Tickets: ticket.NewService(st)} // 故意不注入 Mail
+	rc := observability.NewRunCtx(ctx, "mail_pending", "20261023")
+	if err := mailPending(ctx, rc, d); err != nil {
+		t.Fatalf("mail_pending 不应依赖邮件发送: %v", err)
+	}
+	tk, err := st.TradeRepo().GetTicket(ctx, id)
+	if err != nil {
+		t.Fatalf("读取指令单失败: %v", err)
+	}
+	if tk.Status != model.TicketIssued {
+		t.Errorf("IssueAll 未执行：状态=%s，期望 issued", tk.Status)
 	}
 }

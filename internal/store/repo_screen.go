@@ -61,6 +61,33 @@ func (r *ScreenRepo) StockName(ctx context.Context, tsCode string) (string, erro
 	return name, nil
 }
 
+// StockBriefs 批量读取代码 →（名称、行业），供归因补旧决策留痕缺的元数据。
+//
+// 只 SELECT 三列：归因不需要估值/上市日期，把 5500 行的完整快照读进内存没有收益。
+// 按 400 一批拼 IN，避开 SQLite 的变量上限；查无此码不报错（留痕可能来自已摘牌标的）。
+func (r *ScreenRepo) StockBriefs(ctx context.Context, codes []string) (map[string]model.StockBasic, error) {
+	out := make(map[string]model.StockBasic, len(codes))
+	const chunk = 400
+	for start := 0; start < len(codes); start += chunk {
+		end := min(start+chunk, len(codes))
+		part := codes[start:end]
+		args := make([]interface{}, len(part))
+		for i, c := range part {
+			args[i] = c
+		}
+		q := `SELECT ts_code, name, COALESCE(industry,'') AS industry
+			FROM stock_basic WHERE ts_code IN (` + placeholders(len(part)) + `)`
+		var rows []model.StockBasic
+		if err := r.rdb.SelectContext(ctx, &rows, q, args...); err != nil {
+			return nil, fmt.Errorf("批量读取股票名称/行业失败: %w", err)
+		}
+		for _, row := range rows {
+			out[row.TsCode] = row
+		}
+	}
+	return out, nil
+}
+
 // WindowDates 返回截至 beforeInclusive（含）的最近 n 个交易日，升序。
 //
 // 以交易日历为准而不是 daily_bar 出现过的日期：后者一旦混入历史残留行（库中曾留有
@@ -76,6 +103,23 @@ func (r *ScreenRepo) WindowDates(ctx context.Context, beforeInclusive string, n 
 	dates := make([]string, len(desc))
 	for i, d := range desc {
 		dates[len(desc)-1-i] = d
+	}
+	return dates, nil
+}
+
+// NextTradeDates 返回 afterExclusive 之后的 n 个交易日，升序。
+//
+// 归因的前瞻窗口用：5/10/20 个交易日后的收盘价按日历取，不能按自然日加天数
+// （会跨周末/节假日）。日历里未来日期不足 n 个时返回已有的那些，调用方据此判"待到期"。
+func (r *ScreenRepo) NextTradeDates(ctx context.Context, afterExclusive string, n int) ([]string, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+	var dates []string
+	const q = `SELECT cal_date FROM trade_cal WHERE is_open = 1 AND cal_date > ?
+		ORDER BY cal_date ASC LIMIT ?`
+	if err := r.rdb.SelectContext(ctx, &dates, q, afterExclusive, n); err != nil {
+		return nil, fmt.Errorf("读取 %s 之后 %d 个交易日失败: %w", afterExclusive, n, err)
 	}
 	return dates, nil
 }

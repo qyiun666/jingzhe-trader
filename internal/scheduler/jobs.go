@@ -5,13 +5,13 @@ package scheduler
 //	09:00  morning_plan     T+1 结转 → 邮件「当日计划 + 持仓」
 //	09:30-11:30 / 13:00-15:00  intraday_scan  每 5 分钟扫持仓，跌破止损出卖单
 //	16:30  evening_pipeline  同步 → 选股 → LLM 评审 → 写待买卖表 → 次日计划
-//	17:00  mail_pending      读待买卖表发邮件，空表不发
+//	17:00  mail_pending      下发指令单（IssueAll）；M1 已取消，不再单独发信
 //	18:00  daily_report      日报：当天总结 + 持仓 + 次日计划 + 当天失败汇报
 //
 // 每个大方法的成功/失败由 Scheduler.runJob 统一落 run_trace（一行一个最终结果），
 // 大方法内部不再单独落库；失败后不自动重试（当日一个时刻只跑一次）。
 //
-// 16:30 的流水线不含发信步骤：邮件由 17:00 / 18:00 两个独立任务读表发出，
+// 16:30 的流水线不含发信步骤：邮件由 09:00 / 18:00 两个独立任务读表发出，
 // 这样流水线即使中断重跑也不会重复发信。保留清理挂在 18:00 日报之后。
 
 import (
@@ -84,6 +84,7 @@ func accountBriefOf(d Deps, ctx context.Context, date string) (notify.Brief, err
 type AlertService interface {
 	Raise(ctx context.Context, tradeDate, source string, level model.AlertLevel, code, title, content string) error
 	RaiseUrgent(ctx context.Context, tradeDate, source, code, title, content string) error
+	RaiseUrgentTraceOnly(ctx context.Context, tradeDate, source, code, title, content string) error
 }
 
 // raiseW / raiseU 落 warning / urgent 告警。告警写失败必须留痕：
@@ -96,6 +97,14 @@ func (d Deps) raiseW(rc *observability.RunCtx, code, title, content string) {
 
 func (d Deps) raiseU(rc *observability.RunCtx, code, title, content string) {
 	if err := d.Alerts.RaiseUrgent(rc.Ctx(), rc.TradeDate(), "scheduler", code, title, content); err != nil {
+		observability.S().Errorw("写 urgent 告警失败", "code", code, "err", err.Error())
+	}
+}
+
+// raiseUTrace 落 urgent 轨迹但不发 M6：该事件已有专属邮件（盘中卖出发 M3），
+// 再走 M6 就是同一笔卖单两封邮件。
+func (d Deps) raiseUTrace(rc *observability.RunCtx, code, title, content string) {
+	if err := d.Alerts.RaiseUrgentTraceOnly(rc.Ctx(), rc.TradeDate(), "scheduler", code, title, content); err != nil {
 		observability.S().Errorw("写 urgent 告警失败", "code", code, "err", err.Error())
 	}
 }

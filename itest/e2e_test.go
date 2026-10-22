@@ -157,38 +157,36 @@ func TestTradingDayEndToEnd(t *testing.T) {
 	}
 	t.Log(describe("止损单", stopSell.ID, "数量", int64(stopSell.Qty), "理由", stopSell.Reason))
 
-	// ---------- ⑤ 四类邮件真的投递：M2 盘前 / M1 指令 / M5 日报 ----------
-	for _, tc := range []struct {
-		job, mail string
-		typ       model.MailType
-	}{
-		{"morning_plan", "M2", model.MailM2},
-		{"mail_pending", "M1", model.MailM1},
-		{"daily_report", "M5", model.MailM5},
-	} {
-		if err := rt.RunTaskOnce(ctx, tc.job, date, "itest"); err != nil {
-			t.Errorf("%s 失败: %v", tc.job, err)
-			continue
+	// ---------- ⑤ 邮件投递与下发：M2 盘前 / M5 日报；17:00 只下发、不再发 M1 ----------
+	if err := rt.RunTaskOnce(ctx, "morning_plan", date, "itest"); err != nil {
+		t.Errorf("morning_plan 失败: %v", err)
+	} else if !lastTraceOK(t, st, date, model.TraceMail(model.MailM2)) {
+		t.Error("morning_plan 跑完了但 M2 邮件没有成功投递记录")
+	}
+	// M1 已取消：mail_pending 仍必须执行 IssueAll，但不能再留 mail:M1 轨迹。
+	if err := rt.RunTaskOnce(ctx, "mail_pending", date, "itest"); err != nil {
+		t.Errorf("mail_pending 失败: %v", err)
+	}
+	if got := countTraces(t, st, date, func(s string) bool {
+		return s == model.TraceMail(model.MailType("M1"))
+	}); got != 0 {
+		t.Errorf("M1 已取消，当日却仍有 %d 行 mail:M1 轨迹", got)
+	}
+	allTickets, err := st.TradeRepo().ListTickets(ctx, date, "")
+	mustNoErr(t, "ListTickets", err)
+	issued := 0
+	for _, tk := range allTickets {
+		if tk.Status == model.TicketIssued {
+			issued++
 		}
-		if tc.typ == model.MailM1 {
-			// M1 是否必发取决于跑 mail_pending 时待买卖表还有没有活跃单。
-			// 套件在锚日（默认 20260903）次日 15:00 之后跑时，上面 morning_plan 已把
-			// 过有效期的单收口成 expired：空表降级 NO_PENDING_TICKET 不发信是设计内行为，
-			// 倒是发了才要查。单据状态在 mail_pending 前后不变（drafted→issued 都是活跃），
-			// 此刻读到的口径与它判定时一致。
-			acts, aerr := st.TradeRepo().ListActiveTickets(ctx, date)
-			mustNoErr(t, "读取活跃单", aerr)
-			if len(acts) == 0 {
-				outcome, detail := jobOutcome(t, st, date, tc.job)
-				if outcome != model.TracePartial || !strings.Contains(detail, "NO_PENDING_TICKET") {
-					t.Errorf("待买卖表为空时 mail_pending 应降级 NO_PENDING_TICKET（不发信），得到 %s/%s", outcome, detail)
-				}
-				continue
-			}
-		}
-		if !lastTraceOK(t, st, date, model.TraceMail(tc.typ)) {
-			t.Errorf("%s 跑完了但 %s 邮件没有成功投递记录", tc.job, tc.mail)
-		}
+	}
+	if issued == 0 {
+		t.Error("mail_pending 没把 drafted 单下发为 issued —— IssueAll 的下发动作必须保留")
+	}
+	if err := rt.RunTaskOnce(ctx, "daily_report", date, "itest"); err != nil {
+		t.Errorf("daily_report 失败: %v", err)
+	} else if !lastTraceOK(t, st, date, model.TraceMail(model.MailM5)) {
+		t.Error("daily_report 跑完了但 M5 邮件没有成功投递记录")
 	}
 	// 日报里的任务分列必须看得见今天这一整串（成功/降级/失败三列）。
 	if n := countTraces(t, st, date, func(s string) bool { return strings.HasPrefix(s, "job:") }); n < 4 {

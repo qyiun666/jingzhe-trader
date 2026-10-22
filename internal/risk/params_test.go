@@ -22,6 +22,7 @@ func TestDefaultParamsBaseline(t *testing.T) {
 	assertEqF(t, "基准", "TakeProfitPct", p.TakeProfitPct, 0.15)
 	assertEqF(t, "基准", "MinConfidence", p.MinConfidence, 0.55)
 	assertEqF(t, "基准", "MaxSingleAmountPct", p.MaxSingleAmountPct, 1.0)
+	assertEqF(t, "基准", "MinAmountRatio", p.MinAmountRatio, 0.5)
 	if p.MaxPositions != 2 {
 		t.Errorf("MaxPositions=%d, 期望 2", p.MaxPositions)
 	}
@@ -129,11 +130,26 @@ func TestWeakParamsShrinksOnly(t *testing.T) {
 	assertEqF(t, "坏值回落", "MaxTotalPositionPct", p.MaxTotalPositionPct, WeakMaxTotalPctDefault)
 	assertEqF(t, "坏值回落", "MaxPositionPct", p.MaxPositionPct, WeakMaxSinglePctDefault)
 
-	// 只动仓位上限：止损/止盈/持仓数/置信度原样保留
+	// 只动仓位口径：止损/止盈/持仓数/置信度原样保留；单笔下限比例按弱势档提高
 	p = WeakParams(base, 0.20, 0.10)
 	if p.StopLossPct != base.StopLossPct || p.TakeProfitPct != base.TakeProfitPct ||
 		p.TrailingArmPct != base.TrailingArmPct ||
 		p.MaxPositions != base.MaxPositions || p.MinConfidence != base.MinConfidence {
 		t.Errorf("WeakParams 不应改动仓位以外的风控字段")
+	}
+	assertEqF(t, "弱势", "MinAmountRatio", p.MinAmountRatio, WeakMinAmountRatio)
+}
+
+// TestWeakParamsRaisesMinAmountFloor 弱势档的最小交易额必须高于旧口径（单票上限的一半）：
+// 单票约 1000 元时，500 元的单子双边成本约 10 元（2%），750 元起才降到约 1.4%。
+func TestWeakParamsRaisesMinAmountFloor(t *testing.T) {
+	weak := WeakParams(DefaultParams(baseAsset()), 0.20, 0.10) // 单票 1000 元
+	oldFloor := weak.SingleCapFen() / 2
+	got := weak.MinAmountFloor()
+	if got <= oldFloor {
+		t.Errorf("弱势档单笔下限=%s，应高于旧口径 %s", got, oldFloor)
+	}
+	if want := pctOf(weak.SingleCapFen(), WeakMinAmountRatio); got != want {
+		t.Errorf("弱势档单笔下限=%s，期望 单票上限×%.2f=%s", got, WeakMinAmountRatio, want)
 	}
 }

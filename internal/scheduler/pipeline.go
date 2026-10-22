@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -87,8 +88,48 @@ func eveningPipeline(ctx context.Context, rc *observability.RunCtx, d Deps) erro
 	// 在弱势期选不出任何"买得起"的科技敞口。白名单 → 流动性两级，不排名，
 	// 与个股候选并入同一批交给同一个 LLM 评审。读不到数只降级，不断链。
 	cands = appendETFCandidates(ctx, rc, d, date, cands, budget)
+	// 候选快照先于决策落库：LLM 评审失败时当日仍然要有"当时选出了谁、评分多少"，
+	// 否则归因只剩失败留痕，无法区分"没选出来"与"选了但没批"。
+	if err := writeScreenSnapshot(ctx, d, date, cands, rp); err != nil {
+		observability.S().Warnw("候选快照落库失败，当日归因将缺少成分",
+			"date", date, "candidates", len(cands), "err", err.Error())
+		rc.Degrade("SCREEN_SNAPSHOT_FAILED", "候选快照落库失败："+err.Error())
+	}
 	if err := buildTickets(ctx, rc, d, date, cands, watch, rp); err != nil {
 		return fmt.Errorf("④ 买卖决策: %w", err)
+	}
+	return nil
+}
+
+// writeScreenSnapshot 把进入决策链的整批候选（含 ETF 补口）写成 screen:topn 一行。
+//
+// 只写归因需要的字段：代码、评分、因子、行业、收盘价与当晚资金口径。
+// 失败不阻断交易（诊断缺行不能反过来让当日无单），但必须降级留痕。
+func writeScreenSnapshot(ctx context.Context, d Deps, date string, cands []model.Candidate, rp risk.RiskParams) error {
+	snap := model.ScreenSnapshot{
+		TradeDate:     date,
+		TotalAssetFen: int64(rp.TotalAsset),
+		SlotFen:       int64(rp.SingleCapFen()),
+		Candidates:    make([]model.CandidateSnapshot, 0, len(cands)),
+	}
+	for _, c := range cands {
+		snap.Candidates = append(snap.Candidates, model.CandidateSnapshot{
+			TsCode: c.TsCode, Name: c.Name, Industry: c.Industry, Kind: c.Kind,
+			Rank: c.Rank, PoolSize: c.PoolSize, Score: c.Score,
+			Momentum: c.Factors.Momentum, Value: c.Factors.Value,
+			LowVol: c.Factors.LowVol, Liquidity: c.Factors.Liquidity,
+			CloseFen: int64(c.Close), Mom: c.Mom, SectorMom: c.SectorMom,
+		})
+	}
+	raw, err := json.Marshal(snap)
+	if err != nil {
+		return fmt.Errorf("序列化候选快照失败: %w", err)
+	}
+	if err := d.Store.TraceRepo().Write(ctx, model.RunTrace{
+		TradeDate: date, Subject: model.TraceScreenTopN(), Outcome: model.TraceOK,
+		Detail: string(raw), At: time.Now().UTC().Format(time.RFC3339),
+	}); err != nil {
+		return err
 	}
 	return nil
 }
@@ -232,6 +273,15 @@ func screenCandidates(ctx context.Context, rc *observability.RunCtx, d Deps, dat
 	}
 	if rep.Empty {
 		rc.Degrade("SCREEN_EMPTY", emptyReason(rep))
+	}
+	// 估值覆盖率是读侧事实：低于告警线时，PE/PB 筛选可能把"数据没同步"误判成
+	// "估值不合格"。单列降级，日报里能直接看到，不必从候选数量反推。
+	if rep.ValuationSparse {
+		note := fmt.Sprintf("估值截面覆盖 %d/%d（%.1f%%），低于 80%% 告警线：PE/PB 筛选可能大面积误杀",
+			rep.ValuationCovered, rep.ValuationTotal, rep.ValuationCoverage*100)
+		rc.Degrade("VALUATION_SPARSE", note)
+		observability.S().Warnw("估值截面覆盖不足", "date", date, "covered", rep.ValuationCovered,
+			"total", rep.ValuationTotal, "coverage", rep.ValuationCoverage)
 	}
 	watch = rep.Watch
 	if rep.RegimeClosed {

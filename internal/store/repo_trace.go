@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/jmoiron/sqlx"
@@ -112,6 +113,92 @@ const llmDecisionSubjectLike = "llm:%:" + llmPromptKeyDecision
 // 这一处刻意用字面量而不 import llm：store 只依赖 model（依赖方向铁律），
 // 而改名时由 repo_trace_test.go 的断言兜住两边同步。
 const llmPromptKeyDecision = "decision"
+
+// screenTopNSubject 每日候选快照的 subject（与 model.TraceScreenTopN 同值）。
+// 与决策键一样用字面量而不再 import model 的构造函数：模型侧改名时由这里的测试兜住。
+const screenTopNSubject = "screen:topn"
+
+// ListScreenTopN 读取区间内每日候选快照（screen:topn），按日期升序返回 map[date]snapshot。
+//
+// 归因要回答"当时 TopN 的评分/因子与后来的收益是否相关"：决策留痕只有 buy/skip，
+// 不含候选截面，所以必须读这一行。没有快照的日期（功能上线前）直接缺席，
+// 归因侧回落用 stock_basic 补名称/行业，不拿空快照伪造数据。
+func (r *TraceRepo) ListScreenTopN(ctx context.Context, fromDate, toDate string) (map[string]model.ScreenSnapshot, error) {
+	var ts []model.RunTrace
+	q := `SELECT ` + traceColumns + ` FROM run_trace
+		WHERE subject = ? AND trade_date >= ? AND trade_date <= ? ORDER BY trade_date`
+	if err := r.rdb.SelectContext(ctx, &ts, q, screenTopNSubject, fromDate, toDate); err != nil {
+		return nil, fmt.Errorf("读取候选快照 %s~%s 失败: %w", fromDate, toDate, err)
+	}
+	out := make(map[string]model.ScreenSnapshot, len(ts))
+	for _, t := range ts {
+		var snap model.ScreenSnapshot
+		if t.Detail != "" {
+			if err := json.Unmarshal([]byte(t.Detail), &snap); err != nil {
+				return nil, fmt.Errorf("候选快照 %s 正文解不开: %w", t.TradeDate, err)
+			}
+		}
+		snap.TradeDate = t.TradeDate
+		out[t.TradeDate] = snap
+	}
+	return out, nil
+}
+
+// ListLLMCodes 读取区间内出现过 LLM 留痕的 (日期, 标的) 对，按日期分组去重。
+//
+// 只用于归因的失败候选还原：某日连 decision 行都没有（整批证据失败，例如 20261009
+// 的 DSML 工具泄漏）时，仍能从 tech/value/sector 等证据行的 subject 里还原出当日候选，
+// 按"评审失败"计入前瞻收益。正常有 decision 的日期不会用到这份数据。
+func (r *TraceRepo) ListLLMCodes(ctx context.Context, fromDate, toDate string) (map[string][]string, error) {
+	var rows []struct {
+		TradeDate string `db:"trade_date"`
+		Subject   string `db:"subject"`
+	}
+	q := `SELECT trade_date, subject FROM run_trace
+		WHERE subject LIKE 'llm:%' AND trade_date >= ? AND trade_date <= ?
+		ORDER BY trade_date, subject`
+	if err := r.rdb.SelectContext(ctx, &rows, q, fromDate, toDate); err != nil {
+		return nil, fmt.Errorf("读取 LLM 留痕代码 %s~%s 失败: %w", fromDate, toDate, err)
+	}
+	seen := make(map[string]map[string]bool)
+	for _, row := range rows {
+		code := llmSubjectCode(row.Subject)
+		if code == "" {
+			continue
+		}
+		set := seen[row.TradeDate]
+		if set == nil {
+			set = make(map[string]bool)
+			seen[row.TradeDate] = set
+		}
+		set[code] = true
+	}
+	out := make(map[string][]string, len(seen))
+	for date, set := range seen {
+		out[date] = sortedStringKeys(set)
+	}
+	return out, nil
+}
+
+// llmSubjectCode 从 llm:<标的>:<prompt_key> 里取标的；格式不符返回空串。
+// 标的本身不含冒号（ts_code 形如 600000.SH），所以取最后一个冒号前的部分。
+func llmSubjectCode(subject string) string {
+	rest := strings.TrimPrefix(subject, "llm:")
+	i := strings.LastIndexByte(rest, ':')
+	if i <= 0 {
+		return ""
+	}
+	return rest[:i]
+}
+
+func sortedStringKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // ListLLMDecisions 读取区间内的决策留痕行（llm:<标的>:decision），升序。
 //

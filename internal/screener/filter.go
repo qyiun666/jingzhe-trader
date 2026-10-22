@@ -42,7 +42,7 @@ const (
 	reasonSuspended      = "当日停牌"
 	reasonNoIndustry     = "无行业归属"
 	reasonSectorOut      = "非强势板块"
-	reasonNoValuation    = "无当日估值截面"
+	reasonNoValuation    = "估值截面缺失（数据未同步）"
 	reasonUnaffordable   = "一手超单笔预算"
 	reasonSmallMV        = "流通市值过小"
 	reasonIlliquid       = "换手率不足"
