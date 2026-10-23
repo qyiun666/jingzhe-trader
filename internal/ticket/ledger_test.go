@@ -731,6 +731,91 @@ func TestReportFillNeverLosesOpenDate(t *testing.T) {
 	}
 }
 
+// TestReportFillOpenDateUsesFillDate 建仓日取实际成交日（agent_issues #13 根因）：
+// 2026-10-23 的 601328 是 10-22 签发的跨日单，回执时用 t.TradeDate 会把建仓日写成
+// 10-22，最小持有期少算一天。四类路径各守一条：跨日、同日、空值回落、清仓后重开。
+func TestReportFillOpenDateUsesFillDate(t *testing.T) {
+	s, led := openLedger(t)
+	ctx := context.Background()
+
+	// 一、跨日单：指令单 20261022 生成、20261023 成交 → 建仓日必须是成交日
+	cross := "sh601328"
+	tk := seedTicketOn(t, s, cross, model.DirBuy, 100, model.FromFloat(8.26), "20261022")
+	if _, err := led.ReportFill(ctx, FillRequest{TicketID: tk.ID, Qty: 100,
+		Price: model.FromFloat(8.26), FillDate: "20261023"}); err != nil {
+		t.Fatalf("跨日回执失败: %v", err)
+	}
+	if got := mustPos(t, s, ctx, cross).FirstOpenDate; got != "20261023" {
+		t.Errorf("跨日单建仓日=%q, 期望 20261023（成交日，不是指令单生成日）", got)
+	}
+
+	// 二、同日单：成交日与指令单日期一致，结果不变
+	sameDay := "sh600519"
+	tk2 := seedTicketOn(t, s, sameDay, model.DirBuy, 100, model.FromFloat(10), "20261023")
+	if _, err := led.ReportFill(ctx, FillRequest{TicketID: tk2.ID, Qty: 100,
+		Price: model.FromFloat(10), FillDate: "20261023"}); err != nil {
+		t.Fatalf("同日回执失败: %v", err)
+	}
+	if got := mustPos(t, s, ctx, sameDay).FirstOpenDate; got != "20261023" {
+		t.Errorf("同日单建仓日=%q, 期望 20261023", got)
+	}
+
+	// 三、FillDate 为空回落指令单交易日（兼容既有 CLI/测试调用）
+	fallback := "sh600520"
+	tk3 := seedTicketOn(t, s, fallback, model.DirBuy, 100, model.FromFloat(10), "20261022")
+	if _, err := led.ReportFill(ctx, FillRequest{TicketID: tk3.ID, Qty: 100, Price: model.FromFloat(10)}); err != nil {
+		t.Fatalf("无 FillDate 回执失败: %v", err)
+	}
+	if got := mustPos(t, s, ctx, fallback).FirstOpenDate; got != "20261022" {
+		t.Errorf("空 FillDate 建仓日=%q, 期望回落 20261022", got)
+	}
+
+	// 四、清仓后重开：新仓取新成交日，不沿用上一轮的建仓日
+	reopen := "sh600030"
+	buy1 := seedTicketOn(t, s, reopen, model.DirBuy, 100, model.FromFloat(10), "20261020")
+	if _, err := led.ReportFill(ctx, FillRequest{TicketID: buy1.ID, Qty: 100,
+		Price: model.FromFloat(10), FillDate: "20261020"}); err != nil {
+		t.Fatal(err)
+	}
+	sell := seedTicketOn(t, s, reopen, model.DirSell, 100, model.FromFloat(11), "20261021")
+	if _, err := led.ReportFill(ctx, FillRequest{TicketID: sell.ID, Qty: 100,
+		Price: model.FromFloat(11), FillDate: "20261021"}); err != nil {
+		t.Fatal(err)
+	}
+	buy2 := seedTicketOn(t, s, reopen, model.DirBuy, 100, model.FromFloat(12), "20261022") // 前一晚生成
+	if _, err := led.ReportFill(ctx, FillRequest{TicketID: buy2.ID, Qty: 100,
+		Price: model.FromFloat(12), FillDate: "20261023"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustPos(t, s, ctx, reopen).FirstOpenDate; got != "20261023" {
+		t.Errorf("清仓重开建仓日=%q, 期望 20261023（取本笔成交日，不沿用 20261020）", got)
+	}
+}
+
+// TestReportFillRejectsMalformedFillDate 成交日格式非法必须整次拒绝：
+// 错格式日期按字符串比较会被算成"持有几百天"，比缺日期更坏，且拒绝时账本零改动。
+func TestReportFillRejectsMalformedFillDate(t *testing.T) {
+	s, led := openLedger(t)
+	ctx := context.Background()
+	tk := seedTicket(t, s, "sh600033", model.DirBuy, 100, model.FromFloat(10))
+	for _, bad := range []string{"2026-10-23", "2026102", "202610233", "20261323", "2026102X"} {
+		if _, err := led.ReportFill(ctx, FillRequest{TicketID: tk.ID, Qty: 100,
+			Price: model.FromFloat(10), FillDate: bad}); err == nil {
+			t.Errorf("非法 fill_date %q 应被拒绝", bad)
+		}
+	}
+	after, err := s.TradeRepo().GetTicket(ctx, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.HasFill() || after.Status != model.TicketIssued {
+		t.Errorf("被拒绝的回执动了指令单: status=%s fill=%v", after.Status, after.HasFill())
+	}
+	if _, err := s.TradeRepo().GetPosition(ctx, tk.TsCode); err == nil {
+		t.Errorf("被拒绝的回执写出了持仓")
+	}
+}
+
 // TestSyncPortfolioRejectsUnitErrorPrice 复现 20261015 的量纲事故（agent_issues #12-A）：
 // 券商口径 5.07 元的成本被传成 507。成本一旦被写进 position，止损线就变成 507×0.92≈466 元，
 // 之后每轮扫描都判"已跌破止损"，直接误发 M3 紧急邮件惊扰用户。

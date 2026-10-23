@@ -51,6 +51,10 @@ type FillRequest struct {
 	Price    model.Fen // 实际成交价（分）
 	Note     string
 	Actor    string
+	// FillDate 实际成交日（YYYYMMDD）。跨日指令单（如 10-22 生成、10-23 成交）
+	// 必须用成交日作为持仓建仓日，不能用指令单生成日；空值回落 t.TradeDate
+	// 仅为兼容既有 CLI/测试调用。
+	FillDate string
 }
 
 // FillResult 回执结果。Duplicate=true 表示该单据已回执过（幂等命中，账本零改动）。
@@ -67,6 +71,11 @@ func (l *Ledger) ReportFill(ctx context.Context, req FillRequest) (FillResult, e
 	}
 	if req.Qty <= 0 || req.Price <= 0 {
 		return FillResult{}, fmt.Errorf("回执失败: 成交量/价非法 (qty=%d price=%d)", req.Qty, int64(req.Price))
+	}
+	if req.FillDate != "" {
+		if _, err := time.Parse("20060102", req.FillDate); err != nil {
+			return FillResult{}, fmt.Errorf("回执失败: fill_date 非法（应 YYYYMMDD）: %q", req.FillDate)
+		}
 	}
 	// 从幂等判定到成交/持仓提交全程串行：否则两个并发回执都能在对方提交前
 	// 通过 HasFill，第二个 applyPosition 会把同一笔数量再加一遍。
@@ -175,7 +184,12 @@ func (l *Ledger) applyPosition(ctx context.Context, tx *sqlx.Tx, t model.OrderTi
 			pos.HighPrice = req.Price
 		}
 		if pos.FirstOpenDate == "" {
-			pos.FirstOpenDate = t.TradeDate
+			// 建仓日取实际成交日，不取指令单生成日：跨日单（10-22 生成、10-23 成交）
+			// 用生成日会把最小持有期多算一天（agent_issues #13 回归）。
+			pos.FirstOpenDate = req.FillDate
+			if pos.FirstOpenDate == "" {
+				pos.FirstOpenDate = t.TradeDate
+			}
 		}
 	case model.DirSell:
 		if pos.TotalQty < req.Qty {

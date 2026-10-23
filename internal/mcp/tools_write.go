@@ -120,6 +120,9 @@ func (s *Server) registerWriteTools() {
 			res, err := s.deps.Ledger.ReportFill(ctx, ticket.FillRequest{
 				TicketID: ticketID, TsCode: tsCode, Qty: model.Qty(qty),
 				Price: model.FromFloat(price), Note: note, Actor: actor,
+				// 成交日取实际今天：date 参数只用于按日匹配指令单，
+				// 跨日单（昨晚生成、今天成交）的持仓建仓日必须是今天。
+				FillDate: today(),
 			})
 			if err != nil {
 				return nil, err
