@@ -21,7 +21,12 @@ func (s *Server) buildBrief(ctx context.Context, date string) (map[string]interf
 		blockers = append(blockers, "freshness_check_error: "+err.Error())
 	} else if !rep.Fresh && !rep.Skipped {
 		dataFresh = false
-		blockers = append(blockers, "DATA_STALE: 数据不新鲜，今日不应生成/执行任何指令")
+		// 文案作用域必须与实现一致：DATA_STALE 只收口当日买入/EOD 重平衡链
+		// （scheduler/pipeline.go 的 raiseU）。盘中扫描不读 data_fresh，价格型卖出
+		// （止损/移动止盈/止盈）照常用实时行情判定——原文案写成"任何指令"，
+		// 于是 20261103 早上 blocker 与 09:50 的 601328 止盈卖单并存看起来像违规，
+		// 实际两者都在设计内，被误导的是这句话而不是代码。
+		blockers = append(blockers, "DATA_STALE: 数据不新鲜，今日不应生成/执行任何买入或重平衡指令（盘中价格型卖出不受此限制）")
 	} else if rep.Skipped {
 		out["note"] = "非交易日，仅展示既有状态"
 	}

@@ -32,8 +32,26 @@ func MarketGateOf(cfg ConfigReader) store.MarketGate {
 	if err != nil {
 		enabled = true
 	}
-	return store.MarketGate{Enabled: enabled, Window: w}
+	// 转强防抖天数（定参④）。**显式配置的 0/1 必须尊重**——那是"只看当日收盘"的历史
+	// 口径回退开关（组长定参要求可回退）；只有读不出来或负值才兜底成默认档，
+	// 上限钳到装配期同一个数，防的是"一个手滑的大数把转强永远锁死"。
+	cd, err := strconv.Atoi(strings.TrimSpace(cfg.GetString("screen.gate_confirm_days")))
+	if err != nil || cd < 0 {
+		cd = gateConfirmDaysFallback
+	}
+	if cd > gateConfirmDaysMax {
+		cd = gateConfirmDaysMax
+	}
+	return store.MarketGate{Enabled: enabled, Window: w, ConfirmDays: cd}
 }
+
+// 转强防抖天数的兜底与上限。fallback 与 config KeySpec 的 screen.gate_confirm_days
+// 默认值同值（生产路径由 config.Load 物化，这里只服务局部构造的 Config：测试与 CLI 片段）；
+// 上限与装配期校验（app.validateEnums）一致，防的是"一个手滑的大数把转强永远锁死"。
+const (
+	gateConfirmDaysFallback = 3
+	gateConfirmDaysMax      = 10
+)
 
 // RankOutPolicyOf 卖出规则 4 的最小持有期口径（signal.rank_out_min_hold_days）。
 // 读法与 MarketGateOf 一致：键缺失的旧库或坏值回落到"无保护"的旧口径——
@@ -375,7 +393,7 @@ func ScreenBudget(ctx context.Context, st *store.Store, led *ticket.Ledger,
 		b.MarketOK = true
 		// 门槛被人为关闭不等于大盘变好：弱势判定照常做，只是不再据此关闸，
 		// 而是收缩到试探风控后让漏斗与决策链一起用它。指数读不到也算弱势——数据未知时宁缩量不满仓。
-		b.WeakRegime, b.WeakNote = detectWeakRegime(ctx, st, date, gate.Window)
+		b.WeakRegime, b.WeakNote = detectWeakRegime(ctx, st, date, gate)
 		if b.WeakRegime {
 			rp = risk.WeakParams(rp, caps.TotalPct, caps.SinglePct)
 		}
@@ -400,7 +418,17 @@ func ScreenBudget(ctx context.Context, st *store.Store, led *ticket.Ledger,
 // 与闸门开启路径的判据相反是刻意的——那时"读不到指数"必须整链失败（拿不到基准
 // 就把恶化判成没恶化是静默放行），而这里闸门已开、弱势只影响仓位收缩幅度，
 // 数据不可用就按最保守的"弱势"处理并把这个原因写进 note 供归因。
-func detectWeakRegime(ctx context.Context, st *store.Store, date string, window int) (bool, string) {
+//
+// 定参④（2026-11-03）把"站上均线"与"认定转强"拆成两件事：
+//   - 转弱**快**：当日收盘跌破均线立刻收缩到试探档（下面的 < 分支，一天都不等）；
+//   - 转强**慢**：当日收盘站上均线还不够，要连续 gate.ConfirmDays 日都站上各自的
+//     当日均线才放开常规档。单日反抽就把单票上限从 10% 放回 40%、总仓从 20% 放回 90%，
+//     是本轮复盘里唯一还没被定价的风险（11-02 那根 0.0044 元的上影线已经证明一次
+//     瞬时高点能把退出规则骗到位，均线侧同理）。
+//
+// gate.ConfirmDays ≤ 1 时退化为"只看当日"，与加防抖之前的历史口径逐字一致（回退档）。
+func detectWeakRegime(ctx context.Context, st *store.Store, date string, gate store.MarketGate) (bool, string) {
+	window := gate.Window
 	if window < 1 || window > store.MarketMAWindow {
 		window = store.MarketMAWindow
 	}
@@ -413,6 +441,18 @@ func detectWeakRegime(ctx context.Context, st *store.Store, date string, window 
 	}
 	if idx.Close < idx.MA {
 		return true, fmt.Sprintf("指数 %s 收盘在 MA%d 下方", store.MarketIndex, window)
+	}
+	if gate.ConfirmDays <= 1 {
+		return false, "" // 回退档：站上均线即转强，历史口径
+	}
+	closes, err := st.ScreenRepo().MarketIndexCloses(ctx, date, window+gate.ConfirmDays-1)
+	if err != nil {
+		return true, fmt.Sprintf("指数 %s 转强确认序列不可读（%v），按弱势降级", store.MarketIndex, err)
+	}
+	strong, note := screener.ConfirmStrengthen(closes, window, gate.ConfirmDays)
+	if !strong {
+		return true, fmt.Sprintf("指数 %s 收盘已站上 MA%d，但转强未获连续 %d 日确认：%s",
+			store.MarketIndex, window, gate.ConfirmDays, note)
 	}
 	return false, ""
 }

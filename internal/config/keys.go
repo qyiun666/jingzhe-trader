@@ -64,7 +64,17 @@ var KeySpecs = []KeySpec{
 	// 建仓首日 high==cost，旧口径下 5% 回撤线会先于 8% 止损触发，实际把止损收紧成 5%
 	// （20261022 600704：成本/高点 5.07、现价 4.81 被"移动止盈"卖出）。
 	// 0 合法 = 回到旧口径（成本线即武装）；装配期校验 0..0.5。
-	{Key: "risk.trailing_arm_pct", Type: TypeFloat, Default: "0.06"},
+	//
+	// 2026-11-03 由 0.06 提到 0.08（组长定参，最近几单亏损复盘）：0.06 与 5% 回撤线组合的
+	// 触发价 = 成本×1.06×0.95 = 成本×1.007，只锁 +0.7% 毛利；而 5 元最低佣金下 1,000 元级
+	// 小单的双边摩擦实测 1.09%~1.78% → 止盈只要在武装线附近触发，算术上就注定净亏
+	// （20261103 601328：高点 8.76 仅以 0.0044 元越过 6% 线，次日低开触发、8.13 成交 −18.83）。
+	// 本键是**静态下限**；实际生效值由 risk 侧按当笔名义额动态推导取严，见 trailing_arm_safety_pct。
+	{Key: "risk.trailing_arm_pct", Type: TypeFloat, Default: "0.08"},
+	// 动态武装线的安全垫：arm = max(上面的静态下限, (1+当笔预估双边摩擦)/(1−回撤线)−1 + 本垫)。
+	// 摩擦与名义额成反比，所以武装线必须随下单规模放大，不能是全局常数——这是小资金账户
+	// 必须有的耦合。装配期校验 0..0.1。
+	{Key: "risk.trailing_arm_safety_pct", Type: TypeFloat, Default: "0.01"},
 
 	// ---------- 交易成本 ----------
 	{Key: "cost.commission_rate", Type: TypeFloat, Default: "0.00025"},
@@ -97,6 +107,11 @@ var KeySpecs = []KeySpec{
 	// 默认总仓 20%、单票 10%（组长 20260924 批准）；装配期校验 ≤ 物理熔断且 single≤total。
 	{Key: "screen.gate_off_max_total_pct", Type: TypeFloat, Default: "0.20", RefuseZero: true},
 	{Key: "screen.gate_off_max_single_pct", Type: TypeFloat, Default: "0.10", RefuseZero: true},
+	// 转强防抖：需要连续 N 个交易日收盘 ≥ MA60 才恢复常规档；转弱（收盘 < MA60）仍然即时。
+	// 不对称是刻意的——进场慢、出场快，弱势里立刻收手、不因一天的反弹就把仓位放回满档。
+	// 20261103 定参：09-28 至 11-02 全窗口无一次 MA60 上穿，防抖参数没有实盘反例可标定，
+	// 因此按原则给默认 3；0 或 1 = 回退"即时转强"旧行为。装配期校验 0..10。
+	{Key: "screen.gate_confirm_days", Type: TypeInt, Default: "3"},
 	// 因子方向模式：reversal = 反向使用动量/低波/流动性（默认）；momentum = 原始方向（保留供 A/B）。
 	// 默认取 reversal 的依据是 2023-09~2026-09 的 20 日 RankIC 实测：
 	// 原始方向综合分 −0.0896（ICIR −0.648，n=689 个截面），反向 +0.0930；
@@ -113,6 +128,25 @@ var KeySpecs = []KeySpec{
 	// 0 合法（单独关闭该项保护 = 回到旧口径），负值装配期拒绝。
 	{Key: "signal.rank_out_min_hold_days", Type: TypeInt, Default: "10"},
 	{Key: "signal.rank_out_buffer_n", Type: TypeInt, Default: "10"},
+	// 弱势期是否仍生成排名淘汰卖单。默认 **false = 停用**（2026-11-03 组长定参）：
+	// 保留带名义深度 TopN+buffer=30，但 screener 为保证"候选一定是保留带成员"会把带深
+	// 拉伸到覆盖最后一名候选（11-02 被挤到 42）→ 30↔42 逐日摆动，单日掉带即淘汰等于
+	// 用噪声做退出（19 个交易日 18 张指令单里 7 张是它）。且弱势期买入已停，轮换失去意义。
+	// 价格型三线（止损/移动止盈/止盈）与弱势减仓线 weak_exit_* 不受本键影响；
+	// min_hold_days / buffer_n 两键保留，转强后继续生效。true = 回退旧行为。
+	{Key: "signal.rank_out_weak_enabled", Type: TypeBool, Default: "false"},
+	// ---------- 买入摩擦闸（2026-11-03 组长定参）----------
+	// 前提事实：用户券商的 5 元最低佣金不可取消。12,000 元账户在弱势档单票上限 10% 下
+	// 每笔名义 ≤1,200 元，实测双边摩擦 1.09%~1.78%（本轮 4 笔合计 -43.06，占实现亏损 40.6%），
+	// 而归因节点"买入 vs 跳过"的 5 日超额 +0.79pp 在 n=6 下不显著。
+	// 弱势试探期（判定 WeakRegime）默认**不下发买入指令单**：评审链、影子清单、screen:topn、
+	// 归因留痕全部照跑，样本继续积累且零成本。true = 回退"弱势期也小额试探"。
+	{Key: "signal.weak_buy_enabled", Type: TypeBool, Default: "false"},
+	// 通用摩擦闸的预估持有期超额（小数，0.005 = 0.5%），转强后的常规档同样使用。
+	// 判据：当笔预估双边摩擦 ≥ 本值 → 不下发。**默认 0 = 无显著证据 = 全拦**
+	// （组长按"不显著按 0 处理"定）。要在常规档放行买单，必须由归因节点把显著正超额
+	// 写进这个键，而不是把闸拆掉。装配期校验 0..0.2（超过 20% 的预期超额等于没有闸）。
+	{Key: "signal.expected_excess_pct", Type: TypeFloat, Default: "0"},
 	// ---------- 弱势期市场退出线（signal.weak_exit_*）----------
 	// 只在 screen.gate_enabled=false 时生效：闸门关着就不会有规则 5（大盘恶化），
 	// 弱势期的退出只能靠 8% 止损；但阴跌不是一次跌穿止损线，而是每天 -0.5% 磨下去。
@@ -153,6 +187,17 @@ var KeySpecs = []KeySpec{
 	// 见 internal/llm/prompts.go 顶部），所以这个键暂时不落实际；保留是为了
 	// 将来接入真正可用的检索时不用再动装配层与校验。值仍按 low|medium|high 校验。
 	{Key: "llm.search_context_size", Type: TypeString, Default: "high"},
+	// 评审链的时间与批次预算（agent_issues #14：20261009 与 20261030 两次同形态超时）。
+	// 旧形状是**结构性预算重叠**，不是"网络慢"：整轮 deadline 12min、单条 prompt 允许 10min、
+	// 只给决策与落库留 2min ⇒ 任一证据 prompt 用满 10 分钟就吃光整轮预算，第 2 次重问必然
+	// 看见 ctx 已 Done（`重试第 2 次前上下文已取消: context deadline exceeded`），
+	// askAttempts=3 形同虚设——10-30 的 20 条 value 阶段失败全是这一形状。
+	// 因此默认改成「单条 5min + 每批 5 只」，整轮仍 12min；装配期不变量（validateEnums）
+	// 保证整轮预算不超过跑评审链那条任务的级超时，否则评审自己还没收口就被调度器掐死、
+	// 连失败行都落不了库。三键都是运维可调，不需要重新编译。
+	{Key: "llm.review_deadline_min", Type: TypeInt, Default: "12"},
+	{Key: "llm.review_prompt_timeout_min", Type: TypeInt, Default: "5"},
+	{Key: "llm.review_batch_size", Type: TypeInt, Default: "5"},
 
 	// ---------- 调度（scheduler.BuildJobs 逐键读取）----------
 	// 五个触发点：09:00 计划 / 盘中扫描 / 16:30 流水线 / 17:00 待买卖邮件 / 18:00 日报。

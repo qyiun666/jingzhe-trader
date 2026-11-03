@@ -17,6 +17,7 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -122,6 +123,32 @@ const (
 	jobTimeoutReport   = 10 * time.Minute
 )
 
+// reviewJobMargin 流水线任务在评审链整轮预算之外必须留的余量：选股、风控、建单、
+// 轨迹与发信都在同一条任务里，评审收口只是其中最慢的一段。
+const reviewJobMargin = 5 * time.Minute
+
+// reviewDeadlineFallback 与 config KeySpec 的 llm.review_deadline_min 默认值同值。
+// 只在读不到键时使用（局部构造的 Deps、测试桩），不是第二处可编辑的配置。
+const reviewDeadlineFallback = 12 * time.Minute
+
+// pipelineJobTimeout 任务级上限必须容得下评审链的整轮预算，否则调度器会先于评审
+// 把任务掐死——评审的失败行与 LLM_FAILED 降级来不及落库，当天轨迹看上去像"什么都没发生"
+// （agent_issues #14 的 20261030：20 只候选的 value 阶段全部消失）。
+// 把两者绑成一条推导而不是两处常量：有人把 review_deadline 调到 30 分钟以上时，
+// 这里自动扩，不需要谁记得同步改另一个数。下限仍是原来的 30min。
+func pipelineJobTimeout(d Deps) time.Duration {
+	need := reviewDeadlineFallback + reviewJobMargin
+	if raw := strings.TrimSpace(d.Config.GetString("llm.review_deadline_min")); raw != "" {
+		if mins, err := strconv.Atoi(raw); err == nil && mins > 0 {
+			need = time.Duration(mins)*time.Minute + reviewJobMargin
+		}
+	}
+	if need > jobTimeoutPipeline {
+		return need
+	}
+	return jobTimeoutPipeline
+}
+
 // BuildJobs 构建 5 个触发点。顺序即同一时刻的执行次序。
 func BuildJobs(d Deps) []JobSpec {
 	return []JobSpec{
@@ -139,7 +166,7 @@ func BuildJobs(d Deps) []JobSpec {
 		},
 		{
 			Name: JobEveningPipeline, At: d.at("scheduler.pipeline"), TradeDayOnly: true,
-			Timeout: jobTimeoutPipeline,
+			Timeout: pipelineJobTimeout(d),
 			Run:     func(ctx context.Context, rc *observability.RunCtx) error { return eveningPipeline(ctx, rc, d) },
 		},
 		{

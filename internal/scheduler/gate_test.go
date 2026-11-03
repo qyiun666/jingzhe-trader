@@ -75,20 +75,84 @@ func TestDetectWeakRegime(t *testing.T) {
 		}
 	}
 
-	if weak, note := detectWeakRegime(ctx, st, "20260303", 1); weak || note != "" {
+	if weak, note := detectWeakRegime(ctx, st, "20260303", store.MarketGate{Window: 1}); weak || note != "" {
 		t.Errorf("收盘=MA1 应判非弱势，实际 weak=%v note=%q", weak, note)
 	}
-	weak, note := detectWeakRegime(ctx, st, "20260303", 2) // MA2=150 > 收盘100
+	weak, note := detectWeakRegime(ctx, st, "20260303", store.MarketGate{Window: 2}) // MA2=150 > 收盘100
 	if !weak || !strings.Contains(note, "MA2") {
 		t.Errorf("收盘低于 MA2 应判弱势且点名窗口，实际 weak=%v note=%q", weak, note)
 	}
-	weak, note = detectWeakRegime(ctx, st, "20260303", 4) // 只有 3 根：均线不可算
+	weak, note = detectWeakRegime(ctx, st, "20260303", store.MarketGate{Window: 4}) // 只有 3 根：均线不可算
 	if !weak || !strings.Contains(note, "不可算") {
 		t.Errorf("均线不可算应按弱势降级，实际 weak=%v note=%q", weak, note)
 	}
-	weak, note = detectWeakRegime(ctx, st, "20260201", 2) // 该日之前无任何指数行
+	weak, note = detectWeakRegime(ctx, st, "20260201", store.MarketGate{Window: 2}) // 该日之前无任何指数行
 	if !weak || note == "" {
 		t.Errorf("指数不可读应按弱势降级，实际 weak=%v note=%q", weak, note)
+	}
+	// ConfirmDays 缺省（=0，手工构造的 gate）走历史口径：站上均线即转强，不等确认。
+	if weak, note = detectWeakRegime(ctx, st, "20260303", store.MarketGate{Window: 1}); weak {
+		t.Errorf("未显式配置防抖天数时应保持历史口径，实际 weak=%v note=%q", weak, note)
+	}
+}
+
+// TestDetectWeakRegimeRequiresConsecutiveConfirmation 定参④ 的调度侧接线：
+// 收盘站上均线**不等于**转强，必须连续 ConfirmDays 日都站上各自当日均线，
+// 才把仓位从"弱势试探档"放回常规档。单日反抽就放开（旧口径）等于把单票上限
+// 从 10% 一次放回 40%，而本轮全部亏损都来自"弱势里硬做小单"这一侧。
+//
+// 夹具用同一条数据分别过两种口径，这样"防抖真的在拦"是可证的而不是注释里的声称：
+// 收盘 10,10,8,10,12（MA3 逐日 9.33 / 9.33 / 10）：末日 12 站上均线，
+// 但倒数第 3 日 8 在其日均线下方 → 连续确认中断。
+func TestDetectWeakRegimeRequiresConsecutiveConfirmation(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/confirm.db")
+	if err != nil {
+		t.Fatalf("打开测试库失败: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	days := []string{"20260301", "20260302", "20260303", "20260304", "20260305"}
+	closes := []model.Fen{1000, 1000, 800, 1000, 1200}
+	for i, d := range days {
+		if err := st.MarketRepo().UpsertBar(ctx, model.Bar{
+			TsCode: store.MarketIndex, TradeDate: d, Close: closes[i]}); err != nil {
+			t.Fatalf("插入指数日线失败: %v", err)
+		}
+	}
+
+	// 旧口径（ConfirmDays=1）：末日 1200 ≥ MA3=1000 → 判非弱势。
+	if weak, note := detectWeakRegime(ctx, st, "20260305",
+		store.MarketGate{Window: 3, ConfirmDays: 1}); weak {
+		t.Errorf("回退档应保持历史口径（站上均线即转强），实际 weak=%v note=%q", weak, note)
+	}
+
+	// 加防抖（ConfirmDays=3）：同一条数据必须仍判弱势，且 note 点名"未获连续 3 日确认"。
+	weak, note := detectWeakRegime(ctx, st, "20260305", store.MarketGate{Window: 3, ConfirmDays: 3})
+	if !weak {
+		t.Fatalf("连续确认被中途一天打断，绝不能判转强（那等于把单票上限放回 40%%），实际 weak=%v note=%q", weak, note)
+	}
+	if !strings.Contains(note, "未获连续 3 日确认") || !strings.Contains(note, "收盘已站上 MA3") {
+		t.Errorf("note 要同时写明「已经站上」与「确认未过」两件事供归因，实际 %q", note)
+	}
+
+	// 补齐连续三日：最后三根收盘 1200,1201,1202（各自 MA3 都 ≤ 收盘）→ 转强放开。
+	for i, d := range []string{"20260303", "20260304", "20260305"} {
+		if err := st.MarketRepo().UpsertBar(ctx, model.Bar{
+			TsCode: store.MarketIndex, TradeDate: d, Close: model.Fen(1200 + i)}); err != nil {
+			t.Fatalf("改写指数日线失败: %v", err)
+		}
+	}
+	if weak, note := detectWeakRegime(ctx, st, "20260305",
+		store.MarketGate{Window: 3, ConfirmDays: 3}); weak {
+		t.Errorf("连续 3 日站上均线后应放开常规档，实际 weak=%v note=%q", weak, note)
+	}
+
+	// 确认序列深度不足（window+confirmDays-1 根读不满）必须读成"未转强"，
+	// 不能读成"没有反例所以放行"：这里窗口 2 + 确认 5 需要 6 根，库里只有 5 根，
+	// 而当日收盘确实站在 MA2 上方——不写清这一条，测试很容易以为拦的是方向。
+	if weak, note := detectWeakRegime(ctx, st, "20260305",
+		store.MarketGate{Window: 2, ConfirmDays: 5}); !weak || !strings.Contains(note, "按未转强处理") {
+		t.Errorf("确认序列长度不足应按弱势降级并点名数据不足，实际 weak=%v note=%q", weak, note)
 	}
 }
 

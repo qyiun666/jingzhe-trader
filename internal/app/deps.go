@@ -81,7 +81,15 @@ func BuildRuntime(ctx context.Context, st *store.Store, cfg *config.Config) (*Ru
 	// 未启用时不回落成"规则说了算"—— 那等于把刚拆掉的均线/综合分门槛装回来。
 	llmClient := llm.NewClient(cfg.GetString("llm.api_key"), cfg.GetString("llm.base_url"),
 		cfg.GetString("llm.model"), cfg.GetString("llm.search_context_size"), nil)
-	decider := llm.NewReviewer(llmClient, st, cfg.GetBool("llm.enabled"))
+	// 评审链的整轮/单条时限与批大小由配置注入（agent_issues #14）：旧形状是编译期常量
+	// 12min 整轮 + 10min 单条，任一证据 prompt 用满就吃光整轮预算、第 2 次重问必然
+	// 看见 ctx 已 Done。装配期已校验三键范围与"单条 < 整轮"，流水线任务级超时
+	// 也随整轮预算自动扩（scheduler.pipelineJobTimeout），三者不再各自为政。
+	// 批大小 n≤0 时 llm 侧保持"整批一次问"的历史行为，这里不做二次解释。
+	decider := llm.NewReviewer(llmClient, st, cfg.GetBool("llm.enabled")).
+		WithTimeouts(time.Duration(cfg.GetInt("llm.review_deadline_min"))*time.Minute,
+			time.Duration(cfg.GetInt("llm.review_prompt_timeout_min"))*time.Minute).
+		WithBatchSize(cfg.GetInt("llm.review_batch_size"))
 
 	cost := CostParamsOf(cfg)
 	ledger := ticket.NewLedger(st, cost, ic)
@@ -250,6 +258,68 @@ func validateEnums(cfg *config.Config) error {
 	}
 	if v := cfg.GetInt("signal.rank_out_buffer_n"); v < 0 {
 		return fmt.Errorf("signal.rank_out_buffer_n=%d 非法（合法 ≥0，0=保留带与 TopN 等深）", v)
+	}
+	// 2026-11-03 定参的三个买入侧开关/阈值。布尔两键单独再解析一遍：GetBool 对拼错的
+	// 值按 false 处理，而这里 false 与 true 是相反的政策（停买 vs 试探买），
+	// 静默落错边等于"配置写错了系统替你做主还不吭声"。
+	for _, key := range []string{"signal.weak_buy_enabled", "signal.rank_out_weak_enabled"} {
+		if raw := strings.TrimSpace(cfg.GetString(key)); raw != "" {
+			if _, err := strconv.ParseBool(raw); err != nil {
+				return fmt.Errorf("%s=%q 非法（合法 true|false）", key, raw)
+			}
+		}
+	}
+	// 摩擦闸的预估持有期超额。0 是**默认且有意的值**（无显著归因证据 = 全拦），
+	// 所以这里不设 RefuseZero；上限 0.2 挡的是把百分数当小数写（20 而不是 0.20）
+	// ——那种量纲事故的后果是"闸永久放行"，比关掉闸更难被发现。
+	if raw := strings.TrimSpace(cfg.GetString("signal.expected_excess_pct")); raw != "" {
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil || v < 0 || v > 0.2 {
+			return fmt.Errorf("signal.expected_excess_pct=%q 非法（合法 0..0.2 的小数；0=无显著证据即全拦，百分数请写成 0.005 而不是 0.5）", raw)
+		}
+	}
+	// 动态武装线的安全垫：0 合法（只取静态下限），超过 10% 会把武装线推到弱势档
+	// 单票上限之上，等于止盈永不武装——那应该显式关掉它，不是靠一个大数凑出来。
+	if raw := strings.TrimSpace(cfg.GetString("risk.trailing_arm_safety_pct")); raw != "" {
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil || v < 0 || v > 0.1 {
+			return fmt.Errorf("risk.trailing_arm_safety_pct=%q 非法（合法 0..0.1）", raw)
+		}
+	}
+	// 转强防抖天数：0/1 = 即时转强（旧行为可回退）；上限 10 天，更长等于事实上
+	// 永不转强，这种事应当由人显式决定，不由一个手滑的数字决定。
+	if raw := strings.TrimSpace(cfg.GetString("screen.gate_confirm_days")); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 0 || v > 10 {
+			return fmt.Errorf("screen.gate_confirm_days=%q 非法（合法 0..10，0/1=即时转强）", raw)
+		}
+	}
+	// 评审链三个预算键（agent_issues #14）。单条时限必须**严格小于**整轮：
+	// 10-09/10-30 两次事故的形状就是单条 10min 贴着整轮 12min，任一条用满就吃光
+	// 整轮预算，第 2 次重问必然看见 ctx 已 Done。llm.WithTimeouts 对越界是静默忽略，
+	// 那等于把事故原因藏在被忽略的配置里——所以同一条判据挪到装配期，直接拒绝启动。
+	reviewDeadline := 0
+	if raw := strings.TrimSpace(cfg.GetString("llm.review_deadline_min")); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 1 || v > 60 {
+			return fmt.Errorf("llm.review_deadline_min=%q 非法（合法 1..60 分钟）", raw)
+		}
+		reviewDeadline = v
+	}
+	if raw := strings.TrimSpace(cfg.GetString("llm.review_prompt_timeout_min")); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 1 || v > 60 {
+			return fmt.Errorf("llm.review_prompt_timeout_min=%q 非法（合法 1..60 分钟）", raw)
+		}
+		if reviewDeadline > 0 && v >= reviewDeadline {
+			return fmt.Errorf("llm.review_prompt_timeout_min=%d 不小于 llm.review_deadline_min=%d（单条必须小于整轮，否则重问永远等不到自己的超时）", v, reviewDeadline)
+		}
+	}
+	if raw := strings.TrimSpace(cfg.GetString("llm.review_batch_size")); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 1 || v > 50 {
+			return fmt.Errorf("llm.review_batch_size=%q 非法（合法 1..50 只/批）", raw)
+		}
 	}
 	// 弱势减仓：只减不清是硬语义，reduce_pct 必须严格小于 1；跌幅阈值 0 会让
 	// 任何一天的小跌都触发减仓，也不是有效配置。只校验显式配置过的键，

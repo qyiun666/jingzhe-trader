@@ -242,9 +242,16 @@ func pendingSellSet(ctx context.Context, d Deps, date string) (map[string]bool, 
 	return set, nil
 }
 
-// stopLossTickets 逐只持仓：先抬升期间最高价（移动止盈的回撤基准），
-// 再按价格型卖出规则（止损/移动止盈/止盈）判定，触发则建卖出指令单。
+// stopLossTickets 逐只持仓：按价格型卖出规则（止损/移动止盈/止盈）判定，触发则建卖出指令单。
 // 返回本轮新增单（供发信）。
+//
+// 期间最高价**不在这里抬升**（2026-11-03 定参，原第 264-269 行的盘中 RaiseHighPrice 已删）：
+// 高点只由 EOD 路径以当日收盘价维护（pipeline.go 的 raiseHighWatermarks）。原来每 5 分钟
+// 用瞬时现价抬高点是"只升不降"的，一根上影线就能永久武装移动止盈基准——20261103 601328
+// 就是被 8.76 这个仅高出武装线 0.0044 元的盘中上影武装后，次日低开穿破 8.322 触发价、
+// 8.13 成交，+3.75% 浮盈翻成 -2.28% 实现。删除后 LastClose 与 HighPrice 同源（都是收盘口径），
+// 代价是移动止盈对一个收盘周期内的冲高回落不再反应；8% 硬止损与 15% 止盈不使用高点，
+// 盘中照常即时触发，下跌保护没有被削弱。
 func stopLossTickets(ctx context.Context, rc *observability.RunCtx, d Deps, date string,
 	holding []string, quoted map[string]quote.Quote, rp risk.RiskParams,
 	pending map[string]bool) ([]notify.TicketLine, error) {
@@ -262,15 +269,10 @@ func stopLossTickets(ctx context.Context, rc *observability.RunCtx, d Deps, date
 		if q.Price <= 0 {
 			return nil, fmt.Errorf("持仓 %s 报价非法（price=%d），无法判断卖出", code, int64(q.Price))
 		}
-		// 先用现价抬升高点：移动止盈的回撤基准必须反映当日盘中创出的新高，
-		// 否则"高点"停在买入价，回撤线永远够不着（历史缺陷）。
-		if err := d.Store.TradeRepo().RaiseHighPrice(ctx, code, q.Price); err != nil {
-			return nil, err
-		}
 		if pending[code] {
 			continue // 已有未执行卖单：不重复建单也不重复发信
 		}
-		// 抬升之后再读持仓：移动止盈要用到刚更新的 high_price。
+		// 高点由 EOD 维护，这里直接读持仓即可（不再"抬升之后再读"）。
 		pos, err := d.Store.TradeRepo().GetPosition(ctx, code)
 		if err != nil {
 			return nil, fmt.Errorf("读取持仓 %s 失败: %w", code, err)

@@ -250,6 +250,10 @@ const MarketMAWindow = 60
 type MarketGate struct {
 	Enabled bool
 	Window  int // 均线窗口（交易日），1..MarketMAWindow
+	// ConfirmDays 转强防抖（定参④，2026-11-03）：需要连续 N 个交易日收盘 ≥ 当日
+	// 均线才认定"转强"（放开常规风控档）。转弱方向不受它影响，当日跌破即收缩。
+	// 0/1 = 只看当日，即加防抖之前的历史口径（回退开关）。
+	ConfirmDays int
 }
 
 // LatestMarketIndex 读取大盘指数截至 beforeInclusive 的最后一根日线，
@@ -290,4 +294,32 @@ func (r *ScreenRepo) IndexReturnPct(ctx context.Context, beforeInclusive string,
 		return 0, false, nil
 	}
 	return closes[0]/closes[days] - 1, true, nil
+}
+
+// MarketIndexCloses 读取大盘指数截至 beforeInclusive 的最近 n 根日线收盘，
+// 按交易日**升序**返回（最后一个元素是当日）。
+//
+// 用途是定参④ 的转强防抖（screener.ConfirmStrengthen 要逐日回溯算当日 MA，
+// 需要 window+confirmDays-1 根，默认档即 60+3-1=62 根）。升序是这条判据的契约，
+// 与 IndexReturnPct 那类"只比首尾"的降序取数不同，两个方向搞反会静默改变判定结果。
+//
+// 少于 n 根不是错误：原样返回读到的部分，让调用方把"数据不够"读成"未转强"。
+// 兜底方向只在 ConfirmStrengthen 一处定义，这里不再重复判断，否则两处的保守程度
+// 会各自漂移。指数日线不受保留窗口裁剪（见 RetentionRules 的 ExceptTSCode: MarketIndex），
+// 正常不会饿死。
+func (r *ScreenRepo) MarketIndexCloses(ctx context.Context, beforeInclusive string, n int) ([]float64, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+	var desc []float64
+	const q = `SELECT close FROM daily_bar WHERE ts_code = ? AND trade_date <= ?
+		ORDER BY trade_date DESC LIMIT ?`
+	if err := r.rdb.SelectContext(ctx, &desc, q, MarketIndex, beforeInclusive, n); err != nil {
+		return nil, fmt.Errorf("读取大盘指数 %s 最近 %d 根收盘（≤%s）失败: %w", MarketIndex, n, beforeInclusive, err)
+	}
+	closes := make([]float64, len(desc))
+	for i, c := range desc {
+		closes[len(desc)-1-i] = c // 降序 → 升序
+	}
+	return closes, nil
 }
