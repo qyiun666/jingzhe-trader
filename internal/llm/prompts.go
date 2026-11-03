@@ -30,6 +30,14 @@ type PromptSpec struct {
 	Title  string
 	System string
 	Search bool
+	// Degradable 本维度问不出来时，允许"降权继续"而不是把该标的判成评审失败。
+	// 只有 value 打上它（2026-11-03 组长定参⑤）：它的输入是 daily_basic 的 PE/PB
+	// 截面，属于"数据可能没同步"的维度，10-30 那次整批 value 超时把 20 只候选全部
+	// 判成失败、当日零计划，代价远大于少看一个维度。
+	// tech/news/sector 保持"没问出来就不批"：它们各自挡的是走势、退市立案、板块冲击
+	// 这类会直接改变结论的风险，缺一个就是缺一个否决权（TestReviewFailedPromptIsRetried
+	// 锁的正是这条不变量）。
+	Degradable bool
 }
 
 // evidenceShared 四条证据 prompt 共用的输出契约。
@@ -66,7 +74,7 @@ var EvidencePrompts = []PromptSpec{
 本次维度：基本面。注意你手上的数据只有估值口径 —— PE(TTM)、PB、流通市值、换手率，
 没有财务报表、没有盈利预测、没有行业景气数据，也不许你去猜这家公司做什么、赚不赚钱。
 请只回答"按这几个数，这个价格是贵、是便宜、还是无从判断"，并警惕估值陷阱：
-低 PE 可能是一次性收益，低 PB 可能是资产质量问题，你无法分辨时就答 unknown。`},
+低 PE 可能是一次性收益，低 PB 可能是资产质量问题，你无法分辨时就答 unknown。`, Degradable: true},
 	{Key: KeyNews, Title: "消息面与退市立案风险", System: evidenceShared + "\n" + offlineClause + `
 本次维度：消息面与退市/立案风险。**本系统没有接入任何公告、新闻或监管数据源**，
 你在这一维度手上只有本地算出的价格异常线索（写在每只票那一段里）。

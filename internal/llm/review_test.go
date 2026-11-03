@@ -432,9 +432,14 @@ func TestPartialBatchReply(t *testing.T) {
 
 // TestReviewEvidenceFailureYieldsNoDecision 整条 prompt 问不出来时不许凑决策：
 // 全部候选记 Failed（不是"评审说不买"），且不写任何决策行。
+// TestReviewEvidenceFailureYieldsNoDecision 不可降权维度（news）问不出来时不批：
+// 证据不全就凑一个决策，等于把"没查过的风险"读成"没有风险"。
+// 2026-11-03 定参⑤把 value 单独移出这一类（见 TestReviewValueFailureDegradesNotFails），
+// 所以这里必须用 news 而不是原来的 value —— 三条严格维度（tech/news/sector）
+// 的"缺一个就不批"不变量仍然要有用例守着，用例本身不能跟着维度漂走。
 func TestReviewEvidenceFailureYieldsNoDecision(t *testing.T) {
 	st := testStore(t)
-	srv := newStub(t, allOKBatch(), map[string]int{markValue: 9})
+	srv := newStub(t, allOKBatch(), map[string]int{markNews: 9})
 	got, err := newReviewer(srv.srv.URL, st, true).DecideBatch(context.Background(), batchReq())
 	if err != nil {
 		t.Fatalf("模型故障不应中断流程: %v", err)
@@ -446,12 +451,110 @@ func TestReviewEvidenceFailureYieldsNoDecision(t *testing.T) {
 		if _, found := rowOf(t, st, code, KeyDecision); found {
 			t.Errorf("证据不全时 %s 不应产生决策行", code)
 		}
-		if mustRow(t, st, code, KeyValue).Status != model.TraceFail {
+		if mustRow(t, st, code, KeyNews).Status != model.TraceFail {
 			t.Errorf("%s 的失败维度应落 failed", code)
 		}
 		if mustRow(t, st, code, KeyTech).Verdict == "" {
 			t.Errorf("%s 成功维度的结论应保留（重跑不必重问）", code)
 		}
+	}
+}
+
+// TestReviewValueFailureDegradesNotFails 定参⑤：value（基本面）维度问不出来时
+// 降权继续，不整批判失败。出处是 20261030 —— 20 只候选的 value 阶段全部超时，
+// 按旧口径当日零计划、零评审样本，代价远大于少看一个估值维度。
+// 三条要求：① 决策照常常现且不判 Failed；② 减维必须明明白白告诉模型（不许静默减维）；
+// ③ value 的 failed 行仍留在库里，当日重跑会补问它（不能把缺的维度永久钉死）。
+func TestReviewValueFailureDegradesNotFails(t *testing.T) {
+	st := testStore(t)
+	srv := newStub(t, allOKBatch(), map[string]int{markValue: 9})
+	got, err := newReviewer(srv.srv.URL, st, true).DecideBatch(context.Background(), batchReq())
+	if err != nil {
+		t.Fatalf("value 缺失不应中断链路: %v", err)
+	}
+	for _, code := range []string{codeA, codeB} {
+		if d := got[code]; d.Failed {
+			t.Errorf("%s 只因 value 缺失就应降权继续，实际判成评审失败: %+v", code, d)
+		}
+		if _, found := rowOf(t, st, code, KeyDecision); !found {
+			t.Errorf("%s 应有决策行（降权继续而不是整批否决）", code)
+		}
+		if mustRow(t, st, code, KeyValue).Status != model.TraceFail {
+			t.Errorf("%s 的 value 行应保持 failed，重跑要补问", code)
+		}
+	}
+	asked := strings.Join(srv.usersOf(markDecide), "\n")
+	if !strings.Contains(asked, "本维度缺失") || !strings.Contains(asked, "基本面") {
+		t.Errorf("决策 prompt 必须写明缺了哪一维（不许静默减维），实际正文：\n%s", clip(asked, 400))
+	}
+	if !strings.Contains(asked, "不要把") {
+		t.Errorf("降权指令要给模型可执行的口径，不能只说'缺了'")
+	}
+}
+
+// TestRetryBudgetStopsWhenRoundDeadlineIsSpent 20261030 的真因修复：单条 prompt 用满
+// 10 分钟就吃光 12 分钟整轮预算，第 2 次重问一进 client 就看到 ctx 已 Done，
+// 失败原因被写成"重试第 2 次前上下文已取消"——把"预算不够"误诊成"模型抖动"。
+// 现在重问前先算剩余预算，不足就立即记失败行，理由写明缺多少。
+func TestRetryBudgetStopsWhenRoundDeadlineIsSpent(t *testing.T) {
+	st := testStore(t)
+	fixed := time.Date(2026, 11, 3, 8, 0, 0, 0, time.UTC)
+	r := newReviewer("http://127.0.0.1:0", st, true).
+		WithTimeouts(12*time.Minute, 5*time.Minute).
+		WithRetryBackoff(2 * time.Second).
+		WithClock(func() time.Time { return fixed })
+	a := askAsk{roundDDL: fixed.Add(12 * time.Minute)}
+
+	// 剩余 11 分钟 ≥ 5 分钟 + 退避：允许再问。
+	r.WithClock(func() time.Time { return fixed.Add(time.Minute) })
+	if err := r.retryBudgetOK(a, 2); err != nil {
+		t.Errorf("剩余 11 分钟应允许重问，实际拒绝: %v", err)
+	}
+	// 剩余 4 分钟 < 单问上限 5 分钟：必须停（再问也只是被整轮 deadline 拦腰截断）。
+	r.WithClock(func() time.Time { return fixed.Add(8 * time.Minute) })
+	err := r.retryBudgetOK(a, 2)
+	if err == nil {
+		t.Fatalf("剩余 4 分钟不足一次单问，应拒绝重问")
+	}
+	if !strings.Contains(err.Error(), "剩余评审预算") {
+		t.Errorf("失败理由要写明是预算不足，实际 %q", err.Error())
+	}
+	// 整轮预算已耗尽（剩余为负）同样拒绝，且不能 panic。
+	r.WithClock(func() time.Time { return fixed.Add(13 * time.Minute) })
+	if err := r.retryBudgetOK(a, 1); err == nil {
+		t.Errorf("预算已耗尽时首问也应拒绝")
+	}
+	// 未设整轮 deadline（roundDDL 零值）时恒通过：判据不能凭空发明预算。
+	if err := r.retryBudgetOK(askAsk{}, 3); err != nil {
+		t.Errorf("未设整轮预算不应拦截，实际 %v", err)
+	}
+}
+
+// TestSplitBatches 分批的边界：默认不分批（与历史行为逐位一致），
+// 只有显式配了每批只数才切，且切分不丢标的、不重不漏。
+func TestSplitBatches(t *testing.T) {
+	items := make([]signal.BuyRequest, 0, 12)
+	for i := 0; i < 12; i++ {
+		items = append(items, item(fmt.Sprintf("6000%02d.SH", i), fmt.Sprintf("丙%d", i)))
+	}
+	if got := splitBatches(items, 0); len(got) != 1 || len(got[0]) != 12 {
+		t.Errorf("size=0 应整批一次问，实际 %d 批", len(got))
+	}
+	if got := splitBatches(items, 12); len(got) != 1 {
+		t.Errorf("size=12 等于批大小刚好，应一批问完，实际 %d 批", len(got))
+	}
+	var seen int
+	for i, b := range splitBatches(items, 5) {
+		if len(b) > 5 || len(b) == 0 {
+			t.Errorf("第 %d 批只数 %d 越界", i, len(b))
+		}
+		seen += len(b)
+	}
+	if seen != 12 {
+		t.Errorf("分批后共 %d 只，应不丢不重等于 12", seen)
+	}
+	if got := splitBatches(nil, 5); len(got) != 1 || len(got[0]) != 0 {
+		t.Errorf("空候选集应原样返回一批（由调用方按无候选收口），实际 %+v", got)
 	}
 }
 

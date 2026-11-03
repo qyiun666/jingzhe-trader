@@ -33,8 +33,16 @@ func addOnState(totalAssetYuan, cashYuan, positionsMVYuan float64, code string, 
 }
 
 // g1Params 按总资产解析出的生效参数。10 万元：单票 4 万 / 总仓 9 万 / 最大持仓 6 / 置信度 0.55。
+//
+// 这里刻意把摩擦闸关掉（ExpectedExcessPct=1，即"预期超额 100%"，任何摩擦都盖得过）：
+// DefaultParams 的生效默认值是 0 = 无显著归因证据即全拦（20261103 定参①），
+// 那是**另一条独立规则**，由 TestFrictionGate* 专门覆盖。本文件的用例测的是
+// 批次累计总仓、行业上限、持仓数、金额上下限、加仓额度——让它们各自先撞上
+// 摩擦闸就等于什么都没测到。闸的开与关在下面的专项用例里断言，不在这里顺带。
 func g1Params(totalAssetYuan float64) RiskParams {
-	return DefaultParams(model.Fen(int64(totalAssetYuan * 100)))
+	p := DefaultParams(model.Fen(int64(totalAssetYuan * 100)))
+	p.ExpectedExcessPct = 1
+	return p
 }
 
 // intent 构造一笔"决策要求投入 wantYuan 元"的买入意向（缺省要满）。
@@ -134,6 +142,10 @@ func TestIndustryCapDefaultAllowsTwo(t *testing.T) {
 // ETF 不占个股行业名额。
 func TestIndustryCapWeakAndUnknown(t *testing.T) {
 	weak := WeakParams(g1Params(100000), 0.20, 0.10)
+	// 本用例测的是行业上限，不是买入闸：WeakParams 按定参默认会把 BuysBlocked 置起来
+	// （弱势期不下买单），这里显式放开才能走到行业上限那条判定。
+	// 闸本身由 TestWeakParamsBlocksBuysByDefault 与 TestBuysBlockedRejectsEveryIntent 覆盖。
+	weak.BuysBlocked = false
 	if weak.MaxPerIndustry != 1 {
 		t.Fatalf("弱势档行业上限=%d，期望 1", weak.MaxPerIndustry)
 	}
@@ -385,5 +397,74 @@ func TestAddOnAllowsHeldCode(t *testing.T) {
 	}
 	if batch[1].Amount != model.FromFloat(10000) {
 		t.Errorf("同码加仓金额=%s, 期望 10000.00", batch[1].Amount)
+	}
+}
+
+// TestBuysBlockedRejectsEveryIntent 弱势试探期买入闸（20261103 定参①）：
+// BuysBlocked 优先于一切买入判定，新仓与加仓一律拦，且 reject_rule 必须是
+// weak_buy_disabled —— 组长要求轨迹里能分清"弱势不许买"与"名额/行业上限"，
+// 事后归因才能区分"拦对了"和"拦错了"。
+func TestBuysBlockedRejectsEveryIntent(t *testing.T) {
+	p := WeakParams(g1Params(12000), 0.20, 0.10)
+	if !p.BuysBlocked {
+		t.Fatalf("弱势档默认应置 BuysBlocked（signal.weak_buy_enabled 默认 false）")
+	}
+	got := NewManager(p).CheckBatch([]BuyIntent{
+		{TsCode: "a", RefPrice: model.FromFloat(10), Confidence: 0.9, WantFen: model.FromFloat(1000)},
+		{TsCode: "b", Industry: "银行", RefPrice: model.FromFloat(8), Confidence: 0.9, WantFen: model.FromFloat(800)},
+	}, batchState(12000, 11000, 1000, 1, "a"))
+	for _, d := range got {
+		if d.Approved || d.RejectRule != RuleBuysBlocked {
+			t.Errorf("%s 应被 weak_buy_disabled 拦，实际 %+v", d.TsCode, d)
+		}
+		if !strings.Contains(d.RejectMsg, "弱势") || !strings.Contains(d.RejectMsg, "weak_buy_enabled") {
+			t.Errorf("拒绝理由应写明政策出处与回退键，实际 %q", d.RejectMsg)
+		}
+	}
+}
+
+// TestFrictionGateBlocksDefaultParams 摩擦闸在"无显著归因证据"（expected_excess_pct=0）
+// 时必须拦掉本轮实盘那种小额单：这是组长确认的设计意图（宁可长期空仓等样本变强），
+// 不是缺陷。拒绝理由必须带上摩擦率与阈值两个数，否则事后无法复核拦得对不对。
+//
+// 这里刻意把单笔下限放开（MinAmountRatio 调小）来隔离被测规则：实盘上 821 元这一档
+// 在弱势档还会先撞上 min_amount（0.75×单票上限≈880 元），两条闸都拦是对的，
+// 但断言 reject_rule 时必须知道是哪一条先说话。
+func TestFrictionGateBlocksDefaultParams(t *testing.T) {
+	p := DefaultParams(model.FromFloat(11727.74)) // 空仓后的真实总资产
+	if p.ExpectedExcessPct != 0 {
+		t.Fatalf("DefaultParams.ExpectedExcessPct=%v，期望 0（无显著证据即全拦）", p.ExpectedExcessPct)
+	}
+	p.MinAmountRatio = 0.01
+	got := NewManager(p).CheckBatch([]BuyIntent{
+		{TsCode: "601328.SH", Industry: "银行", RefPrice: model.FromFloat(8.21),
+			Confidence: 0.82, WantFen: model.FromFloat(1100)},
+	}, batchState(11727.74, 11727.74, 0, 0))
+	if got[0].Approved || got[0].RejectRule != RuleFrictionGate {
+		t.Fatalf("默认参数下应被摩擦闸拦掉，实际 %+v", got[0])
+	}
+	if !strings.Contains(got[0].RejectMsg, "≥") || !strings.Contains(got[0].RejectMsg, "expected_excess_pct") {
+		t.Errorf("拒绝理由应写明摩擦/阈值与回退键，实际 %q", got[0].RejectMsg)
+	}
+}
+
+// TestFrictionGateAllowsWhenExcessJustified 摩擦闸只拦"确定成本盖过预期收益"的单子：
+// 阈值给到显著正值后，费率低的单必须放行，否则这道闸等于永久停买。
+// 同时钉住"摩擦率与名义额反比"：同一阈值下 595 元级被拦、5,000 元级放行。
+func TestFrictionGateAllowsWhenExcessJustified(t *testing.T) {
+	p := DefaultParams(model.FromFloat(50000))
+	p.ExpectedExcessPct = 0.005 // 0.5% 的预期持有期超额
+	p.MinAmountRatio = 0.01     // 放开单笔下限，本用例只测摩擦闸
+	small := NewManager(p).CheckBatch([]BuyIntent{
+		{TsCode: "s", RefPrice: model.FromFloat(5.95), Confidence: 0.9, WantFen: model.FromFloat(600)},
+	}, batchState(50000, 50000, 0, 0))
+	if small[0].Approved || small[0].RejectRule != RuleFrictionGate {
+		t.Errorf("595 元单摩擦约 1.79%% > 阈值 0.5%%，应被拦，实际 %+v", small[0])
+	}
+	big := NewManager(p).CheckBatch([]BuyIntent{
+		{TsCode: "b", RefPrice: model.FromFloat(10), Confidence: 0.9, WantFen: model.FromFloat(5000)},
+	}, batchState(50000, 50000, 0, 0))
+	if !big[0].Approved {
+		t.Errorf("5,000 元单摩擦约 0.30%% < 阈值 0.5%%，应放行，实际 %+v", big[0])
 	}
 }

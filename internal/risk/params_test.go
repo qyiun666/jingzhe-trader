@@ -18,7 +18,13 @@ func TestDefaultParamsBaseline(t *testing.T) {
 	assertEqF(t, "基准", "MaxPositionPct", p.MaxPositionPct, 0.40)
 	assertEqF(t, "基准", "StopLossPct", p.StopLossPct, 0.08)
 	assertEqF(t, "基准", "TrailingStopPct", p.TrailingStopPct, 0.05)
-	assertEqF(t, "基准", "TrailingArmPct", p.TrailingArmPct, 0.06)
+	// 0.06 → 0.08（20261103 定参②）：arm=6% 配 d=5% 的触发价下限只有成本×1.007，
+	// 而小单双边摩擦实测 1.09%~1.78% —— 止盈在武装线附近触发即注定净亏。
+	// 静态下限与 config risk.trailing_arm_pct 的 KeySpec 默认值必须一致，
+	// 两处不一致时线上取 config（deps.go 覆盖基准），但读代码的人会被基准值误导。
+	assertEqF(t, "基准", "TrailingArmPct", p.TrailingArmPct, 0.08)
+	assertEqF(t, "基准", "TrailingArmSafetyPct", p.TrailingArmSafetyPct, 0.01)
+	assertEqF(t, "基准", "ExpectedExcessPct", p.ExpectedExcessPct, 0)
 	assertEqF(t, "基准", "TakeProfitPct", p.TakeProfitPct, 0.15)
 	assertEqF(t, "基准", "MinConfidence", p.MinConfidence, 0.55)
 	assertEqF(t, "基准", "MaxSingleAmountPct", p.MaxSingleAmountPct, 1.0)
@@ -174,5 +180,111 @@ func TestWeakParamsRaisesMinAmountFloor(t *testing.T) {
 	}
 	if want := pctOf(weak.SingleCapFen(), WeakMinAmountRatio); got != want {
 		t.Errorf("弱势档单笔下限=%s，期望 单票上限×%.2f=%s", got, WeakMinAmountRatio, want)
+	}
+}
+
+// TestWeakParamsBlocksBuysByDefault 弱势试探期买入闸（20261103 定参①）：
+// 判到弱势 + 键没配（默认 false）= 一律不下发买单；显式回退才放行。
+// 断言"默认即拦截"很关键——线上库里没有这个键，生效值全靠这里的零值方向。
+func TestWeakParamsBlocksBuysByDefault(t *testing.T) {
+	base := DefaultParams(baseAsset())
+	if base.WeakBuyAllowed { // 默认 false（新政策），不是漏赋值的 true
+		t.Fatalf("DefaultParams.WeakBuyAllowed=%v，期望 false", base.WeakBuyAllowed)
+	}
+	if base.BuysBlocked {
+		t.Errorf("非弱势档不应置 BuysBlocked")
+	}
+	weak := WeakParams(base, 0.20, 0.10)
+	if !weak.WeakProbe || !weak.BuysBlocked {
+		t.Errorf("弱势档默认应同时置 WeakProbe 与 BuysBlocked: %+v", weak)
+	}
+	// 回退开关：只放开买入，不改变弱势档的其他任何收缩（仓位/行业/下限）。
+	base.WeakBuyAllowed = true
+	rollback := WeakParams(base, 0.20, 0.10)
+	if rollback.BuysBlocked {
+		t.Errorf("signal.weak_buy_enabled=true 应回退买入闸，实际仍被拦")
+	}
+	if rollback.MaxPositionPct != weak.MaxPositionPct || rollback.MinAmountRatio != weak.MinAmountRatio ||
+		rollback.MaxPerIndustry != weak.MaxPerIndustry || !rollback.WeakProbe {
+		t.Errorf("回退买入闸不应连带放松弱势档其他收缩")
+	}
+}
+
+// TestFrictionPctMatchesRealFills 摩擦率估算必须贴住本轮 4 笔券商实际回执：
+// 5.95×100→1.78%、6.39×100→1.67%、8.21×100→1.32%、5.05×200→1.09%
+// （费用合计 10.61/10.64/10.83/10.98 元，见 logs/jingzhe-new.log 成交回执）。
+// 这条是摩擦闸与动态武装线共同的分母，估歪就等于闸形同虚设或误拦。
+func TestFrictionPctMatchesRealFills(t *testing.T) {
+	cases := []struct {
+		notionalYuan float64
+		wantPct      float64
+	}{
+		{595, 1.78}, {639, 1.67}, {821, 1.32}, {1010, 1.09},
+	}
+	for _, tc := range cases {
+		got := FrictionPct(model.FromFloat(tc.notionalYuan)) * 100
+		if diff := got - tc.wantPct; diff > 0.03 || diff < -0.03 {
+			t.Errorf("%.0f 元摩擦率=%.3f%%，期望≈%.2f%%", tc.notionalYuan, got, tc.wantPct)
+		}
+	}
+	if got := FrictionPct(0); got != 1 {
+		t.Errorf("非正名义额应按最保守的 100%% 处理，实际 %.4f", got)
+	}
+}
+
+// TestTrailingArmPctForCoversFriction 定参②的算术不变量：
+// 触发价下限 = 成本×(1+arm)×(1−d) 必须高于 成本×(1+摩擦)，即触发后净毛利为正。
+//
+// 同时锁住旧参数为什么是错的：arm=6% 配 d=5% 时触发价只到成本×1.007（+0.70% 毛利），
+// 而 595 元那笔摩擦 1.78% → 净 -1.08%，止盈一触发就必亏，与标的涨跌无关。
+// 这笔就是 20261103 601328 的形状（+3.75% 浮盈翻成 -2.28% 实现）。
+//
+// 安全垫的口径要说清：定参给的公式把 1pp 加在**价格侧**（arm），落到净收益是
+// pad×(1−d)=0.95%，不是 1.00%。这里按公式实现并在测试里钉死这个换算，
+// 免得日后有人"顺手修正"成收益侧、把武装线抬高到 8.05% 而以为只是四舍五入。
+func TestTrailingArmPctForCoversFriction(t *testing.T) {
+	p := DefaultParams(model.FromFloat(12000))
+	d := p.TrailingStopPct
+	for _, yuan := range []float64{595, 639, 821, 1010, 2000, 5000, 10000} {
+		notional := model.FromFloat(yuan)
+		f := FrictionPct(notional)
+		arm := p.TrailingArmPctFor(notional)
+		net := (1+arm)*(1-d) - 1 - f
+		if net <= 0 {
+			t.Errorf("%.0f 元：arm=%.4f 触发后净毛利 %.4f%%，仍为非正（旧缺陷复发）", yuan, arm, net*100)
+		}
+		if arm < p.TrailingArmPct-1e-9 {
+			t.Errorf("%.0f 元：arm=%.4f 低于静态下限 %.4f", yuan, arm, p.TrailingArmPct)
+		}
+		// 动态项绑定时（小额单）净毛利恰好是一个价格侧安全垫换算到收益侧。
+		if arm > p.TrailingArmPct {
+			if want := p.TrailingArmSafetyPct * (1 - d); net < want-1e-9 {
+				t.Errorf("%.0f 元：arm=%.4f 动态绑定但净毛利 %.4f%% < 安全垫换算 %.4f%%",
+					yuan, arm, net*100, want*100)
+			}
+		}
+	}
+	// 小额单的武装线必须严格高于静态下限（595 元那笔正是它把闸抬到 8.14%）。
+	small := p.TrailingArmPctFor(model.FromFloat(595))
+	if small <= p.TrailingArmPct {
+		t.Errorf("595 元单子 arm=%.4f，应高于静态下限 %.4f", small, p.TrailingArmPct)
+	}
+	// 旧参数为什么注定亏：arm=6% 时这两笔触发后都是净亏。
+	for _, yuan := range []float64{595, 639} {
+		if net := (1+0.06)*(1-d) - 1 - FrictionPct(model.FromFloat(yuan)); net >= 0 {
+			t.Errorf("旧参数复核失败：arm=6%% 时 %.0f 元净毛利=%.4f%%，应为负", yuan, net*100)
+		}
+	}
+	// arm=0 是显式回退开关，必须退回旧口径而不是被动态项覆盖。
+	legacy := p
+	legacy.TrailingArmPct = 0
+	if got := legacy.TrailingArmPctFor(model.FromFloat(595)); got != 0 {
+		t.Errorf("TrailingArmPct=0 应返回 0（旧口径），实际 %.4f", got)
+	}
+	// 回撤线坏值（0 或 ≥1）不能把分母变成 0/负数：回落基准 5% 后仍是正毛利。
+	bad := p
+	bad.TrailingStopPct = 0
+	if got := bad.TrailingArmPctFor(model.FromFloat(595)); got < p.TrailingArmPct {
+		t.Errorf("回撤线坏值应回落基准 5%%，实际 arm=%.4f", got)
 	}
 }

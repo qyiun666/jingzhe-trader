@@ -47,6 +47,8 @@ type Reviewer struct {
 	// 否则 4 条并行证据里只要有一条挂死，就会拖到任务级超时，连失败行都来不及落。
 	deadline      time.Duration
 	promptTimeout time.Duration
+	// batchSize 每次问模型的候选只数（llm.review_batch_size）；0 = 整批一次问（历史行为）。
+	batchSize int
 }
 
 // 评审时限：全局 12 分钟、单 prompt 10 分钟。
@@ -103,6 +105,20 @@ func (r *Reviewer) WithTimeouts(deadline, prompt time.Duration) *Reviewer {
 	return r
 }
 
+// WithBatchSize 设定每次问模型的候选只数（llm.review_batch_size）。
+//
+// 0 或负值 = 整批一次问，与历史行为一致（默认值安全：键没加、没配，行为不变）。
+// 必须与整轮 deadline 一起看：批数 × 单问时限接近整轮预算时，后面的批次会被
+// retryBudgetOK 逐标的记成"预算不足"的失败行——那比让整轮挂死、20 条一起消失好，
+// 但它不是"分批免费"，装配期那条 job_timeout ≥ review_deadline + 余量 的不变量
+// 仍然是唯一真正兜住这件事的地方。
+func (r *Reviewer) WithBatchSize(n int) *Reviewer {
+	if n > 0 {
+		r.batchSize = n
+	}
+	return r
+}
+
 // Enabled 买入决策是否真的在跑（调度器据此记降级并汇总告警）。
 func (r *Reviewer) Enabled() bool { return r != nil && r.enabled }
 
@@ -146,14 +162,47 @@ func (r *Reviewer) DecideBatch(ctx context.Context, req signal.BatchRequest) (ma
 	// 整轮 deadline：四条证据并行 + 一次决策，任何一条挂死都必须在 12 分钟内收口。
 	// 调用方（evening_pipeline）另有 30 分钟任务级超时，这里先到期才能把失败行落库、
 	// 把 LLM_FAILED 降级写进当日轨迹，而不是整条任务被外部掐死。
+	var roundDDL time.Time
 	if r.deadline > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, r.deadline)
 		defer cancel()
+		roundDDL = r.now().Add(r.deadline)
 	}
-	conclusions, broken, err := r.reviewEvidence(ctx, req)
+	// 分批（llm.review_batch_size，默认 0=整批一次问，与历史行为完全一致）。
+	// 拆批本身不解决 10-30 的故障——四条证据并行、批与批之间串行，批数越多挤进
+	// 同一份 12 分钟预算的 prompt 反而越多。它只有在与上面的预算闸门同时生效时
+	// 才有意义：每批开问前先确认剩余预算够一次单问，不够就逐标的记失败行收口。
+	for _, batch := range splitBatches(req.Items, r.batchSize) {
+		if err := r.reviewRound(ctx, signal.BatchRequest{TradeDate: req.TradeDate, Items: batch}, roundDDL, out); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// splitBatches 按 size 切分候选；size ≤ 0 或不大于一批时原样返回（整批一次问）。
+func splitBatches(items []signal.BuyRequest, size int) [][]signal.BuyRequest {
+	if size <= 0 || len(items) <= size {
+		return [][]signal.BuyRequest{items}
+	}
+	out := make([][]signal.BuyRequest, 0, (len(items)+size-1)/size)
+	for start := 0; start < len(items); start += size {
+		end := start + size
+		if end > len(items) {
+			end = len(items)
+		}
+		out = append(out, items[start:end])
+	}
+	return out
+}
+
+// reviewRound 一批候选的完整评审：四条证据并行 → 问坏的收口 → 一次总裁决，结果写进 out。
+func (r *Reviewer) reviewRound(ctx context.Context, req signal.BatchRequest, roundDDL time.Time,
+	out map[string]signal.BuyDecision) error {
+	conclusions, broken, err := r.reviewEvidence(ctx, req, roundDDL)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	// 整轮 deadline 已到：即便四条证据恰好都答完了，也没有时间再问决策。
 	// 把全部候选按"评审失败"收口，而不是拿一个已过期的 ctx 去调下一次模型。
@@ -174,10 +223,10 @@ func (r *Reviewer) DecideBatch(ctx context.Context, req signal.BatchRequest) (ma
 		ready = append(ready, it)
 	}
 	if err := r.decideBatch(ctx, batchState{date: req.TradeDate, items: ready,
-		conclusions: conclusions, out: out}); err != nil {
-		return nil, err
+		conclusions: conclusions, out: out, roundDDL: roundDDL}); err != nil {
+		return err
 	}
-	return out, nil
+	return nil
 }
 
 // reviewEvidence 四条证据并行各问一次（整批），返回每只票的结论行与问坏的票（→ 原因）。
@@ -186,7 +235,7 @@ func (r *Reviewer) DecideBatch(ctx context.Context, req signal.BatchRequest) (ma
 // （单问实测可达数分钟），并行后约等于最慢的一条。这里没有引入 errgroup 依赖，
 // 用 WaitGroup 达到同样语义，但**不因第一条失败取消其余三条**：每条 prompt 的失败行
 // 都要落库，已答好的证据也要留给当日重跑复用；DB 错误在全部结束后按固定顺序返回。
-func (r *Reviewer) reviewEvidence(ctx context.Context, req signal.BatchRequest) (map[string][]string, map[string]string, error) {
+func (r *Reviewer) reviewEvidence(ctx context.Context, req signal.BatchRequest, roundDDL time.Time) (map[string][]string, map[string]string, error) {
 	type outcome struct {
 		spec PromptSpec
 		got  map[string]evidenceRow
@@ -206,7 +255,8 @@ func (r *Reviewer) reviewEvidence(ctx context.Context, req signal.BatchRequest) 
 				defer cancel()
 			}
 			started := time.Now()
-			got, err := r.askEvidence(pctx, askAsk{date: req.TradeDate, spec: p, items: req.Items})
+			got, err := r.askEvidence(pctx, askAsk{date: req.TradeDate, spec: p, items: req.Items,
+				roundDDL: roundDDL})
 			outs[i] = outcome{spec: p, got: got}
 			errs[i] = err
 			fields := []any{"prompt", p.Key, "date", req.TradeDate, "codes", len(req.Items),
@@ -252,18 +302,37 @@ func (r *Reviewer) reviewEvidence(ctx context.Context, req signal.BatchRequest) 
 
 	lines := make(map[string][]string, len(req.Items))
 	broken := make(map[string]string)
-	for _, o := range outs {
-		for _, it := range req.Items {
-			code := it.Candidate.TsCode
+	degraded := make(map[string][]string)
+	// 逐只票对四条证据做一次收口：答上的进结论，没答上的分两种处理。
+	for _, it := range req.Items {
+		code := it.Candidate.TsCode
+		for _, o := range outs {
 			row, ok := o.got[code]
-			if !ok {
-				if _, bad := broken[code]; !bad {
-					broken[code] = fmt.Sprintf("%s评审未问出结果", o.spec.Title)
-				}
+			if ok {
+				lines[code] = append(lines[code], conclusionLine(o.spec, row))
 				continue
 			}
-			lines[code] = append(lines[code], conclusionLine(o.spec, row))
+			// 可降权维度（只有 value）缺失 → 不判失败，改为把"这一维缺了"明确告诉决策
+			// prompt（2026-11-03 定参⑤）。不写这句话就是静默减维：模型会拿三条证据
+			// 凑一个看起来完整的结论，比少一个维度更危险。
+			// 该标的这条 prompt 的 failed 行仍然保留，当日重跑会补问它。
+			if o.spec.Degradable {
+				degraded[code] = append(degraded[code], o.spec.Title)
+				continue
+			}
+			if _, bad := broken[code]; !bad {
+				broken[code] = fmt.Sprintf("%s评审未问出结果", o.spec.Title)
+			}
 		}
+	}
+	for code, dims := range degraded {
+		// 减维必须出声：一次网络抖动把 20 只票的基本面维度整体抹掉时，
+		// 日志与当日轨迹要能看见"少问了哪一维"，而不是只看到一片正常决策行。
+		lines[code] = append(lines[code], fmt.Sprintf(
+			"⚠ 本维度缺失：%s 本轮未问出结果。决策时请按缺一个维度处理——降低对该方向的把握度、"+
+				"不要把'没看到估值风险'读成'估值安全'；置信度应相应下调。", strings.Join(dims, "、")))
+		observability.S().Warnw("评审维度缺失，降权继续", "date", req.TradeDate,
+			"ts_code", code, "missing_dims", strings.Join(dims, ","))
 	}
 	return lines, broken, nil
 }
@@ -328,12 +397,14 @@ func (r *Reviewer) askEvidence(ctx context.Context, a askAsk) (map[string]eviden
 	return out, nil
 }
 
-// batchState 一次批量裁决的全部上下文（收成一个结构，避免五个位置参数）。
+// batchState 一次批量裁决的全部上下文（收成一个结构，避免位置参数过长）。
 type batchState struct {
 	date        string
 	items       []signal.BuyRequest
 	conclusions map[string][]string
 	out         map[string]signal.BuyDecision
+	// roundDDL 整轮评审预算截止时刻（与 askAsk.roundDDL 同义，零值=不限）。
+	roundDDL time.Time
 }
 
 // decideBatch 问一次总裁决（整批）；已缓存的标的不重问，问坏的标的记 Failed。
@@ -357,7 +428,7 @@ func (r *Reviewer) decideBatch(ctx context.Context, b batchState) error {
 		return nil
 	}
 	a := askAsk{date: b.date, spec: PromptSpec{Key: KeyDecision, Title: "买入决策", System: decisionSystem},
-		items: pending, user: decisionUser(pending, b.conclusions)}
+		items: pending, user: decisionUser(pending, b.conclusions), roundDDL: b.roundDDL}
 	var reply decisionReply
 	if err := r.ask(ctx, a, fillDecision(&reply)); err != nil {
 		for _, it := range pending {
@@ -394,6 +465,10 @@ type askAsk struct {
 	spec  PromptSpec
 	items []signal.BuyRequest
 	user  string
+	// roundDDL 整轮评审的预算截止时刻（r.now() 同一时标）。零值 = 未设整轮 deadline，
+	// 此时重问不做预算检查。用它而不是 ctx.Deadline()：判据必须与 r.now() 同源，
+	// 否则测试注入的假时钟与真实单调时钟互相看不见，预算判断在测试里是错的。
+	roundDDL time.Time
 }
 
 // ask 问一批：调模型 → 解析 {"results":[...]}，最多问 askAttempts 次，任何一次成功即返回。
@@ -419,9 +494,21 @@ func (r *Reviewer) ask(ctx context.Context, a askAsk, decode func(string) error)
 			observability.S().Warnw("prompt 未问出结果，重问同一问",
 				"prompt", a.spec.Key, "date", a.date, "attempt", attempt, "of", askAttempts,
 				"codes", len(a.items), "err", clip(lastErr.Error(), 200))
+			// 重问前先算预算：这是 20261030 那 20 条 value 失败的真因修复。
+			// 原来直到 pauseBeforeRetry 才发现 ctx 已 Done，失败原因被写成
+			// "重试第 2 次前上下文已取消"，把"预算根本不够再问一次"误诊成"模型抖动"。
+			if berr := r.retryBudgetOK(a, attempt); berr != nil {
+				observability.S().Warnw("剩余评审预算不足，停止重问",
+					"prompt", a.spec.Key, "date", a.date, "attempt", attempt, "err", berr.Error())
+				return r.quoteFailure(ctx, a, berr)
+			}
 			if perr := r.pauseBeforeRetry(ctx, attempt); perr != nil {
 				return r.quoteFailure(ctx, a, perr)
 			}
+		} else if err := r.retryBudgetOK(a, 1); err != nil {
+			// 首问前也要查：整轮已被前面的批次吃掉时，这一批一次都不该问，
+			// 逐标的记下"预算不足"的失败行比让 client 拿着已取消的 ctx 空转更有信息量。
+			return r.quoteFailure(ctx, a, err)
 		}
 		raw, cerr := r.client.Complete(ctx, Request{
 			System: a.spec.System, User: a.user, Search: a.spec.Search})
@@ -448,6 +535,24 @@ func (r *Reviewer) ask(ctx context.Context, a askAsk, decode func(string) error)
 // 问同一问也是同一结局，连问三次只会拖长决策链并多花钱。
 func retryable(err error) bool {
 	return err != nil && !errors.Is(err, errPermanent)
+}
+
+// retryBudgetOK 剩余整轮预算是否还够跑一次本 prompt（含该次退避）。
+//
+// 判据是"单 prompt 时限 + 本次退避"而不是"还剩一点点时间就试一下"：一次问出去
+// 最坏要占满 promptTimeout 才回来，剩余时间比它短就必然被整轮 deadline 拦腰截断,
+// 截断产生的错误还会盖掉真实失败原因。roundDDL 零值（未设整轮时限）时恒通过。
+func (r *Reviewer) retryBudgetOK(a askAsk, attempt int) error {
+	if a.roundDDL.IsZero() {
+		return nil
+	}
+	wait := time.Duration(attempt) * r.backoff
+	need := r.promptTimeout + wait
+	if left := a.roundDDL.Sub(r.now()); left < need {
+		return fmt.Errorf("剩余评审预算 %.0f 秒不足再问一次（单问上限 %.0f 秒 + 退避 %.0f 秒）",
+			left.Seconds(), r.promptTimeout.Seconds(), wait.Seconds())
+	}
+	return nil
 }
 
 // isCtxErr 超时/取消是"评审没问出来"，不是数据库或链路故障。

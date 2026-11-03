@@ -241,6 +241,9 @@ func (s *Service) sellDecisions(ctx context.Context, tradeDate string, cands, wa
 	}
 	ro := s.rankOut
 	ro.WatchTopN = len(inTopN)
+	// 弱势试探期停用规则 4（20261103 定参③）：判据与买入闸同源（p.WeakProbe），
+	// 允许 signal.rank_out_weak_enabled=true 逐项回退。
+	ro.DisabledNow = p.WeakProbe && !s.rankOut.WeakEnabled
 	var out []model.Signal
 	for _, pos := range positions {
 		if pos.TotalQty <= 0 {
@@ -264,7 +267,14 @@ func (s *Service) sellDecisions(ctx context.Context, tradeDate string, cands, wa
 		// 否则"为什么这只没卖"只能靠翻日历反推。判定条件与 evalRankOut 的保护分支同构。
 		// 空 band 时没有"未进榜"这回事（规则 4 整体不适用），不写这条豁免说明，
 		// 否则会和 RANK_BAND_EMPTY 一起让人误以为规则 4 跑过、只是被保护了。
-		if !noBand && !h.InTopN && !h.IsETF && ro.MinHoldDays > 0 && held >= 0 && held < ro.MinHoldDays {
+		if !noBand && !h.InTopN && !h.IsETF && ro.DisabledNow {
+			// 停用也要留痕：否则"掉带却没卖"与"规则没跑"在 run_trace 里一模一样，
+			// 事后归因会把政策当成故障。
+			rep.Notes = append(rep.Notes, fmt.Sprintf(
+				"RANK_OUT_SUSPENDED %s 未进当日排名保留带，但本轮处于弱势试探档，规则4已停用（signal.rank_out_weak_enabled=false），"+
+					"继续由止损/移动止盈/止盈与弱势减仓管理（已持有 %s）",
+				pos.TsCode, heldLabel(held)))
+		} else if !noBand && !h.InTopN && !h.IsETF && ro.MinHoldDays > 0 && held >= 0 && held < ro.MinHoldDays {
 			rep.Notes = append(rep.Notes, fmt.Sprintf(
 				"%s 未进当日排名保留带，但已持有 %d 个交易日 < 最小持有期 %d，本次排名淘汰豁免",
 				pos.TsCode, held, ro.MinHoldDays))
@@ -286,6 +296,14 @@ func (s *Service) sellDecisions(ctx context.Context, tradeDate string, cands, wa
 		}
 	}
 	return out, nil
+}
+
+// heldLabel 已持有交易日数的展示串：-1 = 无建仓日期（老同步持仓），不能显示成"持有 -1 天"。
+func heldLabel(held int) string {
+	if held < 0 {
+		return "持有期未知"
+	}
+	return fmt.Sprintf("%d 个交易日", held)
 }
 
 // tradingDaysHeld 建仓日之后（不含建仓日）到 tradeDate（含）的交易日数。

@@ -366,3 +366,58 @@ func TestEvalPriceRulesPriority(t *testing.T) {
 		t.Fatalf("移动止盈应优先: %+v", sig)
 	}
 }
+
+// TestTrailingStopReplay20261103 用 11-03 601328 的真实形状回放定参②的修复：
+// 持仓 cost 8.26 元、期间高 8.76 元（仅高出旧武装线 8.26×1.06=8.7556 共 0.0044 元）、
+// 11-03 现价 8.13 元 ≤ 旧触发线 8.76×0.95=8.322 → 旧参数会卖在 8.13（实际实现 -18.83，
+// 把 11-02 的 +3.75% 浮盈翻成亏损）。
+//
+// 新参数下不应出卖单：这笔名义 826 元的摩擦约 1.31%，动态武装取静态下限 8%
+// → 武装线 8.92 元，8.76 未达 → 移动止盈未武装；8% 止损线 7.60 元未破；15% 止盈未到。
+func TestTrailingStopReplay20261103(t *testing.T) {
+	h := HoldingCtx{
+		Pos:       model.Position{TsCode: "601328.SH", TotalQty: 100, CostPrice: 826, HighPrice: 876},
+		LastClose: 813, LastDate: "20261103", InTopN: true,
+		DaysHeld: 8, RankOut: RankOutPolicy{MinHoldDays: 10, WatchTopN: 30},
+	}
+	if sig := EvalPriceRules("20261103", h, risk.DefaultParams(model.FromFloat(11777.56))); sig != nil {
+		t.Fatalf("新武装线下 601328 不应被移动止盈卖出，实际 %+v", sig)
+	}
+	// 反向确认这条用例真的测到了东西：旧参数（静态 6%、无动态项）在同一形状下必须触发。
+	legacy := risk.DefaultParams(model.FromFloat(11777.56))
+	legacy.TrailingArmPct = 0 // 旧口径：成本线即武装，动态推导整体不介入
+	if sig := EvalPriceRules("20261103", h, legacy); sig == nil || sig.Rule != RuleTrailingStop {
+		t.Fatalf("旧口径应复现 11-03 的移动止盈卖单，实际 %+v", sig)
+	}
+}
+
+// TestRankOutSuspendedInWeakProbe 定参③：弱势试探档停用规则 4（DisabledNow 由 Service
+// 按 p.WeakProbe 与 signal.rank_out_weak_enabled 合成）。停用后未进保留带也不出淘汰单，
+// 但价格型三线必须照常工作——停用的是"排名换仓"，不是下跌保护。
+func TestRankOutSuspendedInWeakProbe(t *testing.T) {
+	p := g1()
+	on := RankOutPolicy{MinHoldDays: 10, WatchTopN: 30}
+	off := on
+	off.DisabledNow = true
+
+	if sig := EvalSell("20261103", rankOutHold(30, off), p, 0, 0); sig != nil {
+		t.Fatalf("弱势期停用后不应排名淘汰，实际 %+v", sig)
+	}
+	sig := EvalSell("20261103", rankOutHold(30, on), p, 0, 0)
+	if sig == nil || sig.Rule != RuleRankOut {
+		t.Fatalf("未停用时满持有期应照常淘汰，实际 %+v", sig)
+	}
+	// 停用不影响止损：跌破 8% 线仍须出卖单（回退的是换手，不是下跌保护）。
+	h := rankOutHold(30, off)
+	h.Pos.CostPrice = model.FromFloat(10)
+	h.LastClose = model.FromFloat(9)
+	if sig := EvalSell("20261103", h, p, 0, 0); sig == nil || sig.Rule != RuleStopLoss {
+		t.Fatalf("停用规则4不应影响止损，实际 %+v", sig)
+	}
+	// ETF 与空 band 两条既有豁免在停用后依然成立（口径不漂移）。
+	etf := rankOutHold(30, off)
+	etf.IsETF = true
+	if sig := EvalSell("20261103", etf, p, 0, 0); sig != nil {
+		t.Errorf("ETF 豁免不应触发任何卖单，实际 %+v", sig)
+	}
+}

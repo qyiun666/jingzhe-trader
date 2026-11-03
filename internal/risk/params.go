@@ -16,18 +16,38 @@ import "jingzhe-trader/internal/model"
 // 这里只有"硬截断"：单票/总仓/持仓数/一手价/金额下限/置信度下限。
 // 综合分不做门槛（它是选股漏斗与 prompt 的证据，不是否决权），故本结构不含因子权重。
 type RiskParams struct {
-	MaxTotalPositionPct float64   // 总仓位上限（占总资产）
-	MaxPositionPct      float64   // 单票上限（占总资产）
-	MaxPositions        int       // 最大持仓数（自适应）
-	StopLossPct         float64   // 止损
-	TrailingStopPct     float64   // 移动止盈回撤
-	TrailingArmPct      float64   // 移动止盈激活线：高点≥成本×(1+arm) 才启用；0=旧口径
-	TakeProfitPct       float64   // 止盈
-	AllowNewPosition    bool      // 是否允许开新仓
-	MaxSingleAmountPct  float64   // 单笔金额上限（占总资产）
-	MinSingleAmountFen  model.Fen // 单笔金额下限（分，见 MinAmountFloor 的小资金收口）
-	MinAmountRatio      float64   // 单笔下限占单票上限的比例（默认 0.5；弱势试探提高到 0.75）
-	MinConfidence       float64   // 决策置信度下限（模型自报值）
+	MaxTotalPositionPct float64 // 总仓位上限（占总资产）
+	MaxPositionPct      float64 // 单票上限（占总资产）
+	MaxPositions        int     // 最大持仓数（自适应）
+	StopLossPct         float64 // 止损
+	TrailingStopPct     float64 // 移动止盈回撤
+	TrailingArmPct      float64 // 移动止盈激活线：高点≥成本×(1+arm) 才启用；0=旧口径
+	// TrailingArmSafetyPct 动态武装线的安全垫：在"刚好盖住双边摩擦"的武装线上再加的
+	// 比例（见 TrailingArmPctFor）。0 = 只盖摩擦、不留利润。
+	TrailingArmSafetyPct float64
+	TakeProfitPct        float64   // 止盈
+	AllowNewPosition     bool      // 是否允许开新仓
+	MaxSingleAmountPct   float64   // 单笔金额上限（占总资产）
+	MinSingleAmountFen   model.Fen // 单笔金额下限（分，见 MinAmountFloor 的小资金收口）
+	MinAmountRatio       float64   // 单笔下限占单票上限的比例（默认 0.5；弱势试探提高到 0.75）
+	MinConfidence        float64   // 决策置信度下限（模型自报值）
+	// ExpectedExcessPct 摩擦闸的输入：预估持有期超额（小数，0.005=0.5%）。
+	// 取值只能来自归因的"买入 vs 跳过"差值，且**不显著时必须填 0**：0 意味着
+	// 任何正摩擦都会被拦（组长 20261103 定参①，是设计意图而不是缺陷）。
+	ExpectedExcessPct float64
+	// WeakBuyAllowed 弱势试探期是否允许下发买入指令单（config signal.weak_buy_enabled）。
+	// 默认 false（新政策）：true 只是回退开关，由 WeakParams 消费成 BuysBlocked。
+	WeakBuyAllowed bool
+	// WeakProbe 本轮处于"门槛关闭且判定弱势"的小仓位试探档（WeakParams 实际生效的标记）。
+	// 它是买入闸与规则 4 停用**共用的同一条判据**：两条政策都以 run_trace 里那条
+	// alert:WEAK_REGIME（"门槛关闭且大盘弱势，进入小仓位试探模式"）为准，
+	// 不允许一条按配置开关、另一条按指数判据，那会在边界日出现
+	// "买单已停但还在按排名淘汰换仓"这种自相矛盾的形态。
+	WeakProbe bool
+	// BuysBlocked 本轮一律不下发买入指令单：弱势试探期买入闸的结果位，
+	// 由 WeakParams 在 WeakBuyAllowed=false 时置位，Manager 据此以 weak_buy_disabled 拒绝。
+	// 买入评审链、影子清单与归因留痕不受它影响（拦的是"下单"，不是"判断"）。
+	BuysBlocked bool
 	// MaxPerIndustry 组合同行业持仓只数上限（0=关闭）。默认档 2，弱势档 1；
 	// 只约束"开新仓"，已持有标的加仓不占新名额。行业未知时降级放行。
 	MaxPerIndustry int
@@ -60,6 +80,51 @@ func (p RiskParams) MinAmountFloor() model.Fen {
 	return p.MinSingleAmountFen
 }
 
+// FrictionPct 给定成交金额的双边摩擦率（小数）：双边成本 / 名义额。
+//
+// 最低 5 元佣金让这项与名义额成反比——12,000 元账户的单票上限级别（约 1,200 元）
+// 是 0.9% 左右，600 元级是 1.8% 左右。它是"这笔交易值不值得做"的唯一硬成本，
+// 所以摩擦闸与动态武装线都用它，而不是用名义费率。金额非正返回 1（最保守：
+// 无法核算成本时按"成本高到吃光收益"处理，而不是当成 0 放行）。
+func FrictionPct(amount model.Fen) float64 {
+	if amount <= 0 {
+		return 1
+	}
+	return float64(RoundTripCostFen(amount)) / float64(amount)
+}
+
+// TrailingArmPctFor 按当笔名义额推导移动止盈武装线（20261103 定参②）。
+//
+// 为什么不能是全局常数：触发价 = 成本×(1+arm)×(1−d)，要净赚就必须
+// (1+arm)(1−d) − 1 > f，而 f 随名义额变化（最低佣金）。所以
+//
+//	arm_min = (1 + f) / (1 − d) − 1        （打平，一分利润都不留）
+//	arm_eff = arm_min + 安全垫              （默认再留 1pp）
+//
+// 最终取 max(静态下限, arm_eff)：静态下限保证"就算算出来的很小也不许低于 8%"，
+// 动态项保证"单子越小、武装线越高"——600 元的单子要涨约 8.2% 才允许武装。
+//
+// TrailingArmPct <= 0 是显式的旧口径开关（回到"成本线即武装"），此时不做动态推导，
+// 否则"设 0 回滚"会被动态项悄悄覆盖，回退开关就形同虚设。
+func (p RiskParams) TrailingArmPctFor(notional model.Fen) float64 {
+	if p.TrailingArmPct <= 0 {
+		return 0
+	}
+	d := p.TrailingStopPct
+	if d <= 0 || d >= 1 {
+		d = baseTrailingStopPct // 坏值回落基准，不让回撤线把分母变成 0 或负数
+	}
+	safety := p.TrailingArmSafetyPct
+	if safety < 0 {
+		safety = baseTrailingArmSafetyPct
+	}
+	arm := (1+FrictionPct(notional))/(1-d) - 1 + safety
+	if arm < p.TrailingArmPct {
+		return p.TrailingArmPct
+	}
+	return arm
+}
+
 // 物理熔断底线（永远生效、不可配置关闭）。
 const (
 	CircuitMaxSinglePct = 0.60 // 单票集中度硬上限
@@ -73,12 +138,18 @@ const (
 	baseMaxPositionPct      = 0.40 // 单票上限
 	baseStopLossPct         = 0.08 // 止损
 	baseTrailingStopPct     = 0.05 // 移动止盈回撤
-	baseTrailingArmPct      = 0.06 // 移动止盈激活线（高点至少 +6% 才启用）
-	baseTakeProfitPct       = 0.15 // 止盈
-	baseMaxSingleAmountPct  = 1.0  // 单笔金额上限（占总资产）
-	baseMinConfidence       = 0.55 // 决策置信度下限
-	baseMinAmountRatio      = 0.5  // 单笔下限 = 单票上限 × 该比例（与绝对下限取小）
-	baseMaxPerIndustry      = 2    // 组合同行业持仓上限（默认档）
+	// baseTrailingArmPct 移动止盈武装线的**静态下限**（高点至少 +8% 才启用）。
+	// 从 0.06 提到 0.08 的理由是算术而非手感：arm=6% 配 d=5% 时触发价下限
+	// = 1.06×0.95 = 成本×1.007，只锁 +0.7% 毛利，而 600~1,000 元小单的双边摩擦
+	// 实测 1.09%~1.78% —— 止盈只要在武装线附近触发就注定净亏（20261103 601328）。
+	// 实际生效值由 TrailingArmPctFor 按当笔名义额动态推导，这里只是不可低于的下限。
+	baseTrailingArmPct       = 0.08
+	baseTrailingArmSafetyPct = 0.01 // 动态武装线的安全垫（盖住摩擦之外再留 1pp 利润）
+	baseTakeProfitPct        = 0.15 // 止盈
+	baseMaxSingleAmountPct   = 1.0  // 单笔金额上限（占总资产）
+	baseMinConfidence        = 0.55 // 决策置信度下限
+	baseMinAmountRatio       = 0.5  // 单笔下限 = 单票上限 × 该比例（与绝对下限取小）
+	baseMaxPerIndustry       = 2    // 组合同行业持仓上限（默认档）
 )
 
 // 默认单笔金额下限：5000 元（保费率 ≤0.1%；小资金账户由 MinAmountFloor 自动缩放）。
@@ -126,6 +197,15 @@ func WeakParams(p RiskParams, maxTotalPct, maxSinglePct float64) RiskParams {
 	// 仓位上限收缩后，单笔下限按新单票上限重新取比例：不提高比例的话，
 	// 试探档会允许 600 元级交易，双边成本占比接近 2%。
 	p.MinAmountRatio = WeakMinAmountRatio
+	// 弱势试探期买入闸（20261103 定参①）：判到弱势就把"下单"这一侧整体关掉。
+	// 只关下单，不关评审——漏斗、影子清单与归因留痕继续跑，样本零成本积累；
+	// 已有的持仓仍由价格型三线与弱势减仓管理（下面两条不动是刻意的：
+	// 弱势下的"快跑"能力比"少亏"能力更值钱）。
+	if !p.WeakBuyAllowed {
+		p.BuysBlocked = true
+	}
+	// 弱势试探档标记（规则 4 停用与买入闸共用的判据，见 RiskParams.WeakProbe）。
+	p.WeakProbe = true
 	// 弱势档同行业最多 1 只：行业相关性在下跌市里被放大，2 只同行业等于一只
 	// 双倍仓位。0=关闭时保持关闭（不替用户推翻显式配置）。
 	if p.MaxPerIndustry > 0 && p.MaxPerIndustry > 1 {
@@ -155,19 +235,25 @@ func BuyIndustryCap(candidateCap int) int {
 // 保证小资金账户不会把仓位摊到十几只票上、每只都不够一手。
 func DefaultParams(totalAsset model.Fen) RiskParams {
 	p := RiskParams{
-		MaxTotalPositionPct: baseMaxTotalPositionPct,
-		MaxPositionPct:      baseMaxPositionPct,
-		StopLossPct:         baseStopLossPct,
-		TrailingStopPct:     baseTrailingStopPct,
-		TrailingArmPct:      baseTrailingArmPct,
-		TakeProfitPct:       baseTakeProfitPct,
-		AllowNewPosition:    true,
-		MaxSingleAmountPct:  baseMaxSingleAmountPct,
-		MinConfidence:       baseMinConfidence,
-		MinSingleAmountFen:  DefaultMinSingleAmountFen,
-		MinAmountRatio:      baseMinAmountRatio,
-		MaxPerIndustry:      baseMaxPerIndustry,
-		TotalAsset:          totalAsset,
+		MaxTotalPositionPct:  baseMaxTotalPositionPct,
+		MaxPositionPct:       baseMaxPositionPct,
+		StopLossPct:          baseStopLossPct,
+		TrailingStopPct:      baseTrailingStopPct,
+		TrailingArmPct:       baseTrailingArmPct,
+		TrailingArmSafetyPct: baseTrailingArmSafetyPct,
+		TakeProfitPct:        baseTakeProfitPct,
+		AllowNewPosition:     true,
+		MaxSingleAmountPct:   baseMaxSingleAmountPct,
+		MinConfidence:        baseMinConfidence,
+		MinSingleAmountFen:   DefaultMinSingleAmountFen,
+		MinAmountRatio:       baseMinAmountRatio,
+		MaxPerIndustry:       baseMaxPerIndustry,
+		// 两项都是"键缺失时=新政策"的取严默认（组长 20261103 定参①）：
+		// 弱势试探期不允许买、没有显著归因证据时预期超额按 0（=摩擦全拦）。
+		// 老库里没有这两个键时，行为与今天的定参一致，不需要先写键才生效。
+		WeakBuyAllowed:    false,
+		ExpectedExcessPct: 0,
+		TotalAsset:        totalAsset,
 	}
 
 	assetYuan := float64(totalAsset) / 100

@@ -30,6 +30,13 @@ type WeakExitPolicy struct {
 type RankOutPolicy struct {
 	MinHoldDays int // 建仓后 N 个交易日内排名淘汰不触发；0 = 无持有期保护（旧口径）
 	WatchTopN   int // 保留带深度（TopN+buffer）；≤0 时理由文案退回"TopN"字样
+	// WeakEnabled 弱势试探期是否仍然生成排名淘汰卖单（config signal.rank_out_weak_enabled，
+	// 默认 false=停用，20261103 定参③）。由装配层注入，service 每轮把它与当轮弱势标记
+	// 合成为 DisabledNow，规则本身不再读配置。
+	WeakEnabled bool
+	// DisabledNow 本轮规则 4 整体不适用（弱势试探期停用）。由 Service 逐轮算出：
+	// 停用是**政策**，判定弱势是**事实**，两者只有在 service 里合成才不会漂移。
+	DisabledNow bool
 }
 
 // HoldingCtx 单只持仓的卖出规则输入。
@@ -98,18 +105,25 @@ func evalTrailingStop(date string, h HoldingCtx, p risk.RiskParams) *model.Signa
 	if h.LastClose > highGate {
 		return nil
 	}
-	// 移动止盈只在"已经涨够"之后才武装：期间高点必须达到 成本×(1+arm)。
-	// 建仓首日 high 就是成本，若没有这一步，5% 回撤线会先于 8% 止损线触发，
-	// 把止损收紧成 5%（20261022 600704：成本/高点 5.07，现价 4.81 被"移动止盈"卖出）。
-	// arm=0 退回旧口径（成本线即武装），保留 A/B 与回滚能力。
-	armGate := model.Fen(float64(h.Pos.CostPrice) * (1 + p.TrailingArmPct))
+	// 移动止盈只在"已经涨够"之后才武装：高点必须达到 成本×(1+arm)。
+	//
+	// arm 不再是全局常数，而是按**这笔持仓的实际名义额**推导（20261103 定参②，
+	// 见 risk.TrailingArmPctFor）：触发价 = 成本×(1+arm)×(1−回撤线)，要净赚必须
+	// 它高于成本×(1+双边摩擦)，而摩擦率随名义额反比（5 元最低佣金）。固定 6% 配 5%
+	// 时触发价下限只有成本×1.007，600~1,000 元的小单摩擦 1.09%~1.78% —— 止盈一旦
+	// 在武装线附近触发就注定净亏（20261103 601328：+3.75% 浮盈翻成 -2.28% 实现）。
+	//
+	// arm=0 退回旧口径（成本线即武装），保留 A/B 与回滚能力：这里刻意不跳过判定，
+	// 否则"设 0 回滚"会被动态推导覆盖，回退开关就形同虚设。
+	arm := p.TrailingArmPctFor(h.Pos.CostPrice.Mul(h.Pos.TotalQty))
+	armGate := model.Fen(float64(h.Pos.CostPrice) * (1 + arm))
 	if h.Pos.HighPrice < armGate {
 		return nil
 	}
 	drawdown := (float64(h.Pos.HighPrice-h.LastClose) / float64(h.Pos.HighPrice)) * 100
 	return newSell(date, h, RuleTrailingStop,
-		fmt.Sprintf("移动止盈：现价 %s 自高点 %s 回撤 %.1f%%（超过 %.0f%%）",
-			h.LastClose, h.Pos.HighPrice, drawdown, p.TrailingStopPct*100))
+		fmt.Sprintf("移动止盈：现价 %s 自高点 %s 回撤 %.1f%%（超过 %.0f%%，武装线 %.2f%%）",
+			h.LastClose, h.Pos.HighPrice, drawdown, p.TrailingStopPct*100, arm*100))
 }
 
 // evalTakeProfit 规则 3 止盈：最新收盘 ≥ 成本 × (1 + 止盈线)。
@@ -144,6 +158,18 @@ func evalTakeProfit(date string, h HoldingCtx, p risk.RiskParams) *model.Signal 
 // 的输入对它不存在"——规则依赖的口径没成立时，正确反应是跳过，不是卖出。
 func evalRankOut(date string, h HoldingCtx) *model.Signal {
 	if h.Pos.TotalQty <= 0 || h.InTopN || h.IsETF || h.NoBand {
+		return nil
+	}
+	// 弱势试探期停用规则 4（20261103 定参③）。三条理由都来自本轮实盘数据：
+	//  1. 保留带深度逐日在 30↔42 之间摆动（行业上限把候选挤到带深之外，screener 为免
+	//     "候选分散顺手变成卖出提前"而把带拉伸），单日掉带大多是同业排名洗牌而不是
+	//     该股走弱——用噪声做退出。19 个试探交易日里 7 张淘汰单 + 14 次持有期豁免。
+	//  2. 两次实际执行的淘汰都是费用主导：600908 实现 -11.61 里 91% 是手续费
+	//     （股价 5.95→5.94 几乎没动），601766 是 64%。
+	//  3. 试探期买入已整体停掉，"淘汰掉弱票去换新候选"这个前提不存在了——轮换只剩下
+	//     成本，没有收益来源。
+	// 退出仍由三条价格型规则与弱势减仓负责（那条是"只减不清"，不受本停用影响）。
+	if h.RankOut.DisabledNow {
 		return nil
 	}
 	if h.RankOut.MinHoldDays > 0 && h.DaysHeld >= 0 && h.DaysHeld < h.RankOut.MinHoldDays {

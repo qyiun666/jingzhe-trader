@@ -9,7 +9,13 @@ import (
 
 // 否决规则名（落 order_ticket 记录与日志，验收 #7/#8 的取值契约）。
 const (
-	RuleAllowNewPosition   = "allow_new_position"
+	RuleAllowNewPosition = "allow_new_position"
+	// RuleBuysBlocked 弱势试探期买入闸（20261103 定参①）：整条买入链关掉。
+	// 与 allow_new_position 分开命名，是为了让事后归因能分清"弱势不许买"和
+	// "风控本来就不允许开新仓"——前者是政策，后者是账户结构。
+	RuleBuysBlocked = "weak_buy_disabled"
+	// RuleFrictionGate 摩擦闸：预估双边摩擦 ≥ 预估持有期超额，这笔交易不值得做。
+	RuleFrictionGate       = "friction_gate"
 	RuleMinConfidence      = "min_confidence"
 	RuleMaxPositions       = "max_positions"
 	RuleAlreadyHolding     = "already_holding" // 保留为契约取值；已持有现在走加仓路径，不再据此拒绝
@@ -107,6 +113,16 @@ func (m *Manager) CheckBatch(intents []BuyIntent, st AccountState) []Decision {
 			dec.RejectMsg = msg
 		}
 
+		// 0) 弱势试探期买入闸（20261103 定参①）：判到弱势就整条买入链关掉。
+		// 放在最前面是因为它优先于一切——加仓也拦（试探仓的轮换本身就是被拦的行为），
+		// 且拦单不拦判决：LLM 评审、影子清单、screen:topn 与归因留痕都在上游照常完成，
+		// 样本零成本继续积累，回退只需把 signal.weak_buy_enabled 设回 true。
+		if m.P.BuysBlocked {
+			reject(RuleBuysBlocked, "弱势试探期买入闸：门槛关闭且大盘弱势，本轮不下发任何买入指令单"+
+				"（评审与归因留痕照跑；回退键 signal.weak_buy_enabled=true）")
+			out = append(out, dec)
+			continue
+		}
 		// 1) 开新仓开关
 		if !m.P.AllowNewPosition {
 			reject(RuleAllowNewPosition, "当前风控参数禁止开新仓")
@@ -177,6 +193,18 @@ func (m *Manager) CheckBatch(intents []BuyIntent, st AccountState) []Decision {
 		if qty <= 0 || amount < minAmount {
 			reject(RuleMinAmount, fmt.Sprintf("按现价只能投入 %s 元，低于生效单笔下限 %s 元",
 				amount, minAmount))
+			out = append(out, dec)
+			continue
+		}
+		// 摩擦闸（20261103 定参①）：确定的成本必须小于不确定的预期收益。
+		// ExpectedExcessPct 只能取归因的"买入 vs 跳过"差值，且**不显著时按 0**——
+		// 0 意味着任何正摩擦都被拦，这是组长明确确认的设计意图（宁可长期空仓等
+		// 样本与信号变强），不是缺陷。放在金额定稿之后：先算出真实名义额再估摩擦，
+		// 否则用上限金额估会低估小额单的费率（最低佣金与名义额成反比）。
+		if f := FrictionPct(amount); f >= m.P.ExpectedExcessPct {
+			reject(RuleFrictionGate, fmt.Sprintf("摩擦闸：名义 %s 元的双边摩擦 %.2f%% ≥ 预估持有期超额 %.2f%%"+
+				"（后者取不到显著归因值时按 0，即一律拦；回退键 signal.expected_excess_pct）",
+				amount, f*100, m.P.ExpectedExcessPct*100))
 			out = append(out, dec)
 			continue
 		}
