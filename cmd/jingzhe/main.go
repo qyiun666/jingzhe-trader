@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -53,6 +54,15 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "打开数据库失败: %v\n", err)
 		os.Exit(1)
+	}
+	// 启动即回显库文件真身（agent_issues #15②）。命令行上写的路径与进程实际打开的路径
+	// 曾经两套并存（11-03 那条 `-db .qoder-collab-runtime/jingzhe.db` 是平台托管目录里的
+	// 符号链接），事后复盘只能看到链接、看不出真库在哪，自愈脚本也无从核对。
+	// 现在 Open 已把链接摘掉，这一行就是唯一权威口径；两者不等时说明启动参数还在用链接。
+	if req, _ := filepath.Abs(*dbPath); req != st.Path() {
+		observability.S().Warnw("数据库路径经符号链接解析", "requested", req, "resolved", st.Path())
+	} else {
+		observability.S().Infow("数据库已打开", "path", st.Path())
 	}
 	// 启动清点发现库结构与现役 schema 不一致时出声：建表只做加法，跨版本重写留下的
 	// 废表/重复索引不会自己消失。这里只提示，不自动 DROP（删表不可逆）。

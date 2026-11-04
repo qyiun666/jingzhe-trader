@@ -71,7 +71,12 @@ func TestField_MissingRequiredParams(t *testing.T) {
 	}{
 		// sync_portfolio: positions + available_cash_yuan 必填
 		{"sync_portfolio 缺 positions", "sync_portfolio", map[string]interface{}{"available_cash_yuan": 10000}, true},
-		{"sync_portfolio positions 空数组", "sync_portfolio", map[string]interface{}{"available_cash_yuan": 10000, "positions": []interface{}{}}, true},
+		// 契约变更（agent_issues #16，组长 20261104 批准）：这一行原本断言"空数组＝缺失"。
+		// 那是把"券商整本没有持仓"当成漏传，清仓后的校准没有正门可走——11-03 两次被拒后
+		// 只能手改 account.cash_anchor，绕过了 #12 那两道价格量纲闸。现在**显式空数组合法**
+		// （语义＝只校准资金口径、不动任何持仓行，SyncPortfolio 本来就是 upsert-only），
+		// 上面那行"键完全不传"仍必须拒，防漏传的意图一个字没丢。
+		{"sync_portfolio positions 空数组（显式声明无持仓）", "sync_portfolio", map[string]interface{}{"available_cash_yuan": 10000, "positions": []interface{}{}}, false},
 		{"sync_portfolio 缺 available_cash_yuan", "sync_portfolio", map[string]interface{}{"positions": []map[string]interface{}{{"ts_code": "600519.SH"}}}, true},
 		{"sync_portfolio available_cash_yuan=0", "sync_portfolio", map[string]interface{}{"positions": []map[string]interface{}{{"ts_code": "600519.SH"}}, "available_cash_yuan": 0}, true},
 

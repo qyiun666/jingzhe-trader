@@ -87,23 +87,26 @@ cp deploy/env.example .env && chmod 600 .env
 make -f deploy/Makefile build     # 产物 bin/jingzhe
 
 # 3) 查看生效配置（凭据默认掩码）
-./bin/jingzhe -db data/jingzhe.db config dump
+#    下面所有示例都省略 `-db`：它的默认值就是生产库的绝对路径（cmd/jingzhe/main.go）。
+#    确实要换库时只传绝对真身路径——不要把 `-db` 指向符号链接：链接所在目录（往往是运维
+#    临时目录）被清理后进程直接起不来，且库目录的同步标记守卫会顺着链接查错目录（agent_issues #15）。
+./bin/jingzhe config dump
 
 # 4) 账户基线：本金 / 当前持仓 / 可用资金（首次必做，本金 write-once）
-./bin/jingzhe -db data/jingzhe.db init -capital 20000 -hold "601233.SH:200:26.48"
+./bin/jingzhe init -capital 20000 -hold "601233.SH:200:26.48"
 #   省略 -cash 时可用资金按 本金 − 持仓成本 推算；给了 -hold 就必须给得出可用资金，
 #   它落成"现金锚点"，否则校准进来的持仓成本会被双算成可用资金（见 sync_portfolio 同一条路径）
 
 # 5) 手动跑一次当日闭环（任务名 = 调度器注册名，与 serve 到点触发同一条路径）
-./bin/jingzhe -db data/jingzhe.db run task evening_pipeline --date 20260903
+./bin/jingzhe run task evening_pipeline --date 20260903
 #   日历补齐 → 行情同步 → 新鲜度门禁 → 选股漏斗 → LLM 决策 → 落待买卖表
-./bin/jingzhe -db data/jingzhe.db run task mail_pending  --date 20260903
-./bin/jingzhe -db data/jingzhe.db run task daily_report  --date 20260903
+./bin/jingzhe run task mail_pending  --date 20260903
+./bin/jingzhe run task daily_report  --date 20260903
 #   另有 4 个只有 CLI 提供的数据面任务：calendar / daily / freshness / screen
 #   （screen 是只试跑漏斗不落单；freshness 不新鲜时非零退出）
 
 # 6) 启动常驻服务（调度器 + MCP 接口，供外部 Agent 接入）
-./bin/jingzhe -db data/jingzhe.db serve -addr :8080
+./bin/jingzhe serve -addr :8080
 ```
 
 ## 单一二进制的六个子命令
@@ -125,8 +128,8 @@ make -f deploy/Makefile build     # 产物 bin/jingzhe
 一边同为负、另一边同为正，非样本内挑参，故默认取反向权重 `ReversalWeights`。
 
 ```bash
-jingzhe -db data/jingzhe.db config get screen.factor_mode   # 默认 reversal
-jingzhe -db data/jingzhe.db config set screen.factor_mode momentum         # 回退到原始方向（A/B 对照用）
+jingzhe config get screen.factor_mode   # 默认 reversal
+jingzhe config set screen.factor_mode momentum         # 回退到原始方向（A/B 对照用）
 ```
 
 > 改这一项会影响每一笔选股，属策略层变更。IC 度量所使用的 `research backfill|ic` 子命令

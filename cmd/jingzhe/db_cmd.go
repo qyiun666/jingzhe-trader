@@ -4,8 +4,8 @@
 //
 // 用法:
 //
-//	jingzhe -db data/jingzhe.db db audit          库结构与现役 schema 的差异清点（只读）
-//	jingzhe -db data/jingzhe.db db rebuild-bar    把 daily_bar 重建为 WITHOUT ROWID（离线执行）
+//	jingzhe db audit          库结构与现役 schema 的差异清点（只读）
+//	jingzhe db rebuild-bar    把 daily_bar 重建为 WITHOUT ROWID（离线执行）
 package main
 
 import (

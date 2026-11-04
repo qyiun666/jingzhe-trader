@@ -37,7 +37,7 @@ make -f deploy/Makefile build          # 产物 bin/jingzhe
 
 # 启动并挂后台（日志落 logs/）
 mkdir -p logs
-nohup ./bin/jingzhe -db data/jingzhe.db serve -addr :8080 >> logs/jingzhe.log 2>&1 &
+nohup ./bin/jingzhe serve -addr :8080 >> logs/jingzhe.log 2>&1 &   # -db 省略即用默认绝对路径
 ```
 
 - `-db`　SQLite 数据库路径（默认 `/home/qodercli/work/jingzhe-db/jingzhe.db`）
@@ -368,11 +368,18 @@ Authorization: Bearer <token>
 所有配置项（时刻表、选股阈值、成本费率、保留窗口）只能经运维 CLI 改，**改完必须重启进程才生效**：
 
 ```bash
-./bin/jingzhe -db data/jingzhe.db config dump                 # 看全部键与当前生效值
-./bin/jingzhe -db data/jingzhe.db config set scheduler.pipeline 16:45
-./bin/jingzhe -db data/jingzhe.db jobs -date 20260903          # 重启前先演练核对时间线
-pkill -f 'jingzhe .*serve' && nohup ./bin/jingzhe -db data/jingzhe.db serve -addr :8080 >> logs/jingzhe.log 2>&1 &
+./bin/jingzhe config dump                 # 看全部键与当前生效值（-db 省略即用默认库路径）
+./bin/jingzhe config set scheduler.pipeline 16:45
+./bin/jingzhe jobs -date 20260903          # 重启前先演练核对时间线
+# 停旧进程按**精确 PID**，不要 pkill -f：那条命令的命令行里含 "jingzhe"，会把自己也匹配进去
+kill "$(ps -eo pid=,args= | awk '$2=="./bin/jingzhe"{print $1}')"
+nohup ./bin/jingzhe serve -addr :8080 >> logs/jingzhe.log 2>&1 &
 ```
+
+> `-db` 的默认值就是生产库的**绝对路径**（`cmd/jingzhe/main.go`），示例里一律省略它。
+> 只在确实要换库时显式传，且必须是绝对真身路径：**不要把 `-db` 指向符号链接**，
+> 尤其是指向运维临时目录里搭出来的链接——目录被清理后进程一起来就"打开数据库失败"（agent_issues #15）。
+> `store.Open` 现在会把符号链接摘成真身再打开，日志首行回显的就是真身路径，以它为准。
 
 - `scheduler.*`：4 个键 —— `scheduler.morning`(09:00) / `scheduler.pipeline`(16:30，整链一条顺序
   流水线) / `scheduler.mail_pending`(17:00 待买卖邮件) / `scheduler.report`(18:00 日报)。

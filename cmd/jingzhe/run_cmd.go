@@ -9,12 +9,12 @@
 //
 // 用法:
 //
-//	jingzhe -db data/jingzhe.db run task calendar
-//	jingzhe -db data/jingzhe.db run task daily     --date 20260901 [--back N]
-//	jingzhe -db data/jingzhe.db run task etf       --date 20260901 [--back N]
-//	jingzhe -db data/jingzhe.db run task freshness --date 20260901
-//	jingzhe -db data/jingzhe.db run task screen    --date 20260901
-//	jingzhe -db data/jingzhe.db run task evening_pipeline --date 20260901
+//	jingzhe run task calendar
+//	jingzhe run task daily     --date 20260901 [--back N]
+//	jingzhe run task etf       --date 20260901 [--back N]
+//	jingzhe run task freshness --date 20260901
+//	jingzhe run task screen    --date 20260901
+//	jingzhe run task evening_pipeline --date 20260901
 package main
 
 import (

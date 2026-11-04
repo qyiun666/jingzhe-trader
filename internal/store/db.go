@@ -6,6 +6,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -42,7 +43,17 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("解析数据库路径失败: %w", err)
 	}
-	dir := filepath.Dir(abs)
+	// 符号链接在这一步就摘掉，后面所有判断都按库文件的**真身**做（agent_issues #15）：
+	//  ① checkNoSyncMarkers 查的是"库所在目录"。拿链接路径时它查的是链接所在的那临时目录，
+	//     真库若住在同步/云盘目录里就看不见标记了——D6 那条防线被一个符号链接静默绕过。
+	//  ② 进程一旦依赖链接存活，链接所在目录被平台清理后自愈/人工拉起会直接"打开数据库失败"
+	//     （11-03 那次 `-db .qoder-collab-runtime/jingzhe.db` 就是这个状态）。
+	//  ③ 顺带让 Path()/日志回显的是真路径，运维核对时不会再出现"两个都合法的路径"。
+	real, err := resolveDBPath(abs)
+	if err != nil {
+		return nil, err
+	}
+	dir := filepath.Dir(real)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("创建数据库目录 %s 失败: %w", dir, err)
 	}
@@ -50,7 +61,7 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 
-	dsn := buildDSN(abs)
+	dsn := buildDSN(real)
 
 	wdb, err := sqlx.Open("sqlite", dsn)
 	if err != nil {
@@ -74,14 +85,15 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("读库连接失败: %w", err)
 	}
 
-	st := &Store{writeDB: wdb, readDB: rdb, path: abs}
+	st := &Store{writeDB: wdb, readDB: rdb, path: real}
 
 	// 库文件权限收敛（§6.3）：库里存着 Tushare / LLM / 邮箱授权码，锁不住就不开。
 	// store 层禁止 import 业务包（含 observability），所以这里只能上抛而不是记日志。
-	if err := os.Chmod(abs, 0o600); err != nil {
+	// 按真身收敛：链接可以被随便建在那个目录里，权限必须落在实际那个库文件上。
+	if err := os.Chmod(real, 0o600); err != nil {
 		wdb.Close()
 		rdb.Close()
-		return nil, fmt.Errorf("库文件 %s 权限收敛为 0600 失败（内含凭据，拒绝打开）: %w", abs, err)
+		return nil, fmt.Errorf("库文件 %s 权限收敛为 0600 失败（内含凭据，拒绝打开）: %w", real, err)
 	}
 
 	if err := st.VerifyPragmas(context.Background()); err != nil {
@@ -203,6 +215,24 @@ func buildDSN(path string) string {
 		"&_pragma=synchronous(NORMAL)" +
 		"&_pragma=foreign_keys(ON)" +
 		"&_pragma=auto_vacuum(INCREMENTAL)"
+}
+
+// resolveDBPath 把库路径摘成真实文件路径（agent_issues #15①）。
+//
+// 库还不存在时（首次建库）EvalSymlinks 报 ENOENT：这时退一步只解析**父目录**再拼回文件名，
+// 因为同步标记守卫查的是目录，"父目录是链接、文件还没建"同样得按真身判。
+// 父目录也不存在（多级新建）就沿用原路径——MkdirAll 之后那条路径就是真身，不会误判。
+// 其余错误（权限、循环链接等）一律上抛：路径都读不准的时候，宁可不开库。
+func resolveDBPath(abs string) (string, error) {
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		return real, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("解析数据库路径的符号链接失败 %s: %w", abs, err)
+	}
+	if parent, err := filepath.EvalSymlinks(filepath.Dir(abs)); err == nil {
+		return filepath.Join(parent, filepath.Base(abs)), nil
+	}
+	return abs, nil
 }
 
 // checkNoSyncMarkers 检测库目录是否存在文件同步标记（D6 / P0-15-6）。

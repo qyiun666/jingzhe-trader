@@ -46,8 +46,21 @@ func objSchema(props map[string]interface{}, required []string) map[string]inter
 // 把一次错误调用变成一次静默写入（sync_portfolio 会在不动持仓的情况下重写现金锚点）。
 func checkRequiredArgs(t *Tool, args map[string]interface{}) error {
 	req, _ := t.InputSchema["required"].([]string)
+	props, _ := t.InputSchema["properties"].(map[string]interface{})
 	for _, name := range req {
-		if v, ok := args[name]; !ok || isEmptyArg(v) {
+		v, ok := args[name]
+		if !ok {
+			return fmt.Errorf("缺少必填参数 %s（工具 %s）", name, t.Name)
+		}
+		// 数组类必填只判"键在不在"，空数组是**一个合法状态**而不是漏传。
+		// sync_portfolio 的 positions:[] 意思是"券商那边整本清仓了"；把它跟"没传 positions"
+		// 同等对待，等于清仓后的组合校准没有正门可走——11-03 两次被拒后只能手改
+		// account.cash_anchor，绕过了 #12 那两道价格量纲闸（agent_issues #16）。
+		// 这与下面 checkArrayItems 已有的口径一致：项内 total_qty:0 也算合法校准。
+		if spec, ok := props[name].(map[string]interface{}); ok && spec["type"] == "array" {
+			continue
+		}
+		if isEmptyArg(v) {
 			return fmt.Errorf("缺少必填参数 %s（工具 %s）", name, t.Name)
 		}
 	}

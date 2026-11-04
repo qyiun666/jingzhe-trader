@@ -586,8 +586,19 @@ func buildTickets(ctx context.Context, rc *observability.RunCtx, d Deps, date st
 		rc.Degrade("LLM_FAILED", msg)
 	}
 	if rep.Rejected > 0 && rep.Tickets == 0 && rep.Approved+rep.SellSignals > 0 {
-		d.raiseU(rc, "ALL_REJECTED", "有决策但全被风控否决", fmt.Sprintf("否决 %d 条", rep.Rejected))
-		rc.Degrade("ALL_REJECTED", fmt.Sprintf("否决 %d 条", rep.Rejected))
+		// 否决全部来自设计内运行期开关时，"0 买单"是当日结论而不是故障：只落降级
+		// （outcome=partial，进日报「今日结论」），不占 urgent/M6 紧急通道。
+		// 11-03 那次是 weak_buy_enabled=false 拒掉唯一批准的买单，照样发了 M6——
+		// 紧急通道被常态产出占用，真故障来时会被告警疲劳吞掉（与 SOP 红线⑥
+		// "盘中 data_fresh=false 不报警"同一类误报）。口径由组长 20261104 定。
+		if gates, ok := designGateRules(rep.Rejections); ok {
+			rc.Degrade("ALL_REJECTED", fmt.Sprintf(
+				"否决 %d 条，全部来自设计内开关 %s（政策否决，非故障；回退键见 risk 规则名）",
+				rep.Rejected, strings.Join(gates, "/")))
+		} else {
+			d.raiseU(rc, "ALL_REJECTED", "有决策但全被风控否决", fmt.Sprintf("否决 %d 条", rep.Rejected))
+			rc.Degrade("ALL_REJECTED", fmt.Sprintf("否决 %d 条", rep.Rejected))
+		}
 	}
 	// 有候选却 0 指令：候选非空说明漏斗正常，是"评审全否/风控全拒"这类要交代的结论。
 	// 满仓短路时"没评审"是已知结论，不能再走这条降级去暗示评审过程跑过。
@@ -598,4 +609,40 @@ func buildTickets(ctx context.Context, rc *observability.RunCtx, d Deps, date st
 				len(cands), rep.Declined, rep.Failed))
 	}
 	return nil
+}
+
+// designGateRules 判这批否决是不是**全部**出自设计内运行期开关，返回命中的规则名。
+//
+// 只有 weak_buy_disabled（弱势买入闸）与 friction_gate（摩擦闸）算"政策说不买"：
+// 它们是组长定参时**故意**让买入链空转的开关，每天照样被拒是预期产出。
+// 其余规则名（额度上限、现金不足、一手买不起、行业上限、非法价格…）说明账户结构或
+// 数据出了问题，必须仍走 urgent——宁可多报一封，不可把真故障收进静默分支。
+// 空清单一律返回 false：没有否决记录就没有"全为设计内"可判，不改变原 urgent 行为。
+func designGateRules(rs []signal.Rejection) ([]string, bool) {
+	if len(rs) == 0 {
+		return nil, false
+	}
+	known := [...]string{risk.RuleBuysBlocked, risk.RuleFrictionGate}
+	seen := make(map[string]bool, len(rs))
+	for _, r := range rs {
+		hit := false
+		for _, name := range known {
+			if r.Rule == name {
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			return nil, false
+		}
+		seen[r.Rule] = true
+	}
+	// 按固定顺序输出，不用 map 遍历：降级文案要可复现，测试才能断言。
+	var out []string
+	for _, name := range known {
+		if seen[name] {
+			out = append(out, name)
+		}
+	}
+	return out, true
 }

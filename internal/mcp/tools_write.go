@@ -144,7 +144,10 @@ func (s *Server) registerWriteTools() {
 			"（验收 #14），持仓与现金照常同步。价格为元，数量为股；**有持仓（total_qty>0）的每一项都必须给 " +
 			"cost_price**，缺了会整次拒绝而不是静默落 0 成本。建仓日 first_open_date 是持有期" +
 			"保护的依据，券商口径没有这一列：不传则保留账本既有建仓日（同步绝不清空它），" +
-			"只在人工纠错或首次接入确知真实建仓日时才显式传 YYYYMMDD。",
+			"只在人工纠错或首次接入确知真实建仓日时才显式传 YYYYMMDD。" +
+			"positions 传**空数组**＝本次只校准资金口径（本金+现金锚点），不动任何持仓行——" +
+			"qty>0 的持仓不会因此清零，整本清仓要逐只传 total_qty:0 或由成交回执收口；" +
+			"**键完全不传仍被拒**，防的就是漏传退化成静默改锚点（agent_issues #16）。",
 		InputSchema: objSchema(map[string]interface{}{
 			"date":                 dateProp,
 			"initial_capital_yuan": numProp("本金 = 期初总资产（元），0=不改本金"),
