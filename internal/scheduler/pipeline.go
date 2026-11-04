@@ -357,6 +357,17 @@ func emptyReason(rep *screener.Report) string {
 			break
 		}
 	}
+	// 整手窗口筛光是设计内结果（B1 + 组长 20261104 批复）：小账户 + 弱势档的
+	// [单笔下限, 单票上限] 只有约 293 元宽，100 股步距下存在一只都下不了单的合法日子。
+	// 这句必须与 screener.raiseEmptyAlert 的 partial 分级同口径，否则 trace 说"设计内"
+	// 而邮件说"筛光候选"，读的人仍会当成故障。
+	if n := rep.LotWindowDrops(); n > 0 {
+		if last != "" {
+			return "漏斗在「" + last + "」按整手窗口筛掉候选（设计内：打分样本 " + itoa(rep.ScoredTotal) +
+				" 只里有 " + itoa(n) + " 只没有任何整手倍数落进 [单笔下限, 单票上限]，非数据故障，无需介入）"
+		}
+		return "候选 0 条（设计内：整手窗口淘汰 " + itoa(n) + " 只，非数据故障，无需介入）"
+	}
 	if last != "" {
 		return "漏斗在「" + last + "」筛光候选（打分样本 " + itoa(rep.ScoredTotal) + " 只）"
 	}

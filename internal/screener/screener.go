@@ -446,20 +446,45 @@ func (s *Screener) finish(ctx context.Context, tradeDate string, rep *Report) er
 	return s.raiseEmptyAlert(ctx, tradeDate, rep, summary)
 }
 
+// LotWindowDrops 因"没有任何整手倍数能落进 [单笔下限, 单票上限]"而被剔掉的标的数（B1）。
+//
+// 这个计数决定 0 候选是不是故障。小账户 + 弱势档的窗口只有约 293 元宽，而整手步距是
+// 100×price，所以存在"强势板块里一只都下不了单"的合法日子：那不是数据故障，也不该
+// 把"请人工介入"打进用户的早间邮件——真故障那天这句话就没有分量了。
+// 调度器的降级文案按同一个键名判定（见 scheduler.emptyReason）。
+func (r *Report) LotWindowDrops() int {
+	var n int
+	for _, st := range r.Stages {
+		n += st.Drops[ReasonLotWindow]
+	}
+	return n
+}
+
 // raiseEmptyAlert 候选为 0 时落一条 alert:SCREEN_EMPTY 轨迹。
 //
 // 两种 0 候选必须分开定级：闸门关闭是规则的正常输出（partial，无需人介入，
 // 但给出影子清单证明漏斗本身是通的）；漏斗某级把池子筛光才是要人看的故障（fail）。
 // 两者混写成同一句"请人工介入"时，人每天被叫去介入一个不需要介入的东西，
 // 真出故障那天这句就没有分量了。
+//
+// 20261104 加第三级（组长批复）：整手窗口筛光同样是**设计内**结果，按 partial 走。
+// 判据必须是"淘汰原因里确实有整手窗口这一条"，而不是"看到 0 候选就降级"——
+// 否则数据故障会被这条新出口一并吞掉，那就从"天天误报"翻成"永远不报"，更危险。
 func (s *Screener) raiseEmptyAlert(ctx context.Context, tradeDate string, rep *Report, summary string) error {
 	detail := fmt.Sprintf("%s 选股候选 0 条（打分样本 %d 只）。漏斗：%s。板块前三：%s。",
 		tradeDate, rep.ScoredTotal, summary, strings.Join(topSectorNames(rep.Sectors, 3), "、"))
 	outcome := model.TraceFail
-	if rep.RegimeClosed {
+	switch {
+	case rep.RegimeClosed:
 		detail += fmt.Sprintf(reasonMarketRegime, rep.RegimeMALabel()) + "，无需介入；" + rep.ShadowBrief()
 		outcome = model.TracePartial
-	} else {
+	case rep.LotWindowDrops() > 0:
+		n := rep.LotWindowDrops()
+		detail += fmt.Sprintf("设计内（B1 整手窗口淘汰）：%d 只标的没有任何整手倍数能落进 [单笔下限, 单票上限]，"+
+			"这是账户规模与弱势档仓位共同决定的结果，不是数据故障，无需介入、不要回滚；"+
+			"买入闸当日若关闭，0 候选与 0 指令单没有差别。", n)
+		outcome = model.TracePartial
+	default:
 		detail += "请人工介入。"
 	}
 	trace := model.RunTrace{

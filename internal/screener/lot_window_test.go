@@ -39,8 +39,8 @@ func TestLotWindowRejectsUnorderableCandidates(t *testing.T) {
 				price, float64(price), minFen.Float(), capFen.Float())
 			continue
 		}
-		if why != reasonLotWindow {
-			t.Errorf("%d 分/股 拒绝原因应为 %q，实际 %q", price, reasonLotWindow, why)
+		if why != ReasonLotWindow {
+			t.Errorf("%d 分/股 拒绝原因应为 %q，实际 %q", price, ReasonLotWindow, why)
 		}
 	}
 	if len(orderable)+len(hollow) != 20 {

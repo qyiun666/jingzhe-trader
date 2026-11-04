@@ -91,8 +91,12 @@ func sectorGateStage(industry string, hot map[string]bool) (bool, string) {
 // lotsPerShare A 股一手 = 100 股。
 const lotsPerShare = 100
 
-// reasonLotWindow 整手金额落不进[单笔下限, 单票上限]窗口（20261104 策略 B1）。
-const reasonLotWindow = "整手金额落不进单笔下限与单票上限之间"
+// ReasonLotWindow 整手金额落不进[单笔下限, 单票上限]窗口（20261104 策略 B1）。
+//
+// 导出是为了让调度器的降级文案（scheduler.emptyReason）与告警分级共用同一个键名：
+// 这条原因字符串在 StageStat.Drops 的 map 里是 key，判"0 候选是不是设计内"必须按它查，
+// 两边各写一遍中文就会漂移——而漂移的结果是"设计内的筛光被报成故障"，正是本次要防的。
+const ReasonLotWindow = "整手金额落不进单笔下限与单票上限之间"
 
 // affordableStage 可用资金筛：一手成本必须落在**风控真的能下单**的金额区间内。
 //
@@ -126,7 +130,7 @@ func affordableStage(price model.Fen, capFen, minFen model.Fen) (bool, string) {
 	// lot>0 且 lot≤capFen 已在上两步保证，故 floor(capFen/lot) ≥ 1，不必再钳下界。
 	nMin := (minFen + lot - 1) / lot
 	if nMin > capFen/lot {
-		return false, reasonLotWindow
+		return false, ReasonLotWindow
 	}
 	return true, ""
 }
