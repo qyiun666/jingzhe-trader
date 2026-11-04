@@ -14,7 +14,7 @@
 //	jingzhe run task <任务名> [--date YYYYMMDD]
 //	                                             调度器任务：morning_plan/intraday_scan/evening_pipeline/mail_pending/daily_report
 //	                                             数据面任务：calendar/daily/freshness/screen
-//	jingzhe db audit|rebuild-bar                 库结构清点 / daily_bar 重建为 WITHOUT ROWID
+//	jingzhe db audit|backup|rebuild-bar          库结构清点 / 部署前一致性快照 / daily_bar 重建为 WITHOUT ROWID
 package main
 
 import (
@@ -109,7 +109,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  jobs   [-date 20260901]                    演练当日时间线（dry-run，不执行）")
 	fmt.Fprintln(os.Stderr, "  config <dump|get KEY|set KEY VALUE>        查看/修改 config_kv（凭据默认掩码）")
 	fmt.Fprintln(os.Stderr, "  init   [-capital 元] [-cash 元] [-hold 代码:股数:成本,…]  写入账户基线")
-	fmt.Fprintln(os.Stderr, "  db     <audit|rebuild-bar>                  库结构清点 / 重建 daily_bar")
+	fmt.Fprintln(os.Stderr, "  db     <audit|backup|rebuild-bar>            库结构清点 / 部署前快照 / 重建 daily_bar")
 	fmt.Fprintln(os.Stderr, "  attribution [--from YYYYMMDD] [--to YYYYMMDD] [--horizons 5,10,20]")
 	fmt.Fprintln(os.Stderr, "                                             候选归因：前瞻净收益/相对沪深300/分层")
 	fmt.Fprintln(os.Stderr, "  run task <任务名> [--date YYYYMMDD]          手工执行单个任务（与到点触发同源）")

@@ -118,7 +118,7 @@ make -f deploy/Makefile build     # 产物 bin/jingzhe
 | `config` | `dump` / `get KEY` / `set KEY VALUE`（凭据默认掩码，`--show-secrets` 才显示明文） |
 | `init` | 写账户基线：`-capital` 本金（= 期初总资产，write-once）、`-hold 代码:股数:成本` 当前持仓、`-cash` 可用资金（省略则按本金−持仓成本推算）；顺带补齐 config_kv 默认值 |
 | `run task` | 手工执行单个任务。接受两类名字：**调度器注册名** `morning_plan`/`intraday_scan`/`evening_pipeline`/`mail_pending`/`daily_report`（与 `serve` 同一份注册表、同一条 `runJob`，落库口径一致），以及**只有 CLI 提供的数据面任务** `calendar`/`daily`/`freshness`/`screen`（接入与排查用，没有到点触发） |
-| `db` | `audit` = 清点库结构与现役 schema 的差异（遗留表/索引、`daily_bar` 是否仍为普通表），有差异非零退出；`rebuild-bar` = 把 `daily_bar` 重建为 `WITHOUT ROWID`（离线执行） |
+| `db` | `audit` = 清点库结构与现役 schema 的差异（遗留表/索引、`daily_bar` 是否仍为普通表），有差异非零退出；`backup` = 部署前给现役库拍一致性快照（`VACUUM INTO` + 对副本跑 `integrity_check`，默认落 `<库所在目录>/backup/jingzhe.pre-deploy-<时间戳>.db`，可用 `-to` 覆盖；**不要用 `cp` 拷 WAL 库**）；`rebuild-bar` = 把 `daily_bar` 重建为 `WITHOUT ROWID`（离线执行） |
 
 ### 因子方向（`screen.factor_mode`，默认 `reversal`）
 
