@@ -410,6 +410,10 @@ func ScreenBudget(ctx context.Context, st *store.Store, led *ticket.Ledger,
 	}
 	// 单票上限按生效后的 rp 算：弱势收缩在上一步已经落进 rp。
 	b.CapFen = rp.SingleCapFen()
+	// 单笔下限同批注入（20261104 策略 B1）：漏斗的"可用资金"这一级要判的是整手金额能否
+	// 落进 [下限, 上限]，而不只是"一手买得起"。下限算式只在 risk 里有一份，这里传值
+	// 而不是让 screener 再抄一遍——两处各抄就会漂移，症状是"候选进来了却被风控全斩"。
+	b.MinFen = rp.MinAmountFloor()
 	return b, rp, nil
 }
 

@@ -74,10 +74,31 @@ func (p RiskParams) MinAmountFloor() model.Fen {
 	if ratio <= 0 || ratio > 1 {
 		ratio = baseMinAmountRatio // 坏值/旧构造回落到基准，不静默放行
 	}
-	if byRatio := pctOf(p.SingleCapFen(), ratio); byRatio > 0 && byRatio < p.MinSingleAmountFen {
+	return minAmountFen(p.SingleCapFen(), ratio, p.MinSingleAmountFen)
+}
+
+// MinAmountFor 只凭"单票上限 + 是否弱势档"推导生效单笔下限（分）。
+//
+// 存在的理由是漏斗与风控必须用同一条下限线：MinAmountFloor 是 RiskParams 的方法，
+// 而选股漏斗手里只有单票上限（Budget.CapFen）与弱势旗标，拿不到完整 rp——把算式抽成
+// 这个纯函数、由 MinAmountFloor 同样调用，比让 screener 再抄一遍"0.75 × 上限"安全
+// （抄一遍就会在两处分别漂移，而漂移的症状是"候选进来了却被风控全斩"）。
+// 绝对下限取 DefaultMinSingleAmountFen：它不是配置键（见 keys.go 对 cost 段的说明），
+// 所以这里不需要参数化。
+func MinAmountFor(singleCapFen model.Fen, weak bool) model.Fen {
+	ratio := baseMinAmountRatio
+	if weak {
+		ratio = WeakMinAmountRatio
+	}
+	return minAmountFen(singleCapFen, ratio, DefaultMinSingleAmountFen)
+}
+
+// minAmountFen 单笔下限的唯一算式：绝对下限与"单票上限 × 比例"取严。
+func minAmountFen(singleCapFen model.Fen, ratio float64, absFloor model.Fen) model.Fen {
+	if byRatio := pctOf(singleCapFen, ratio); byRatio > 0 && byRatio < absFloor {
 		return byRatio
 	}
-	return p.MinSingleAmountFen
+	return absFloor
 }
 
 // FrictionPct 给定成交金额的双边摩擦率（小数）：双边成本 / 名义额。
@@ -87,10 +108,24 @@ func (p RiskParams) MinAmountFloor() model.Fen {
 // 所以摩擦闸与动态武装线都用它，而不是用名义费率。金额非正返回 1（最保守：
 // 无法核算成本时按"成本高到吃光收益"处理，而不是当成 0 放行）。
 func FrictionPct(amount model.Fen) float64 {
+	return frictionPct(amount, false)
+}
+
+// FrictionPctFund 场内基金档的双边摩擦率（无卖出印花税）。
+func FrictionPctFund(amount model.Fen) float64 {
+	return frictionPct(amount, true)
+}
+
+// FrictionPctFor 按标的品种取双边摩擦率：isFund=true 走场内基金档。
+func FrictionPctFor(amount model.Fen, isFund bool) float64 {
+	return frictionPct(amount, isFund)
+}
+
+func frictionPct(amount model.Fen, fund bool) float64 {
 	if amount <= 0 {
 		return 1
 	}
-	return float64(RoundTripCostFen(amount)) / float64(amount)
+	return float64(RoundTripCostFenFor(amount, fund)) / float64(amount)
 }
 
 // TrailingArmPctFor 按当笔名义额推导移动止盈武装线（20261103 定参②）。
@@ -107,6 +142,20 @@ func FrictionPct(amount model.Fen) float64 {
 // TrailingArmPct <= 0 是显式的旧口径开关（回到"成本线即武装"），此时不做动态推导，
 // 否则"设 0 回滚"会被动态项悄悄覆盖，回退开关就形同虚设。
 func (p RiskParams) TrailingArmPctFor(notional model.Fen) float64 {
+	return p.trailingArm(notional, false)
+}
+
+// TrailingArmPctForFund 场内基金档的武装线：算式同 TrailingArmPctFor，摩擦项免印花税。
+func (p RiskParams) TrailingArmPctForFund(notional model.Fen) float64 {
+	return p.trailingArm(notional, true)
+}
+
+// TrailingArmPctForVariant 按标的品种取武装线（isFund=true 走场内基金档）。
+func (p RiskParams) TrailingArmPctForVariant(notional model.Fen, isFund bool) float64 {
+	return p.trailingArm(notional, isFund)
+}
+
+func (p RiskParams) trailingArm(notional model.Fen, fund bool) float64 {
 	if p.TrailingArmPct <= 0 {
 		return 0
 	}
@@ -118,7 +167,7 @@ func (p RiskParams) TrailingArmPctFor(notional model.Fen) float64 {
 	if safety < 0 {
 		safety = baseTrailingArmSafetyPct
 	}
-	arm := (1+FrictionPct(notional))/(1-d) - 1 + safety
+	arm := (1+frictionPct(notional, fund))/(1-d) - 1 + safety
 	if arm < p.TrailingArmPct {
 		return p.TrailingArmPct
 	}

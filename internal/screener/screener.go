@@ -66,6 +66,14 @@ type Budget struct {
 	// 进决策链必被 RuleLotUnaffordable 斩掉（20260930/20261008 实测各 7/20、4/20 只），
 	// 等于每天白跑一遍 LLM 评审并让"候选池"这个观测口径失真。
 	CapFen model.Fen
+	// MinFen 风控生效的单笔下限（risk.RiskParams.MinAmountFloor 的结果）。0 表示调用方
+	// 没给下界口径 —— "可用资金"这一级退化成只判上界（B1 之前的旧行为）。
+	//
+	// 必须由调用方注入而不是漏斗自己算：下界是"单票上限 × 比例（弱势 0.75）与绝对下限
+	// 5000 元取小"的风控口径，把这条算式在 screener 里再抄一遍，就会在两处各自漂移，
+	// 而漂移的症状正是"候选进来了却被风控全斩"——B1 修的就是这个。
+	// 依赖方向也因此保持不变：screener 仍只依赖 model 与 store（见包注释）。
+	MinFen model.Fen
 	// MAWindow 本次判定所用的大盘均线窗口（供文案回显，0 视为默认深度）。
 	MAWindow int
 	// WeakRegime 门槛关闭（gate_enabled=false）且大盘仍处弱势（收盘<均线，
@@ -74,6 +82,19 @@ type Budget struct {
 	WeakRegime bool
 	// WeakNote 弱势判定原因（"指数不可读，按弱势降级"等），进 run_trace 供事后归因。
 	WeakNote string
+}
+
+// bounds 实际生效的整手金额区间 [minFen, capFen]，以及该区间是否为空集旗标。
+//
+// 空集（下界 > 上界）时把下界置 0 返回 —— 调用方据此退化成只判上界并出声，
+// 而不是让漏斗把整个候选池筛光。个股链与 ETF 补口共用这一份判定，两侧不可能漂移。
+func (b Budget) bounds() (capFen, minFen model.Fen, emptyWindow bool) {
+	capFen = b.perSlot()
+	minFen = b.MinFen
+	if capFen > 0 && minFen > capFen {
+		return capFen, 0, true
+	}
+	return capFen, minFen, false
 }
 
 // perSlot 漏斗"一手买得起吗"这一级的预算线：现金均分与风控单票上限取严。
@@ -95,11 +116,22 @@ func (b Budget) perSlot() model.Fen {
 //
 // 加它的原因是归因成本：20261008 盘查"为什么没有科技股"时，这条线只能从现金、
 // 持仓数与风控参数反推，而它恰恰是解释候选构成最关键的一级。
+//
+// 下界一并写出来（B1）：整手窗口 [下界, 上界] 只有两三百元宽时，"一手买得起"并不等于
+// "能下单"——不写这一行，事后就分不出"这只票被筛掉了"和"这只票根本没法按整手买"。
 func budgetNote(b Budget) string {
 	avg := model.Fen(0)
 	if b.Slots > 0 && b.Cash > 0 {
 		avg = b.Cash / model.Fen(b.Slots)
 	}
+	line := budgetNoteCap(b, avg)
+	if b.MinFen > 0 {
+		line += fmt.Sprintf(" ｜ 单笔下限 %.2f 元（整手金额须落在此区间）", b.MinFen.Float())
+	}
+	return line
+}
+
+func budgetNoteCap(b Budget, avg model.Fen) string {
 	if b.CapFen > 0 && b.CapFen < avg {
 		return fmt.Sprintf("单笔预算 %.2f 元（现金均分 %.2f → 风控单票上限 %.2f 取严）",
 			b.CapFen.Float(), avg.Float(), b.CapFen.Float())
@@ -223,8 +255,20 @@ func (s *Screener) Run(ctx context.Context, tradeDate string, budget Budget) (*R
 		}
 		return true, ""
 	})
+	// 可用资金这一级判的是"风控真的能不能下这一手"，所以上下界都要（B1）。
+	// 两界自相矛盾（下限 > 上限 ⇒ 整手窗口是空集）时不在这里清空候选池：那会把
+	// "配置坏了"显示成"今天没有符合条件的票"，是最难归因的一种误读。bounds() 已把
+	// 下界置 0（本级退化成只判上界），这里只负责把矛盾本身写进 Notes——风控侧仍会
+	// 按 RuleMinAmount 逐笔否决，绝不因为漏斗放行就多下一张单。
+	capFen, minFen, emptyWindow := budget.bounds()
+	if emptyWindow {
+		rep.Notes = append(rep.Notes, fmt.Sprintf(
+			"单笔下限 %.2f 元 > 单票上限 %.2f 元：整手窗口为空集，可用资金这一级本次只判上界；"+
+				"这是配置矛盾（任何金额都过不了风控），不是筛选结果，请先核对风控参数",
+			budget.MinFen.Float(), capFen.Float()))
+	}
 	survivors = s.filterStage(tr, "budget", "可用资金(一手≤预算)", survivors, func(stk model.StockBasic) (bool, string) {
-		return affordableStage(in.price(stk.TsCode), budget.perSlot())
+		return affordableStage(in.price(stk.TsCode), capFen, minFen)
 	})
 	survivors = s.filterStage(tr, "liq", "流动性(市值/换手)", survivors, func(stk model.StockBasic) (bool, string) {
 		return liquidityStage(stk, s.cfg)

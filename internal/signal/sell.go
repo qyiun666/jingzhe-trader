@@ -115,7 +115,12 @@ func evalTrailingStop(date string, h HoldingCtx, p risk.RiskParams) *model.Signa
 	//
 	// arm=0 退回旧口径（成本线即武装），保留 A/B 与回滚能力：这里刻意不跳过判定，
 	// 否则"设 0 回滚"会被动态推导覆盖，回退开关就形同虚设。
-	arm := p.TrailingArmPctFor(h.Pos.CostPrice.Mul(h.Pos.TotalQty))
+	//
+	// 摩擦档位按持仓品种取（20261104 策略 B3）：场内基金没有卖出印花税，按个股档推导
+	// 会把 ETF 的武装线抬高约 0.11pp——高点的钱已经涨到可触发位置却还不开闸，
+	// 等于用一个算错的常数把趋势利润换成回撤风险。ETF 持仓只可能来自 ETF 补口，
+	// IsETF 由 screen.etf_whitelist 认定（见 Service.ETFUniverse）。
+	arm := p.TrailingArmPctForVariant(h.Pos.CostPrice.Mul(h.Pos.TotalQty), h.IsETF)
 	armGate := model.Fen(float64(h.Pos.CostPrice) * (1 + arm))
 	if h.Pos.HighPrice < armGate {
 		return nil

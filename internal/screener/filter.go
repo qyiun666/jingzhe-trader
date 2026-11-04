@@ -91,14 +91,42 @@ func sectorGateStage(industry string, hot map[string]bool) (bool, string) {
 // lotsPerShare A 股一手 = 100 股。
 const lotsPerShare = 100
 
-// affordableStage 可用资金筛：一手成本必须落在单笔预算内，否则这只票买不起。
-// budgetFen<=0 表示没有可用资金口径 —— 不放行（宁缺勿滥），由调用方记降级说明原因。
-func affordableStage(price model.Fen, budgetFen model.Fen) (bool, string) {
-	if budgetFen <= 0 {
+// reasonLotWindow 整手金额落不进[单笔下限, 单票上限]窗口（20261104 策略 B1）。
+const reasonLotWindow = "整手金额落不进单笔下限与单票上限之间"
+
+// affordableStage 可用资金筛：一手成本必须落在**风控真的能下单**的金额区间内。
+//
+// 两个边界都必须判，只判上界是缺陷（B1 修正前的形态）：
+//   - 上界 capFen = 单票上限（Budget.perSlot()，与风控 SingleCapFen 同一条线）；
+//   - 下界 minFen = 风控生效的单笔下限（risk.MinAmountFloor 的口径，由调用方注入）。
+//     风控在金额定稿后还会判 `amount < minAmount → 否决`（RuleMinAmount），而申报量
+//     必须是 100 股的整数倍：窗口 [880.34, 1,173.78] 只有 293 元宽，而整手步距是
+//     100×price。11-03 实测 20 只候选里 13 只**没有任何一手倍数能落进这个窗口**
+//     （上海银行一手 833 < 下限、两手 1,666 > 上限），它们照过了漏斗、每天白过一遍
+//     LLM 评审，真开闸时会被 RuleMinAmount 斩掉。11-04 的留痕里模型自己写出了这件事
+//     （九芝堂："一手843元低于单笔下限880.34元，200股又超单票上限…无法合规建仓"）。
+//
+// minFen<=0（调用方没给下限口径）时退化成只判上界，与修正前逐位一致——不越权凭空
+// 造一条限制线，这与 perSlot() 对 CapFen 的处理同一哲学。
+func affordableStage(price model.Fen, capFen, minFen model.Fen) (bool, string) {
+	if capFen <= 0 {
 		return false, reasonUnaffordable
 	}
-	if price.Mul(lotsPerShare) > budgetFen {
+	lot := price.Mul(lotsPerShare)
+	if lot <= 0 {
+		return false, reasonUnaffordable // 价格非法时不放行，与无资金口径同处理
+	}
+	if lot > capFen {
 		return false, reasonUnaffordable
+	}
+	if minFen <= 0 || minFen > capFen {
+		return true, "" // 无下界，或配置自相矛盾（由调用方记 Note 并把下界置 0）
+	}
+	// 存在正整数 n 使 n×lot ∈ [minFen, capFen]：n ≥ ceil(minFen/lot) 且 n ≤ floor(capFen/lot)。
+	// lot>0 且 lot≤capFen 已在上两步保证，故 floor(capFen/lot) ≥ 1，不必再钳下界。
+	nMin := (minFen + lot - 1) / lot
+	if nMin > capFen/lot {
+		return false, reasonLotWindow
 	}
 	return true, ""
 }

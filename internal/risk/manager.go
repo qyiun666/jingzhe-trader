@@ -201,10 +201,19 @@ func (m *Manager) CheckBatch(intents []BuyIntent, st AccountState) []Decision {
 		// 0 意味着任何正摩擦都被拦，这是组长明确确认的设计意图（宁可长期空仓等
 		// 样本与信号变强），不是缺陷。放在金额定稿之后：先算出真实名义额再估摩擦，
 		// 否则用上限金额估会低估小额单的费率（最低佣金与名义额成反比）。
-		if f := FrictionPct(amount); f >= m.P.ExpectedExcessPct {
+		//
+		// 档位按品种取（20261104 策略 B3）：场内基金卖出没有印花税，用个股档估 ETF 会把
+		// 摩擦高估约 0.10pp——在 1,100 元级名义额上等于把这笔单的"该不该做"判据整体
+		// 抬高，而这条线同时是移动止盈武装线的输入。品种错一档的方向是"少买"，不是"乱买"，
+		// 但 ETF 补口的立项依据恰恰是小额可行的科技敞口，算错就等于把它提前否掉。
+		if f := FrictionPctFor(amount, in.IsETF); f >= m.P.ExpectedExcessPct {
+			profile := "个股档"
+			if in.IsETF {
+				profile = "场内基金档（无卖出印花税）"
+			}
 			reject(RuleFrictionGate, fmt.Sprintf("摩擦闸：名义 %s 元的双边摩擦 %.2f%% ≥ 预估持有期超额 %.2f%%"+
-				"（后者取不到显著归因值时按 0，即一律拦；回退键 signal.expected_excess_pct）",
-				amount, f*100, m.P.ExpectedExcessPct*100))
+				"（%s；后者取不到显著归因值时按 0，即一律拦；回退键 signal.expected_excess_pct）",
+				amount, f*100, m.P.ExpectedExcessPct*100, profile))
 			out = append(out, dec)
 			continue
 		}

@@ -341,7 +341,7 @@ func (s *Service) buyDecisions(ctx context.Context, tradeDate string, cands []mo
 		ev, evOK := EvaluateRules(bs)
 		items = append(items, BuyRequest{
 			TradeDate: tradeDate, Candidate: c, Bars: bs, Rules: ev, RulesOK: evOK,
-			Budget:  budgetOf(state, p, c.TsCode, c.Close),
+			Budget:  budgetOf(state, p, c.TsCode, c.Close, c.IsETF()),
 			Holding: held[c.TsCode],
 		})
 	}
@@ -404,9 +404,12 @@ func (s *Service) pendingBuy(it BuyRequest, d BuyDecision, total model.Fen, rep 
 // budgetOf 把风控口径翻译成模型能读懂的几个钱数：能动用的现金、单票上限、一手成本、
 // 还剩几个持仓名额，以及（若已持有该代码）现有敞口与还能加多少。
 // 模型只在这些数之内表达意愿，越界由 Manager 斩掉。
-func budgetOf(state risk.AccountState, p risk.RiskParams, code string, price model.Fen) BuyBudget {
+//
+// isFund 决定成本档位（20261104 策略 B3）：场内基金卖出没有印花税，按个股档估会把
+// 双边成本多算约 1 元/千名义额，进而抬高"净收益至少覆盖 2×成本"这条门槛。
+func budgetOf(state risk.AccountState, p risk.RiskParams, code string, price model.Fen, isFund bool) BuyBudget {
 	slot := p.SingleCapFen()
-	cost := risk.RoundTripCostFen(slot)
+	cost := risk.RoundTripCostFenFor(slot, isFund)
 	b := BuyBudget{
 		CashFen: state.Cash, SlotFen: slot,
 		LotCostFen: price.Mul(model.LotShares),

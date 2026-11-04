@@ -42,22 +42,27 @@ func TestAffordableStageUsesCapLine(t *testing.T) {
 	b := Budget{Cash: model.Fen(1183380), Slots: 2, CapFen: model.Fen(118338)}
 	line := b.perSlot()
 	// 12.63 元/股 → 一手 1263 元：均分口径买得起（< 5916.90），上限口径买不起（> 1183.38）。
-	if ok, reason := affordableStage(model.Fen(1263), line); ok {
+	if ok, reason := affordableStage(model.Fen(1263), line, 0); ok {
 		t.Errorf("一手 1263 元在 1183.38 元预算线下应被拒，实际放行")
 	} else if reason != reasonUnaffordable {
 		t.Errorf("拒绝原因应为 %q，实际 %q", reasonUnaffordable, reason)
 	}
 	// 11.83 元/股 → 一手 1183 元：卡线内，必须放行（边界不能被多收一分钱砍掉）。
-	if ok, reason := affordableStage(model.Fen(1183), line); !ok {
+	if ok, reason := affordableStage(model.Fen(1183), line, 0); !ok {
 		t.Errorf("一手 1183 元小于预算线 1183.38 元应放行，实际被拒：%q", reason)
 	}
 	// 11.84 元/股 → 一手 1184 元：刚过线，必须被拒。
-	if ok, _ := affordableStage(model.Fen(1184), line); ok {
+	if ok, _ := affordableStage(model.Fen(1184), line, 0); ok {
 		t.Errorf("一手 1184 元超过预算线 1183.38 元应被拒，实际放行")
 	}
 	// 收口前这条线是 5916.90 元：同一只票在旧口径下会放行，这就是 bug 的形态。
-	if ok, _ := affordableStage(model.Fen(1263), b.Cash/model.Fen(b.Slots)); !ok {
+	if ok, _ := affordableStage(model.Fen(1263), b.Cash/model.Fen(b.Slots), 0); !ok {
 		t.Errorf("旧的均分口径应放行一手 1263 元（用于对照，证明差异来自收口）")
+	}
+	// 下界缺省（MinFen=0）时判据与 B1 之前逐位一致：不给口径不等于凭空收紧。
+	// 8.33 元/股（上海银行 11-03 实价）一手 833 元：旧口径放行，B1 有下界时判空洞。
+	if ok, _ := affordableStage(model.Fen(833), line, 0); !ok {
+		t.Errorf("无下界口径时一手 833 元应放行（旧行为）")
 	}
 }
 

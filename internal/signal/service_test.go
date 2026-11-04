@@ -265,7 +265,7 @@ func TestBudgetOfCarriesTradeCost(t *testing.T) {
 	state := risk.AccountState{
 		TotalAsset: model.FromFloat(10000), Cash: model.FromFloat(10000),
 	}
-	b := budgetOf(state, p, "600000.SH", model.FromFloat(10))
+	b := budgetOf(state, p, "600000.SH", model.FromFloat(10), false)
 	if b.SlotFen != p.SingleCapFen() {
 		t.Errorf("SlotFen=%s，期望单票上限 %s", b.SlotFen, p.SingleCapFen())
 	}
@@ -274,6 +274,18 @@ func TestBudgetOfCarriesTradeCost(t *testing.T) {
 	}
 	if want := risk.RoundTripCostFen(b.SlotFen); b.RoundTripCostFen != want {
 		t.Errorf("RoundTripCostFen=%s，期望按单票上限估算 %s", b.RoundTripCostFen, want)
+	}
+	// 同一只标的按场内基金档取成本：模型看到的"双边成本/最低净收益"必须与风控档位一致
+	// （20261104 策略 B3）。差额恰为卖出印花税，两档都低于单笔下限时这笔单仍不该下。
+	fund := budgetOf(state, p, "588200.SH", model.FromFloat(0.79), true)
+	if wantFund := risk.RoundTripCostFundFen(fund.SlotFen); fund.RoundTripCostFen != wantFund {
+		t.Errorf("基金档 RoundTripCostFen=%s，期望 %s", fund.RoundTripCostFen, wantFund)
+	}
+	if !(fund.RoundTripCostFen < b.RoundTripCostFen) {
+		t.Errorf("基金档双边成本应低于个股档（免印花税）：%s vs %s", fund.RoundTripCostFen, b.RoundTripCostFen)
+	}
+	if fund.MinAmountFen != b.MinAmountFen {
+		t.Errorf("单笔下限与品种无关，两档必须同值：%s vs %s", fund.MinAmountFen, b.MinAmountFen)
 	}
 	if b.MinNetReturnFen != b.RoundTripCostFen*2 {
 		t.Errorf("MinNetReturnFen=%s，期望 2×双边成本 %s", b.MinNetReturnFen, b.RoundTripCostFen*2)

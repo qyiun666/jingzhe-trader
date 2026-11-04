@@ -326,13 +326,18 @@ func TestHorizonStatus(t *testing.T) {
 // TestNetReturnCosts 净收益公式的边界：买入额不同，最低佣金对小单的拖累不同。
 func TestNetReturnCosts(t *testing.T) {
 	// 3000 元买入、+10%：双边成本约 13.36 元，净收益约 9.54%。
-	near(t, "3000元+10%", netReturn(1000, 1100, 300000), 0.095385)
+	near(t, "3000元+10%", netReturn(1000, 1100, 300000, false), 0.095385)
 	// 5000 元买入、-5%：净收益约 -5.29%。
-	near(t, "5000元-5%", netReturn(2000, 1900, 500000), -0.052917)
-	if got := netReturn(0, 1100, 500000); !math.IsNaN(got) {
+	near(t, "5000元-5%", netReturn(2000, 1900, 500000, false), -0.052917)
+	// 同一笔按场内基金档（无卖出印花税）：净收益必须高于个股档，且差额随名义额摊薄。
+	stock, fund := netReturn(1000, 1100, 300000, false), netReturn(1000, 1100, 300000, true)
+	if !(fund > stock) {
+		t.Errorf("基金档净收益应高于个股档（免税），实际 个股 %.6f vs 基金 %.6f", stock, fund)
+	}
+	if got := netReturn(0, 1100, 500000, false); !math.IsNaN(got) {
 		t.Errorf("非法买入价应返回 NaN，实际 %v", got)
 	}
-	if got := netReturn(1000, 1100, 0); !math.IsNaN(got) {
+	if got := netReturn(1000, 1100, 0, false); !math.IsNaN(got) {
 		t.Errorf("非法买入额应返回 NaN，实际 %v", got)
 	}
 }

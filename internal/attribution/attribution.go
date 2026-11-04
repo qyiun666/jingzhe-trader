@@ -74,6 +74,9 @@ type Row struct {
 	// NotionalFen 收益估算用的买入额：买入行按 weight×总资产（不超过单票上限），
 	// 跳过/失败行按当日单票上限（等风险反事实），缺快照时回落到 5000 元参考额。
 	NotionalFen model.Fen
+	// IsFund 该候选是场内 ETF（快照 kind=etf）：费用档位判据，卖出没有印花税。
+	// 缺快照时按个股档（保守：多算一分成本，不会把不该批的单算成划算）。
+	IsFund bool
 	// EntryMissing 信号日没有该标的收盘价，所有窗口都无法计算。
 	EntryMissing bool
 	Returns      map[int]HorizonReturn
@@ -142,7 +145,7 @@ func Compute(ctx context.Context, st *store.Store, opts Options) (*Report, error
 		Decisions: len(decisions), Snapshots: len(snaps),
 	}
 	rep.Notes = append(rep.Notes,
-		"净收益按信号日收盘买入、第 N 个交易日收盘卖出估算，已扣双边佣金(最低5元/笔)、卖出印花税0.1%与过户费；实际执行通常在次日，滑点未计。")
+		"净收益按信号日收盘买入、第 N 个交易日收盘卖出估算，已扣双边佣金(最低5元/笔)、卖出印花税0.1%(场内基金免)与过户费；实际执行通常在次日，滑点未计。")
 	if len(snaps) == 0 {
 		rep.Notes = append(rep.Notes, "区间内没有候选快照（功能上线前的留痕），score/factors 不可用，行业与名称取自 stock_basic。")
 	}
@@ -174,6 +177,7 @@ func Compute(ctx context.Context, st *store.Store, opts Options) (*Report, error
 		}
 		if c, ok := snapByDate[d.TradeDate][d.TsCode]; ok {
 			r.Name, r.Industry, r.Rank, r.Score, r.CloseFen = c.Name, c.Industry, c.Rank, c.Score, c.CloseFen
+			r.IsFund = c.Kind == model.KindETF
 			r.Factors = model.FactorScore{Momentum: c.Momentum, Value: c.Value,
 				LowVol: c.LowVol, Liquidity: c.Liquidity}
 		}
@@ -292,7 +296,7 @@ func Compute(ctx context.Context, st *store.Store, opts Options) (*Report, error
 				continue
 			}
 			hr.Completed = true
-			hr.Net = netReturn(model.Fen(entryFen), model.Fen(rawFen(exit)), r.NotionalFen)
+			hr.Net = netReturn(model.Fen(entryFen), model.Fen(rawFen(exit)), r.NotionalFen, r.IsFund)
 			if idxOK && idxEntry.Close > 0 {
 				if idxExit, ok := bars[IndexCode][target]; ok && idxExit.Close > 0 {
 					hr.Index = idxExit.Close/idxEntry.Close - 1
@@ -404,8 +408,9 @@ func notionalOf(r Row, snap model.ScreenSnapshot) model.Fen {
 	return risk.DefaultMinSingleAmountFen
 }
 
-// netReturn 扣双边成本的净收益率。amount 为买入金额（分）。
-func netReturn(entry, exit, amount model.Fen) float64 {
+// netReturn 扣双边成本的净收益率。amount 为买入金额（分）；isFund 选费用档
+// （场内基金卖出没有印花税，20261104 策略 B3）。
+func netReturn(entry, exit, amount model.Fen, isFund bool) float64 {
 	if entry <= 0 || amount <= 0 {
 		return math.NaN()
 	}
@@ -413,7 +418,7 @@ func netReturn(entry, exit, amount model.Fen) float64 {
 	buyAmt := float64(entry) * qty
 	sellAmt := float64(exit) * qty
 	buyFee := float64(risk.BuyFeeFen(model.Fen(math.Round(buyAmt))))
-	sellFee := float64(risk.SellFeeFen(model.Fen(math.Round(sellAmt))))
+	sellFee := float64(risk.SellFeeFenFor(model.Fen(math.Round(sellAmt)), isFund))
 	return (sellAmt - sellFee - buyAmt - buyFee) / (buyAmt + buyFee)
 }
 

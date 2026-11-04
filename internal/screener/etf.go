@@ -317,6 +317,14 @@ func RunETF(ctx context.Context, repo ETFRepo, opts ETFOptions, budget Budget, t
 	// VWAP 与收盘价的 1~3% 偏差不会让结论翻面。
 	// 一手成本必须用未复权价（与成交成本同口径）：前复权价算出来的"一手 91 元"
 	// 在某次份额折算后就是假的。
+	// 整手窗口与个股链共用同一份判据（B1）：ETF 一手只有几十到一百多元，下界通常不构成
+	// 约束，但"通常"不是口径 —— 补口的立项依据正是"小额可负担"，判据必须与风控一致。
+	capFen, minFen, emptyWindow := budget.bounds()
+	if emptyWindow {
+		rep.Notes = append(rep.Notes, fmt.Sprintf(
+			"单笔下限 %.2f 元 > 单票上限 %.2f 元：整手窗口为空集，ETF 流动性这一级本次只判上界（配置矛盾，非筛选结果）",
+			budget.MinFen.Float(), capFen.Float()))
+	}
 	var ok []ETFInstrument
 	for _, in := range live {
 		ss := series[in.TsCode]
@@ -333,7 +341,7 @@ func RunETF(ctx context.Context, repo ETFRepo, opts ETFOptions, budget Budget, t
 		}
 		// 一手成本交给 affordableStage 统一乘一手股数：与个股那一级共用同一条预算线，
 		// 不另造一份"ETF 特殊口径"。
-		if pass, why := affordableStage(model.Fen(math.Round(last.RawClose)), budget.perSlot()); !pass {
+		if pass, why := affordableStage(model.Fen(math.Round(last.RawClose)), capFen, minFen); !pass {
 			tr.drop(etfSlugLiq, why)
 			continue
 		}
