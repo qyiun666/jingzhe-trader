@@ -105,6 +105,9 @@ signals.json
 # 本机环境标记 (开发环境声明, 不推送)
 agent.md
 
+# 本工程手册含账户实数与内部绝对路径，仓库为 public，不入库（与 agent.md、/docs/ 约定同源）
+/AGENTS.md
+
 # ==================== 设计文档 ====================
 # 用户要求：docs/ 不推送 GitHub（含 PRD/ARCHITECTURE 等内部设计稿，本地保留）
 # 面向外部 Agent 的接入文档已放根目录 MCP-AGENT-GUIDE.md，不在本忽略范围内
