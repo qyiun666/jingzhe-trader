@@ -195,6 +195,7 @@ func FilterConfigOf(cfg *config.Config) screener.FilterConfig {
 		PETtmMax:         cfg.GetFloat("screen.pe_ttm_max"),
 		PBMax:            cfg.GetFloat("screen.pb_max"),
 		MaxPerIndustry:   cfg.GetInt("screen.max_per_industry"),
+		SectorShadow:     cfg.GetBool("screen.sector_shadow"),
 	}
 }
 

@@ -58,6 +58,9 @@ type Candidate struct {
 	Mom          float64
 	SectorMom    float64
 	Reason       string
+	// SectorShadowFiltered B2 影子标记：sector 级淘汰时置 true，仅当 screen.sector_shadow=true
+	// 且 RegimeClosed=false 时写入 Report.SectorShadow。零值=false 表示正常候选或整条漏斗影子。
+	SectorShadowFiltered bool
 }
 
 // IsETF 是否场内 ETF：下游（LLM prompt、告警文案）按它换一套字段渲染。

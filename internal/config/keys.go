@@ -117,6 +117,11 @@ var KeySpecs = []KeySpec{
 	// 原始方向综合分 −0.0896（ICIR −0.648，n=689 个截面），反向 +0.0930；
 	// 前后两段独立样本（300 / 389 个截面）一边同为负、另一边同为正，非样本内挑参。
 	{Key: "screen.factor_mode", Type: TypeString, Default: "reversal"},
+	// B2 板块影子模式：true 时 sector 级淘汰不落 reasonSectorOut，改为落 Report.SectorShadow
+	// 并标 SectorShadowFiltered=true，供观测"若板块门槛关闭会多出哪些候选"。
+	// 默认 false = 零开销（不落库、不影响 Candidates、不改现有 trace 输出）。
+	// 与 RegimeClosed 互斥：关闸时整条漏斗影子已含 sector 级信息，SectorShadow 留空。
+	{Key: "screen.sector_shadow", Type: TypeBool, Default: "false"},
 	// ---------- 卖出规则 4（排名淘汰，signal.*）----------
 	// 2026-10-14 组长批准（无锡银行/物产中大两笔"买入 2-5 日即被排名淘汰"的复盘）：
 	// reversal 的 20 日 RankIC 隐含月度级调仓，而原规则 4 是日频 TopN 即时换仓，

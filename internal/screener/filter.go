@@ -36,6 +36,9 @@ type FilterConfig struct {
 	// MaxPerIndustry 因子 TopN 每行业最多几只（0=关闭）。保留带按同一上限选，
 	// 保证"候选一定是保留带成员"——否则买入当晚就可能因排名在半带外被规则 4 淘汰。
 	MaxPerIndustry int
+	// SectorShadow B2 板块影子模式：true 时 sector 级淘汰不落 reasonSectorOut，
+	// 改为落 Report.SectorShadow 并标 SectorShadowFiltered=true。
+	SectorShadow bool
 }
 
 // 漏斗各级淘汰原因（统一文案，只出现在日志与告警正文）。

@@ -168,6 +168,10 @@ type Report struct {
 	// Shadow 闸门关闭时跑完漏斗得到的候选：只用于展示"若开闸会选到谁"，
 	// 不进决策链（Candidates 保持 nil ⇒ 0 指令）。
 	Shadow []model.Candidate
+	// SectorShadow B2 板块影子清单：screen.sector_shadow=true 且 RegimeClosed=false 时，
+	// sector 级淘汰的标的落此字段并标 SectorShadowFiltered=true。与 Shadow 互斥：
+	// RegimeClosed=true 时本字段留空（整条漏斗影子已含 sector 级信息，避免重复）。
+	SectorShadow []model.Candidate
 	// Watch 排名保留带 = 因子排序前 TopN+BufferN（FilterConfig.BufferN）：
 	// 只喂卖出规则 4 的滞回判定（跌出保留带才淘汰），买入候选仍只取 TopN。
 	// 含 Candidates 全部条目且同序；关闸日漏斗照跑、保留带照常产出，
@@ -243,6 +247,28 @@ func (s *Screener) Run(ctx context.Context, tradeDate string, budget Budget) (*R
 		tr.emitRaw("regime", "大盘门槛(关闭，下方为影子)", len(survivors), len(survivors), nil)
 	}
 
+	// B2 板块影子模式：RegimeClosed=false 且 SectorShadow=true 时，sector 级淘汰的标的
+	// 落 Report.SectorShadow 并标 SectorShadowFiltered=true，供观测"若板块门槛关闭会多出哪些候选"。
+	// 与 RegimeClosed 互斥：关闸时整条漏斗影子已含 sector 级信息，SectorShadow 留空。
+	var sectorShadowCandidates []model.Candidate
+	if s.cfg.SectorShadow && !rep.RegimeClosed {
+		for _, stk := range survivors {
+			if ok, _ := sectorGateStage(stk.Industry, hot); !ok {
+				sectorShadowCandidates = append(sectorShadowCandidates, model.Candidate{
+					TsCode:               stk.TsCode,
+					Name:                 stk.Name,
+					Industry:             stk.Industry,
+					Close:                in.price(stk.TsCode),
+					CircMvW:              stk.CircMvW,
+					PETtm:                stk.PETtm,
+					PB:                   stk.PB,
+					TurnoverRate:         stk.TurnoverRate,
+					SectorShadowFiltered: true,
+				})
+			}
+		}
+	}
+
 	survivors = s.filterStage(tr, "sector", "板块强弱TopK", survivors, func(stk model.StockBasic) (bool, string) {
 		return sectorGateStage(stk.Industry, hot)
 	})
@@ -280,6 +306,7 @@ func (s *Screener) Run(ctx context.Context, tradeDate string, budget Budget) (*R
 	rep.ScoredTotal = len(survivors)
 	scored, watch := s.pickTopN(survivors, in, sectors, tr)
 	rep.Watch = watch
+	rep.SectorShadow = sectorShadowCandidates
 	if rep.RegimeClosed {
 		rep.Shadow = scored
 		rep.Empty = true // 关闸当日仍是"0 候选"，只是原因明确且带影子清单
