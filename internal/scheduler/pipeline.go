@@ -109,10 +109,11 @@ func eveningPipeline(ctx context.Context, rc *observability.RunCtx, d Deps) erro
 		return fmt.Errorf("更新持仓期间高点: %w", err)
 	}
 	caps := WeakCapsOf(d.Config)
-	cands, watch, budget, rp, err := screenCandidates(ctx, rc, d, date, rp, caps)
+	rep, watch, budget, rp, err := screenCandidates(ctx, rc, d, date, rp, caps)
 	if err != nil {
 		return fmt.Errorf("③ 选股: %w", err)
 	}
+	cands := rep.Candidates
 	// 弱势试探留痕：门槛被人为关闭（gate_enabled=false）且大盘仍弱势时，风控已在
 	// ScreenBudget 里按同一份 caps 收缩到试探档，漏斗与决策链共用同一条单票上限线
 	// （不收紧的话，"放开闸门"与"满仓接飞刀"是同一件事）。这里只负责让判定可归因。
@@ -129,7 +130,11 @@ func eveningPipeline(ctx context.Context, rc *observability.RunCtx, d Deps) erro
 	cands = appendETFCandidates(ctx, rc, d, date, cands, budget)
 	// 候选快照先于决策落库：LLM 评审失败时当日仍然要有"当时选出了谁、评分多少"，
 	// 否则归因只剩失败留痕，无法区分"没选出来"与"选了但没批"。
-	if err := writeScreenSnapshot(ctx, d, date, cands, rp); err != nil {
+	//
+	// 板块影子摘要与快照同批落库而不是另起一行：screen:topn 是"当日选股侧到底看见了什么"
+	// 的唯一每日留痕点（每天必写、重跑覆盖、归因与 get_logs 都读它），另开一行就会出现
+	// 第二个选股留痕点，两个口径迟早漂移。摘要本身在开关关闭时恒为空串 ⇒ 载荷不写该键。
+	if err := writeScreenSnapshot(ctx, d, date, cands, rp, rep.SectorShadowBrief()); err != nil {
 		observability.S().Warnw("候选快照落库失败，当日归因将缺少成分",
 			"date", date, "candidates", len(cands), "err", err.Error())
 		rc.Degrade("SCREEN_SNAPSHOT_FAILED", "候选快照落库失败："+err.Error())
@@ -144,12 +149,19 @@ func eveningPipeline(ctx context.Context, rc *observability.RunCtx, d Deps) erro
 //
 // 只写归因需要的字段：代码、评分、因子、行业、收盘价与当晚资金口径。
 // 失败不阻断交易（诊断缺行不能反过来让当日无单），但必须降级留痕。
-func writeScreenSnapshot(ctx context.Context, d Deps, date string, cands []model.Candidate, rp risk.RiskParams) error {
+//
+// sectorShadowBrief 是 B2 板块影子摘要（report 未开启该观测时为空串）：走载荷末尾的
+// omitempty 独立字段，既不动 candidates 里的任何既有键，也不动键序 ⇒ 关闭观测的日子
+// detail 与本参数出现前逐字节相同，逐日 diff 仍然可比。
+func writeScreenSnapshot(ctx context.Context, d Deps, date string, cands []model.Candidate, rp risk.RiskParams,
+	sectorShadowBrief string) error {
 	snap := model.ScreenSnapshot{
 		TradeDate:     date,
 		TotalAssetFen: int64(rp.TotalAsset),
 		SlotFen:       int64(rp.SingleCapFen()),
 		Candidates:    make([]model.CandidateSnapshot, 0, len(cands)),
+
+		SectorShadowBrief: sectorShadowBrief,
 	}
 	for _, c := range cands {
 		snap.Candidates = append(snap.Candidates, model.CandidateSnapshot{
@@ -286,19 +298,22 @@ func gateFreshness(ctx context.Context, d Deps, date string) error {
 	return nil
 }
 
-// screenCandidates 跑选股漏斗（全程内存），返回买入候选（TopN）、排名保留带（TopN+buffer，
-// 仅供卖出规则 4 滞回）、本轮大盘口径与**生效后的**风控参数
+// screenCandidates 跑选股漏斗（全程内存），返回漏斗报告（买入候选在 rep.Candidates 里）、
+// 排名保留带（TopN+buffer，仅供卖出规则 4 滞回）、本轮大盘口径与**生效后的**风控参数
 // （弱势收缩发生在 ScreenBudget 内，调用方拿到的 rp 与漏斗用的是同一份）。
+//
+// 返回整个 rep 而不是只返回候选切片，是为了给观测侧留一个取数入口（B2 板块影子摘要
+// rep.SectorShadowBrief）；决策链照旧只读 rep.Candidates，rep 里的其它字段一概不参与下单。
 //
 // 关闸日保留带退回 nil：那是"买入停摆"的口径，卖出侧维持既有的淘汰/大盘恶化行为，
 // 不让保留带改动从未生效过的路径。
 func screenCandidates(ctx context.Context, rc *observability.RunCtx, d Deps, date string,
-	rp risk.RiskParams, caps WeakCaps) (cands, watch []model.Candidate, _ screener.Budget, _ risk.RiskParams, err error) {
+	rp risk.RiskParams, caps WeakCaps) (rep *screener.Report, watch []model.Candidate, _ screener.Budget, _ risk.RiskParams, err error) {
 	budget, rp, err := ScreenBudget(ctx, d.Store, d.Ledger, date, rp, MarketGateOf(d.Config), caps)
 	if err != nil {
 		return nil, nil, budget, rp, err
 	}
-	rep, err := d.Screener.Run(ctx, date, budget)
+	rep, err = d.Screener.Run(ctx, date, budget)
 	if err != nil {
 		return nil, nil, budget, rp, err
 	}
@@ -328,7 +343,7 @@ func screenCandidates(ctx context.Context, rc *observability.RunCtx, d Deps, dat
 		// 保留带不参与——不能让缓冲把"停摆退出"变成"部分保留"。
 		watch = nil
 	}
-	return rep.Candidates, watch, budget, rp, nil
+	return rep, watch, budget, rp, nil
 }
 
 // candidateExpect 候选产出物的期望数量。

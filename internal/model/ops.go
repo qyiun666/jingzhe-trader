@@ -58,11 +58,18 @@ type PortfolioSnapshot struct {
 // ScreenSnapshot 每日候选快照（run_trace.detail 的 JSON 载荷）。
 // 只存归因用得到的字段：代码、评分、因子、行业与当日资金口径；
 // 不存理由/估值明细——那些在日志与 LLM 留痕里，重复存会撑大轨迹表。
+//
+// 新增字段一律**追加在末尾且带 omitempty**：JSON 的键序跟随结构体声明序，插入中间会让
+// 同一天的 detail 逐字节漂移（归因与逐日 diff 都在比这句），omitempty 则保证开关关闭时
+// 载荷与本字段出现前完全相同。
 type ScreenSnapshot struct {
 	TradeDate     string              `json:"trade_date"`
 	TotalAssetFen int64               `json:"total_asset_fen"`
 	SlotFen       int64               `json:"slot_fen"` // 当晚生效的单票上限（弱势档为收缩后的值）
 	Candidates    []CandidateSnapshot `json:"candidates"`
+	// SectorShadowBrief B2 板块影子清单摘要（screen.sector_shadow=true 且当日未关闸时才有内容）。
+	// 独立字段、不参与任何决策与既有 candidates 的渲染；关闭开关时为空串 ⇒ 不写出该键。
+	SectorShadowBrief string `json:"sector_shadow_brief,omitempty"`
 }
 
 // CandidateSnapshot 单只候选的快照。

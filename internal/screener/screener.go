@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"jingzhe-trader/internal/model"
 	"jingzhe-trader/internal/observability"
@@ -250,6 +251,8 @@ func (s *Screener) Run(ctx context.Context, tradeDate string, budget Budget) (*R
 	// B2 板块影子模式：RegimeClosed=false 且 SectorShadow=true 时，sector 级淘汰的标的
 	// 落 Report.SectorShadow 并标 SectorShadowFiltered=true，供观测"若板块门槛关闭会多出哪些候选"。
 	// 与 RegimeClosed 互斥：关闸时整条漏斗影子已含 sector 级信息，SectorShadow 留空。
+	// 这是「附加」观测：下面的 sector 级 filterStage 与"非强势板块"计数照常执行，
+	// 漏斗数字与候选集合不因开关改变。唯一消费出口是 SectorShadowBrief() → screen:topn 快照。
 	var sectorShadowCandidates []model.Candidate
 	if s.cfg.SectorShadow && !rep.RegimeClosed {
 		for _, stk := range survivors {
@@ -553,6 +556,57 @@ func (r *Report) ShadowBrief() string {
 
 // shadowTop 告警正文里列出的影子候选条数（只取前几名，全量在日志与 CLI）。
 const shadowTop = 5
+
+// SectorShadowBrief B2 板块影子清单摘要（screen.sector_shadow=true 时才有内容）。
+//
+// 它回答的是与 ShadowBrief 不同的另一个问题：ShadowBrief 在关闸日说"若开闸会选到谁"，
+// 本函数在开闸日说"板块门槛今天挡住了谁"。两者互斥——同一天只会有一句，否则一条 detail
+// 里出现两份口径重叠的影子清单，读的人反而判断不出哪一份是结论。
+//
+// 清单里的标的在 sector 级就被剔掉，从未进入打分，所以没有 Rank/Score 可展示；这里只给
+// 代码/名称/行业/收盘价（收盘价用来判断"若放开板块门槛，这些票本账户买不买得起"）。
+// 顺序沿用漏斗输入序（基础资格 survivors），不是因子排名——说清这点比假装有序诚实。
+//
+// 整段长度上限 sectorShadowBriefMax 个字符：这一句最终落在 run_trace 的 screen:topn
+// detail 里，会被 get_logs 与日报整段读出来。超长时从尾部整只丢弃（不截半只——半条记录
+// 断在串里连代码都读不出来），丢弃只数由"列前 N"如实反映，总数永远是精确值。
+func (r *Report) SectorShadowBrief() string {
+	// 关闸日（影子已由 ShadowBrief 覆盖）与总数为 0 都返回空串：关闭开关时 SectorShadow
+	// 必为空 ⇒ 这里一次遍历都不做，调用方的 omitempty 字段也就不写，detail 逐字节不变。
+	if r.RegimeClosed || len(r.SectorShadow) == 0 {
+		return ""
+	}
+	total := len(r.SectorShadow)
+	entries := make([]string, 0, sectorShadowTop)
+	for _, c := range r.SectorShadow[:min(sectorShadowTop, total)] {
+		entries = append(entries, fmt.Sprintf("%s %s/%s %.2f元", c.TsCode, c.Name, c.Industry, c.Close.Float()))
+	}
+	for n := len(entries); n >= 1; n-- {
+		brief := joinSectorShadow(total, n, entries[:n])
+		if utf8.RuneCountInString(brief) <= sectorShadowBriefMax {
+			return brief
+		}
+	}
+	// 连一只都放不下（名称/行业异常长）：至少把总数报全，宁可不列也不给半条记录。
+	return fmt.Sprintf("板块影子 %d 只（sector 级淘汰，未参与打分；条目过长，只报总数）。", total)
+}
+
+// joinSectorShadow 拼一句板块影子摘要：总数永远精确，实际列出只数由 n 决定。
+func joinSectorShadow(total, n int, entries []string) string {
+	head := fmt.Sprintf("板块影子 %d 只（sector 级淘汰，未参与打分，漏斗输入序", total)
+	if total > n {
+		head += fmt.Sprintf("，列前 %d", n)
+	}
+	return head + "）：" + strings.Join(entries, "、") + "。"
+}
+
+// sectorShadowTop 板块影子摘要列出的条数（默认 10）。比 shadowTop（5）宽：这一句是纯观测
+// 通道、不进任何决策，多列几只才看得出"板块门槛挡住的是不是一小撮同质标的"；
+// 整段仍由 sectorShadowBriefMax 兜住，不会撑爆 detail。
+const sectorShadowTop = 10
+
+// sectorShadowBriefMax 摘要整段长度上限，按字符数计（不是字节数——中文 3 字节）。
+const sectorShadowBriefMax = 600
 
 // load 读取因子窗口内的全部截面数据；窗口有日线缺口时直接报错（不拿旧日期凑数）。
 func (s *Screener) load(ctx context.Context, tradeDate string) (*inputs, error) {

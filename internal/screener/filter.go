@@ -36,8 +36,12 @@ type FilterConfig struct {
 	// MaxPerIndustry 因子 TopN 每行业最多几只（0=关闭）。保留带按同一上限选，
 	// 保证"候选一定是保留带成员"——否则买入当晚就可能因排名在半带外被规则 4 淘汰。
 	MaxPerIndustry int
-	// SectorShadow B2 板块影子模式：true 时 sector 级淘汰不落 reasonSectorOut，
-	// 改为落 Report.SectorShadow 并标 SectorShadowFiltered=true。
+	// SectorShadow B2 板块影子观测开关：true 时**额外**把 sector 级淘汰的标的落
+	// Report.SectorShadow（标 SectorShadowFiltered=true），并由 SectorShadowBrief() 摘要
+	// 写进 screen:topn 快照。
+	// 语义是「附加」不是「替换」：sector 这一级 filterStage 无条件照常执行，
+	// reasonSectorOut（"非强势板块"）计数与各级漏斗数字都不受本开关影响。
+	// false（默认）= 零开销：不遍历、不产出清单、快照载荷里连该键都不写。
 	SectorShadow bool
 }
 

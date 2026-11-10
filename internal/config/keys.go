@@ -117,10 +117,14 @@ var KeySpecs = []KeySpec{
 	// 原始方向综合分 −0.0896（ICIR −0.648，n=689 个截面），反向 +0.0930；
 	// 前后两段独立样本（300 / 389 个截面）一边同为负、另一边同为正，非样本内挑参。
 	{Key: "screen.factor_mode", Type: TypeString, Default: "reversal"},
-	// B2 板块影子模式：true 时 sector 级淘汰不落 reasonSectorOut，改为落 Report.SectorShadow
-	// 并标 SectorShadowFiltered=true，供观测"若板块门槛关闭会多出哪些候选"。
-	// 默认 false = 零开销（不落库、不影响 Candidates、不改现有 trace 输出）。
-	// 与 RegimeClosed 互斥：关闸时整条漏斗影子已含 sector 级信息，SectorShadow 留空。
+	// B2 板块影子观测模式：true 时**额外**产出 Report.SectorShadow（sector 级淘汰的标的，
+	// 标 SectorShadowFiltered=true），并由 Report.SectorShadowBrief() 摘要写进 screen:topn
+	// 快照的 sector_shadow_brief 字段，供观测"若板块门槛关闭会多出哪些候选"。
+	// 语义是「附加」不是「替换」：sector 这一级 filterStage 无条件照常执行，reasonSectorOut
+	// （"非强势板块"）计数、各级漏斗数字、既有 trace 文案与候选集合都不受本开关影响——
+	// 开关只额外产出一份观测清单，因此开关前后的 trace 同型可比。
+	// 默认 false = 零开销（不遍历、不生成摘要、载荷里连该键都不写）。
+	// 与 RegimeClosed 互斥：关闸日整条漏斗影子（ShadowBrief）已含 sector 级信息，此处留空。
 	{Key: "screen.sector_shadow", Type: TypeBool, Default: "false"},
 	// ---------- 卖出规则 4（排名淘汰，signal.*）----------
 	// 2026-10-14 组长批准（无锡银行/物产中大两笔"买入 2-5 日即被排名淘汰"的复盘）：
