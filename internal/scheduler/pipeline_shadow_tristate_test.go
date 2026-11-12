@@ -3,6 +3,9 @@ package scheduler
 import (
 	"context"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"strings"
 	"testing"
 
@@ -140,5 +143,52 @@ func TestWriteScreenSnapshotSectorShadowTriState(t *testing.T) {
 	if len(snapZero.Candidates) != len(snapOff.Candidates) ||
 		snapZero.Candidates[0] != snapOff.Candidates[0] {
 		t.Errorf("③ 改动了 candidates: %+v vs %+v", snapZero.Candidates, snapOff.Candidates)
+	}
+}
+
+// TestScreenSnapshotCallSiteDerivesShadowBrief 接线锁：调用 writeScreenSnapshot 的那个函数
+// 体内必须存在 SectorShadowBrief 的取用（写成选择器，允许先落进局部变量再传参）。
+//
+// 为什么要有这一条：上面所有载荷用例都是**直接调 writer**，它们能证明 writer 正确，
+// 却证明不了"当日那行 detail 里真的会有这个键"。11-10 的故障形态正是产出侧齐备、
+// 消费侧零调用，而彼时的测试全绿 —— 本工单要消灭的"看不见 ⇒ 判不出"不能只消灭一半。
+// 变异验证：把调用点的实参换成 "" 或 rep.ShadowBrief()，本用例必须红。
+func TestScreenSnapshotCallSiteDerivesShadowBrief(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "pipeline.go", nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("解析 pipeline.go 失败（接线锁不能空跑）: %v", err)
+	}
+	checked := 0
+	ast.Inspect(file, func(n ast.Node) bool {
+		fd, ok := n.(*ast.FuncDecl)
+		if !ok || fd.Body == nil {
+			return true
+		}
+		var callsWriter, takesBrief bool
+		ast.Inspect(fd.Body, func(m ast.Node) bool {
+			switch e := m.(type) {
+			case *ast.CallExpr:
+				if id, ok := e.Fun.(*ast.Ident); ok && id.Name == "writeScreenSnapshot" {
+					callsWriter = true
+				}
+			case *ast.SelectorExpr:
+				if e.Sel.Name == "SectorShadowBrief" {
+					takesBrief = true
+				}
+			}
+			return true
+		})
+		if callsWriter {
+			checked++
+			if !takesBrief {
+				t.Errorf("%s 调用了 writeScreenSnapshot 却没有取用 SectorShadowBrief ⇒ 影子键不会出现在当日 detail",
+					fd.Name.Name)
+			}
+		}
+		return true
+	})
+	if checked == 0 {
+		t.Fatal("pipeline.go 里找不到 writeScreenSnapshot 调用点：接线锁本身失效了（改名/搬走也要有人发现）")
 	}
 }
