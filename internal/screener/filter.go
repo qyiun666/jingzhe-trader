@@ -42,6 +42,8 @@ type FilterConfig struct {
 	// 语义是「附加」不是「替换」：sector 这一级 filterStage 无条件照常执行，
 	// reasonSectorOut（"非强势板块"）计数与各级漏斗数字都不受本开关影响。
 	// false（默认）= 零开销：不遍历、不产出清单、快照载荷里连该键都不写。
+	// true 且当日未关闸时清单必为**非 nil**（0 淘汰时是空切片），摘要据此分出
+	// "未开启 / 已开启但 0 淘汰 / 已开启且有清单"三态，见 Report.SectorShadow。
 	SectorShadow bool
 }
 

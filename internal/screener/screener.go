@@ -172,6 +172,10 @@ type Report struct {
 	// SectorShadow B2 板块影子清单：screen.sector_shadow=true 且 RegimeClosed=false 时，
 	// sector 级淘汰的标的落此字段并标 SectorShadowFiltered=true。与 Shadow 互斥：
 	// RegimeClosed=true 时本字段留空（整条漏斗影子已含 sector 级信息，避免重复）。
+	// 三态靠 nil / 空非 nil / 非空区分（派工 20261112 第 4 条）：
+	//   nil      = 观测未生效（开关关闭，或关闸互斥）⇒ sector_shadow_brief 键不出现
+	//   空非 nil = 观测已生效、当日 sector 级 0 淘汰  ⇒ 键出现，值为 sectorShadowEmptyBrief
+	//   非空     = 正常清单                                    ⇒ 键出现，值为总数 + 前 N 只
 	SectorShadow []model.Candidate
 	// Watch 排名保留带 = 因子排序前 TopN+BufferN（FilterConfig.BufferN）：
 	// 只喂卖出规则 4 的滞回判定（跌出保留带才淘汰），买入候选仍只取 TopN。
@@ -255,6 +259,10 @@ func (s *Screener) Run(ctx context.Context, tradeDate string, budget Budget) (*R
 	// 漏斗数字与候选集合不因开关改变。唯一消费出口是 SectorShadowBrief() → screen:topn 快照。
 	var sectorShadowCandidates []model.Candidate
 	if s.cfg.SectorShadow && !rep.RegimeClosed {
+		// 先置成**非 nil 的空切片**：nil 表示"这段一次都没跑"（开关关闭或关闸互斥），
+		// 空而非 nil 表示"跑了、当日 sector 级确实 0 淘汰"。SectorShadowBrief 靠这一点
+		// 把三态写成不同的载荷，否则「开关没接上」与「今天确实没挡住票」在数据面上同形。
+		sectorShadowCandidates = []model.Candidate{}
 		for _, stk := range survivors {
 			if ok, _ := sectorGateStage(stk.Industry, hot); !ok {
 				sectorShadowCandidates = append(sectorShadowCandidates, model.Candidate{
@@ -570,13 +578,25 @@ const shadowTop = 5
 // 整段长度上限 sectorShadowBriefMax 个字符：这一句最终落在 run_trace 的 screen:topn
 // detail 里，会被 get_logs 与日报整段读出来。超长时从尾部整只丢弃（不截半只——半条记录
 // 断在串里连代码都读不出来），丢弃只数由"列前 N"如实反映，总数永远是精确值。
+//
+// 三态可分（派工 20261112 第 4 条，11-10 那次"开关开了却看不到产物"无法定性的直接教训）：
+//
+//	r.RegimeClosed 或 SectorShadow == nil → ""     载荷不写键（观测未生效；关闭态逐字节同型）
+//	清单为空但非 nil                      → 0 只句  载荷写键，证明观测已生效且当日确实 0 淘汰
+//	清单非空                              → 总数句   与今日实况同型
 func (r *Report) SectorShadowBrief() string {
-	// 关闸日（影子已由 ShadowBrief 覆盖）与总数为 0 都返回空串：关闭开关时 SectorShadow
-	// 必为空 ⇒ 这里一次遍历都不做，调用方的 omitempty 字段也就不写，detail 逐字节不变。
-	if r.RegimeClosed || len(r.SectorShadow) == 0 {
+	// 关闸日（影子已由 ShadowBrief 覆盖）与开关关闭（清单从未计算 ⇒ nil）都返回空串：
+	// 关闭开关时这里连清单都不读，一次遍历都不做，调用方的 omitempty 字段也就不写，
+	// detail 逐字节不变。
+	if r.RegimeClosed || r.SectorShadow == nil {
 		return ""
 	}
 	total := len(r.SectorShadow)
+	if total == 0 {
+		// 算过且为空：必须留下一句，否则与"没接上/没开启"同形（这里不列任何标的，
+		// 所以不写"漏斗输入序"——没有顺序可交代）。
+		return sectorShadowEmptyBrief
+	}
 	entries := make([]string, 0, sectorShadowTop)
 	for _, c := range r.SectorShadow[:min(sectorShadowTop, total)] {
 		entries = append(entries, fmt.Sprintf("%s %s/%s %.2f元", c.TsCode, c.Name, c.Industry, c.Close.Float()))
@@ -607,6 +627,16 @@ const sectorShadowTop = 10
 
 // sectorShadowBriefMax 摘要整段长度上限，按字符数计（不是字节数——中文 3 字节）。
 const sectorShadowBriefMax = 600
+
+// sectorShadowEmptyBrief 观测已生效、当日 sector 级 0 淘汰时的定长文案（66 字符，
+// 约为 sectorShadowBriefMax 预算的九分之一，不走截断分支）。
+//
+// 措辞理由：开头仍是"板块影子 0 只"，与有清单时的"板块影子 N 只"同前缀 ⇒ 一句 grep
+// 就能把两种日子都捞出来，总数永远精确这条规则不因空集破例。"观测开关已开启"是本句唯一
+// 的使命：键出现本身就等于开关为真，把这句话写进值里，读的人不必再回头确认接线。
+// 末尾括号堵掉另一个误读：sector 级 0 淘汰也可能是上游各级先把池子筛空了（此时本级的
+// In 就是 0），不代表板块门槛"放了行"——想知道是哪一种看同一行的漏斗数字即可。
+const sectorShadowEmptyBrief = "板块影子 0 只（sector 级淘汰，未参与打分）：观测开关已开启，当日 sector 级淘汰为空（上游各级先筛空时同样为 0）。"
 
 // load 读取因子窗口内的全部截面数据；窗口有日线缺口时直接报错（不拿旧日期凑数）。
 func (s *Screener) load(ctx context.Context, tradeDate string) (*inputs, error) {
