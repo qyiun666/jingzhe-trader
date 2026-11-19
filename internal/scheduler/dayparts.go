@@ -114,8 +114,9 @@ func todayPlanLines(ctx context.Context, d Deps, date string) ([]string, []notif
 
 // tradeConclusion 最近一次收盘流水线给当日留下的人话结论（供计划/日报引用）。
 //
-// 数据来源是 job:evening_pipeline 轨迹行：它的 Detail 在"有单"时为空，
+// 数据来源是 job:evening_pipeline 轨迹行：它的 Detail 正文在"有单"时为空，
 // 在"无单/降级"时写着原因（SCREEN_EMPTY 的关闸说明、ALL_REJECTED、NO_TICKET_FROM_CANDIDATES）。
+// 行尾另有 runJob 追加的「｜ 触发=…」观测标注，读前先剔（见 stripTriggerNote）。
 // 当日 16:30 之前该行还不存在，故按 ≤date 取最近一行（通常是上一交易日的）。
 func tradeConclusion(ctx context.Context, d Deps, date string) string {
 	t, ok, err := d.Store.TraceRepo().LatestBySubject(ctx, model.TraceJob(JobEveningPipeline), date)
@@ -125,10 +126,12 @@ func tradeConclusion(ctx context.Context, d Deps, date string) string {
 	if !ok {
 		return "（暂无收盘流水线记录）"
 	}
-	if t.Outcome == model.TraceOK && t.Detail == "" {
+	// detail 末尾的「触发=…」是调度观测标注，不是结论正文，判空与展示前都先剔掉。
+	concl := stripTriggerNote(t.Detail)
+	if t.Outcome == model.TraceOK && concl == "" {
 		return fmt.Sprintf("收盘流水线（%s）正常跑完，见下方待执行指令", t.TradeDate)
 	}
-	return fmt.Sprintf("收盘流水线（%s）：%s", t.TradeDate, t.Detail)
+	return fmt.Sprintf("收盘流水线（%s）：%s", t.TradeDate, concl)
 }
 
 // positionLines 持仓逐条：成本与止损参考线（风控参数读不到就整段失败）。

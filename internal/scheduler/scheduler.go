@@ -3,10 +3,17 @@
 // 自研 tick 不引 cron（§9.3）：到点触发 + 当日未成功补跑 + 失败冷却 30 分钟
 // 只需 parseClock + TraceRepo().HasSucceeded + TraceRepo().LastAt 三个判断。
 //
+// 「补跑」有两个完全不同的落地面，别混成一个（判定顺序见 dueTriggers）：
+//   - 跨进程补跑：fired 是内存态，重启即清空，启动后那一轮按 run_trace 轨迹把当日
+//     未做成（既非 ok 也非 partial）的任务追回来 —— 验收 §10.5-9 指的是这一面；
+//   - 当日补跑：只有同一任务配了多个时刻才存在。dueTriggers 在执行前预标记 fired，
+//     失败不回滚、当天不清 ⇒ 单时刻任务当日失败后不再重跑，连 shouldSkip 都到不了。
+//
 // 原则：
 //   - panic 只允许在 Scheduler.runJob 中 recover（§11.1）；
 //   - 补跑按 run_trace 轨迹判定（重启后自动补跑当日未做成任务，验收 §10.5-9）；
-//   - 失败冷却 30 分钟内不重复触发（验收 §10.5-10）；
+//   - 失败冷却 30 分钟内不重复触发**已配置的**后续时刻（验收 §10.5-10）；冷却只管放行，
+//     不制造时刻 —— 没有下一个时刻就没有下一次尝试；
 //   - 时间注入（fake clock）可加速跑完整交易日（验收 §10.5-8）。
 package scheduler
 
@@ -197,8 +204,9 @@ func (s *Scheduler) Tick(ctx context.Context, now time.Time) []string {
 			if status != "" {
 				triggered = append(triggered, spec.Name)
 				if spec.EveryMinutes > 0 && status == model.TraceFail {
-					// 间隔任务这轮失败：退避一个 cooldown，别每 5 分钟撞同一堵墙
-					// （到点任务的重试节奏由 shouldSkip 的轨迹冷却承担）。
+					// 间隔任务这轮失败：退避一个 cooldown，别每 5 分钟撞同一堵墙。
+					// 到点任务不走这条分支，也不该按"轨迹冷却会自动重试"理解：fired 已在
+					// 执行前标记，当天还能不能再跑只看有没有配了下一个时刻（见 dueTriggers）。
 					s.markIntervalBackoff(spec.Name, now)
 				}
 				if s.onDone != nil {
@@ -277,7 +285,11 @@ func (s *Scheduler) dueTriggers(spec JobSpec, date string, now time.Time) []stri
 		if s.shouldSkip(spec.Name, date) {
 			continue // 冷却中：不标记 fired，冷却到期自动重试（补跑语义）
 		}
-		s.fired[key] = true // 预标记：无论成败，本次窗口只执行一次；失败靠冷却+下一窗口重试
+		s.fired[key] = true // 预标记：失败不回滚、内存态当天不清 ⇒ 正常首触后该时刻当天不再执行
+		// 当天还想再跑只有三条路：① 同一 spec 里另一个已配置的 At 时刻（key 不同，仍受上面
+		// shouldSkip 的"已成即跳过"与冷却约束）；② 进程重启（fired 清空后走轨迹补跑判定）；
+		// ③ 首触那一刻正好被冷却挡住 —— 下面两个 continue 都不标记 fired，冷却到期后
+		// 同一时刻仍可放行（典型情形：手工 run task 先写了一行 fail，紧跟着到点触发）。
 		due = append(due, hm)
 	}
 	return due
@@ -322,7 +334,8 @@ func (s *Scheduler) dueInterval(spec JobSpec, date string, now time.Time) []stri
 }
 
 // markIntervalBackoff 给刚失败的间隔轮次挂退避（时长 = cooldown）。
-// 只有间隔任务用得到：到点任务的重试节奏由 shouldSkip 的轨迹冷却承担。
+// 只有间隔任务用得到：到点任务当天能否再来一次由 fired 与"是否配了下一个时刻"决定，
+// shouldSkip 的轨迹冷却只是那个时刻的准入条件，不是独立的重试定时器。
 func (s *Scheduler) markIntervalBackoff(jobName string, at time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -441,6 +454,12 @@ func (s *Scheduler) runJob(ctx context.Context, spec JobSpec, date, trigger stri
 		}
 	}
 
+	// 触发来源与时刻并入 job 行的 detail 文本（run_trace 没有对应列，也不新加列/新加键）：
+	// 同一任务配多个时刻后共用一行，事后要能看出这行是哪一次执行留下的。判定面不受影响 ——
+	// HasSucceeded 只看 outcome，shouldSkip 看 outcome+at，告警另有自己的 subject；
+	// 唯一读这段文本正文的邮件结论用 stripTriggerNote 剔掉标注（dayparts.go tradeConclusion）。
+	detail = appendTriggerNote(detail, trigger, manual)
+
 	werr := s.st.TraceRepo().Write(ctx, model.RunTrace{
 		TradeDate: date, Subject: model.TraceJob(spec.Name),
 		Outcome: outcome, Detail: detail, At: s.clock().UTC().Format(time.RFC3339),
@@ -451,6 +470,40 @@ func (s *Scheduler) runJob(ctx context.Context, spec JobSpec, date, trigger stri
 	observability.S().Infow("任务完成", "job", spec.Name, "date", date,
 		"outcome", outcome, "detail", detail, "trigger", trigger)
 	return outcome, jobErr
+}
+
+// triggerNoteSep 分隔"给人看的结论正文"与"触发标注"，读回时按它剔掉标注（stripTriggerNote）。
+const triggerNoteSep = " ｜ "
+
+// appendTriggerNote 把触发来源（scheduler / manual）与触发时刻追加到 job 行 detail 末尾。
+// 原有失败原因或降级说明一字不动，只在其后追加一段。
+//
+// manual 路径的 trigger 本身就是 "manual"（RunNamed / RunTaskOnce 传进来的现成值），
+// 不再重复拼 "@manual"。
+func appendTriggerNote(detail, trigger string, manual bool) string {
+	note := "触发=scheduler"
+	switch {
+	case manual:
+		note = "触发=manual"
+	case trigger != "":
+		note += "@" + trigger
+	}
+	if detail == "" {
+		return note
+	}
+	return detail + triggerNoteSep + note
+}
+
+// stripTriggerNote 剔掉 appendTriggerNote 追加的标注，还原结论正文。
+// 邮件里的"收盘流水线正常跑完"靠 detail 是否为空判定，不能被这条纯观测文本带偏。
+func stripTriggerNote(detail string) string {
+	if i := strings.Index(detail, triggerNoteSep+"触发="); i >= 0 {
+		return detail[:i]
+	}
+	if strings.HasPrefix(detail, "触发=") {
+		return ""
+	}
+	return detail
 }
 
 // SimulateDay 用注入时钟顺序推演一个完整交易日（06:50→21:00，步长 1 分钟），
