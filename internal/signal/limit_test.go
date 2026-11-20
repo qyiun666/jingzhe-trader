@@ -508,6 +508,30 @@ func TestLimitBriefTruncatesEntriesToRuneBudget(t *testing.T) {
 	}
 }
 
+// 生产形态实测：ts_code 9 字符 + 最长状态 blocked_limit_down(18) + 最长形态 close_only(10)
+// + 最长价格 1234.56(8) = 单条 48 字符，列满 10 条也不该撞到 600。
+// 这条存在的理由：裁定【5】要「长度实测上界」，而 stress fixture 用的是假长代码，
+// 不能拿它当生产数；真形态下若反而超限，说明预算给小了，必须在接线前报组长。
+// 档位刻意取「收盘=跌停价、high>low」这组最长组合：状态串比拦买长 2 字符。
+func TestLimitBriefProductionShapeFitsBudget(t *testing.T) {
+	var codes []string
+	rows := map[string]LimitDay{}
+	for i := 0; i < 10; i++ {
+		code := fmt.Sprintf("60%04d.SZ", i)
+		codes = append(codes, code)
+		rows[code] = LimitDay{Up: fen(1357.99), Down: fen(1234.56), RawClose: fen(1234.56), High: fen(1234.57), Low: fen(1230.00)}
+	}
+	got := LimitBrief(codes, rows)
+	n := utf8.RuneCountInString(got)
+	t.Logf("生产形态实测：列满 10 条 = %d 字符（上限 600）", n)
+	if n > 600 {
+		t.Errorf("生产形态已撞上限，预算需报组长重议：%d 字符", n)
+	}
+	if strings.Count(got, "blocked_limit_down/close_only") != 10 {
+		t.Errorf("生产形态应能列满 10 条：%q", got)
+	}
+}
+
 // T16 同型：摘要也是纯函数，同输入必得逐字节相同的串。
 func TestLimitBriefIsDeterministic(t *testing.T) {
 	up, down := fen(11.00), fen(9.00)
