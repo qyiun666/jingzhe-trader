@@ -70,6 +70,11 @@ type ScreenSnapshot struct {
 	// SectorShadowBrief B2 板块影子清单摘要（screen.sector_shadow=true 且当日未关闸时才有内容）。
 	// 独立字段、不参与任何决策与既有 candidates 的渲染；关闭开关时为空串 ⇒ 不写出该键。
 	SectorShadowBrief string `json:"sector_shadow_brief,omitempty"`
+	// LimitBrief 阶段1 涨跌停影子摘要（signal.LimitBrief 产出，只对当日候选做可成交性判定）。
+	// 与上一个字段不同，它**没有开关**：无条件观测 ⇒ 算过就必是非空串（0 拦截也是「涨跌停影子
+	// 0/候选 M 只」那句），所以这个键缺失只可能来自还没接线的旧二进制，不代表「当日 0 拦截」。
+	// 空串在这里只用于接线前的旧数据回放，接线批（11-24）之后不应再出现。
+	LimitBrief string `json:"limit_brief,omitempty"`
 }
 
 // CandidateSnapshot 单只候选的快照。

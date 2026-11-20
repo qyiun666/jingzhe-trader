@@ -9,8 +9,10 @@ import (
 	"go/token"
 	"os"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"jingzhe-trader/internal/model"
 )
@@ -261,8 +263,16 @@ func TestJudgeInputHasNoAdjustedCloseField(t *testing.T) {
 	}
 }
 
-// T6 + T18（判定侧半面）：判定区不出现任何涨跌幅阈值，也不引入第二套费用算式。
+// T6 + T18（判定侧半面）：判定算式里不得出现任何涨跌幅阈值，也不得引用费用算式。
 // 断言对象是证据文件本身，不是复刻的常量表——有人日后塞进 0.098 就会红。
+//
+// 作用域刻意分成三条，因为一把梭扫整个判定区会自欺：
+//  1. 判定函数体内除 0 以外不许有任何数字字面量 ⇒ 阈值只能来自入参档位；
+//  2. 判定区的顶层 const/var 不许有浮点字面量 ⇒ 9.8 / 0.098 这类写法立刻红，
+//     而摘要预算 limitBriefTop=10、limitBriefMax=600 是整数、合法且必要；
+//  3. 判定区的注释里不许出现「数字+百分号」⇒ 注释留数字等于给后人递阈值
+//     （本区原注释写过「主板 10%、ST 5%」，就是被这条规则逼着删掉的）。
+//     注意不能退化成"整区不许出现 %"——Sprintf 的格式动词满是 %，那样只能假绿。
 func TestJudgeRegionHasNoPercentageOrFeeRule(t *testing.T) {
 	const marker = "涨跌停可成交性判定"
 	src, err := os.ReadFile("evidence.go")
@@ -273,62 +283,247 @@ func TestJudgeRegionHasNoPercentageOrFeeRule(t *testing.T) {
 	if idx < 0 {
 		t.Fatalf("evidence.go 里找不到判定区分隔注释 %q", marker)
 	}
-	region := src[idx:]
-	for _, fn := range []string{"func JudgeLimitDay", "func RecoverT1", "func sealOf", "func limitPairErr"} {
-		if !bytes.Contains(region, []byte(fn)) {
-			t.Fatalf("判定区扫描范围为空：缺 %s", fn)
-		}
-	}
-	if i := bytes.IndexRune(region, '%'); i >= 0 {
-		t.Errorf("判定区出现百分号（涨跌幅阈值嫌疑）：…%s…", snippet(region, i))
-	}
 
+	judged := map[string]bool{
+		"JudgeLimitDay": true, "RecoverT1": true, "sealOf": true,
+		"limitPairErr": true, "Blocks": true, "UnknownNoRow": true, "limitEntry": true,
+	}
+	// 用 ParseComments 一次解析，四条规则共用同一棵语法树（分两次解析会留下两份真相）。
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "evidence.go", src, 0)
+	file, err := parser.ParseFile(fset, "evidence.go", src, parser.ParseComments)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var bad []string
-	ast.Inspect(f, func(n ast.Node) bool {
-		lit, ok := n.(*ast.BasicLit)
-		if !ok || (lit.Kind != token.INT && lit.Kind != token.FLOAT) {
-			return true
+	inRegion := func(p token.Pos) bool { return fset.Position(p).Offset >= idx }
+
+	for _, cg := range file.Comments {
+		if !inRegion(cg.Pos()) {
+			continue
 		}
-		if fset.Position(lit.Pos()).Offset < idx || lit.Value == "0" {
-			return true
+		if m := regexp.MustCompile(`[0-9]+(\.[0-9]+)?\s*%`).FindString(cg.Text()); m != "" {
+			t.Errorf("判定区注释出现「数字+百分号」%q（line %d）：阈值不该写进判定侧文档", m, fset.Position(cg.Pos()).Line)
 		}
-		bad = append(bad, fmt.Sprintf("%s(line %d)", lit.Value, fset.Position(lit.Pos()).Line))
-		return true
-	})
-	if len(bad) > 0 {
-		t.Errorf("判定区出现 0 以外的数字字面量，等于私自引入档位规则：%v", bad)
 	}
-	var refs []string
-	ast.Inspect(f, func(n ast.Node) bool {
+
+	var badBody, badConst []string
+	for _, d := range file.Decls {
+		switch decl := d.(type) {
+		case *ast.FuncDecl:
+			if !judged[decl.Name.Name] {
+				continue
+			}
+			delete(judged, decl.Name.Name)
+			ast.Inspect(decl.Body, func(n ast.Node) bool {
+				lit, ok := n.(*ast.BasicLit)
+				if !ok || (lit.Kind != token.INT && lit.Kind != token.FLOAT) {
+					return true
+				}
+				if lit.Value != "0" {
+					badBody = append(badBody, fmt.Sprintf("%s 体内 %s(line %d)", decl.Name.Name, lit.Value, fset.Position(lit.Pos()).Line))
+				}
+				return true
+			})
+		case *ast.GenDecl:
+			if (decl.Tok != token.CONST && decl.Tok != token.VAR) || !inRegion(decl.Pos()) {
+				continue
+			}
+			ast.Inspect(decl, func(n ast.Node) bool {
+				lit, ok := n.(*ast.BasicLit)
+				if ok && lit.Kind == token.FLOAT {
+					badConst = append(badConst, fmt.Sprintf("%s(line %d)", lit.Value, fset.Position(lit.Pos()).Line))
+				}
+				return true
+			})
+		}
+	}
+	if len(judged) > 0 {
+		t.Fatalf("判定函数清单里有名字不在文件里（规则已过期或函数被改名）：%v", keysOf(judged))
+	}
+	if len(badBody) > 0 {
+		t.Errorf("判定函数体里出现 0 以外的数字字面量，等于私自引入档位规则：%v", badBody)
+	}
+	if len(badConst) > 0 {
+		t.Errorf("判定区顶层常量出现浮点字面量（涨跌幅阈值形态）：%v", badConst)
+	}
+
+	// 判定区不引用费用算式：摩擦一律由调用方用 risk.RoundTripCostFenFor 现算（T18 判定侧半面）。
+	ast.Inspect(file, func(n ast.Node) bool {
 		sel, ok := n.(*ast.SelectorExpr)
-		if !ok {
+		if !ok || !inRegion(sel.Pos()) {
 			return true
 		}
-		if id, ok := sel.X.(*ast.Ident); ok && fset.Position(sel.Pos()).Offset >= idx {
-			refs = append(refs, id.Name+"."+sel.Sel.Name)
+		if id, ok := sel.X.(*ast.Ident); ok && id.Name == "risk" {
+			t.Errorf("判定区引用了费用算式 risk.%s（line %d），摩擦必须由调用方现算", sel.Sel.Name, fset.Position(sel.Pos()).Line)
 		}
 		return true
 	})
-	for _, r := range refs {
-		if strings.HasPrefix(r, "risk.") {
-			t.Errorf("判定区引用了费用算式 %q，摩擦必须由调用方现算", r)
-		}
+}
+
+func keysOf(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+// 硬要求【2】：无条件观测下"算过"必须留下句子，0 拦截也不能返回空串——
+// omitempty 对空串同样省略，返回空串就等于把「算过且 0 拦截」和「旧二进制没接线」压回同一态。
+func TestLimitBriefAlwaysNonEmptyWhenComputed(t *testing.T) {
+	up, down := fen(11.00), fen(9.00)
+	rows := map[string]LimitDay{
+		"600001": {Up: up, Down: down, RawClose: fen(10.50)},
+		"600002": {Up: up, Down: down, RawClose: fen(10.00)},
+	}
+	got := LimitBrief([]string{"600001", "600002"}, rows)
+	if got == "" {
+		t.Fatal("全可成交时返回了空串 ⇒ 载荷键消失，与未接线同形")
+	}
+	if !strings.HasPrefix(got, "涨跌停影子 0/候选 2 只") {
+		t.Errorf("0 拦截句前缀漂移（前缀必须与有清单时同型，一句 grep 捞两种日子）：%q", got)
+	}
+	if !strings.Contains(got, "判定已生效") {
+		t.Errorf("0 拦截句必须自证判定跑过：%q", got)
+	}
+	// 候选集本身为空（漏斗筛空/关闸日）同样是"算过"，不得退化成空串。
+	if empty := LimitBrief(nil, nil); !strings.HasPrefix(empty, "涨跌停影子 0/候选 0 只") {
+		t.Errorf("空候选集句=%q，期望仍出句子", empty)
 	}
 }
 
-func snippet(b []byte, i int) string {
-	lo := i - 40
-	if lo < 0 {
-		lo = 0
+// 格式锁：整串逐字节钉死（照 TestSectorShadowBriefFormatLockNonEmpty 的先例）。
+// 载荷字面量必须直接用四态/形态/reason 常量，翻成中文等于再造一份口径。
+func TestLimitBriefFormatLock(t *testing.T) {
+	rows := map[string]LimitDay{
+		"600001": {Up: fen(11.00), Down: fen(9.00), RawClose: fen(11.00), High: fen(11.00), Low: fen(11.00)},
+		"600002": {Up: fen(11.00), Down: fen(9.00), RawClose: fen(9.00)},
+		"600003": {Up: fen(11.00), Down: fen(9.00), RawClose: fen(10.00)},
 	}
-	hi := i + 40
-	if hi > len(b) {
-		hi = len(b)
+	want := "涨跌停影子 2/候选 3 只（拦买 1、拦卖 1、判定未知 0；档位取交易所公布涨跌停价，" +
+		"价格基准=真实收盘价，纯观测不参与决策）：" +
+		"600001 blocked_limit_up/one_word 11.00、600002 blocked_limit_down/unresolved 9.00。"
+	if got := LimitBrief([]string{"600001", "600002", "600003"}, rows); got != want {
+		t.Errorf("格式漂移:\n got=%q\nwant=%q", got, want)
 	}
-	return string(b[lo:hi])
+}
+
+// 缺失键 map 的语义必须与"有行但档位为 0"可区分：前者 no_row（接口没供数/库里没这行），
+// 后者 limit_le0（有行没档位）。两者都算 unknown，但归因结论完全不同。
+func TestLimitBriefDistinguishesNoRowFromNoLimit(t *testing.T) {
+	rows := map[string]LimitDay{
+		"600001": {}, // 有行没档位（工程若填 0 冒充就会落这里）
+	}
+	got := LimitBrief([]string{"600001", "600002"}, rows)
+	if !strings.Contains(got, "600001 unknown/limit_le0") || !strings.Contains(got, "600002 unknown/no_row") {
+		t.Errorf("两种 unknown 未区分：%q", got)
+	}
+	if !strings.Contains(got, "判定未知 2") || !strings.HasPrefix(got, "涨跌停影子 2/候选 2 只") {
+		t.Errorf("计数不对：%q", got)
+	}
+	// rows 整体为 nil（接线漏了）必须一眼看出来：全部 no_row，而不是静默出空串。
+	if allMissing := LimitBrief([]string{"600001", "600002"}, nil); !strings.Contains(allMissing, "拦买 0、拦卖 0、判定未知 2") {
+		t.Errorf("rows=nil 时应全记 no_row：%q", allMissing)
+	}
+}
+
+// 裁定【5】：最多列前 10 只、总数永远精确、整段 rune 数永远 ≤600。
+func TestLimitBriefTopTenAndLengthBound(t *testing.T) {
+	up, down := fen(11.00), fen(9.00)
+	var codes []string
+	rows := map[string]LimitDay{}
+	for i := 0; i < 25; i++ {
+		code := fmt.Sprintf("60%04d", i)
+		codes = append(codes, code)
+		rows[code] = LimitDay{Up: up, Down: down, RawClose: up}
+	}
+	got := LimitBrief(codes, rows)
+	if !strings.HasPrefix(got, "涨跌停影子 25/候选 25 只") {
+		t.Errorf("总数被截断改了：%q", got[:40])
+	}
+	if !strings.Contains(got, "列前 10") {
+		t.Errorf("未标注实列只数：%q", got)
+	}
+	if n := utf8.RuneCountInString(got); n > 600 {
+		t.Errorf("%d 字符，超过裁定【5】的 600 上限", n)
+	}
+	// 10 与 600 在这里刻意写死：引用 limitBriefTop/limitBriefMax 会让断言跟着常量一起漂，
+	// 把"改掉预算"这种语义变更判成绿灯。
+	if strings.Count(got, "blocked_limit_up") != 10 {
+		t.Errorf("条目数不是裁定【5】的 10：%d", strings.Count(got, "blocked_limit_up"))
+	}
+
+	// 条目长得连一只都放不下：兜底句仍须报全总数与四档计数，且不得半条记录。
+	long := make([]string, 0, 3)
+	longRows := map[string]LimitDay{}
+	for i := 0; i < 3; i++ {
+		code := strings.Repeat("长", 600) + fmt.Sprintf("%d", i)
+		long = append(long, code)
+		longRows[code] = LimitDay{Up: up, Down: down, RawClose: up}
+	}
+	fallback := LimitBrief(long, longRows)
+	if !strings.Contains(fallback, "涨跌停影子 3/候选 3 只") || !strings.Contains(fallback, "条目过长只报总数") {
+		t.Errorf("兜底句不对：%q", fallback[:80])
+	}
+	if n := utf8.RuneCountInString(fallback); n > 600 {
+		t.Errorf("兜底句 %d 字符，超过裁定【5】的 600 上限", n)
+	}
+	if strings.Contains(fallback, "blocked_limit_up") {
+		t.Errorf("兜底句里不得留半条记录：%q", fallback)
+	}
+	// n=0 表示「不列条目」，此时"列前 0"是无意义句：只报总数的兜底与 0 拦截句都不许出现。
+	if strings.Contains(fallback, "列前") {
+		t.Errorf("兜底句不得提列前只数：%q", fallback)
+	}
+}
+
+// 截断必须按 600 上界收缩「列前」只数，而不是按「反正最多 10 只」硬塞。
+//
+// 条目用 32 字符代码撑长（stress fixture：真实 ts_code 只有 9 字符，生产形态下这条分支极少
+// 触发；留着是因为它一旦触发就是「句子撑爆 detail」）。单条 = 32 代码 + 1 + 16 状态 + 1 + 10
+// 形态（high/low 未落库 ⇒ unresolved）+ 1 + 5 价格 = 66 字符，整段 = 74 头部 + 66n + (n-1) 顿号
+// + 1 句号：n=8 ⇒ 610（>600 被拒），n=7 ⇒ 543 ⇒ 实列 7 是手算钉死的。
+// 有人把预算抬到 700 时 n=8 就合法了，这一枪当场变红（M-M）。写死 7 而不是引用 limitBriefMax，
+// 同 TestLimitBriefTopTenAndLengthBound 里写死 10/600 的理由一致。
+func TestLimitBriefTruncatesEntriesToRuneBudget(t *testing.T) {
+	up, down := fen(11.00), fen(9.00)
+	var codes []string
+	rows := map[string]LimitDay{}
+	for i := 0; i < 12; i++ {
+		code := strings.Repeat("长", 30) + fmt.Sprintf("%02d", i)
+		codes = append(codes, code)
+		rows[code] = LimitDay{Up: up, Down: down, RawClose: up}
+	}
+	got := LimitBrief(codes, rows)
+	if n := strings.Count(got, "blocked_limit_up"); n != 7 {
+		t.Errorf("列出条数 = %d，期望 7（第 8 条会把整段推到 610 字符）：%d 字符", n, utf8.RuneCountInString(got))
+	}
+	if !strings.Contains(got, "列前 7") {
+		t.Errorf("实列只数没诚实报出来：%q", got)
+	}
+	if !strings.HasPrefix(got, "涨跌停影子 12/候选 12 只") {
+		t.Errorf("截断日总数句必须仍是精确 12：%q", got[:40])
+	}
+	if utf8.RuneCountInString(got) > 600 {
+		t.Errorf("整段 %d 字符超过 600", utf8.RuneCountInString(got))
+	}
+}
+
+// T16 同型：摘要也是纯函数，同输入必得逐字节相同的串。
+func TestLimitBriefIsDeterministic(t *testing.T) {
+	up, down := fen(11.00), fen(9.00)
+	codes := []string{"600001", "600002", "000001", "301999"}
+	rows := map[string]LimitDay{
+		"600001": {Up: up, Down: down, RawClose: up, High: up, Low: down},
+		"600002": {Up: up, Down: down, RawClose: down, High: down, Low: down},
+		"000001": {Up: up, Down: down, RawClose: fen(10.00)},
+	}
+	want := LimitBrief(codes, rows)
+	for i := 0; i < 16; i++ {
+		if got := LimitBrief(codes, rows); got != want {
+			t.Fatalf("第 %d 次摘要漂移:\n %q\n %q", i, got, want)
+		}
+	}
+	if b, err := json.Marshal(LimitBrief(codes, rows)); err != nil || !bytes.Contains(b, []byte("涨跌停影子")) {
+		t.Errorf("摘要序列化异常: %s %v", b, err)
+	}
 }

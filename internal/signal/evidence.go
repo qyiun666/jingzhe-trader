@@ -1,7 +1,10 @@
 package signal
 
 import (
+	"fmt"
 	"math"
+	"strings"
+	"unicode/utf8"
 
 	"jingzhe-trader/internal/model"
 )
@@ -268,4 +271,88 @@ func RecoverT1(d model.Direction, q T1Quote) T1Outcome {
 	out.RetPct = pctChange(q.RawClose.Float(), q.Open.Float())
 	out.Anomaly = q.Open > q.Up || q.Open < q.Down
 	return out
+}
+
+// ===== limit_brief 影子摘要（裁定③⑤⑥：只附加进 screen:topn 载荷末尾，不进任何决策）=====
+
+// limitBriefTop 摘要最多列出的只数（与板块影子先例 sectorShadowTop 一致）。
+const limitBriefTop = 10
+
+// limitBriefMax 摘要整段长度上限，按字符数计（不是字节数——中文 3 字节），同 sectorShadowBriefMax。
+const limitBriefMax = 600
+
+// limitBriefBasis 口径句，只此一份：空集句、清单句、只报总数的兜底句都从这里拼，不各写一遍。
+const limitBriefBasis = "档位取交易所公布涨跌停价，价格基准=真实收盘价，纯观测不参与决策"
+
+// limitTally 一次遍历数出来的四档计数；total 由计数相加得出，不作为第二份真相保存。
+type limitTally struct{ cands, up, down, unknown int }
+
+func (t limitTally) total() int { return t.up + t.down + t.unknown }
+
+// head 拼「涨跌停影子 N/候选 M 只（拦买 a、拦卖 b、判定未知 c；口径[，列前 n]」，不含收尾括号。
+// n<=0 表示"不列条目"（0 拦截句与只报总数的兜底句），此时不提列前只数。
+func (t limitTally) head(n int) string {
+	s := fmt.Sprintf("涨跌停影子 %d/候选 %d 只（拦买 %d、拦卖 %d、判定未知 %d；%s", t.total(), t.cands, t.up, t.down, t.unknown, limitBriefBasis)
+	if n > 0 && t.total() > n {
+		s += fmt.Sprintf("，列前 %d", n)
+	}
+	return s
+}
+
+// LimitBrief 按候选顺序逐只判定，产出一句涨跌停影子摘要。
+//
+// rows 必须是缺失键 map：未命中即无键 ⇒ 记 no_row。不许用零值结构体顶替，那样只能得到
+// limit_le0，而「交易所没供这个档位的数」和「库里没这一行」在归因上是两回事。
+//
+// 键的有无只区分「算过 / 旧二进制」：无条件观测下只要跑过就必出句子，当日 0 拦截也写
+// 「涨跌停影子 0/候选 M 只」——omitempty 对空串同样省略，所以这里绝不能返回空串。
+func LimitBrief(codes []string, rows map[string]LimitDay) string {
+	var t limitTally
+	t.cands = len(codes)
+	var entries []string
+	for _, code := range codes {
+		px, ok := rows[code]
+		v := UnknownNoRow()
+		if ok {
+			v = JudgeLimitDay(px)
+		}
+		switch v.State {
+		case LimitBlockedUp:
+			t.up++
+		case LimitBlockedDown:
+			t.down++
+		case LimitUnknown:
+			t.unknown++
+		case LimitTradeable:
+			continue
+		}
+		entries = append(entries, limitEntry(code, v, px))
+	}
+	if t.total() == 0 {
+		return t.head(0) + "）：当日候选无一触板，判定已生效。"
+	}
+	for n := min(limitBriefTop, len(entries)); n >= 1; n-- {
+		brief := t.head(n) + "）：" + strings.Join(entries[:n], "、") + "。"
+		if utf8.RuneCountInString(brief) <= limitBriefMax {
+			return brief
+		}
+	}
+	// 连一只都放不下（代码或档位异常长）：至少把总数与四档计数报全，不给半条记录。
+	return t.head(0) + "，条目过长只报总数）。"
+}
+
+// limitEntry 一条记录：代码 状态[/形态][/原因] 触发价（元，走 model.Fen.String 这唯一展示口）。
+// 状态与原因直接写四态字面量：归因与 grep 用的就是这些串，翻成中文等于再造一份口径。
+func limitEntry(code string, v LimitVerdict, px LimitDay) string {
+	s := code + " " + string(v.State)
+	if v.Seal != SealNone {
+		s += "/" + string(v.Seal)
+	}
+	if v.Reason != "" {
+		s += "/" + string(v.Reason)
+	}
+	if px.RawClose > 0 {
+		s += " " + px.RawClose.String()
+	}
+	return s
 }
