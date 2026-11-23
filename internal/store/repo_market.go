@@ -205,6 +205,64 @@ func (r *MarketRepo) UpdateBarQuote(ctx context.Context, tsCode, tradeDate strin
 	return n > 0, nil
 }
 
+// ===================== 封板价格截面（只读，服务阶段1 的收盘封板判定）=====================
+
+// LimitRow 判"收盘封板"所需的一行价格，全部是**未复权真实价**口径。
+//
+// 为什么把 raw_close 与两列限价捆在同一个类型里、而不是让调用侧自己拼：封板判定就是
+// 真实收盘价比真实限价，两个操作数分在两条读法上必然有人拿 close（前复权）去比
+// up_limit。20261123 实测这种误用的代价 —— 当日 5,426/5,570 行复权因子≠1，
+// `raw_close=up_limit` 命中 152 只，`close=up_limit` 只剩 2 只，等于把封板面读没。
+// 本类型**刻意没有 Close 字段**：编译面上就不给误用留路径（组长 20261123 裁定三）。
+//
+// 两列限价三态：非 nil=有值，nil=库里 NULL=unknown（含"接口给的是无涨跌幅限制的
+// 哨兵极值"这类已在写入侧归一的情形，见 dataloader 的 upLimitFen/downLimitFen）。
+type LimitRow struct {
+	TsCode    string     `db:"ts_code"`
+	RawClose  model.Fen  `db:"raw_close"`
+	UpLimit   *model.Fen `db:"up_limit"`
+	DownLimit *model.Fen `db:"down_limit"`
+}
+
+// LimitRowsFor 取指定交易日的封板价格截面，返回**缺失键 map**：库里当日没有该
+// (ts_code, trade_date) 行 ⇒ 代码根本不出现在 map 里。
+//
+// 用「缺失键」而不是「值为零值的 map」：零值的 LimitRow 带着 RawClose=0，看上去像
+// "今天收在 0.00 元"，而事实是"今天这根线不存在"（停牌、退市、或还没同步）。让
+// 不存在可判只需要 `v, ok := m[code]`，让零值不可判要在每个消费点补一次 `RawClose>0`
+// —— 后者一定会漏。store 只给数据不给判定，封板语义归 signal 侧的适配器。
+//
+// 指数的 5 列扩展价族永久 NULL（schema.go 口径 3），因此指数行会以"有 RawClose、
+// 两列限价 nil"的形态出现在 map 里，调用侧不必特殊处理。
+func (r *MarketRepo) LimitRowsFor(ctx context.Context, tradeDate string) (map[string]LimitRow, error) {
+	var scanned []struct {
+		TsCode    string        `db:"ts_code"`
+		RawClose  model.Fen     `db:"raw_close"`
+		UpLimit   sql.NullInt64 `db:"up_limit"`
+		DownLimit sql.NullInt64 `db:"down_limit"`
+	}
+	// 只取四列：走 idx_bar_date，且把 close 挡在 SELECT 之外（见 LimitRow 注释）。
+	const query = `SELECT ts_code, raw_close, up_limit, down_limit FROM daily_bar
+		WHERE trade_date = ?`
+	if err := r.rdb.SelectContext(ctx, &scanned, query, tradeDate); err != nil {
+		return nil, fmt.Errorf("读取 %s 封板价格截面失败: %w", tradeDate, err)
+	}
+	out := make(map[string]LimitRow, len(scanned))
+	for _, s := range scanned {
+		row := LimitRow{TsCode: s.TsCode, RawClose: s.RawClose}
+		if s.UpLimit.Valid {
+			f := model.Fen(s.UpLimit.Int64)
+			row.UpLimit = &f
+		}
+		if s.DownLimit.Valid {
+			f := model.Fen(s.DownLimit.Int64)
+			row.DownLimit = &f
+		}
+		out[s.TsCode] = row
+	}
+	return out, nil
+}
+
 // ===================== 估值截面 / 停牌集合 =====================
 
 // ErrValuationSparse 估值截面空/覆盖不足：本次不得覆盖已有截面。

@@ -368,16 +368,53 @@ func fenPtr(v model.Fen) *model.Fen {
 	return &v
 }
 
+// noLimitUpSentinel 是 stk_limit 表达「本品种当日无价格涨跌幅限制」用的极值哨兵，
+// 不是价格。实测（20261123 回填批，26 行 / 12 只）三种量级：
+//
+//	9999999（99,999.99 元）—— 北交所新股 920xxx，6 行，同批 down_limit 给 0
+//	10000000（100,000.00 元）—— 科创板 688827.SH，5 行，同批 down_limit 给 1
+//	100000000（1,000,000.00 元）—— 创业板/主板新股 301xxx/001381/002731，15 行，同批 down_limit 给 1
+//
+// 接口对"无限制"既不返回 NULL 也不返回 0，所以 fenPtr 的 `<=0` 挡不住它们：一旦原样
+// 落库，"距涨停还有多少"会算出天文数字，"跌停价 0.01 元"更是凭空造出的语义。
+// 归一放在写入侧（数据面一次真相），消费侧不许各自复制阈值 —— 阈值散到 signal/screener
+// 就等于没有。组长 20261123 裁定二·方案 (a)。
+var noLimitUpSentinel = map[model.Fen]bool{9999999: true, 10000000: true, 100000000: true}
+
+// upLimitFen 上限价的三态：哨兵极值与 <=0 一律 unknown。
+//
+// 只在上限价这一侧认 9999999/10000000/100000000：它们是"没有上限"的编码，不会与真实
+// 涨停价撞车（A 股真实涨停价的分值上限量级远低于 10^7）。
+func upLimitFen(v model.Fen) *model.Fen {
+	if noLimitUpSentinel[v] {
+		return nil
+	}
+	return fenPtr(v)
+}
+
+// downLimitFen 下限价的三态：1 分（0.01 元）是"没有下限"的编码，不是价格。
+//
+// 实测这批 20 行 down_limit=1 全部与上面的极值上限价同批出现（新股无跌幅限制）。真实
+// 跌停价到不了 0.01 元量级：面值退市边缘的个股也在 10 分以上，所以这一条不会吃掉真值。
+// 0 与负数仍走 fenPtr 的 <=0 支路（既有行为不变）。
+func downLimitFen(v model.Fen) *model.Fen {
+	if v == 1 {
+		return nil
+	}
+	return fenPtr(v)
+}
+
 // barQuoteOf 组装一条 daily_bar 扩展价族。OHLC 用**未复权**真实价（b.Open/High/Low
-// 由 ToModelBar 原样透传，不参与 Close 的复权改写），限价按 hasLim 决定写值还是 unknown。
+// 由 ToModelBar 原样透传，不参与 Close 的复权改写），限价按 hasLim 决定写值还是 unknown，
+// 并且只在这两列上清洗"无涨跌幅限制"的哨兵极值（见 upLimitFen/downLimitFen）。
 //
 // 基准一致性判据：up_limit/down_limit 是交易所按 pre_close×(1±档) 公布的真实限价，
 // 封板判定必须是真实价比真实价；若把 OHLC 复权而限价不复权，除权日会整批误判。
 func barQuoteOf(b model.Bar, lim tushare.StkLimitRow, hasLim bool) store.BarQuote {
 	q := store.BarQuote{Open: fenPtr(b.Open), High: fenPtr(b.High), Low: fenPtr(b.Low)}
 	if hasLim {
-		q.UpLimit = fenPtr(lim.UpLimit)
-		q.DownLimit = fenPtr(lim.DownLimit)
+		q.UpLimit = upLimitFen(lim.UpLimit)
+		q.DownLimit = downLimitFen(lim.DownLimit)
 	}
 	return q
 }
