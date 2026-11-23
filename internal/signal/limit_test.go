@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"jingzhe-trader/internal/model"
+	"jingzhe-trader/internal/store"
 )
 
 // fen 元 → 分，只走 model.FromFloat 这一个换算口（M4：不得在测试里另造截断/四舍五入口径）。
@@ -287,6 +288,9 @@ func TestJudgeRegionHasNoPercentageOrFeeRule(t *testing.T) {
 	judged := map[string]bool{
 		"JudgeLimitDay": true, "RecoverT1": true, "sealOf": true,
 		"limitPairErr": true, "Blocks": true, "UnknownNoRow": true, "limitEntry": true,
+		// 适配器也进这张表：它同样不许自己造数（唯一的合法字面量是 0=「没有这个档位」）。
+		// 有人往里塞 9999999 之类的哨兵白名单，就会在这一枪变红——那属于写入侧的口径，不该在读取侧再造一份。
+		"LimitDays": true, "fenOrZero": true,
 	}
 	// 用 ParseComments 一次解析，四条规则共用同一棵语法树（分两次解析会留下两份真相）。
 	fset := token.NewFileSet()
@@ -529,6 +533,78 @@ func TestLimitBriefProductionShapeFitsBudget(t *testing.T) {
 	}
 	if strings.Count(got, "blocked_limit_down/close_only") != 10 {
 		t.Errorf("生产形态应能列满 10 条：%q", got)
+	}
+}
+
+// T19（适配器面）：store 的三态必须原样搬进判定输入。
+// nil 档位（库里 NULL）⇒ LimitDay 的「无值=0」⇒ unknown/limit_le0；有值 ⇒ 逐字不动。
+// 指数行是这条的最要紧的一支：daily_bar 里指数的两档限价永久 NULL（schema.go 口径 3），
+// 它在 map 里以「有 RawClose、两档 nil」出现，适配器只能把它判成 unknown，不得猜档位。
+func TestLimitDaysAdapterPreservesTriState(t *testing.T) {
+	up, down := fen(11.00), fen(9.00)
+	rows := map[string]store.LimitRow{
+		"600001.SH": {TsCode: "600001.SH", RawClose: up, UpLimit: &up, DownLimit: &down},
+		"600002.SH": {TsCode: "600002.SH", RawClose: fen(10.00), UpLimit: nil, DownLimit: &down},
+		"000300.SH": {TsCode: "000300.SH", RawClose: fen(4000.00)},
+	}
+	days := LimitDays(rows)
+	if len(days) != len(rows) {
+		t.Fatalf("结果键数 %d ≠ 入参键数 %d（适配器不得增删键）", len(days), len(rows))
+	}
+	if v := JudgeLimitDay(days["600001.SH"]); v.State != LimitBlockedUp || v.Anomaly {
+		t.Errorf("有档位的一支结论漂移: %+v", v)
+	}
+	// LimitRow 没有 high/low 列 ⇒ 形态一律 unresolved：阶段1 摘要能分触没触板，
+	// 分不出「一字还是收盘才封」。这条不是 bug，是 §四 具名报出的已声明限制。
+	if v := JudgeLimitDay(days["600001.SH"]); v.Seal != SealUnresolved {
+		t.Errorf("真实数据形状下封板形态只能是 unresolved: %+v", v)
+	}
+	for _, code := range []string{"600002.SH", "000300.SH"} {
+		if v := JudgeLimitDay(days[code]); v.State != LimitUnknown || v.Reason != ReasonLimitLE0 {
+			t.Errorf("%s 档位 NULL 必须落 unknown/limit_le0: %+v", code, v)
+		}
+	}
+	if empty := LimitDays(nil); len(empty) != 0 {
+		t.Errorf("nil 入参要回空 map，不得 panic，得到 %d 键", len(empty))
+	}
+}
+
+// 适配器只搬值、绝不补键：库里当日没有的行，摘要必须记 no_row 而不是 limit_le0。
+// 两种 unknown 的归因完全不同（接口没供这行的数 vs 有行但没档位），这条链路锁住。
+func TestLimitDaysAdapterKeepsMissingKeysAbsent(t *testing.T) {
+	up, down := fen(11.00), fen(9.00)
+	rows := map[string]store.LimitRow{
+		"600001.SH": {TsCode: "600001.SH", RawClose: up, UpLimit: &up, DownLimit: &down},
+	}
+	brief := LimitBrief([]string{"600001.SH", "600002.SH"}, LimitDays(rows))
+	if !strings.Contains(brief, "600001.SH blocked_limit_up/unresolved 11.00") {
+		t.Errorf("有行且触板的一支没进清单：%q", brief)
+	}
+	if !strings.Contains(brief, "600002.SH unknown/no_row") {
+		t.Errorf("缺行的一支必须记 no_row（被补键就会变 limit_le0）：%q", brief)
+	}
+	if !strings.HasPrefix(brief, "涨跌停影子 2/候选 2 只（拦买 1、拦卖 0、判定未知 1") {
+		t.Errorf("计数不对：%q", brief)
+	}
+}
+
+// 裁定【1】的价格基准面：适配器只许把 raw_close 交给判定器，不许把档位价当成交价。
+// 未触板的一行（raw_close 落在两档之间）在正确实现下必须判 tradeable、且不进清单；
+// 基准价一旦被写成涨停档，它就变成 blocked_limit_up 拦买 —— 摘要当场谎报，归因全盘作废。
+func TestLimitDaysAdapterKeepsRawCloseAsBasis(t *testing.T) {
+	up, down := fen(11.00), fen(9.00)
+	rows := map[string]store.LimitRow{
+		"600001.SH": {TsCode: "600001.SH", RawClose: fen(10.00), UpLimit: &up, DownLimit: &down},
+	}
+	days := LimitDays(rows)
+	if got := days["600001.SH"].RawClose; got != fen(10.00) {
+		t.Errorf("判定基准被换成 %s（元），与「真实收盘价」口径脱钩", got.String())
+	}
+	if v := JudgeLimitDay(days["600001.SH"]); v.State != LimitTradeable {
+		t.Fatalf("raw_close 落在两档之间必须判可成交: %+v", v)
+	}
+	if brief := LimitBrief([]string{"600001.SH"}, days); !strings.Contains(brief, "当日候选无一触板") {
+		t.Errorf("未触板的行不得进清单：%q", brief)
 	}
 }
 

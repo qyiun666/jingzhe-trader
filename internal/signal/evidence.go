@@ -7,6 +7,7 @@ import (
 	"unicode/utf8"
 
 	"jingzhe-trader/internal/model"
+	"jingzhe-trader/internal/store"
 )
 
 // RuleEvidence 规则算出的证据列。
@@ -355,4 +356,31 @@ func limitEntry(code string, v LimitVerdict, px LimitDay) string {
 		s += " " + px.RawClose.String()
 	}
 	return s
+}
+
+// ===== 数据面适配器（裁定【1】：store 不得反向依赖 signal，转换写在这一侧）=====
+
+// fenOrZero 把库里的三态（非 nil=有值 / nil=NULL=没这个档位）转成 LimitDay 的「无值=0」表示。
+// nil 不等于 0 元：0 在这里只表示「没有这个数」，判定器据此落 unknown/limit_le0。
+func fenOrZero(p *model.Fen) model.Fen {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
+// LimitDays 把 store.LimitRowsFor 的封板价格截面转成判定输入。
+//
+// 只搬值、不补键：库里当日没有某只票的行 ⇒ 那个键在结果 map 里也不出现，摘要据此记
+// no_row；这里若给缺失的票造一个零值条目，就把「交易所没供数」压成了「档位是 0」（裁定【1】）。
+//
+// store.LimitRow 只有 ts_code/raw_close/up_limit/down_limit 四列，不带 high/low ⇒
+// 封板形态一律 unresolved：阶段1 的摘要能分「触没触板」，分不出「一字还是收盘才封」，
+// 这条限制在 11-23 handoff §四 已具名报出，要打通得由组长裁定给 LimitRow 增列。
+func LimitDays(rows map[string]store.LimitRow) map[string]LimitDay {
+	out := make(map[string]LimitDay, len(rows))
+	for code, r := range rows {
+		out[code] = LimitDay{Up: fenOrZero(r.UpLimit), Down: fenOrZero(r.DownLimit), RawClose: r.RawClose}
+	}
+	return out
 }
