@@ -56,11 +56,12 @@ func (c *Client) StockBasic(ctx context.Context) ([]model.StockBasic, error) {
 }
 
 // Daily 按交易日全市场拉取日线（单次调用，约 5500+ 行）。
-// 价格为未复权原始值，前复权口径由 dataloader 结合 adj_factor 计算。
+// 价格为未复权原始值：close 由 dataloader 结合 adj_factor 复权后写 Close，
+// open/high/low 原样保留（与 raw_close 同基准，不复权）。
 func (c *Client) Daily(ctx context.Context, tradeDate string) ([]model.Bar, error) {
 	fields, items, err := c.Call(ctx, "daily",
 		map[string]interface{}{"trade_date": tradeDate},
-		"ts_code", "trade_date", "close", "vol")
+		"ts_code", "trade_date", "close", "vol", "open", "high", "low")
 	if err != nil {
 		return nil, err
 	}
@@ -105,6 +106,36 @@ func (c *Client) AdjFactor(ctx context.Context, tradeDate string) ([]AdjFactorRo
 		return nil, err
 	}
 	var rows []AdjFactorRow
+	if err := DecodeItems(fields, items, &rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// StkLimitRow 单日单只票的涨跌停价（单位分，**未复权真实价**口径）。
+type StkLimitRow struct {
+	TsCode    string    `db:"ts_code"`
+	TradeDate string    `db:"trade_date"`
+	UpLimit   model.Fen `db:"up_limit"`
+	DownLimit model.Fen `db:"down_limit"`
+}
+
+// StkLimit 按交易日全市场拉取涨跌停价。
+//
+// 档位：5000 积分档已含本接口（2026-11-23 只读探针实测 code=0、20261120 返回 5657 行），
+// 未新增付费权限。字段 up_limit/down_limit 单位元，由 DecodeItems 经 FromFloat 转分。
+//
+// 口径是"当日有效限价"（由 pre_close×(1±档) 四舍五入到分），与是否触板无关；
+// 缺数据（新股首日、退市、停牌等）不返回该行 —— 由调用侧记 unknown，不得补 0。
+// 本接口比 daily 多出的代码不得在 daily_bar 造行（防假 bar，见 store.UpdateBarQuote）。
+func (c *Client) StkLimit(ctx context.Context, tradeDate string) ([]StkLimitRow, error) {
+	fields, items, err := c.Call(ctx, "stk_limit",
+		map[string]interface{}{"trade_date": tradeDate},
+		"ts_code", "trade_date", "up_limit", "down_limit")
+	if err != nil {
+		return nil, err
+	}
+	var rows []StkLimitRow
 	if err := DecodeItems(fields, items, &rows); err != nil {
 		return nil, err
 	}

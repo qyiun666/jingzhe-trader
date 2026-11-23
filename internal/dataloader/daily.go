@@ -235,9 +235,11 @@ func pickBackDates(days []string, tradeDate string, backDays int) []string {
 	return prior[len(prior)-count:]
 }
 
-// syncOneDay 单交易日四接口快路径同步（各一次调用，全市场批量）：
-// daily / daily_basic / adj_factor / suspend_d。
-// 不拉 stk_limit 与 moneyflow：前者涨跌停判定无消费者、后者五因子模型不消费，落库表已删除。
+// syncOneDay 单交易日五接口快路径同步（各一次调用，全市场批量）：
+// daily / daily_basic / adj_factor / suspend_d / stk_limit。
+// stk_limit 只提供 daily_bar 的 up_limit/down_limit 两列，**失败一律降级为 unknown、
+// 不打断本日与整链同步**（理由见下面调用处注释）。不拉 moneyflow：五因子模型不消费，
+// 落库表已删除。
 // 大盘指数不在这里：它的均线窗口比个股因子窗口深得多，由 syncIndexWindow 单码一次补齐。
 func (d *Dataloader) syncOneDay(ctx context.Context, rc *store.MarketRepo, date string) error {
 	bars, err := d.tushare.Daily(ctx, date)
@@ -257,13 +259,38 @@ func (d *Dataloader) syncOneDay(ctx context.Context, rc *store.MarketRepo, date 
 		return d.alertTushare(ctx, "suspend_d", err)
 	}
 
-	// 复权因子映射（前复权统一口径：Close/OHLC = RawClose × AdjFactor）
+	// 涨跌停价：与上面四个接口的关键差别是**它的失败不能往上抛**。这五列只服务
+	// "收盘封板"判定，取不到就让整列保持 NULL（unknown），下游走 unknown 分支；
+	// 若把它当成 daily 同步失败返回，一根限价线的缺失会打断整条收盘链，
+	// 连带估值截面与当日选股都不再更新 —— 那是把可降级的数据面升级成致命故障。
+	// 失败面仍留痕（TUSHARE_LIMIT_SKIPPED 告警行），不静默。
+	lims, lerr := d.tushare.StkLimit(ctx, date)
+	if lerr != nil {
+		d.raiseAlert(ctx, "TUSHARE_LIMIT_SKIPPED",
+			fmt.Sprintf("涨跌停价按 unknown 处理（%s 本日限价列未填）", date), lerr.Error())
+		lims = nil
+	}
+	limMap := make(map[string]tushare.StkLimitRow, len(lims))
+	for _, l := range lims {
+		limMap[l.TsCode] = l
+	}
+
+	// 复权因子映射（前复权口径只作用于 Close：Close = RawClose × AdjFactor；
+	// 扩展价族 open/high/low 与 up_limit/down_limit 一律保持交易所真实价，不复权）
 	adjMap := make(map[string]float64, len(adjs))
 	for _, a := range adjs {
 		adjMap[a.TsCode] = a.AdjFactor
 	}
 
 	var noAdj []string
+	// unknown 计数面：这五列每一列都可能是"接口没给"或"库里没行"。不数出来的话，
+	// 「整列 NULL（未填）」与「本来就无数据」在库里长得一样，事后无法归因。
+	// limit_dropped 里含被 noAdj 跳过、因此没机会配对的代码，属预期非零。
+	var (
+		quoteMiss int // UPDATE 未命中：daily_bar 里没有这一行 → 绝不补建行
+		limitHit  int // 本行拿到了 stk_limit 的限价
+		ohlcNil   int // 本行至少一列 OHLC 缺失
+	)
 	for i := range bars {
 		b := &bars[i]
 		f := adjMap[b.TsCode]
@@ -279,7 +306,30 @@ func (d *Dataloader) syncOneDay(ctx context.Context, rc *store.MarketRepo, date 
 		if err := rc.UpsertBar(ctx, *b); err != nil {
 			return err
 		}
+		lim, hasLim := limMap[b.TsCode]
+		q := barQuoteOf(*b, lim, hasLim)
+		if hasLim {
+			limitHit++
+		}
+		if q.Open == nil || q.High == nil || q.Low == nil {
+			ohlcNil++
+		}
+		// 存储失败照旧中断（那是库的问题，不是新数据源的问题）；数据源失败在
+		// 上面已经降级成 lims=nil，走不到这里报错。
+		hit, err := rc.UpdateBarQuote(ctx, b.TsCode, b.TradeDate, q)
+		if err != nil {
+			return err
+		}
+		if !hit {
+			quoteMiss++
+		}
 	}
+	observability.L().Info("扩展价族补齐完成",
+		zap.String("date", date), zap.Int("bars", len(bars)),
+		zap.Int("limit_hit", limitHit),
+		zap.Int("limit_unknown", len(bars)-limitHit),
+		zap.Int("limit_dropped", len(limMap)-limitHit),
+		zap.Int("ohlc_unknown", ohlcNil), zap.Int("quote_miss", quoteMiss))
 	if len(noAdj) > 0 {
 		return fmt.Errorf("%s 有 %d 只个股缺复权因子（前 5 只 %s），adj_factor 与 daily 不同日",
 			date, len(noAdj), strings.Join(firstN(noAdj, 5), ","))
@@ -305,6 +355,31 @@ func (d *Dataloader) syncOneDay(ctx context.Context, rc *store.MarketRepo, date 
 // adjFen 按复权因子换算金额（分）。
 func adjFen(raw model.Fen, f float64) model.Fen {
 	return model.FromFloat(raw.Float() * f)
+}
+
+// fenPtr 价格三态：<=0 一律视为 unknown（nil → 库里 NULL）。
+//
+// 为什么不照写 0：daily 对停牌或无成交的代码会给 0 价，而 0 分在下游是一个合法价格，
+// 写进去就再也分不出"跌停价 0.00 元"和"今天没有涨跌停价"。
+func fenPtr(v model.Fen) *model.Fen {
+	if v <= 0 {
+		return nil
+	}
+	return &v
+}
+
+// barQuoteOf 组装一条 daily_bar 扩展价族。OHLC 用**未复权**真实价（b.Open/High/Low
+// 由 ToModelBar 原样透传，不参与 Close 的复权改写），限价按 hasLim 决定写值还是 unknown。
+//
+// 基准一致性判据：up_limit/down_limit 是交易所按 pre_close×(1±档) 公布的真实限价，
+// 封板判定必须是真实价比真实价；若把 OHLC 复权而限价不复权，除权日会整批误判。
+func barQuoteOf(b model.Bar, lim tushare.StkLimitRow, hasLim bool) store.BarQuote {
+	q := store.BarQuote{Open: fenPtr(b.Open), High: fenPtr(b.High), Low: fenPtr(b.Low)}
+	if hasLim {
+		q.UpLimit = fenPtr(lim.UpLimit)
+		q.DownLimit = fenPtr(lim.DownLimit)
+	}
+	return q
 }
 
 // firstN 取前 n 个元素（错误信息用：缺失面再大也不能把 detail 撑爆）。

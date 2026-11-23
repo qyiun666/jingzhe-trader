@@ -14,6 +14,13 @@ type Bar struct {
 	Close     Fen     `db:"close"`
 	VolLot    float64 `db:"vol_lot"`
 	RawClose  Fen     `db:"raw_close"`
+	// Open/High/Low 是**未复权**真实价（与 RawClose 同基准，同步侧不复权）。
+	// 基准选择的理由见 store/schema.go 的 daily_bar 注释：封板判定要拿真实价比
+	// 交易所公布的真实限价，而本表的前复权序列只有 Close 一列。
+	// 0 = 接口没给（调用侧按 unknown 落 NULL，不得写 0）。
+	Open Fen `db:"open"`
+	High Fen `db:"high"`
+	Low  Fen `db:"low"`
 }
 
 // StockBasic 每只票一行的当前快照：静态属性 + 最近一个交易日的估值截面。

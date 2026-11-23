@@ -152,21 +152,30 @@ func setField(fv reflect.Value, val interface{}) error {
 // 转换函数归一为 model（分/万元）。转换函数位于适配层，是本包两处 float→Fen 边界之一（§11.4）。
 
 // RawBar 日线原始解码结构（Tushare 字段名，float64 元/手）。
-// 只取实际入库的三列：close 是未复权收盘（转成 RawClose），vol 是成交量（手）。
+// 只取实际入库的列：close 是未复权收盘（转成 RawClose），vol 是成交量（手），
+// open/high/low 是未复权真实价（与 close 同基准，同步侧不复权）。
 type RawBar struct {
 	TsCode    string  `db:"ts_code"`
 	TradeDate string  `db:"trade_date"`
 	Close     float64 `db:"close"`
 	Vol       float64 `db:"vol"`
+	Open      float64 `db:"open"`
+	High      float64 `db:"high"`
+	Low       float64 `db:"low"`
 }
 
 // ToModelBar 将原始日线转为 model.Bar（价格→分；Close 暂存未复权值，由同步侧就地复权）。
+//
+// Open/High/Low 就地透传为**未复权**分值，不参与复权改写 —— 复权只作用于 Close。
 func ToModelBar(r RawBar) model.Bar {
 	return model.Bar{
 		TsCode:    r.TsCode,
 		TradeDate: r.TradeDate,
 		Close:     model.FromFloat(r.Close),
 		VolLot:    r.Vol,
+		Open:      model.FromFloat(r.Open),
+		High:      model.FromFloat(r.High),
+		Low:       model.FromFloat(r.Low),
 	}
 }
 
@@ -190,9 +199,11 @@ type RawValuation struct {
 // 原实现按"千元"再除以 10，把每个流通市值都缩小了 10 倍，致使门槛严了 10 倍
 // （`screen.min_circ_mv_w=500000` 名义 50 亿、实际只放行真值 ≥500 亿的票）。
 // 实测（2026-09-08 截面，data/backtest/vals.csv.gz 口径）：
-//   circ_mv_w ≥ 500000 万元（50 亿）的真值 = 2910 只；
-//   叠加完整硬门槛（50 亿 + 换手≥1% + 0<PE≤80 + 0<PB≤10）后 = 966 只，
-//   而按缩小 10 倍的值过同一组门槛只剩 94 只。
+//
+//	circ_mv_w ≥ 500000 万元（50 亿）的真值 = 2910 只；
+//	叠加完整硬门槛（50 亿 + 换手≥1% + 0<PE≤80 + 0<PB≤10）后 = 966 只，
+//	而按缩小 10 倍的值过同一组门槛只剩 94 只。
+//
 // 同一错误也经 blocks.go 的 /10000 显示传给 LLM（"流通市值 228.6 亿" vs 真实的 2286 亿），
 // 一并由本修正消除。
 func ToModelValuation(r RawValuation) model.Valuation {

@@ -158,6 +158,53 @@ func (r *MarketRepo) UpsertBar(ctx context.Context, b model.Bar) error {
 	return nil
 }
 
+// BarQuote 一根已存在 bar 行的扩展价族（open/high/low/up_limit/down_limit，单位分，
+// **未复权真实价**口径）。每列三态：非 nil=有值，nil=unknown（落 NULL）。
+//
+// 用指针而不是 Fen+一个 valid 布尔位：调用侧不需要记住"0 是什么意思"，写不出 0 价。
+type BarQuote struct {
+	Open      *model.Fen
+	High      *model.Fen
+	Low       *model.Fen
+	UpLimit   *model.Fen
+	DownLimit *model.Fen
+}
+
+// fenArg 把 *Fen 转成 SQL 参数（nil → NULL）。显式转换，不依赖 driver 对指针的反射兜底。
+func fenArg(v *model.Fen) interface{} {
+	if v == nil {
+		return nil
+	}
+	return int64(*v)
+}
+
+// UpdateBarQuote 就地补齐 daily_bar **已有行**的 5 列扩展价族，返回是否命中既有行。
+//
+// UPDATE-only 是这条路径的硬约束（不是风格问题）：这 5 列来自与 daily 不同的接口，
+// stk_limit 比 daily 多出的代码（退市、停牌边缘、口径差）一旦走 INSERT ... ON CONFLICT
+// 就会在库里造出"只有限价、没有收盘"的行 —— close 是 NOT NULL 无默认，那种插入要么
+// 直接报错打断整日同步，要么被逼着给 close 编一个值。两种都不可接受：库里只允许存在
+// 真实出过线的 bar。未命中就返回 false，由调用侧计入 unknown。
+//
+// nil 字段写 NULL 而不是 0：unknown 与"价格为 0"必须能在库里区分（schema.go 口径 1）。
+func (r *MarketRepo) UpdateBarQuote(ctx context.Context, tsCode, tradeDate string, q BarQuote) (bool, error) {
+	const query = `UPDATE daily_bar
+		SET open=?, high=?, low=?, up_limit=?, down_limit=?
+		WHERE ts_code=? AND trade_date=?`
+	res, err := r.wdb.ExecContext(ctx, query,
+		fenArg(q.Open), fenArg(q.High), fenArg(q.Low), fenArg(q.UpLimit), fenArg(q.DownLimit),
+		tsCode, tradeDate,
+	)
+	if err != nil {
+		return false, fmt.Errorf("补齐扩展价族 %s/%s 失败: %w", tsCode, tradeDate, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("补齐扩展价族 %s/%s 取影响行数失败: %w", tsCode, tradeDate, err)
+	}
+	return n > 0, nil
+}
+
 // ===================== 估值截面 / 停牌集合 =====================
 
 // ErrValuationSparse 估值截面空/覆盖不足：本次不得覆盖已有截面。

@@ -44,13 +44,17 @@ import (
 //   - 派生值一律不落列（存了就会出现两处不一致）：可用数量 = total_qty − today_bought；
 //     成交金额 = fill_qty × fill_price；三项费用 = 金额 × 费率配置；前后交易日 = 日历行序；
 //     是否 ST = 股票名称前缀；现金余额 = 本金/锚点 − Σ含费成交合计。
-//   - 日线开高低走、涨跌幅、成交额、复权因子：全链路零消费者。量比由 vol_lot 现算，
-//     均线由 index 收盘现算。
+//   - 日线涨跌幅、成交额、复权因子：全链路零消费者。量比由 vol_lot 现算，
+//     均线由 index 收盘现算。（开高低曾与它们同列"零消费者"而不入库；2026-11-23 起
+//     为"收盘封板 vs 一字板"的可分性落成本表三列，见下面 daily_bar 的口径注释。）
 //   - 指数独立表：与 daily_bar 同形同窗口、代码不重叠，直接共用 daily_bar。
 //   - 停牌并入 daily_bar：实测 190 行停牌记录里 145 行当日没有对应日线（停牌股不出线），
 //     而这 145 行正是覆盖缺口闸门豁免"该有却没行情"的依据，并列会把它丢掉。
-//   - 涨跌停价、个股资金流、财务快照、账户日终快照、档位变更历史、资产净值曲线、新闻公告：
+//   - 个股资金流、财务快照、账户日终快照、档位变更历史、资产净值曲线、新闻公告：
 //     见 ARCHITECTURE §3 各条删表理由。
+//   - 涨跌停价：仍然**不建表**（它是"每票每日一根 bar 的两个属性"，与 daily_bar 同粒度，
+//     建表就是第二个行情根）。2026-11-23 起作为 daily_bar 的 up_limit/down_limit 两列
+//     挂在既有根上，由 stk_limit 接口按 UPDATE-only 填。
 var schemaDDL = []string{
 	// ===================== 配置与状态 =====================
 	// 只有两列：类型/凭据标记/改动人与时间都不存 —— 类型的唯一真相源是代码里的键目录
@@ -97,12 +101,29 @@ var schemaDDL = []string{
 	// 10MB 量级的主键索引（2026-09-15 实测：177K 行时主键索引 10.0MB，表数据 6.8MB），
 	// 而 WITHOUT ROWID 让主键 B 树本身就是表，省掉这棵索引。
 	// 代价：分批删除不能再走 rowid 子查询（见 tx.go 的 DeleteBatchedRows）。
+	// 扩展 5 列（open/high/low/up_limit/down_limit，单位分）的三条口径，缺一不可：
+	//  1. **一律可空、NULL=unknown**。不用 0 表示缺失：daily 对停牌/无成交会给 0 价，
+	//     而 0 分在下游是一个"合法价格"，一旦被写进来就再也分不出"跌停价 0.00 元"和
+	//     "没数据"。可空也让 ensureColumns 能对存量行幂等补列（存量行自动取 NULL，
+	//     不给旧行编造语义），且 ADD COLUMN 不重写行、补列本身零体积代价。
+	//  2. **未复权真实价基准**，与 raw_close 同基准，而不是与 close（前复权）同基准。
+	//     理由：up_limit/down_limit 是交易所按 pre_close×(1±档) 公布的真实限价，
+	//     封板判定必须是真实价比真实价；若把 OHLC 复权而限价不复权，除权日会错判。
+	//     前复权序列在本表仍只有 close 一列，一处真相。
+	//  3. **只由 UPDATE-only 路径填**（见 MarketRepo.UpdateBarQuote）：这 5 列跨两个
+	//     接口（daily 给 OHLC、stk_limit 给限价），任何一路都不许为对侧造行。
+	//     指数行没有这些列的语义，永久保持 NULL。
 	`CREATE TABLE IF NOT EXISTS daily_bar (
 		ts_code     TEXT NOT NULL,
 		trade_date  TEXT NOT NULL,
 		close       INTEGER NOT NULL,
 		vol_lot     REAL,
 		raw_close   INTEGER NOT NULL DEFAULT 0,
+		open        INTEGER,
+		high        INTEGER,
+		low         INTEGER,
+		up_limit    INTEGER,
+		down_limit  INTEGER,
 		PRIMARY KEY (ts_code, trade_date)
 	) WITHOUT ROWID`,
 	`CREATE INDEX IF NOT EXISTS idx_bar_date ON daily_bar(trade_date)`,
@@ -240,6 +261,13 @@ var SchemaColumns = []TableColumns{
 		{"close", ""},      // NOT NULL 无默认
 		{"vol_lot", "vol_lot REAL"},
 		{"raw_close", "raw_close INTEGER NOT NULL DEFAULT 0"},
+		// 扩展 5 列全部可空 ⇒ 可由 ensureColumns 幂等补出，存量行为 NULL=unknown
+		// （不给旧行编造价格）。补列不重写行，体积只在被 UPDATE 到时发生（J2-A 实测）。
+		{"open", "open INTEGER"},
+		{"high", "high INTEGER"},
+		{"low", "low INTEGER"},
+		{"up_limit", "up_limit INTEGER"},
+		{"down_limit", "down_limit INTEGER"},
 	}},
 	{"order_ticket", []ColumnSpec{
 		{"id", ""}, // AUTOINCREMENT 主键

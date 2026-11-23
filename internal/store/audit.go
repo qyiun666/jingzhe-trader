@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -182,6 +183,46 @@ func (s *Store) dailyBarHasRowid(ctx context.Context) (bool, error) {
 	return !strings.Contains(strings.ToUpper(ddl), "WITHOUT ROWID"), nil
 }
 
+// barCopyIdent 列名合法性校验：拼接进 SQL 的列名只允许来自现役列清单的小写下划线标识符。
+var barCopyIdent = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+
+// dailyBarCopyColumns 返回「旧 daily_bar 库里真实有、且现役列清单也要求」的列，按清单顺序。
+//
+// 为什么不能把列清单硬编码进搬迁 SQL：这条路径的输入是**任意年代的旧库**（缺 raw_close
+// 的、缺后来那 5 列的都在范围内）。硬清单会让 "no such column" 直接把重建打死，
+// 而重建是拿到 WITHOUT ROWID 的唯一路径；反过来"只搬旧库有的、其余留空"是安全的 ——
+// 扩展价族列在新表保持 NULL=unknown，不给旧行编造价格。
+// 库里多出来的非现役列不进清单（与旧实现同样被丢弃，清点面由 AuditSchema 点名）。
+func (s *Store) dailyBarCopyColumns(ctx context.Context) ([]string, error) {
+	got, err := s.tableColumns(ctx, "daily_bar")
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, tc := range SchemaColumns {
+		if tc.Table != "daily_bar" {
+			continue
+		}
+		for _, c := range tc.Columns {
+			if !barCopyIdent.MatchString(c.Name) {
+				return nil, fmt.Errorf("现役列清单里的列名 %q 不是合法标识符", c.Name)
+			}
+			if got[c.Name] {
+				out = append(out, c.Name)
+			}
+		}
+	}
+	// 主键与 close 缺任何一条都不能搬：新表的 NOT NULL 约束会当场报错，
+	// 而更早在调用之前就该说清"这不是一张可搬迁的 daily_bar"。这条断言同时保证
+	// 下面的 colList 非空（拼接进 SQL 的只有现役清单里的名字）。
+	for _, need := range []string{"ts_code", "trade_date", "close"} {
+		if !got[need] {
+			return nil, fmt.Errorf("daily_bar 缺主键/必需列 %s，不可重建（可搬列 %v）", need, out)
+		}
+	}
+	return out, nil
+}
+
 // RebuildDailyBar 把 daily_bar 重建为 WITHOUT ROWID，返回搬迁的行数。
 //
 // 只在离线执行（没有其他进程在写库）——重建期间要 DROP 原表。全过程在一个事务里：
@@ -197,21 +238,35 @@ func (s *Store) RebuildDailyBar(ctx context.Context) (int, error) {
 	}
 
 	var moved int
+	copyCols, err := s.dailyBarCopyColumns(ctx)
+	if err != nil {
+		return 0, err
+	}
+	colList := strings.Join(copyCols, ", ")
 	err = WithTx(ctx, s.writeDB, func(tx *sqlx.Tx) error {
 		for _, q := range []string{
 			// 先清残留：上一次重建若在 DROP 之后异常中断，daily_bar_rebuild 会留在库里，
 			// 而 CREATE TABLE 没有 IF NOT EXISTS，会让本次重建永久失败且不自愈。
 			`DROP TABLE IF EXISTS daily_bar_rebuild`,
+			// 新表形状 = 现役 schema（与 schemaDDL 的 daily_bar 同列）。列清单漂移由
+			// TestRebuildDailyBarKeepsExtendedQuotes 抓住：新表少写一列，重建就会把
+			// 已填的扩展价族整批抹掉，而下次启动 ensureColumns 只补出 NULL，
+			// 清点照样报"结构一致"——数据没了还看着没病，是最坏的一种失败。
 			`CREATE TABLE daily_bar_rebuild (
 				ts_code     TEXT NOT NULL,
 				trade_date  TEXT NOT NULL,
 				close       INTEGER NOT NULL,
 				vol_lot     REAL,
 				raw_close   INTEGER NOT NULL DEFAULT 0,
+				open        INTEGER,
+				high        INTEGER,
+				low         INTEGER,
+				up_limit    INTEGER,
+				down_limit  INTEGER,
 				PRIMARY KEY (ts_code, trade_date)
 			) WITHOUT ROWID`,
-			`INSERT INTO daily_bar_rebuild (ts_code, trade_date, close, vol_lot, raw_close)
-				SELECT ts_code, trade_date, close, vol_lot, raw_close FROM daily_bar`,
+			`INSERT INTO daily_bar_rebuild (` + colList + `)
+				SELECT ` + colList + ` FROM daily_bar`,
 		} {
 			if _, err := tx.ExecContext(ctx, q); err != nil {
 				return fmt.Errorf("重建步骤失败: %w", err)
