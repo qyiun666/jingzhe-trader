@@ -162,6 +162,9 @@ func (r *MarketRepo) UpsertBar(ctx context.Context, b model.Bar) error {
 // **未复权真实价**口径）。每列三态：非 nil=有值，nil=unknown（落 NULL）。
 //
 // 用指针而不是 Fen+一个 valid 布尔位：调用侧不需要记住"0 是什么意思"，写不出 0 价。
+//
+// 写侧（UpdateBarQuote）与读侧（BarQuotesFor）共用这一个形状是刻意的：两边列面完全相同，
+// 分两个类型就会各自漂移出一套"什么算没值"的约定。
 type BarQuote struct {
 	Open      *model.Fen
 	High      *model.Fen
@@ -265,42 +268,49 @@ func (r *MarketRepo) LimitRowsFor(ctx context.Context, tradeDate string) (map[st
 
 // ===================== 次日回收行情（只读，服务阶段1 的 T+1 影子回收）=====================
 
-// T1Bar 回收 T 日影子单所需的次日四列价格，全部是**未复权真实价**口径。
+// nullFen 把可空价格列收成三态指针：NULL ⇒ nil（unknown），非 NULL ⇒ 指向该值。
 //
-// 刻意只有这四列、不返回 model.Bar：那个结构还带 Close（前复权）与 VolLot，本读法
-// 不取，留在返回值里就是"字段看着能读、实际恒为 0"。同 LimitRow 刻意不含 Close 一条
-// 纪律（组长 20261123 裁定三）——口径靠结构形状钉住，不靠注释提醒。
-type T1Bar struct {
-	Open     model.Fen `db:"open"`
-	High     model.Fen `db:"high"`
-	Low      model.Fen `db:"low"`
-	RawClose model.Fen `db:"raw_close"`
+// 与 dataloader 的 fenPtr 是相反方向的一对（那边把 Go 侧三态写成 SQL 参数，这边把库里的
+// NULL 读回 Go 侧三态），刻意不同名，避免读代码时以为一边改了另一边跟着变。
+func nullFen(v sql.NullInt64) *model.Fen {
+	if !v.Valid {
+		return nil
+	}
+	f := model.Fen(v.Int64)
+	return &f
 }
 
-// T1BarsFor 取指定代码集在指定交易日的四列真实价，返回**缺失键 map**（当日没出线的
+// BarQuotesFor 取指定代码集在指定交易日的 5 列扩展价族，返回**缺失键 map**（当日没出线的
 // 代码根本不出现在 map 里，判读与 LimitRowsFor 同一条口径）。
 //
-// 为什么不是给 LimitRowsFor 补三列（组长 20261124 裁定 3 的 (b′)）：那条读法是全市场
-// 截面、已提交并复验过（9fe8b06），而回收只需要上一交易日 TopN 的十几只。按代码集过滤
-// 走主键 (ts_code, trade_date)，代价比再扫一遍全表小一个量级。
+// 复用 BarQuote 而不是另立回收专用结构（策略 20261124 §2 的建议，组长 11-23 裁定 3 的
+// "1 个方法 + 最小形状"由此落成 0 新类型）：BarQuote 的五个字段就是回收要用的五列，
+// 且它的三态表达（*Fen，nil=库里没这个数）与裁定【1】同口径。**五列必须取全**——只选
+// open/high/low 三列却返回 BarQuote，会让 UpLimit/DownLimit 以 nil 出现，而 nil 在本类型里
+// 的既有含义是"库里这一列是 NULL＝交易所没供这个档"，"我没读这列"与"这列没值"就共用同一个
+// 字面量（策略 §3 点名的陷阱）。
 //
-// 四列都可能是 0：库里 NULL=该接口当日没给这个值（unknown），回收侧据此落"形态不判"，
-// 不得当成 0 元。
-func (r *MarketRepo) T1BarsFor(ctx context.Context, tradeDate string, codes []string) (map[string]T1Bar, error) {
+// 按代码集过滤而不是取全市场截面（组长 11-23 裁定 3）：回收只需要上一交易日 TopN 的十几只，
+// 走主键 (ts_code, trade_date) 比再扫一遍 idx_bar_date 全表小一个量级。全市场截面已有
+// LimitRowsFor 承担，两者不重复。
+//
+// RawClose 不在本读法里（BarQuote 没有这个字段）：回收侧的真实收盘价从同日期、同一次管线里
+// 已读到的 LimitRowsFor 结果取，两张 map 的键同为 ts_code、同日 ⇒ 不会错配日期。
+func (r *MarketRepo) BarQuotesFor(ctx context.Context, tradeDate string, codes []string) (map[string]BarQuote, error) {
 	if len(codes) == 0 {
-		return map[string]T1Bar{}, nil
+		return map[string]BarQuote{}, nil
 	}
-	// open/high/low 是可空列（NULL=该接口当日没给，schema.go 口径 1），必须经 sql.NullInt64
-	// 中转：直接扫进 model.Fen 会在第一根缺价的线上整条读法报错。raw_close 是 NOT NULL，直读。
+	// 五列全可空（NULL=该接口当日没给），必须经 sql.NullInt64 中转：直接扫进 model.Fen 会在
+	// 第一根缺价的线上整条读法报错（同 LimitRowsFor 的手法）。
 	var scanned []struct {
-		TsCode   string        `db:"ts_code"`
-		Open     sql.NullInt64 `db:"open"`
-		High     sql.NullInt64 `db:"high"`
-		Low      sql.NullInt64 `db:"low"`
-		RawClose model.Fen     `db:"raw_close"`
+		TsCode    string        `db:"ts_code"`
+		Open      sql.NullInt64 `db:"open"`
+		High      sql.NullInt64 `db:"high"`
+		Low       sql.NullInt64 `db:"low"`
+		UpLimit   sql.NullInt64 `db:"up_limit"`
+		DownLimit sql.NullInt64 `db:"down_limit"`
 	}
-	// ts_code 只作 map 键，不进 T1Bar（同 LimitRowsFor 的读法）。
-	q := fmt.Sprintf(`SELECT ts_code, open, high, low, raw_close FROM daily_bar
+	q := fmt.Sprintf(`SELECT ts_code, open, high, low, up_limit, down_limit FROM daily_bar
 		WHERE trade_date=? AND ts_code IN (%s)`, placeholders(len(codes)))
 	args := make([]interface{}, 0, len(codes)+1)
 	args = append(args, tradeDate)
@@ -308,22 +318,14 @@ func (r *MarketRepo) T1BarsFor(ctx context.Context, tradeDate string, codes []st
 		args = append(args, c)
 	}
 	if err := r.rdb.SelectContext(ctx, &scanned, q, args...); err != nil {
-		return nil, fmt.Errorf("读取 %s 回收行情（%d 只）失败: %w", tradeDate, len(codes), err)
+		return nil, fmt.Errorf("读取 %s 扩展价族（%d 只）失败: %w", tradeDate, len(codes), err)
 	}
-	out := make(map[string]T1Bar, len(scanned))
+	out := make(map[string]BarQuote, len(scanned))
 	for _, s := range scanned {
-		out[s.TsCode] = T1Bar{Open: fenOrZero(s.Open), High: fenOrZero(s.High),
-			Low: fenOrZero(s.Low), RawClose: s.RawClose}
+		out[s.TsCode] = BarQuote{Open: nullFen(s.Open), High: nullFen(s.High), Low: nullFen(s.Low),
+			UpLimit: nullFen(s.UpLimit), DownLimit: nullFen(s.DownLimit)}
 	}
 	return out, nil
-}
-
-// fenOrZero 把可空价格列读成的三态收成 model.Fen：NULL ⇒ 0（=unknown，回收侧按"形态不判"处理）。
-func fenOrZero(v sql.NullInt64) model.Fen {
-	if !v.Valid {
-		return 0
-	}
-	return model.Fen(v.Int64)
 }
 
 // ===================== 估值截面 / 停牌集合 =====================

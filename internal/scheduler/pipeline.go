@@ -203,7 +203,7 @@ func recoverT1Shadow(ctx context.Context, d Deps, date string, todayLimits map[s
 	for _, c := range snap.Candidates {
 		codes = append(codes, c.TsCode)
 	}
-	bars, err := d.Store.MarketRepo().T1BarsFor(ctx, date, codes)
+	bars, err := d.Store.MarketRepo().BarQuotesFor(ctx, date, codes)
 	if err != nil {
 		return err
 	}
@@ -213,17 +213,14 @@ func recoverT1Shadow(ctx context.Context, d Deps, date string, todayLimits map[s
 		n++
 		// 两张 map 都是缺失键 map：没键就是没这行/没这个档，交给 RecoverT1 落 unknown，
 		// 不在这里填 0 冒充有效价（signal 侧注释已写明零值会被读成"0 元"）。
+		// 五列三态与 raw_close 同日、同一次管线取（日期错配会静默把一字日读成可成交）。
 		q := signal.T1Quote{}
 		if b, ok := bars[code]; ok {
-			q.Open, q.High, q.Low, q.RawClose = b.Open, b.High, b.Low, b.RawClose
+			q.Open, q.High, q.Low = fenOf(b.Open), fenOf(b.High), fenOf(b.Low)
 		}
 		if l, ok := todayLimits[code]; ok {
-			if l.UpLimit != nil {
-				q.Up = *l.UpLimit
-			}
-			if l.DownLimit != nil {
-				q.Down = *l.DownLimit
-			}
+			q.RawClose = l.RawClose
+			q.Up, q.Down = fenOf(l.UpLimit), fenOf(l.DownLimit)
 		}
 		out := signal.RecoverT1(model.DirBuy, q)
 		if out.Fillable {
@@ -245,6 +242,18 @@ func recoverT1Shadow(ctx context.Context, d Deps, date string, todayLimits map[s
 	observability.S().Infow("T1回收", "prev_date", prevDate, "n", n, "fillable", fillable,
 		"sealed", sealed, "anomaly", anomaly, "avg_ret_pct", avgRetPct)
 	return nil
+}
+
+// fenOf 把 store 读法的三态指针（nil=库里 NULL=unknown）收成 signal 侧的零值表示。
+//
+// 塌成 0 这件事只能发生在**消费侧边界**，不能提前发生在上层，否则库里"NULL"与"0 元"就分不开了：
+// store 一路给的是 *model.Fen（BarQuote/LimitRow 同口径），signal 的 T1Quote/LimitDay 用 0 表示
+// "没有这个档位"（与 signal 自己的 fenOrZero 同一约定），这一行就是两个约定唯一的接缝。
+func fenOf(v *model.Fen) model.Fen {
+	if v == nil {
+		return 0
+	}
+	return *v
 }
 
 // prevCalendarDate 当日往前一个自然日。只要"严格早于当日"这个边界，真正的上一交易日
