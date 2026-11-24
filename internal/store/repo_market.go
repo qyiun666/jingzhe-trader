@@ -263,6 +263,69 @@ func (r *MarketRepo) LimitRowsFor(ctx context.Context, tradeDate string) (map[st
 	return out, nil
 }
 
+// ===================== 次日回收行情（只读，服务阶段1 的 T+1 影子回收）=====================
+
+// T1Bar 回收 T 日影子单所需的次日四列价格，全部是**未复权真实价**口径。
+//
+// 刻意只有这四列、不返回 model.Bar：那个结构还带 Close（前复权）与 VolLot，本读法
+// 不取，留在返回值里就是"字段看着能读、实际恒为 0"。同 LimitRow 刻意不含 Close 一条
+// 纪律（组长 20261123 裁定三）——口径靠结构形状钉住，不靠注释提醒。
+type T1Bar struct {
+	Open     model.Fen `db:"open"`
+	High     model.Fen `db:"high"`
+	Low      model.Fen `db:"low"`
+	RawClose model.Fen `db:"raw_close"`
+}
+
+// T1BarsFor 取指定代码集在指定交易日的四列真实价，返回**缺失键 map**（当日没出线的
+// 代码根本不出现在 map 里，判读与 LimitRowsFor 同一条口径）。
+//
+// 为什么不是给 LimitRowsFor 补三列（组长 20261124 裁定 3 的 (b′)）：那条读法是全市场
+// 截面、已提交并复验过（9fe8b06），而回收只需要上一交易日 TopN 的十几只。按代码集过滤
+// 走主键 (ts_code, trade_date)，代价比再扫一遍全表小一个量级。
+//
+// 四列都可能是 0：库里 NULL=该接口当日没给这个值（unknown），回收侧据此落"形态不判"，
+// 不得当成 0 元。
+func (r *MarketRepo) T1BarsFor(ctx context.Context, tradeDate string, codes []string) (map[string]T1Bar, error) {
+	if len(codes) == 0 {
+		return map[string]T1Bar{}, nil
+	}
+	// open/high/low 是可空列（NULL=该接口当日没给，schema.go 口径 1），必须经 sql.NullInt64
+	// 中转：直接扫进 model.Fen 会在第一根缺价的线上整条读法报错。raw_close 是 NOT NULL，直读。
+	var scanned []struct {
+		TsCode   string        `db:"ts_code"`
+		Open     sql.NullInt64 `db:"open"`
+		High     sql.NullInt64 `db:"high"`
+		Low      sql.NullInt64 `db:"low"`
+		RawClose model.Fen     `db:"raw_close"`
+	}
+	// ts_code 只作 map 键，不进 T1Bar（同 LimitRowsFor 的读法）。
+	q := fmt.Sprintf(`SELECT ts_code, open, high, low, raw_close FROM daily_bar
+		WHERE trade_date=? AND ts_code IN (%s)`, placeholders(len(codes)))
+	args := make([]interface{}, 0, len(codes)+1)
+	args = append(args, tradeDate)
+	for _, c := range codes {
+		args = append(args, c)
+	}
+	if err := r.rdb.SelectContext(ctx, &scanned, q, args...); err != nil {
+		return nil, fmt.Errorf("读取 %s 回收行情（%d 只）失败: %w", tradeDate, len(codes), err)
+	}
+	out := make(map[string]T1Bar, len(scanned))
+	for _, s := range scanned {
+		out[s.TsCode] = T1Bar{Open: fenOrZero(s.Open), High: fenOrZero(s.High),
+			Low: fenOrZero(s.Low), RawClose: s.RawClose}
+	}
+	return out, nil
+}
+
+// fenOrZero 把可空价格列读成的三态收成 model.Fen：NULL ⇒ 0（=unknown，回收侧按"形态不判"处理）。
+func fenOrZero(v sql.NullInt64) model.Fen {
+	if !v.Valid {
+		return 0
+	}
+	return model.Fen(v.Int64)
+}
+
 // ===================== 估值截面 / 停牌集合 =====================
 
 // ErrValuationSparse 估值截面空/覆盖不足：本次不得覆盖已有截面。

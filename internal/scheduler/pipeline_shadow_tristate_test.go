@@ -45,7 +45,7 @@ func TestWriteScreenSnapshotSectorShadowTriState(t *testing.T) {
 	// 四种 Report 形状 → 四种 brief → 写同一天（重跑覆盖），逐格取回原始 detail。
 	detail := func(t *testing.T, rep *screener.Report) string {
 		t.Helper()
-		if err := writeScreenSnapshot(ctx, d, "20261112", cands, rp, rep.SectorShadowBrief()); err != nil {
+		if err := writeScreenSnapshot(ctx, d, "20261112", cands, rp, rep.SectorShadowBrief(), ""); err != nil {
 			t.Fatalf("写快照失败: %v", err)
 		}
 		return topNDetail(t, st, "20261112")

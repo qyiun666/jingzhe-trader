@@ -128,21 +128,133 @@ func eveningPipeline(ctx context.Context, rc *observability.RunCtx, d Deps) erro
 	// 在弱势期选不出任何"买得起"的科技敞口。白名单 → 流动性两级，不排名，
 	// 与个股候选并入同一批交给同一个 LLM 评审。读不到数只降级，不断链。
 	cands = appendETFCandidates(ctx, rc, d, date, cands, budget)
+	// 阶段1 涨跌停影子（无条件观测，无开关）：当日封板价格截面只读一次，供下面两处共用——
+	// 当日候选的收盘触板判定进快照载荷，上一交易日影子单的次日回收只出日志。
+	//
+	// 读失败就让两处一起缺席，并在日志里具名：拿空 map 继续会把"截面没读到"写成
+	// N 只 no_row（交易所没供数），归因当场作废。缺席形态此时只有一行 WARN 可追。
+	limitRows, limitRowsErr := d.Store.MarketRepo().LimitRowsFor(ctx, date)
+	if limitRowsErr != nil {
+		observability.S().Warnw("涨跌停影子当日截面读取失败，limit_brief 与 T+1 回收本日缺席（纯观测，不断链）",
+			"date", date, "err", limitRowsErr.Error())
+	}
+	var limitBrief string
+	if limitRowsErr == nil {
+		// 键必须原样带后缀（map 键是 daily_bar.ts_code）：裁掉后缀全表都会记 no_row。
+		// 顺序必须跟 cands 原序：摘要列的前 N 只就是漏斗前 N 只，这样才和板块影子可比。
+		codes := make([]string, 0, len(cands))
+		for _, c := range cands {
+			codes = append(codes, c.TsCode)
+		}
+		limitBrief = signal.LimitBrief(codes, signal.LimitDays(limitRows))
+	}
 	// 候选快照先于决策落库：LLM 评审失败时当日仍然要有"当时选出了谁、评分多少"，
 	// 否则归因只剩失败留痕，无法区分"没选出来"与"选了但没批"。
 	//
 	// 板块影子摘要与快照同批落库而不是另起一行：screen:topn 是"当日选股侧到底看见了什么"
 	// 的唯一每日留痕点（每天必写、重跑覆盖、归因与 get_logs 都读它），另开一行就会出现
 	// 第二个选股留痕点，两个口径迟早漂移。摘要本身在开关关闭时恒为空串 ⇒ 载荷不写该键。
-	if err := writeScreenSnapshot(ctx, d, date, cands, rp, rep.SectorShadowBrief()); err != nil {
+	if err := writeScreenSnapshot(ctx, d, date, cands, rp, rep.SectorShadowBrief(), limitBrief); err != nil {
 		observability.S().Warnw("候选快照落库失败，当日归因将缺少成分",
 			"date", date, "candidates", len(cands), "err", err.Error())
 		rc.Degrade("SCREEN_SNAPSHOT_FAILED", "候选快照落库失败："+err.Error())
+	}
+	if limitRowsErr == nil {
+		if err := recoverT1Shadow(ctx, d, date, limitRows); err != nil {
+			observability.S().Warnw("T+1 影子回收未完成（纯观测，不断链）", "date", date, "err", err.Error())
+		}
 	}
 	if err := buildTickets(ctx, rc, d, date, cands, watch, rp); err != nil {
 		return fmt.Errorf("④ 买卖决策: %w", err)
 	}
 	return nil
+}
+
+// recoverT1Shadow 用当日实际行情回收"上一交易日 TopN 影子单"，一次运行只出一行日志。
+//
+// 阶段1 纯观测（组长 20261124 派工 3-b）：不落库、不进 screen:topn 载荷、不加 subject、
+// 不加配置键 —— 回收结论每天用当日数据现算，没有需要持久化的状态。
+//
+// 回收对象刻意取上一交易日的候选清单并按买向判：limit_brief 当日答的是"收盘那一刻买不买得到"，
+// 这里答的是"次日真下单买不买得到"，同一批对象两问才可比（卖向影子是持仓单，不在本阶段范围）。
+//
+// "上一交易日"不自己算日历：取 trade_date < 当日 的最近一行快照，周末与节假日自然落到对的日子上，
+// 而且那一行自带 trade_date，不必再查 trade_cal。
+func recoverT1Shadow(ctx context.Context, d Deps, date string, todayLimits map[string]store.LimitRow) error {
+	before, err := prevCalendarDate(date)
+	if err != nil {
+		return err
+	}
+	tr, ok, err := d.Store.TraceRepo().LatestBySubject(ctx, model.TraceScreenTopN(), before)
+	if err != nil {
+		return err
+	}
+	var snap model.ScreenSnapshot
+	if ok && tr.Detail != "" {
+		if err := json.Unmarshal([]byte(tr.Detail), &snap); err != nil {
+			return fmt.Errorf("解析 %s 候选快照失败: %w", tr.TradeDate, err)
+		}
+	}
+	prevDate := ""
+	if ok {
+		prevDate = tr.TradeDate
+	}
+	codes := make([]string, 0, len(snap.Candidates))
+	for _, c := range snap.Candidates {
+		codes = append(codes, c.TsCode)
+	}
+	bars, err := d.Store.MarketRepo().T1BarsFor(ctx, date, codes)
+	if err != nil {
+		return err
+	}
+	var n, fillable, sealed, anomaly int
+	var retSum float64
+	for _, code := range codes {
+		n++
+		// 两张 map 都是缺失键 map：没键就是没这行/没这个档，交给 RecoverT1 落 unknown，
+		// 不在这里填 0 冒充有效价（signal 侧注释已写明零值会被读成"0 元"）。
+		q := signal.T1Quote{}
+		if b, ok := bars[code]; ok {
+			q.Open, q.High, q.Low, q.RawClose = b.Open, b.High, b.Low, b.RawClose
+		}
+		if l, ok := todayLimits[code]; ok {
+			if l.UpLimit != nil {
+				q.Up = *l.UpLimit
+			}
+			if l.DownLimit != nil {
+				q.Down = *l.DownLimit
+			}
+		}
+		out := signal.RecoverT1(model.DirBuy, q)
+		if out.Fillable {
+			fillable++
+			retSum += out.RetPct
+		}
+		if out.Reason == signal.ReasonSealed {
+			sealed++
+		}
+		if out.Anomaly {
+			anomaly++
+		}
+	}
+	// 平均收益只对有成交基准的（fillable）求：未回收成的没有 Entry，把 0 计入会稀释真实档。
+	avgRetPct := 0.0
+	if fillable > 0 {
+		avgRetPct = retSum / float64(fillable)
+	}
+	observability.S().Infow("T1回收", "prev_date", prevDate, "n", n, "fillable", fillable,
+		"sealed", sealed, "anomaly", anomaly, "avg_ret_pct", avgRetPct)
+	return nil
+}
+
+// prevCalendarDate 当日往前一个自然日。只要"严格早于当日"这个边界，真正的上一交易日
+// 由 LatestBySubject 的 trade_date DESC 取行决定，所以这里不需要交易日判据。
+func prevCalendarDate(date string) (string, error) {
+	t, err := time.Parse("20060102", date)
+	if err != nil {
+		return "", fmt.Errorf("日期 %s 不是 YYYYMMDD: %w", date, err)
+	}
+	return t.AddDate(0, 0, -1).Format("20060102"), nil
 }
 
 // writeScreenSnapshot 把进入决策链的整批候选（含 ETF 补口）写成 screen:topn 一行。
@@ -153,8 +265,12 @@ func eveningPipeline(ctx context.Context, rc *observability.RunCtx, d Deps) erro
 // sectorShadowBrief 是 B2 板块影子摘要（report 未开启该观测时为空串）：走载荷末尾的
 // omitempty 独立字段，既不动 candidates 里的任何既有键，也不动键序 ⇒ 关闭观测的日子
 // detail 与本参数出现前逐字节相同，逐日 diff 仍然可比。
+//
+// limitBrief 是阶段1 涨跌停影子摘要（signal.LimitBrief 产出）。与上一个参数不同，它**没有开关**：
+// 正常跑完必为非空串（当日 0 触板也是"涨跌停影子 0/候选 M 只"那句），所以键缺席只有两个来源——
+// 写这行的二进制没接线，或当日截面读失败（调用点已具名 WARN）。空串只用于旧数据回放与读失败日。
 func writeScreenSnapshot(ctx context.Context, d Deps, date string, cands []model.Candidate, rp risk.RiskParams,
-	sectorShadowBrief string) error {
+	sectorShadowBrief, limitBrief string) error {
 	snap := model.ScreenSnapshot{
 		TradeDate:     date,
 		TotalAssetFen: int64(rp.TotalAsset),
@@ -162,6 +278,7 @@ func writeScreenSnapshot(ctx context.Context, d Deps, date string, cands []model
 		Candidates:    make([]model.CandidateSnapshot, 0, len(cands)),
 
 		SectorShadowBrief: sectorShadowBrief,
+		LimitBrief:        limitBrief,
 	}
 	for _, c := range cands {
 		snap.Candidates = append(snap.Candidates, model.CandidateSnapshot{

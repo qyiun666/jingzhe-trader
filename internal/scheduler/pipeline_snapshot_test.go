@@ -29,7 +29,7 @@ func TestWriteScreenSnapshot(t *testing.T) {
 		Score: 88.5, Factors: model.FactorScore{Momentum: 90, Value: 80, LowVol: 70, Liquidity: 60},
 		Close: 1234, Mom: 0.08, SectorMom: 0.05,
 	}}
-	if err := writeScreenSnapshot(ctx, d, "20261009", cands, rp, ""); err != nil {
+	if err := writeScreenSnapshot(ctx, d, "20261009", cands, rp, "", ""); err != nil {
 		t.Fatalf("写快照失败: %v", err)
 	}
 	snaps, err := st.TraceRepo().ListScreenTopN(ctx, "20261009", "20261009")
@@ -53,7 +53,7 @@ func TestWriteScreenSnapshot(t *testing.T) {
 	}
 
 	// 重跑覆盖：同一天仍只有一行；空候选写出 0 条而不是残留上一轮。
-	if err := writeScreenSnapshot(ctx, d, "20261009", nil, rp, ""); err != nil {
+	if err := writeScreenSnapshot(ctx, d, "20261009", nil, rp, "", ""); err != nil {
 		t.Fatalf("写空快照失败: %v", err)
 	}
 	snaps, err = st.TraceRepo().ListScreenTopN(ctx, "20261009", "20261009")
@@ -113,7 +113,7 @@ func TestWriteScreenSnapshotSectorShadowField(t *testing.T) {
 	const date = "20261009"
 
 	// ① 关闭观测（brief 为空串）：新键不得出现，且整段 detail 与旧载荷形状往返一致。
-	if err := writeScreenSnapshot(ctx, d, date, cands, rp, ""); err != nil {
+	if err := writeScreenSnapshot(ctx, d, date, cands, rp, "", ""); err != nil {
 		t.Fatalf("写关闭态快照失败: %v", err)
 	}
 	off := topNDetail(t, st, date)
@@ -142,7 +142,7 @@ func TestWriteScreenSnapshotSectorShadowField(t *testing.T) {
 
 	// ② 开启观测：只追加 sector_shadow_brief 一个键，既有内容一字不改。
 	brief := "板块影子 12 只（sector 级淘汰，未参与打分，漏斗输入序，列前 10）：600000.SH 测试0/银行 10.10元。"
-	if err := writeScreenSnapshot(ctx, d, date, cands, rp, brief); err != nil {
+	if err := writeScreenSnapshot(ctx, d, date, cands, rp, brief, ""); err != nil {
 		t.Fatalf("写开启态快照失败: %v", err)
 	}
 	on := topNDetail(t, st, date)
